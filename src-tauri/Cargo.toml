@@ -1,0 +1,25 @@
+[package]
+name = "tako-switch"
+version = "0.1.0"
+description = "One-click Codex and Claude Code configuration importer"
+authors = ["Tako"]
+edition = "2021"
+
+[lib]
+name = "tako_switch_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.0", features = [] }
+tauri-plugin-opener = "2.0"
+toml_edit = "0.22"
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
