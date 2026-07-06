@@ -1,4 +1,6 @@
 use chrono::Local;
+mod tako;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 #[cfg(windows)]
@@ -10,12 +12,16 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+use tauri::{Emitter, Manager};
+use tauri_plugin_deep_link::DeepLinkExt;
 use toml_edit::{value, DocumentMut, Item, Table};
 use url::Url;
 
 const CODEX_ENV_KEY: &str = "TAKO_CODEX_API_KEY";
 const CODEX_PROVIDER_ID: &str = "tako_proxy";
 const MISSING_SENTINEL: &str = "TAKO_BACKUP_ORIGINAL_FILE_MISSING\n";
+const BACKUP_INDEX_FILE: &str = "tako-config-backups.json";
+const BACKUP_INDEX_VERSION: u32 = 1;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -40,7 +46,7 @@ struct NormalizedInput {
     configure_claude: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolStatus {
     name: String,
@@ -92,7 +98,7 @@ pub struct PreviewResult {
     warnings: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AppliedFile {
     target: String,
@@ -101,7 +107,7 @@ pub struct AppliedFile {
     created: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ApplyResult {
     files: Vec<AppliedFile>,
@@ -117,6 +123,21 @@ pub struct RestoreResult {
     path: String,
     restored_from: String,
     deleted_target: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupIndex {
+    version: u32,
+    saved_at: String,
+    result: ApplyResult,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TakoAuthEvent {
+    key: String,
+    state: Option<String>,
 }
 
 #[tauri::command]
@@ -162,7 +183,7 @@ fn preview_changes(input: ConfigInput) -> Result<PreviewResult, String> {
             target: "codex".to_string(),
             path: display_path(&path),
             exists: path.exists(),
-            backup_path: display_path(&make_backup_path(&path)),
+            backup_path: display_path(&make_backup_path("codex", &path)?),
             before: redact_plain_text(before),
             after: redact_plain_text(after),
         });
@@ -188,7 +209,7 @@ fn preview_changes(input: ConfigInput) -> Result<PreviewResult, String> {
             target: "claude".to_string(),
             path: display_path(&path),
             exists: path.exists(),
-            backup_path: display_path(&make_backup_path(&path)),
+            backup_path: display_path(&make_backup_path("claude", &path)?),
             before: redact_json_text(before),
             after: redact_json_text(after),
         });
@@ -237,12 +258,14 @@ fn apply_configs(input: ConfigInput) -> Result<ApplyResult, String> {
         files.push(write_config_file("claude", &path, &after)?);
     }
 
-    Ok(ApplyResult {
+    let result = ApplyResult {
         files,
         env_updates,
         tools: detect_tools(),
         warnings,
-    })
+    };
+    save_latest_apply_result_to_disk(&result)?;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -265,6 +288,8 @@ fn restore_backup(target: String, backup_path: String) -> Result<RestoreResult, 
                 .map_err(|err| format!("Failed to remove restored target: {err}"))?;
         }
 
+        clear_latest_apply_result_from_disk()?;
+
         return Ok(RestoreResult {
             target,
             path: display_path(&target_path),
@@ -275,6 +300,7 @@ fn restore_backup(target: String, backup_path: String) -> Result<RestoreResult, 
 
     write_file_atomic(&target_path, &backup_content)
         .map_err(|err| format!("Failed to restore backup: {err}"))?;
+    clear_latest_apply_result_from_disk()?;
 
     Ok(RestoreResult {
         target,
@@ -284,18 +310,122 @@ fn restore_backup(target: String, backup_path: String) -> Result<RestoreResult, 
     })
 }
 
+#[tauri::command]
+fn load_latest_apply_result() -> Result<Option<ApplyResult>, String> {
+    load_latest_apply_result_from_disk()
+}
+
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    let parsed = validate_external_url(&url)?;
+    tauri_plugin_opener::open_url(parsed.as_str(), None::<&str>)
+        .map_err(|err| format!("Failed to open browser: {err}"))
+}
+
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            let mut handled_deeplink = false;
+            for arg in args {
+                if handle_deeplink_url(app, &arg) {
+                    handled_deeplink = true;
+                    break;
+                }
+            }
+
+            if !handled_deeplink {
+                focus_main_window(app);
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_store::Builder::default().build())
+        .setup(|app| {
+            #[cfg(all(debug_assertions, windows))]
+            {
+                if let Err(err) = app.deep_link().register_all() {
+                    eprintln!("Failed to register deep-link schemes: {err}");
+                }
+            }
+
+            app.deep_link().on_open_url({
+                let app_handle = app.handle().clone();
+                move |event| {
+                    for url in event.urls() {
+                        handle_deeplink_url(&app_handle, &url.to_string());
+                    }
+                }
+            });
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             detect_tools,
             load_current_configs,
+            load_latest_apply_result,
             preview_changes,
             apply_configs,
-            restore_backup
+            restore_backup,
+            open_external,
+            tako::tako_login,
+            tako::tako_apply_key,
+            tako::tako_current_identity,
+            tako::tako_logout,
+            tako::tako_usage,
+            tako::tako_list_models
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tako Switch");
+}
+
+fn validate_external_url(raw: &str) -> Result<Url, String> {
+    let parsed = Url::parse(raw).map_err(|_| "External URL is invalid.".to_string())?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err("External URL must start with http:// or https://.".to_string());
+    }
+    Ok(parsed)
+}
+
+fn parse_auth_deeplink(url: &str) -> Option<TakoAuthEvent> {
+    let parsed = Url::parse(url).ok()?;
+    if parsed.scheme() != "takoswitch" {
+        return None;
+    }
+
+    let params: std::collections::HashMap<String, String> =
+        parsed.query_pairs().into_owned().collect();
+    if params.get("resource").map(String::as_str) != Some("auth") {
+        return None;
+    }
+
+    let key = params.get("key").filter(|value| !value.is_empty())?.clone();
+    let state = params
+        .get("state")
+        .filter(|value| !value.is_empty())
+        .cloned();
+    Some(TakoAuthEvent { key, state })
+}
+
+fn handle_deeplink_url(app: &tauri::AppHandle, url: &str) -> bool {
+    let Some(auth_event) = parse_auth_deeplink(url) else {
+        return false;
+    };
+
+    if let Err(err) = app.emit("tako-auth", auth_event) {
+        eprintln!("Failed to emit tako-auth event: {err}");
+    }
+
+    focus_main_window(app);
+
+    true
+}
+
+fn focus_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }
 
 fn validate_input(input: ConfigInput) -> Result<NormalizedInput, String> {
@@ -562,11 +692,16 @@ fn merge_claude_settings(
 
 fn write_config_file(target: &str, path: &Path, content: &str) -> Result<AppliedFile, String> {
     let existed = path.exists();
-    let backup_path = make_backup_path(path);
+    let backup_path = make_backup_path(target, path)?;
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("Failed to create config folder: {err}"))?;
+    }
+
+    if let Some(parent) = backup_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create backup folder: {err}"))?;
     }
 
     if existed {
@@ -634,13 +769,104 @@ fn restore_from_backup(path: &Path, backup_path: &Path) -> io::Result<()> {
     write_file_atomic(path, &content)
 }
 
-fn make_backup_path(path: &Path) -> PathBuf {
+fn make_backup_path(target: &str, path: &Path) -> Result<PathBuf, String> {
     let timestamp = Local::now().format("%Y%m%d-%H%M%S");
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("config");
-    path.with_file_name(format!("{file_name}.tako-backup-{timestamp}"))
+    Ok(backup_root()?
+        .join(backup_target_dir(target))
+        .join(format!("{file_name}.tako-backup-{timestamp}")))
+}
+
+fn backup_target_dir(target: &str) -> &'static str {
+    match target {
+        "codex" => "codex",
+        "claude" => "claude-code",
+        _ => "other",
+    }
+}
+
+fn backup_root() -> Result<PathBuf, String> {
+    Ok(install_dir()?.join("backups"))
+}
+
+fn install_dir() -> Result<PathBuf, String> {
+    if cfg!(test) {
+        if let Some(path) = env::var_os("TAKO_SWITCH_INSTALL_DIR") {
+            return Ok(PathBuf::from(path));
+        }
+    }
+
+    if let Ok(exe) = env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            return Ok(parent.to_path_buf());
+        }
+    }
+
+    env::current_dir().map_err(|err| format!("Could not determine install folder: {err}"))
+}
+
+fn backup_index_path() -> Result<PathBuf, String> {
+    Ok(install_dir()?.join(BACKUP_INDEX_FILE))
+}
+
+fn save_latest_apply_result_to_disk(result: &ApplyResult) -> Result<(), String> {
+    let index_path = backup_index_path()?;
+    let index = BackupIndex {
+        version: BACKUP_INDEX_VERSION,
+        saved_at: Local::now().to_rfc3339(),
+        result: result.clone(),
+    };
+    let content = serde_json::to_string_pretty(&index)
+        .map(ensure_trailing_newline)
+        .map_err(|err| format!("Failed to render backup index: {err}"))?;
+    write_file_atomic(&index_path, &content).map_err(|err| {
+        format!(
+            "Failed to save backup index {}: {err}",
+            display_path(&index_path)
+        )
+    })
+}
+
+fn load_latest_apply_result_from_disk() -> Result<Option<ApplyResult>, String> {
+    let index_path = backup_index_path()?;
+    if !index_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&index_path).map_err(|err| {
+        format!(
+            "Failed to read backup index {}: {err}",
+            display_path(&index_path)
+        )
+    })?;
+    let index: BackupIndex = serde_json::from_str(&content).map_err(|err| {
+        format!(
+            "Backup index {} is not valid JSON: {err}",
+            display_path(&index_path)
+        )
+    })?;
+
+    if index.version != BACKUP_INDEX_VERSION {
+        return Ok(None);
+    }
+
+    Ok(Some(index.result))
+}
+
+fn clear_latest_apply_result_from_disk() -> Result<(), String> {
+    let index_path = backup_index_path()?;
+    if index_path.exists() {
+        fs::remove_file(&index_path).map_err(|err| {
+            format!(
+                "Failed to clear backup index {}: {err}",
+                display_path(&index_path)
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn resolve_restore_target(target: &str) -> Result<PathBuf, String> {
@@ -973,6 +1199,57 @@ name = "Other"
     }
 
     #[test]
+    fn backups_and_latest_apply_result_use_install_folder() {
+        let install_dir = env::temp_dir().join(format!(
+            "tako-switch-index-test-{}",
+            Local::now().format("%Y%m%d%H%M%S%3f")
+        ));
+        fs::create_dir_all(&install_dir).unwrap();
+        env::set_var("TAKO_SWITCH_INSTALL_DIR", &install_dir);
+
+        let codex_backup = make_backup_path("codex", Path::new("config.toml")).unwrap();
+        let claude_backup = make_backup_path("claude", Path::new("settings.json")).unwrap();
+        let index = backup_index_path().unwrap();
+
+        assert!(codex_backup.starts_with(install_dir.join("backups").join("codex")));
+        assert!(claude_backup.starts_with(install_dir.join("backups").join("claude-code")));
+        assert_eq!(index, install_dir.join(BACKUP_INDEX_FILE));
+
+        let result = ApplyResult {
+            files: vec![AppliedFile {
+                target: "codex".to_string(),
+                path: "C:\\Users\\demo\\.codex\\config.toml".to_string(),
+                backup_path: display_path(
+                    &install_dir
+                        .join("backups")
+                        .join("codex")
+                        .join("config.toml.tako-backup-test"),
+                ),
+                created: false,
+            }],
+            env_updates: vec!["env updated".to_string()],
+            tools: vec![ToolStatus {
+                name: "Codex".to_string(),
+                installed: true,
+                version: Some("codex 1.0.0".to_string()),
+                error: None,
+            }],
+            warnings: vec!["warning".to_string()],
+        };
+
+        save_latest_apply_result_to_disk(&result).unwrap();
+        assert!(install_dir.join(BACKUP_INDEX_FILE).exists());
+        let loaded = load_latest_apply_result_from_disk().unwrap().unwrap();
+        assert_eq!(loaded.files[0].backup_path, result.files[0].backup_path);
+
+        clear_latest_apply_result_from_disk().unwrap();
+        assert!(load_latest_apply_result_from_disk().unwrap().is_none());
+
+        env::remove_var("TAKO_SWITCH_INSTALL_DIR");
+        let _ = fs::remove_dir_all(&install_dir);
+    }
+
+    #[test]
     fn validation_rejects_empty_secret_and_bad_url() {
         let input = ConfigInput {
             gateway_base_url: "ftp://localhost".to_string(),
@@ -984,6 +1261,32 @@ name = "Other"
         };
 
         assert!(validate_input(input).is_err());
+    }
+
+    #[test]
+    fn external_url_validation_only_allows_http_and_https() {
+        assert!(validate_external_url("https://tako.shiroha.tech/app/authorize").is_ok());
+        assert!(validate_external_url("http://localhost:1420").is_ok());
+        assert!(validate_external_url("takoswitch://v1/import?resource=auth").is_err());
+        assert!(validate_external_url("not a url").is_err());
+    }
+
+    #[test]
+    fn auth_deeplink_parses_key_and_state() {
+        let event =
+            parse_auth_deeplink("takoswitch://v1/import?resource=auth&key=cr_abc123&state=s-xyz")
+                .unwrap();
+
+        assert_eq!(event.key, "cr_abc123");
+        assert_eq!(event.state.as_deref(), Some("s-xyz"));
+    }
+
+    #[test]
+    fn auth_deeplink_rejects_non_auth_or_missing_key() {
+        assert!(parse_auth_deeplink("takoswitch://v1/import?resource=provider&key=cr_x").is_none());
+        assert!(parse_auth_deeplink("takoswitch://v1/import?resource=auth").is_none());
+        assert!(parse_auth_deeplink("takoswitch://v1/import?resource=auth&key=").is_none());
+        assert!(parse_auth_deeplink("https://tako.shiroha.tech/app/authorize").is_none());
     }
 
     #[test]

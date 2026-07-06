@@ -19,6 +19,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -97,6 +98,47 @@ h2 {
   font-size: 14px;
 }
 
+.tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 18px;
+  padding: 6px;
+  border: 1px solid #d8e0e8;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.tab {
+  min-height: 40px;
+  border-color: transparent;
+  background: transparent;
+  color: #40536b;
+  flex: 0 0 auto;
+}
+
+.tab.active {
+  border-color: #b9c9d9;
+  background: #edf4fb;
+  color: #17283d;
+}
+
+.home-layout {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 18px;
+  align-items: start;
+}
+
+.home-main {
+  display: grid;
+  gap: 16px;
+}
+
+.home-main .panel-heading,
+.home-main .status-strip {
+  margin-bottom: 0;
+}
+
 .status-strip {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -120,6 +162,12 @@ h2 {
   background: #effaf3;
 }
 
+.status-item.tako-account-card {
+  align-items: flex-start;
+  border-color: #cfe0dc;
+  background: #f3faf5;
+}
+
 .status-item svg {
   width: 22px;
   height: 22px;
@@ -129,6 +177,10 @@ h2 {
 
 .status-item.installed svg {
   color: #168249;
+}
+
+.status-item.tako-account-card svg {
+  color: #17634b;
 }
 
 .status-item strong,
@@ -141,6 +193,55 @@ h2 {
   color: #5f6f83;
   font-size: 13px;
   overflow-wrap: anywhere;
+}
+
+.tako-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.usage-tile,
+.tako-model-summary {
+  min-height: 96px;
+  padding: 12px;
+  border: 1px solid #d6e3df;
+  border-radius: 8px;
+  background: #fbfefd;
+}
+
+.usage-tile strong,
+.usage-tile span,
+.tako-model-summary strong,
+.tako-model-summary span,
+.tako-model-summary small {
+  display: block;
+}
+
+.usage-tile span,
+.tako-model-summary span {
+  margin-top: 6px;
+  color: #40536b;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.usage-bar {
+  height: 7px;
+  margin-top: 12px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e1ebe8;
+}
+
+.usage-bar div {
+  height: 100%;
+  border-radius: inherit;
+  background: #17634b;
+}
+
+.tako-model-summary small {
+  margin-top: 6px;
 }
 
 .form-panel {
@@ -207,6 +308,7 @@ h2 {
 }
 
 .field input,
+.field select,
 .secret-input,
 textarea {
   width: 100%;
@@ -217,15 +319,19 @@ textarea {
 }
 
 .field input,
+.field select,
 .secret-input {
   min-height: 44px;
 }
 
-.field input {
+.field input,
+.field select {
   padding: 0 12px;
 }
 
-.field input:disabled {
+.field input:disabled,
+.field input[readonly],
+.field select:disabled {
   color: #8a98aa;
   background: #eef2f6;
 }
@@ -251,6 +357,21 @@ textarea {
   outline: 0;
 }
 
+.readonly-secret {
+  padding-right: 4px;
+  background: #eef2f6;
+}
+
+.readonly-secret input {
+  color: #3b4c61;
+}
+
+.inline-icon {
+  width: 34px;
+  min-width: 34px;
+  min-height: 34px;
+}
+
 .field-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -261,6 +382,11 @@ textarea {
   display: flex;
   gap: 10px;
   margin-top: 4px;
+}
+
+.compact-row {
+  margin-top: 0;
+  flex-wrap: wrap;
 }
 
 button {
@@ -299,6 +425,18 @@ button svg {
   color: #ffffff;
 }
 
+.import-action {
+  border-color: #063f2d;
+  background: #07563d;
+  color: #ffffff;
+  font-size: 15px;
+  font-weight: 900;
+}
+
+.wide {
+  min-width: 220px;
+}
+
 .secondary {
   border-color: #c7d3e0;
   background: #ffffff;
@@ -316,6 +454,63 @@ button svg {
   border-color: #c7d3e0;
   background: #ffffff;
   color: #1f344b;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(15, 23, 42, 0.46);
+}
+
+.modal-panel {
+  width: min(1060px, calc(100vw - 32px));
+  max-height: min(860px, calc(100vh - 32px));
+  overflow: auto;
+  border: 1px solid #cfd8e3;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 24px 70px rgba(15, 23, 42, 0.28);
+  padding: 18px;
+}
+
+.modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 18px;
+}
+
+.modal-grid {
+  display: grid;
+  grid-template-columns: minmax(300px, 0.78fr) minmax(420px, 1.22fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.modal-config,
+.modal-preview,
+.modal-results {
+  border: 1px solid #dce5ef;
+  border-radius: 8px;
+  background: #fbfdff;
+  padding: 14px;
+}
+
+.modal-results {
+  margin-top: 14px;
+}
+
+.compact-heading {
+  margin-bottom: 14px;
+}
+
+.compact-preview textarea {
+  min-height: 180px;
 }
 
 .notice {
@@ -443,6 +638,10 @@ textarea {
   margin-top: 18px;
 }
 
+.standalone-panel {
+  margin-top: 0;
+}
+
 .result-row {
   display: flex;
   align-items: center;
@@ -494,7 +693,9 @@ textarea {
 
 @media (max-width: 920px) {
   .workspace,
+  .home-layout,
   .status-strip,
+  .tako-detail-grid,
   .current-grid,
   .diff-grid,
   .field-grid {
@@ -508,6 +709,11 @@ textarea {
   .env-row {
     grid-template-columns: 1fr;
   }
+
+  .compact-row {
+    justify-content: flex-start;
+  }
+
 }
 
 @media (max-width: 620px) {
@@ -520,14 +726,22 @@ textarea {
     align-items: flex-start;
   }
 
+  .tabs,
+  .button-row {
+    flex-direction: column;
+  }
+
+  .tab,
+  .wide {
+    width: 100%;
+  }
+
   h1 {
     font-size: 24px;
   }
 
-  .target-grid,
-  .button-row {
+  .target-grid {
     grid-template-columns: 1fr;
-    flex-direction: column;
   }
 
   .result-row {

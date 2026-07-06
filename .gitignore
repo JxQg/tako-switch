@@ -38,3 +38,8 @@ bun-error.log*
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+
+# Codex
+.agents/
+.codex/
