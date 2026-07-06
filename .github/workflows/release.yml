@@ -1,0 +1,159 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare-release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      release-id: ${{ steps.create_release.outputs.result }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Validate tag version
+        run: bun scripts/sync-version-from-tag.mjs "${{ github.ref_name }}" --validate-only
+
+      - name: Generate release notes
+        run: bun scripts/generate-release-notes.mjs "${{ github.ref_name }}" > release-notes.md
+
+      - name: Create or update GitHub Release
+        id: create_release
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const fs = require('fs');
+            const tag = context.ref.replace('refs/tags/', '');
+            const body = fs.readFileSync('release-notes.md', 'utf8');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            try {
+              const { data: release } = await github.rest.repos.getReleaseByTag({
+                owner,
+                repo,
+                tag,
+              });
+
+              await github.rest.repos.updateRelease({
+                owner,
+                repo,
+                release_id: release.id,
+                name: `Tako Switch ${tag}`,
+                body,
+                draft: false,
+                prerelease: false,
+              });
+
+              return String(release.id);
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+
+              const { data: release } = await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                name: `Tako Switch ${tag}`,
+                body,
+                draft: false,
+                prerelease: false,
+              });
+
+              return String(release.id);
+            }
+
+  build-release:
+    name: Build ${{ matrix.name }}
+    needs: prepare-release
+    runs-on: ${{ matrix.platform }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            platform: windows-latest
+            rustTargets: ""
+            args: "--bundles nsis,msi"
+          - name: macOS
+            platform: macos-latest
+            rustTargets: "aarch64-apple-darwin,x86_64-apple-darwin"
+            args: "--target universal-apple-darwin --bundles dmg"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rustTargets }}
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Sync version from tag
+        run: bun scripts/sync-version-from-tag.mjs "${{ github.ref_name }}"
+
+      - name: Sync Cargo lockfile version
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cargo update --manifest-path src-tauri/Cargo.toml --package tako-switch --precise "$version"
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Configure macOS signing
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY_SECRET: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          if [ -n "$APPLE_SIGNING_IDENTITY_SECRET" ]; then
+            echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY_SECRET" >> "$GITHUB_ENV"
+          else
+            echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build and publish release assets
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.prepare-release.outputs.release-id }}
+          tagName: ${{ github.ref_name }}
+          tauriScript: bun run tauri
+          args: ${{ matrix.args }}
+          retryAttempts: 2
+          releaseAssetNamePattern: "Tako-Switch-v[version]-[platform]-[arch][setup][ext]"

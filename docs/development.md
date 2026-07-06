@@ -19,6 +19,34 @@ cargo test --manifest-path src-tauri/Cargo.toml
 bun run tauri:build
 ```
 
+## Release
+
+Pushing a semantic version tag builds and publishes a GitHub Release:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow syncs the tag version into `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` before building. For example, `v0.1.0` builds app version `0.1.0`.
+
+Release assets are uploaded with versioned names:
+
+- Windows: NSIS `.exe` and MSI `.msi`
+- macOS: universal Apple Silicon + Intel `.dmg`
+
+Release notes are generated from Conventional Commit subjects since the previous tag:
+
+- `feat:` -> Features
+- `fix:` -> Fixes
+- `build:` / `ci:` -> Build
+- `docs:` -> Documentation
+- `chore:` / `refactor:` / `style:` -> Maintenance
+
+Use `!` or a `BREAKING CHANGE:` footer for Breaking Changes, for example `feat!: change config format`.
+
+macOS uses `APPLE_SIGNING_IDENTITY` from Repository secrets when it is configured. If the secret is empty, CI falls back to ad-hoc signing with `APPLE_SIGNING_IDENTITY=-`.
+
 ## Documentation Layout
 
 - `.agents/`: Codex and agent-facing project guidance.
