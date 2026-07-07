@@ -39,6 +39,7 @@ fn profile_paths() -> Result<Vec<PathBuf>, String> {
     let mut paths = vec![home.join(".profile")];
     if cfg!(target_os = "macos") {
         paths.push(home.join(".zshrc"));
+        paths.push(home.join(".zprofile"));
     }
     Ok(paths)
 }

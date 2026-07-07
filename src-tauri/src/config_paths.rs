@@ -8,6 +8,7 @@ use std::{
 
 const PROVIDER_CONFIG_DIR: &str = "config";
 const PROVIDER_CONFIG_FILE: &str = "providers.json";
+const APP_DATA_DIR: &str = "Tako Switch";
 
 pub fn codex_config_path() -> Result<PathBuf, String> {
     if let Some(path) = env::var_os("CODEX_HOME") {
@@ -21,9 +22,21 @@ pub fn claude_settings_path() -> Result<PathBuf, String> {
 }
 
 pub fn provider_config_path() -> Result<PathBuf, String> {
-    Ok(install_dir()?
+    Ok(provider_config_base_dir()?
         .join(PROVIDER_CONFIG_DIR)
         .join(PROVIDER_CONFIG_FILE))
+}
+
+fn provider_config_base_dir() -> Result<PathBuf, String> {
+    if cfg!(test) && env::var_os("TAKO_SWITCH_DATA_DIR").is_some() {
+        return app_data_dir();
+    }
+
+    if cfg!(target_os = "macos") {
+        return app_data_dir();
+    }
+
+    install_dir()
 }
 
 pub fn home_dir() -> Result<PathBuf, String> {
@@ -63,6 +76,23 @@ pub fn install_dir() -> Result<PathBuf, String> {
     }
 
     env::current_dir().map_err(|err| format!("无法确定程序目录：{err}"))
+}
+
+pub fn app_data_dir() -> Result<PathBuf, String> {
+    if cfg!(test) {
+        if let Some(path) = env::var_os("TAKO_SWITCH_DATA_DIR") {
+            return Ok(PathBuf::from(path));
+        }
+    }
+
+    if cfg!(target_os = "macos") {
+        return Ok(home_dir()?
+            .join("Library")
+            .join("Application Support")
+            .join(APP_DATA_DIR));
+    }
+
+    install_dir()
 }
 
 pub fn resolve_restore_target(target: &str) -> Result<PathBuf, String> {

@@ -94,47 +94,47 @@ mod tests {
     }
 
     #[test]
-    fn provider_catalog_prefers_external_config() {
+    fn provider_catalog_prefers_user_data_config() {
         let _lock = install_dir_test_lock();
-        let install_dir = env::temp_dir().join(format!(
+        let data_dir = env::temp_dir().join(format!(
             "tako-switch-provider-test-{}",
             Local::now().format("%Y%m%d%H%M%S%3f")
         ));
-        let config_dir = install_dir.join(TEST_PROVIDER_CONFIG_DIR);
+        let config_dir = data_dir.join(TEST_PROVIDER_CONFIG_DIR);
         fs::create_dir_all(&config_dir).unwrap();
         let mut file = parse_provider_catalog_file(DEFAULT_PROVIDER_CONFIG).unwrap();
         file.providers[0].name = "External Tako".to_string();
         let content = serde_json::to_string_pretty(&file).unwrap();
         fs::write(config_dir.join(TEST_PROVIDER_CONFIG_FILE), content).unwrap();
-        env::set_var("TAKO_SWITCH_INSTALL_DIR", &install_dir);
+        env::set_var("TAKO_SWITCH_DATA_DIR", &data_dir);
 
         let catalog = load_provider_catalog_from_disk().unwrap();
 
         assert_eq!(catalog.providers[0].name, "External Tako");
         assert!(catalog.warning.is_none());
 
-        env::remove_var("TAKO_SWITCH_INSTALL_DIR");
-        let _ = fs::remove_dir_all(&install_dir);
+        env::remove_var("TAKO_SWITCH_DATA_DIR");
+        let _ = fs::remove_dir_all(&data_dir);
     }
 
     #[test]
     fn provider_catalog_falls_back_when_external_config_is_invalid() {
         let _lock = install_dir_test_lock();
-        let install_dir = env::temp_dir().join(format!(
+        let data_dir = env::temp_dir().join(format!(
             "tako-switch-provider-invalid-test-{}",
             Local::now().format("%Y%m%d%H%M%S%3f")
         ));
-        let config_dir = install_dir.join(TEST_PROVIDER_CONFIG_DIR);
+        let config_dir = data_dir.join(TEST_PROVIDER_CONFIG_DIR);
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(config_dir.join(TEST_PROVIDER_CONFIG_FILE), "{ nope").unwrap();
-        env::set_var("TAKO_SWITCH_INSTALL_DIR", &install_dir);
+        env::set_var("TAKO_SWITCH_DATA_DIR", &data_dir);
 
         let catalog = load_provider_catalog_from_disk().unwrap();
 
         assert_eq!(catalog.default_provider_id, "tako");
         assert!(catalog.warning.unwrap().contains("已使用内置默认配置"));
 
-        env::remove_var("TAKO_SWITCH_INSTALL_DIR");
-        let _ = fs::remove_dir_all(&install_dir);
+        env::remove_var("TAKO_SWITCH_DATA_DIR");
+        let _ = fs::remove_dir_all(&data_dir);
     }
 }

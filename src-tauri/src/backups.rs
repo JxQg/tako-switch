@@ -1,5 +1,5 @@
 use crate::{
-    config_paths::{install_dir, resolve_restore_target},
+    config_paths::{app_data_dir, resolve_restore_target},
     models::{AppliedFile, ApplyResult, RestoreResult},
     utils::{display_path, ensure_trailing_newline},
 };
@@ -152,11 +152,11 @@ fn backup_target_dir(target: &str) -> &'static str {
 }
 
 fn backup_root() -> Result<PathBuf, String> {
-    Ok(install_dir()?.join("backups"))
+    Ok(app_data_dir()?.join("backups"))
 }
 
 fn backup_index_path() -> Result<PathBuf, String> {
-    Ok(install_dir()?.join(BACKUP_INDEX_FILE))
+    Ok(app_data_dir()?.join(BACKUP_INDEX_FILE))
 }
 
 pub fn save_latest_apply_result_to_disk(result: &ApplyResult) -> Result<(), String> {
@@ -211,29 +211,29 @@ mod tests {
     use std::env;
 
     #[test]
-    fn backups_and_latest_apply_result_use_install_folder() {
+    fn backups_and_latest_apply_result_use_app_data_folder() {
         let _lock = install_dir_test_lock();
-        let install_dir = env::temp_dir().join(format!(
+        let data_dir = env::temp_dir().join(format!(
             "tako-switch-index-test-{}",
             Local::now().format("%Y%m%d%H%M%S%3f")
         ));
-        fs::create_dir_all(&install_dir).unwrap();
-        env::set_var("TAKO_SWITCH_INSTALL_DIR", &install_dir);
+        fs::create_dir_all(&data_dir).unwrap();
+        env::set_var("TAKO_SWITCH_DATA_DIR", &data_dir);
 
         let codex_backup = make_backup_path("codex", Path::new("config.toml")).unwrap();
         let claude_backup = make_backup_path("claude", Path::new("settings.json")).unwrap();
         let index = backup_index_path().unwrap();
 
-        assert!(codex_backup.starts_with(install_dir.join("backups").join("codex")));
-        assert!(claude_backup.starts_with(install_dir.join("backups").join("claude-code")));
-        assert_eq!(index, install_dir.join(BACKUP_INDEX_FILE));
+        assert!(codex_backup.starts_with(data_dir.join("backups").join("codex")));
+        assert!(claude_backup.starts_with(data_dir.join("backups").join("claude-code")));
+        assert_eq!(index, data_dir.join(BACKUP_INDEX_FILE));
 
         let result = ApplyResult {
             files: vec![AppliedFile {
                 target: "codex".to_string(),
                 path: "C:\\Users\\demo\\.codex\\config.toml".to_string(),
                 backup_path: display_path(
-                    &install_dir
+                    &data_dir
                         .join("backups")
                         .join("codex")
                         .join("config.toml.tako-backup-test"),
@@ -251,14 +251,14 @@ mod tests {
         };
 
         save_latest_apply_result_to_disk(&result).unwrap();
-        assert!(install_dir.join(BACKUP_INDEX_FILE).exists());
+        assert!(data_dir.join(BACKUP_INDEX_FILE).exists());
         let loaded = load_latest_apply_result_from_disk().unwrap().unwrap();
         assert_eq!(loaded.files[0].backup_path, result.files[0].backup_path);
 
         clear_latest_apply_result_from_disk().unwrap();
         assert!(load_latest_apply_result_from_disk().unwrap().is_none());
 
-        env::remove_var("TAKO_SWITCH_INSTALL_DIR");
-        let _ = fs::remove_dir_all(&install_dir);
+        env::remove_var("TAKO_SWITCH_DATA_DIR");
+        let _ = fs::remove_dir_all(&data_dir);
     }
 }
