@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-pub const DEFAULT_PROVIDER_CONFIG: &str = include_str!("../../config/providers.default.json");
+pub const DEFAULT_PROVIDER_CONFIG: &str = include_str!("../../config/providers.json");
 pub const PLATFORM_CODEX: &str = "codex";
 pub const PLATFORM_CLAUDE: &str = "claude";
 pub const PLATFORM_ORDER: [&str; 2] = [PLATFORM_CODEX, PLATFORM_CLAUDE];
@@ -40,7 +40,6 @@ pub struct ProviderAccount {
     pub login_status_label: String,
     pub login_description: String,
     pub auth_service_url: String,
-    pub keys_url: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

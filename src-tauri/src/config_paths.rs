@@ -38,7 +38,7 @@ pub fn home_dir() -> Result<PathBuf, String> {
         .flatten()
         .map(PathBuf::from)
         .find(|path| !path.as_os_str().is_empty())
-        .ok_or_else(|| "Could not determine the user home directory.".to_string())
+        .ok_or_else(|| "无法确定用户主目录，请检查 USERPROFILE 或 HOME 环境变量。".to_string())
 }
 
 fn windows_home_from_parts() -> Option<OsString> {
@@ -62,7 +62,7 @@ pub fn install_dir() -> Result<PathBuf, String> {
         }
     }
 
-    env::current_dir().map_err(|err| format!("Could not determine install folder: {err}"))
+    env::current_dir().map_err(|err| format!("无法确定程序目录：{err}"))
 }
 
 pub fn resolve_restore_target(target: &str) -> Result<PathBuf, String> {
@@ -70,7 +70,7 @@ pub fn resolve_restore_target(target: &str) -> Result<PathBuf, String> {
         "codex" => codex_config_path(),
         "claude" => claude_settings_path(),
         value if !value.trim().is_empty() => Ok(Path::new(value).to_path_buf()),
-        _ => Err("Restore target cannot be empty.".to_string()),
+        _ => Err("恢复目标不能为空。".to_string()),
     }
 }
 

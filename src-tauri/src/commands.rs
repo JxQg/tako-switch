@@ -110,11 +110,11 @@ pub fn load_latest_apply_result() -> Result<Option<ApplyResult>, String> {
 pub fn open_external(url: String) -> Result<(), String> {
     let parsed = validate_external_url(&url)?;
     tauri_plugin_opener::open_url(parsed.as_str(), None::<&str>)
-        .map_err(|err| format!("Failed to open browser: {err}"))
+        .map_err(|err| format!("打开浏览器失败：{err}"))
 }
 
 pub fn validate_external_url(raw: &str) -> Result<Url, String> {
-    parse_http_url(raw, "External URL")
+    parse_http_url(raw, "外部链接")
 }
 
 fn read_existing_config<F>(target: &str, path: &std::path::Path, redact: F) -> ExistingConfig
@@ -156,7 +156,7 @@ pub fn handle_deeplink_url(app: &tauri::AppHandle, url: &str) -> bool {
     };
 
     if let Err(err) = app.emit("tako-auth", auth_event) {
-        eprintln!("Failed to emit tako-auth event: {err}");
+        eprintln!("发送 Tako 授权事件失败：{err}");
     }
 
     focus_main_window(app);

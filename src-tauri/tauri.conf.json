@@ -13,10 +13,10 @@
     "windows": [
       {
         "title": "Tako Switch",
-        "width": 1120,
-        "height": 760,
-        "minWidth": 920,
-        "minHeight": 640
+        "width": 1220,
+        "height": 820,
+        "minWidth": 1080,
+        "minHeight": 740
       }
     ],
     "security": {
@@ -27,7 +27,7 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "config/providers.default.json": "config/providers.json"
+      "config/providers.json": "config/providers.json"
     },
     "icon": [
       "icons/icon.ico",

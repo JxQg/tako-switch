@@ -16,7 +16,7 @@ pub fn preview_platform(
     match platform.definition.writer.kind.as_str() {
         WRITER_CODEX_CONFIG_TOML => codex::preview(platform, api_key, files, env_updates, warnings),
         WRITER_CLAUDE_SETTINGS_JSON => claude::preview(platform, api_key, files),
-        other => Err(format!("Unsupported writer kind: {other}")),
+        other => Err(format!("不支持的写入器类型：{other}")),
     }
 }
 
@@ -30,7 +30,7 @@ pub fn apply_platform(
     match platform.definition.writer.kind.as_str() {
         WRITER_CODEX_CONFIG_TOML => codex::apply(platform, api_key, files, env_updates, warnings),
         WRITER_CLAUDE_SETTINGS_JSON => claude::apply(platform, api_key, files),
-        other => Err(format!("Unsupported writer kind: {other}")),
+        other => Err(format!("不支持的写入器类型：{other}")),
     }
 }
 
@@ -43,7 +43,7 @@ pub fn binding_name<'a>(
         .get(field)
         .map(|binding| binding.name.as_str())
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| format!("writer is missing binding for {field}"))
+        .ok_or_else(|| format!("写入器缺少字段绑定：{field}"))
 }
 
 pub fn constant_value<'a>(
@@ -55,5 +55,5 @@ pub fn constant_value<'a>(
         .get(field)
         .map(String::as_str)
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| format!("writer is missing constant {field}"))
+        .ok_or_else(|| format!("写入器缺少常量：{field}"))
 }

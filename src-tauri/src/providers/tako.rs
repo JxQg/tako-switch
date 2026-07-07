@@ -133,7 +133,7 @@ async fn verify_tako_key(api_key: String) -> Result<TakoLoginResult, String> {
     if api_key.is_empty() {
         return Ok(TakoLoginResult {
             ok: false,
-            error: Some("API key cannot be empty.".to_string()),
+            error: Some("API Key 不能为空。".to_string()),
             ..Default::default()
         });
     }
@@ -144,18 +144,18 @@ async fn verify_tako_key(api_key: String) -> Result<TakoLoginResult, String> {
         .json(&json!({ "apiKey": api_key }))
         .send()
         .await
-        .map_err(|err| format!("Network error: {err}"))?;
+        .map_err(|err| format!("连接 Tako 失败：{err}"))?;
 
     let status = response.status();
     let body: Value = response
         .json()
         .await
-        .map_err(|err| format!("Bad response: {err}"))?;
+        .map_err(|err| format!("解析 Tako 响应失败：{err}"))?;
 
     if !status.is_success() {
         return Ok(TakoLoginResult {
             ok: false,
-            error: Some(format!("Tako identity check failed with HTTP {status}.")),
+            error: Some(format!("Tako 身份校验失败，HTTP 状态码：{status}。")),
             ..Default::default()
         });
     }
@@ -186,7 +186,7 @@ async fn verify_tako_key(api_key: String) -> Result<TakoLoginResult, String> {
             .or_else(|| body.get("error"))
             .and_then(Value::as_str)
             .map(str::to_string)
-            .or_else(|| Some("Invalid Tako API key.".to_string())),
+            .or_else(|| Some("Tako API Key 无效。".to_string())),
         ..Default::default()
     })
 }
@@ -196,7 +196,7 @@ async fn fetch_tako_usage(api_key: String) -> Result<TakoUsage, String> {
     if api_key.is_empty() {
         return Ok(TakoUsage {
             ok: false,
-            error: Some("API key cannot be empty.".to_string()),
+            error: Some("API Key 不能为空。".to_string()),
             ..Default::default()
         });
     }
@@ -207,10 +207,10 @@ async fn fetch_tako_usage(api_key: String) -> Result<TakoUsage, String> {
         .json(&json!({ "apiKey": api_key }))
         .send()
         .await
-        .map_err(|err| format!("network: {err}"))?
+        .map_err(|err| format!("连接 Tako 用量服务失败：{err}"))?
         .json()
         .await
-        .map_err(|err| format!("bad get-key-id: {err}"))?;
+        .map_err(|err| format!("解析 Tako Key 信息失败：{err}"))?;
 
     let api_id = key_response
         .get("data")
@@ -219,7 +219,7 @@ async fn fetch_tako_usage(api_key: String) -> Result<TakoUsage, String> {
     let Some(api_id) = api_id else {
         return Ok(TakoUsage {
             ok: false,
-            error: Some("Invalid key".to_string()),
+            error: Some("Tako API Key 无效，无法读取用量。".to_string()),
             ..Default::default()
         });
     };
@@ -228,10 +228,10 @@ async fn fetch_tako_usage(api_key: String) -> Result<TakoUsage, String> {
         .get(format!("{TAKO_API_STATS_BASE}/user-quota?apiId={api_id}"))
         .send()
         .await
-        .map_err(|err| format!("network: {err}"))?
+        .map_err(|err| format!("读取 Tako 用量失败：{err}"))?
         .json()
         .await
-        .map_err(|err| format!("bad user-quota: {err}"))?;
+        .map_err(|err| format!("解析 Tako 用量响应失败：{err}"))?;
 
     let usage = quota_response.get("usage");
     let plan = quota_response.get("plan");
@@ -261,7 +261,7 @@ async fn fetch_tako_usage(api_key: String) -> Result<TakoUsage, String> {
 async fn list_tako_models(api_key: String) -> Result<Vec<TakoModel>, String> {
     let api_key = api_key.trim().to_string();
     if api_key.is_empty() {
-        return Err("API key cannot be empty.".to_string());
+        return Err("API Key 不能为空。".to_string());
     }
 
     let client = reqwest::Client::new();
@@ -270,15 +270,15 @@ async fn list_tako_models(api_key: String) -> Result<Vec<TakoModel>, String> {
         .bearer_auth(api_key)
         .send()
         .await
-        .map_err(|err| format!("network: {err}"))?
+        .map_err(|err| format!("读取 Tako 模型列表失败：{err}"))?
         .json()
         .await
-        .map_err(|err| format!("bad models response: {err}"))?;
+        .map_err(|err| format!("解析 Tako 模型列表失败：{err}"))?;
 
     let data = response
         .get("data")
         .and_then(Value::as_array)
-        .ok_or_else(|| "no model list in response".to_string())?;
+        .ok_or_else(|| "Tako 模型响应中没有模型列表。".to_string())?;
 
     Ok(parse_models(data))
 }

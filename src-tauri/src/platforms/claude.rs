@@ -69,7 +69,7 @@ pub fn merge_settings(
         json!({})
     } else {
         serde_json::from_str::<Value>(existing)
-            .map_err(|err| format!("Existing Claude settings are not valid JSON: {err}"))?
+            .map_err(|err| format!("现有 Claude Code 设置不是有效的 JSON：{err}"))?
     };
 
     if !root.is_object() {
@@ -98,7 +98,7 @@ pub fn merge_settings(
 
     serde_json::to_string_pretty(&root)
         .map(ensure_trailing_newline)
-        .map_err(|err| format!("Failed to render Claude settings JSON: {err}"))
+        .map_err(|err| format!("生成 Claude Code 设置 JSON 失败：{err}"))
 }
 
 #[cfg(test)]

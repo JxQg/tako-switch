@@ -9,10 +9,10 @@ use url::Url;
 
 pub fn validate_provider_catalog_file(file: &ProviderCatalogFile) -> Result<(), String> {
     if file.default_provider_id.trim().is_empty() {
-        return Err("defaultProviderId cannot be empty".to_string());
+        return Err("defaultProviderId 不能为空。".to_string());
     }
     if file.providers.is_empty() {
-        return Err("providers cannot be empty".to_string());
+        return Err("providers 不能为空。".to_string());
     }
 
     let mut found_default = false;
@@ -24,10 +24,7 @@ pub fn validate_provider_catalog_file(file: &ProviderCatalogFile) -> Result<(), 
     }
 
     if !found_default {
-        return Err(format!(
-            "default provider {} was not found",
-            file.default_provider_id
-        ));
+        return Err(format!("未找到默认服务商：{}", file.default_provider_id));
     }
 
     Ok(())
@@ -35,7 +32,7 @@ pub fn validate_provider_catalog_file(file: &ProviderCatalogFile) -> Result<(), 
 
 fn validate_provider_definition(provider: &ProviderDefinition) -> Result<(), String> {
     let provider_label = if provider.id.trim().is_empty() {
-        "(unknown)"
+        "(未知服务商)"
     } else {
         provider.id.as_str()
     };
@@ -55,10 +52,9 @@ fn validate_provider_definition(provider: &ProviderDefinition) -> Result<(), Str
         &provider.account.auth_service_url,
         "provider.account.authServiceUrl",
     )?;
-    require_http_url(&provider.account.keys_url, "provider.account.keysUrl")?;
 
     if provider.platforms.is_empty() {
-        return Err(format!("provider {provider_label} has no platforms"));
+        return Err(format!("服务商 {provider_label} 没有可用平台配置。"));
     }
 
     for (platform_id, platform) in &provider.platforms {
@@ -106,7 +102,7 @@ fn validate_writer(
         }
         other => {
             return Err(format!(
-                "provider {provider_id} platform {platform_id} has unsupported writer.kind {other}"
+                "服务商 {provider_id} 的平台 {platform_id} 使用了不支持的 writer.kind：{other}"
             ))
         }
     }
@@ -121,7 +117,7 @@ fn require_binding<'a>(
     platform_id: &str,
 ) -> Result<&'a WriterBinding, String> {
     let binding = writer.bindings.get(field).ok_or_else(|| {
-        format!("provider {provider_id} platform {platform_id} is missing writer.bindings.{field}")
+        format!("服务商 {provider_id} 的平台 {platform_id} 缺少 writer.bindings.{field}")
     })?;
     require_text(
         &binding.storage,
@@ -146,15 +142,13 @@ fn require_constant<'a>(
         .map(String::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            format!(
-                "provider {provider_id} platform {platform_id} is missing writer.constants.{field}"
-            )
+            format!("服务商 {provider_id} 的平台 {platform_id} 缺少 writer.constants.{field}")
         })
 }
 
 pub fn require_text(value: &str, field: &str) -> Result<(), String> {
     if value.trim().is_empty() {
-        return Err(format!("{field} cannot be empty"));
+        return Err(format!("{field} 不能为空。"));
     }
     Ok(())
 }
@@ -165,9 +159,9 @@ pub fn require_http_url(value: &str, field: &str) -> Result<(), String> {
 
 pub fn parse_http_url(value: &str, field: &str) -> Result<Url, String> {
     let parsed = Url::parse(value.trim())
-        .map_err(|_| format!("{field} must be a valid http:// or https:// URL"))?;
+        .map_err(|_| format!("{field} 必须是有效的 http:// 或 https:// 地址。"))?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        return Err(format!("{field} must start with http:// or https://"));
+        return Err(format!("{field} 必须以 http:// 或 https:// 开头。"));
     }
     Ok(parsed)
 }
@@ -185,11 +179,11 @@ pub fn validate_input(input: ConfigInput) -> Result<NormalizedInput, String> {
         .iter()
         .find(|provider| provider.id == provider_id)
         .cloned()
-        .ok_or_else(|| format!("Provider not found: {provider_id}"))?;
+        .ok_or_else(|| format!("未找到服务商：{provider_id}"))?;
 
     let api_key = input.api_key.trim().to_string();
     if api_key.is_empty() {
-        return Err("API key cannot be empty.".to_string());
+        return Err("API Key / Token 不能为空。".to_string());
     }
 
     let mut platforms = Vec::new();
@@ -205,12 +199,12 @@ pub fn validate_input(input: ConfigInput) -> Result<NormalizedInput, String> {
             .platforms
             .get(platform_id)
             .cloned()
-            .ok_or_else(|| format!("Provider {} does not support {platform_id}.", provider.id))?;
+            .ok_or_else(|| format!("服务商 {} 不支持 {platform_id}。", provider.id))?;
         if !definition.enabled {
             return Err(format!(
-                "{} is disabled for provider {}.",
-                platform_display_name(platform_id),
-                provider.name
+                "服务商 {} 暂未启用 {}。",
+                provider.name,
+                platform_display_name(platform_id)
             ));
         }
 
@@ -222,7 +216,7 @@ pub fn validate_input(input: ConfigInput) -> Result<NormalizedInput, String> {
     }
 
     if platforms.is_empty() {
-        return Err("Please select at least Codex or Claude Code.".to_string());
+        return Err("请至少选择 Codex 或 Claude Code。".to_string());
     }
 
     Ok(NormalizedInput {
@@ -249,7 +243,7 @@ fn normalize_platform_input(
         .unwrap_or(false);
     if model_required && model.is_none() {
         return Err(format!(
-            "{} model cannot be empty when {} is selected.",
+            "选择 {} 时必须填写 {} 模型。",
             platform_display_name(platform_id),
             platform_display_name(platform_id)
         ));
@@ -289,7 +283,7 @@ fn validate_base_url_rules(
         let normalized_suffix = suffix.trim().trim_end_matches('/');
         if !normalized_suffix.is_empty() && path.ends_with(normalized_suffix) {
             return Err(format!(
-                "{} baseUrl cannot end with {}.",
+                "{} 地址不能以 {} 结尾。",
                 platform_display_name(platform_id),
                 suffix
             ));

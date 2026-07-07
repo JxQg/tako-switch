@@ -85,7 +85,7 @@ pub fn merge_config(
     } else {
         existing
             .parse::<DocumentMut>()
-            .map_err(|err| format!("Existing Codex config is not valid TOML: {err}"))?
+            .map_err(|err| format!("现有 Codex 配置不是有效的 TOML：{err}"))?
     };
 
     document["model"] = value(codex_model);

@@ -40,7 +40,7 @@ fn detect_tool(name: &str, commands: Vec<String>) -> ToolStatus {
             }
             Ok((version, Some(error))) => {
                 let details = version
-                    .map(|value| format!("{error}; output: {value}"))
+                    .map(|value| format!("{error}；输出：{value}"))
                     .unwrap_or(error);
                 errors.push(format!("{command}: {details}"));
             }
@@ -53,12 +53,12 @@ fn detect_tool(name: &str, commands: Vec<String>) -> ToolStatus {
         installed: false,
         version: None,
         error: Some(format!(
-            "Tried {}. Last error: {}",
+            "已尝试 {}。最后一次错误：{}",
             commands.join(", "),
             errors
                 .last()
                 .cloned()
-                .unwrap_or_else(|| "no candidates were available".to_string())
+                .unwrap_or_else(|| "没有可用的命令候选。".to_string())
         )),
     }
 }
@@ -79,10 +79,7 @@ fn command_version(command: &str) -> Result<(Option<String>, Option<String>), St
             if output.status.success() {
                 Ok((version, None))
             } else {
-                Ok((
-                    version,
-                    Some(format!("Command exited with {}", output.status)),
-                ))
+                Ok((version, Some(format!("命令退出状态为 {}", output.status))))
             }
         }
         Err(err) => Err(err.to_string()),

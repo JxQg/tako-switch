@@ -10,6 +10,7 @@ import {
   Loader2,
   LogIn,
   LogOut,
+  Maximize2,
   RefreshCw,
   RotateCcw,
   Save,
@@ -154,6 +155,7 @@ function App() {
   const [homePreview, setHomePreview] = useState<PreviewResult>(emptyPreview);
   const [homeResult, setHomeResult] = useState<ApplyResult | null>(null);
   const [homeRestoreResult, setHomeRestoreResult] = useState<RestoreResult | null>(null);
+  const [showImportApiKey, setShowImportApiKey] = useState(false);
   const [showHomeApiKey, setShowHomeApiKey] = useState(false);
   const [takoAccount, setTakoAccount] = useState<TakoAccount>({
     loggedIn: false,
@@ -252,13 +254,13 @@ function App() {
     setError(null);
     setRestoreResult(null);
     try {
+      const nextPreview = await invoke<PreviewResult>("preview_changes", { input: form });
+      setPreview(nextPreview);
       const applyResult = await invoke<ApplyResult>("apply_configs", { input: form });
       setResult(applyResult);
       setHomeResult(applyResult);
       setTools(applyResult.tools);
       await refreshConfigsOnly();
-      const nextPreview = await invoke<PreviewResult>("preview_changes", { input: form });
-      setPreview(nextPreview);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -448,6 +450,7 @@ function App() {
     setForm(draft);
     setHomePreview(emptyPreview);
     setPreview(emptyPreview);
+    setHomeResult(null);
     setHomeRestoreResult(null);
     setRestoreResult(null);
     setShowHomeApiKey(false);
@@ -483,15 +486,15 @@ function App() {
     setError(null);
     setHomeRestoreResult(null);
     try {
-      const applyResult = await invoke<ApplyResult>("apply_configs", { input: homeImportForm });
+      const nextPreview = await invoke<PreviewResult>("preview_changes", { input: homeImportForm });
       setForm(homeImportForm);
+      setHomePreview(nextPreview);
+      setPreview(nextPreview);
+      const applyResult = await invoke<ApplyResult>("apply_configs", { input: homeImportForm });
       setHomeResult(applyResult);
       setResult(applyResult);
       setTools(applyResult.tools);
       await refreshConfigsOnly();
-      const nextPreview = await invoke<PreviewResult>("preview_changes", { input: homeImportForm });
-      setHomePreview(nextPreview);
-      setPreview(nextPreview);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -605,14 +608,17 @@ function App() {
           busy={busy}
           canSubmit={canSubmit}
           form={form}
+          models={takoModels}
           preview={preview}
           result={result}
           restoreResult={restoreResult}
+          showApiKey={showImportApiKey}
           validation={validation}
           onApply={applyConfigs}
           onCreatePreview={createPreview}
           provider={provider}
           onRestore={restore}
+          onToggleApiKey={() => setShowImportApiKey((current) => !current)}
           setForm={setForm}
         />
       )}
@@ -633,6 +639,7 @@ function App() {
           validation={homeImportValidation}
           onApply={applyHomeConfigs}
           onClose={() => setHomeImportOpen(false)}
+          onConfirm={() => setHomeImportOpen(false)}
           onCreatePreview={createHomePreview}
           onRestore={restoreHome}
           onToggleApiKey={() => setShowHomeApiKey((current) => !current)}
@@ -782,6 +789,7 @@ function HomeImportModal({
   validation,
   onApply,
   onClose,
+  onConfirm,
   onCreatePreview,
   onRestore,
   onToggleApiKey,
@@ -799,15 +807,12 @@ function HomeImportModal({
   validation: string[];
   onApply: () => void;
   onClose: () => void;
+  onConfirm: () => void;
   onCreatePreview: (event?: FormEvent) => void;
   onRestore: (file: AppliedFile) => void;
   onToggleApiKey: () => void;
   setForm: React.Dispatch<React.SetStateAction<ConfigInput>>;
 }) {
-  const loading = busy !== null;
-  const codexModels = models.filter(isCodexModel);
-  const canApply = canSubmit && preview.files.length > 0;
-
   return (
     <div className="modal-backdrop" role="presentation">
       <section className="modal-panel" role="dialog" aria-modal="true" aria-label={`一键导入 ${provider.name} 配置`}>
@@ -821,183 +826,46 @@ function HomeImportModal({
           </button>
         </div>
 
-        <form className="modal-grid" onSubmit={onCreatePreview}>
-          <div className="modal-config">
-            <fieldset className="target-grid">
-              <label className={form.platforms.codex.enabled ? "target active" : "target"}>
-                <input
-                  type="checkbox"
-                  checked={form.platforms.codex.enabled}
-                  onChange={(event) =>
-                    setForm((current) =>
-                      updatePlatform("codex", {
-                        enabled: event.target.checked,
-                        model:
-                          event.target.checked && !current.platforms.codex.model
-                            ? selectDefaultCodexModel(models)
-                            : current.platforms.codex.model
-                      })(current)
-                    )
-                  }
-                />
-                <Terminal />
-                <span>Codex</span>
-              </label>
-              <label className={form.platforms.claude.enabled ? "target active" : "target"}>
-                <input
-                  type="checkbox"
-                  checked={form.platforms.claude.enabled}
-                  onChange={(event) =>
-                    setForm(updatePlatform("claude", { enabled: event.target.checked }))
-                  }
-                />
-                <Terminal />
-                <span>Claude Code</span>
-              </label>
-            </fieldset>
-
-            <div className="field-grid">
-              <label className="field">
-                <span>Codex OpenAI 兼容地址</span>
-                <input readOnly value={form.platforms.codex.baseUrl} />
-              </label>
-              <label className="field">
-                <span>Claude Code 网关地址</span>
-                <input readOnly value={form.platforms.claude.baseUrl} />
-              </label>
-            </div>
-
-            <label className="field">
-              <span>API Key</span>
-              <div className="secret-input readonly-secret">
-                <KeyRound />
-                <input readOnly type={showApiKey ? "text" : "password"} value={form.apiKey} />
-                <button className="icon-button inline-icon" type="button" onClick={onToggleApiKey} title={showApiKey ? "隐藏 ApiKey" : "查看 ApiKey"}>
-                  {showApiKey ? <EyeOff /> : <Eye />}
-                </button>
-              </div>
-            </label>
-
-            <label className="field">
-              <span>Codex 模型</span>
-              <select
-                value={form.platforms.codex.model || ""}
-                disabled={!form.platforms.codex.enabled || codexModels.length === 0}
-                onChange={(event) =>
-                  setForm(updatePlatform("codex", { model: event.target.value }))
-                }
-              >
-                {codexModels.length === 0 ? (
-                  <option value="">暂无 Codex 可用模型</option>
-                ) : (
-                  codexModels.map((model) => (
-                    <option key={model.id} value={model.id}>
-                      {model.name || model.id}
-                      {model.provider ? `  ${model.provider}` : ""}
-                    </option>
-                  ))
-                )}
-              </select>
-            </label>
-
-            {validation.length > 0 && (
-              <div className="notice soft">
-                <AlertTriangle />
-                <span>{validation[0]}</span>
-              </div>
-            )}
-
-            <div className="button-row">
-              <button className="secondary" type="submit" disabled={!canSubmit}>
-                {busy === "preview" ? <Loader2 className="spin" /> : <Eye />}
-                <span>生成预览</span>
-              </button>
-              <button className="primary" type="button" disabled={!canApply} onClick={onApply}>
-                {busy === "apply" ? <Loader2 className="spin" /> : <Save />}
-                <span>应用配置</span>
-              </button>
-            </div>
-          </div>
-
-          <section className="modal-preview" aria-label="写入预览">
-            <div className="panel-heading compact-heading">
-              <ShieldCheck />
-              <div>
-                <h2>写入预览</h2>
-                <p>确认后会自动生成备份。</p>
-              </div>
-            </div>
-
-            {preview.envUpdates.length > 0 && (
-              <div className="env-list">
-                {preview.envUpdates.map((item) => (
-                  <div className="env-row" key={item.name}>
-                    <span>{item.name}</span>
-                    <code>{item.maskedValue}</code>
-                    <small>{item.note}</small>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {preview.warnings.map((warning) => (
-              <div className="notice soft" key={warning}>
-                <AlertTriangle />
-                <span>{warning}</span>
-              </div>
-            ))}
-
-            {preview.files.length === 0 ? (
-              <EmptyState text="点击“生成预览”查看将写入的配置。" />
-            ) : (
-              <div className="preview-stack compact-preview">
-                {preview.files.map((file) => (
-                  <PreviewBlock key={file.target} file={file} />
-                ))}
-              </div>
-            )}
-          </section>
-        </form>
-
         {(result || restoreResult) && (
-          <section className="modal-results" aria-label="结果与恢复">
-            <div className="result-grid">
-              {result?.files.map((file) => (
-                <div className="result-row" key={`${file.target}-${file.path}`}>
-                  <div>
-                    <strong>{file.target === "codex" ? "Codex" : "Claude Code"}</strong>
-                    <span>{file.created ? "已创建配置" : "已更新配置"}</span>
-                    <code>{file.path}</code>
-                    <small>备份：{file.backupPath}</small>
-                  </div>
-                  <button className="secondary compact" onClick={() => onRestore(file)} disabled={loading}>
-                    {busy === "restore" ? <Loader2 className="spin" /> : <RotateCcw />}
-                    <span>恢复</span>
-                  </button>
-                </div>
-              ))}
-
-              {result?.envUpdates.map((item) => (
-                <div className="result-row" key={item}>
-                  <div>
-                    <strong>环境变量</strong>
-                    <span>{item}</span>
-                  </div>
-                </div>
-              ))}
-
-              {restoreResult && (
-                <div className="notice success">
-                  <CheckCircle2 />
-                  <span>
-                    已恢复 {restoreResult.target}：
-                    {restoreResult.deletedTarget ? "目标文件已删除" : restoreResult.path}
-                  </span>
-                </div>
-              )}
-            </div>
-          </section>
+          <ResultsPanel
+            busy={busy}
+            className="modal-results modal-results-top"
+            confirmLabel="确认"
+            result={result}
+            restoreResult={restoreResult}
+            successMessage="配置已保存成功。确认后将关闭窗口。"
+            onConfirm={result ? onConfirm : undefined}
+            onRestore={onRestore}
+          />
         )}
+
+        <div className="modal-grid modal-flow-grid">
+          <ProviderConfigForm
+            apiKeyReadOnly
+            baseUrlsReadOnly
+            busy={busy}
+            canSubmit={canSubmit}
+            className="modal-config"
+            description="确认写入目标、网关地址和模型；点击应用配置会自动生成预览并保存。"
+            form={form}
+            icon={<Settings2 />}
+            models={models}
+            provider={provider}
+            showApiKey={showApiKey}
+            title="一键导入配置"
+            validation={validation}
+            onApply={onApply}
+            onCreatePreview={onCreatePreview}
+            onToggleApiKey={onToggleApiKey}
+            setForm={setForm}
+          />
+          <PreviewPanel
+            compact
+            className="modal-preview"
+            emptyText="点击“应用配置”会自动生成预览并保存；也可以先生成预览查看差异。"
+            preview={preview}
+          />
+        </div>
       </section>
     </div>
   );
@@ -1008,243 +876,408 @@ function ImportTab({
   busy,
   canSubmit,
   form,
+  models,
   preview,
   result,
   restoreResult,
+  showApiKey,
   validation,
   onApply,
   onCreatePreview,
   provider,
   onRestore,
+  onToggleApiKey,
   setForm
 }: {
   apiKeyInputRef: React.MutableRefObject<HTMLInputElement | null>;
-  busy: "loading" | "login" | "logout" | "tako" | "preview" | "apply" | "restore" | null;
+  busy: BusyState;
   canSubmit: boolean;
   form: ConfigInput;
+  models: TakoModel[];
   preview: PreviewResult;
   result: ApplyResult | null;
   restoreResult: RestoreResult | null;
+  showApiKey: boolean;
   validation: string[];
   onApply: () => void;
   onCreatePreview: (event?: FormEvent) => void;
   provider: AccountProviderConfig;
   onRestore: (file: AppliedFile) => void;
+  onToggleApiKey: () => void;
   setForm: React.Dispatch<React.SetStateAction<ConfigInput>>;
+}) {
+  return (
+    <>
+      <div className="workspace">
+        <ProviderConfigForm
+          apiKeyInputRef={apiKeyInputRef}
+          busy={busy}
+          canSubmit={canSubmit}
+          className="panel form-panel"
+          description="填写网关、密钥和需要写入的客户端；也可以直接应用，系统会先生成预览再保存。"
+          form={form}
+          icon={<Settings2 />}
+          models={models}
+          provider={provider}
+          showApiKey={showApiKey}
+          title="导入配置"
+          validation={validation}
+          onApply={onApply}
+          onCreatePreview={onCreatePreview}
+          onToggleApiKey={onToggleApiKey}
+          setForm={setForm}
+        />
+
+        <PreviewPanel
+          className="panel"
+          emptyText="点击“生成预览”查看将写入的配置，或直接点击“应用配置”。"
+          preview={preview}
+        />
+      </div>
+
+      <ResultsPanel
+        busy={busy}
+        className="panel results-panel"
+        result={result}
+        restoreResult={restoreResult}
+        successMessage="配置已保存成功。下方可以查看写入路径和备份位置。"
+        onRestore={onRestore}
+      />
+    </>
+  );
+}
+
+function ProviderConfigForm({
+  apiKeyInputRef,
+  apiKeyReadOnly = false,
+  baseUrlsReadOnly = false,
+  busy,
+  canSubmit,
+  className,
+  description,
+  form,
+  icon,
+  models,
+  provider,
+  showApiKey,
+  title,
+  validation,
+  onApply,
+  onCreatePreview,
+  onToggleApiKey,
+  setForm
+}: {
+  apiKeyInputRef?: React.MutableRefObject<HTMLInputElement | null>;
+  apiKeyReadOnly?: boolean;
+  baseUrlsReadOnly?: boolean;
+  busy: BusyState;
+  canSubmit: boolean;
+  className: string;
+  description: string;
+  form: ConfigInput;
+  icon: React.ReactNode;
+  models: TakoModel[];
+  provider: AccountProviderConfig;
+  showApiKey: boolean;
+  title: string;
+  validation: string[];
+  onApply: () => void;
+  onCreatePreview: (event?: FormEvent) => void;
+  onToggleApiKey: () => void;
+  setForm: React.Dispatch<React.SetStateAction<ConfigInput>>;
+}) {
+  const codexModels = models.filter(isCodexModel);
+  const codexModel = form.platforms.codex.model || "";
+  const codexModelNotInList = codexModel && codexModels.every((model) => model.id !== codexModel);
+
+  function toggleCodex(enabled: boolean) {
+    setForm((current) =>
+      updatePlatform("codex", {
+        enabled,
+        model:
+          enabled && !current.platforms.codex.model
+            ? selectDefaultCodexModel(models) || provider.platforms.codex?.defaults.model || ""
+            : current.platforms.codex.model
+      })(current)
+    );
+  }
+
+  return (
+    <form className={className} onSubmit={onCreatePreview}>
+      <div className="panel-heading">
+        {icon}
+        <div>
+          <h2>{title}</h2>
+          <p>{description}</p>
+        </div>
+      </div>
+
+      <fieldset className="target-grid">
+        <label className={form.platforms.codex.enabled ? "target active" : "target"}>
+          <input type="checkbox" checked={form.platforms.codex.enabled} onChange={(event) => toggleCodex(event.target.checked)} />
+          <Terminal />
+          <span>Codex</span>
+        </label>
+        <label className={form.platforms.claude.enabled ? "target active" : "target"}>
+          <input
+            type="checkbox"
+            checked={form.platforms.claude.enabled}
+            onChange={(event) => setForm(updatePlatform("claude", { enabled: event.target.checked }))}
+          />
+          <Terminal />
+          <span>Claude Code</span>
+        </label>
+      </fieldset>
+
+      <div className="field-grid">
+        <label className="field">
+          <span>Codex OpenAI 兼容地址</span>
+          <input
+            readOnly={baseUrlsReadOnly}
+            value={form.platforms.codex.baseUrl}
+            disabled={!form.platforms.codex.enabled}
+            placeholder={provider.platforms.codex?.defaults.baseUrl || ""}
+            onChange={(event) => setForm(updatePlatform("codex", { baseUrl: event.target.value }))}
+          />
+        </label>
+        <label className="field">
+          <span>Claude Code 网关地址</span>
+          <input
+            readOnly={baseUrlsReadOnly}
+            value={form.platforms.claude.baseUrl}
+            disabled={!form.platforms.claude.enabled}
+            placeholder={provider.platforms.claude?.defaults.baseUrl || ""}
+            onChange={(event) => setForm(updatePlatform("claude", { baseUrl: event.target.value }))}
+          />
+        </label>
+      </div>
+
+      <label className="field">
+        <span>API Key / Token</span>
+        <div className={apiKeyReadOnly ? "secret-input readonly-secret" : "secret-input"}>
+          <KeyRound />
+          <input
+            ref={apiKeyInputRef}
+            readOnly={apiKeyReadOnly}
+            type={showApiKey ? "text" : "password"}
+            value={form.apiKey}
+            placeholder={`粘贴 ${provider.name} ApiKey`}
+            onChange={(event) =>
+              setForm((current) => ({
+                ...current,
+                apiKey: event.target.value
+              }))
+            }
+          />
+          <button
+            className="icon-button inline-icon"
+            type="button"
+            onClick={onToggleApiKey}
+            title={showApiKey ? "隐藏 ApiKey" : "查看 ApiKey"}
+          >
+            {showApiKey ? <EyeOff /> : <Eye />}
+          </button>
+        </div>
+      </label>
+
+      <div className="field-grid">
+        <label className="field">
+          <span>Codex 模型</span>
+          {codexModels.length > 0 ? (
+            <select
+              value={codexModel}
+              disabled={!form.platforms.codex.enabled}
+              onChange={(event) => setForm(updatePlatform("codex", { model: event.target.value }))}
+            >
+              {codexModelNotInList && <option value={codexModel}>{codexModel}</option>}
+              {codexModels.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.name || model.id}
+                  {model.provider ? `  ${model.provider}` : ""}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              value={codexModel}
+              disabled={!form.platforms.codex.enabled}
+              placeholder={provider.platforms.codex?.defaults.model || "gpt-5.4"}
+              onChange={(event) => setForm(updatePlatform("codex", { model: event.target.value }))}
+            />
+          )}
+        </label>
+        <label className="field">
+          <span>Claude 模型</span>
+          <input
+            value={form.platforms.claude.model || ""}
+            disabled={!form.platforms.claude.enabled}
+            placeholder="留空则使用 Claude Code 默认模型"
+            onChange={(event) => setForm(updatePlatform("claude", { model: event.target.value }))}
+          />
+        </label>
+      </div>
+
+      {validation.length > 0 && (
+        <div className="notice soft">
+          <AlertTriangle />
+          <span>{validation[0]}</span>
+        </div>
+      )}
+
+      <div className="button-row">
+        <button className="secondary" type="submit" disabled={!canSubmit}>
+          {busy === "preview" ? <Loader2 className="spin" /> : <Eye />}
+          <span>生成预览</span>
+        </button>
+        <button className="primary" type="button" disabled={!canSubmit} onClick={onApply}>
+          {busy === "apply" ? <Loader2 className="spin" /> : <Save />}
+          <span>应用配置</span>
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function PreviewPanel({
+  className,
+  compact = false,
+  emptyText,
+  preview
+}: {
+  className: string;
+  compact?: boolean;
+  emptyText: string;
+  preview: PreviewResult;
+}) {
+  return (
+    <section className={className} aria-label="写入预览">
+      <div className="panel-heading compact-heading">
+        <ShieldCheck />
+        <div>
+          <h2>写入预览</h2>
+          <p>密钥会被遮罩，应用前会自动生成备份。</p>
+        </div>
+      </div>
+
+      {preview.envUpdates.length > 0 && (
+        <div className="env-list">
+          {preview.envUpdates.map((item) => (
+            <div className="env-row" key={item.name}>
+              <span>{item.name}</span>
+              <code>{item.maskedValue}</code>
+              <small>{item.note}</small>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {preview.warnings.map((warning) => (
+        <div className="notice soft" key={warning}>
+          <AlertTriangle />
+          <span>{warning}</span>
+        </div>
+      ))}
+
+      {preview.files.length === 0 ? (
+        <EmptyState text={emptyText} />
+      ) : (
+        <div className={compact ? "preview-stack compact-preview" : "preview-stack"}>
+          {preview.files.map((file) => (
+            <PreviewBlock key={file.target} file={file} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ResultsPanel({
+  busy,
+  className,
+  confirmLabel = "确认",
+  result,
+  restoreResult,
+  successMessage,
+  onConfirm,
+  onRestore
+}: {
+  busy: BusyState;
+  className: string;
+  confirmLabel?: string;
+  result: ApplyResult | null;
+  restoreResult: RestoreResult | null;
+  successMessage: string;
+  onConfirm?: () => void;
+  onRestore: (file: AppliedFile) => void;
 }) {
   const loading = busy !== null;
 
   return (
-    <>
-      <div className="workspace">
-        <form className="panel form-panel" onSubmit={onCreatePreview}>
-          <div className="panel-heading">
-            <Settings2 />
-            <div>
-              <h2>导入配置</h2>
-              <p>填写网关、密钥和需要写入的客户端。</p>
-            </div>
-          </div>
+    <section className={className} aria-label="结果与恢复">
+      <div className="panel-heading compact-heading">
+        <CheckCircle2 />
+        <div>
+          <h2>结果与恢复</h2>
+          <p>查看写入路径、环境变量提示和最近一次备份。</p>
+        </div>
+      </div>
 
-          <fieldset className="target-grid">
-            <label className={form.platforms.codex.enabled ? "target active" : "target"}>
-              <input
-                type="checkbox"
-                checked={form.platforms.codex.enabled}
-                onChange={(event) =>
-                  setForm(updatePlatform("codex", { enabled: event.target.checked }))
-                }
-              />
-              <Terminal />
-              <span>Codex</span>
-            </label>
-            <label className={form.platforms.claude.enabled ? "target active" : "target"}>
-              <input
-                type="checkbox"
-                checked={form.platforms.claude.enabled}
-                onChange={(event) =>
-                  setForm(updatePlatform("claude", { enabled: event.target.checked }))
-                }
-              />
-              <Terminal />
-              <span>Claude Code</span>
-            </label>
-          </fieldset>
-
-          <div className="field-grid">
-            <label className="field">
-              <span>Codex OpenAI 兼容地址</span>
-              <input
-                value={form.platforms.codex.baseUrl}
-                disabled={!form.platforms.codex.enabled}
-                placeholder={provider.platforms.codex?.defaults.baseUrl || ""}
-                onChange={(event) => setForm(updatePlatform("codex", { baseUrl: event.target.value }))}
-              />
-            </label>
-            <label className="field">
-              <span>Claude Code 网关地址</span>
-              <input
-                value={form.platforms.claude.baseUrl}
-                disabled={!form.platforms.claude.enabled}
-                placeholder={provider.platforms.claude?.defaults.baseUrl || ""}
-                onChange={(event) => setForm(updatePlatform("claude", { baseUrl: event.target.value }))}
-              />
-            </label>
-          </div>
-
-          <label className="field">
-            <span>API Key / Token</span>
-            <div className="secret-input">
-              <KeyRound />
-              <input
-                ref={apiKeyInputRef}
-                type="password"
-                value={form.apiKey}
-                placeholder={`粘贴 ${provider.name} ApiKey`}
-                onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    apiKey: event.target.value
-                  }))
-                }
-              />
-            </div>
-          </label>
-
-          <div className="field-grid">
-            <label className="field">
-              <span>Codex 模型</span>
-              <input
-                value={form.platforms.codex.model || ""}
-                disabled={!form.platforms.codex.enabled}
-                placeholder={provider.platforms.codex?.defaults.model || "gpt-5.4"}
-                onChange={(event) =>
-                  setForm(updatePlatform("codex", { model: event.target.value }))
-                }
-              />
-            </label>
-            <label className="field">
-              <span>Claude 模型</span>
-              <input
-                value={form.platforms.claude.model || ""}
-                disabled={!form.platforms.claude.enabled}
-                placeholder="留空则使用 Claude Code 默认模型"
-                onChange={(event) =>
-                  setForm(updatePlatform("claude", { model: event.target.value }))
-                }
-              />
-            </label>
-          </div>
-
-          {validation.length > 0 && (
-            <div className="notice soft">
-              <AlertTriangle />
-              <span>{validation[0]}</span>
+      {!result && !restoreResult ? (
+        <EmptyState text="还没有写入结果。" />
+      ) : (
+        <div className="result-grid">
+          {result && (
+            <div className="notice success">
+              <CheckCircle2 />
+              <span>{successMessage}</span>
             </div>
           )}
 
-          <div className="button-row">
-            <button className="secondary" type="submit" disabled={!canSubmit}>
-              {busy === "preview" ? <Loader2 className="spin" /> : <Eye />}
-              <span>生成预览</span>
-            </button>
-            <button className="primary" type="button" disabled={!canSubmit} onClick={onApply}>
-              {busy === "apply" ? <Loader2 className="spin" /> : <Save />}
-              <span>应用配置</span>
-            </button>
-          </div>
-        </form>
-
-        <section className="panel">
-          <div className="panel-heading">
-            <ShieldCheck />
-            <div>
-              <h2>写入预览</h2>
-              <p>密钥已遮罩，应用前会自动生成备份。</p>
-            </div>
-          </div>
-
-          {preview.envUpdates.length > 0 && (
-            <div className="env-list">
-              {preview.envUpdates.map((item) => (
-                <div className="env-row" key={item.name}>
-                  <span>{item.name}</span>
-                  <code>{item.maskedValue}</code>
-                  <small>{item.note}</small>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {preview.warnings.map((warning) => (
-            <div className="notice soft" key={warning}>
-              <AlertTriangle />
-              <span>{warning}</span>
+          {result?.files.map((file) => (
+            <div className="result-row" key={`${file.target}-${file.path}`}>
+              <div>
+                <strong>{file.target === "codex" ? "Codex" : "Claude Code"}</strong>
+                <span>{file.created ? "已创建配置" : "已更新配置"}</span>
+                <code>{file.path}</code>
+                <small>备份：{file.backupPath}</small>
+              </div>
+              <button className="secondary compact" type="button" onClick={() => onRestore(file)} disabled={loading}>
+                {busy === "restore" ? <Loader2 className="spin" /> : <RotateCcw />}
+                <span>恢复</span>
+              </button>
             </div>
           ))}
 
-          {preview.files.length === 0 ? (
-            <EmptyState text="点击“生成预览”查看将写入的配置。" />
-          ) : (
-            <div className="preview-stack">
-              {preview.files.map((file) => (
-                <PreviewBlock key={file.target} file={file} />
-              ))}
+          {result?.envUpdates.map((item) => (
+            <div className="result-row" key={item}>
+              <div>
+                <strong>环境变量</strong>
+                <span>{item}</span>
+              </div>
+            </div>
+          ))}
+
+          {restoreResult && (
+            <div className="notice success">
+              <CheckCircle2 />
+              <span>
+                已恢复 {restoreResult.target}：
+                {restoreResult.deletedTarget ? "目标文件已删除" : restoreResult.path}
+              </span>
             </div>
           )}
-        </section>
-      </div>
 
-      <section className="panel results-panel">
-        <div className="panel-heading">
-          <CheckCircle2 />
-          <div>
-            <h2>结果与恢复</h2>
-            <p>成功后可以在这里查看写入路径，并恢复最近一次备份。</p>
-          </div>
-        </div>
-
-        {!result && !restoreResult ? (
-          <EmptyState text="还没有写入结果。" />
-        ) : (
-          <div className="result-grid">
-            {result?.files.map((file) => (
-              <div className="result-row" key={`${file.target}-${file.path}`}>
-                <div>
-                  <strong>{file.target === "codex" ? "Codex" : "Claude Code"}</strong>
-                  <span>{file.created ? "已创建配置" : "已更新配置"}</span>
-                  <code>{file.path}</code>
-                  <small>备份：{file.backupPath}</small>
-                </div>
-                <button className="secondary compact" onClick={() => onRestore(file)} disabled={loading}>
-                  {busy === "restore" ? <Loader2 className="spin" /> : <RotateCcw />}
-                  <span>恢复</span>
-                </button>
-              </div>
-            ))}
-
-            {result?.envUpdates.map((item) => (
-              <div className="result-row" key={item}>
-                <div>
-                  <strong>环境变量</strong>
-                  <span>{item}</span>
-                </div>
-              </div>
-            ))}
-
-            {restoreResult && (
-              <div className="notice success">
+          {onConfirm && result && (
+            <div className="button-row result-actions">
+              <button className="primary" type="button" onClick={onConfirm}>
                 <CheckCircle2 />
-                <span>
-                  已恢复 {restoreResult.target}：
-                  {restoreResult.deletedTarget ? "目标文件已删除" : restoreResult.path}
-                </span>
-              </div>
-            )}
-          </div>
-        )}
-      </section>
-    </>
+                <span>{confirmLabel}</span>
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -1405,13 +1438,22 @@ function formatUsage(value: number) {
 }
 
 function PreviewBlock({ file }: { file: FilePreview }) {
+  const [expanded, setExpanded] = useState(false);
+  const title = file.target === "codex" ? "Codex config.toml" : "Claude settings.json";
+
   return (
     <article className="preview-block">
-      <div className="file-meta">
-        <strong>{file.target === "codex" ? "Codex config.toml" : "Claude settings.json"}</strong>
-        <span>{file.exists ? "更新已有文件" : "创建新文件"}</span>
-        <code>{file.path}</code>
-        <small>备份将写入：{file.backupPath}</small>
+      <div className="preview-block-header">
+        <div className="file-meta">
+          <strong>{title}</strong>
+          <span>{file.exists ? "更新已有文件" : "创建新文件"}</span>
+          <code>{file.path}</code>
+          <small>备份将写入：{file.backupPath}</small>
+        </div>
+        <button className="secondary compact" type="button" onClick={() => setExpanded(true)} title="全窗口查看 diff">
+          <Maximize2 />
+          <span>展开</span>
+        </button>
       </div>
       <div className="diff-grid">
         <label>
@@ -1423,7 +1465,57 @@ function PreviewBlock({ file }: { file: FilePreview }) {
           <textarea readOnly value={file.after} />
         </label>
       </div>
+      {expanded && <DiffFullscreenModal file={file} title={title} onClose={() => setExpanded(false)} />}
     </article>
+  );
+}
+
+function DiffFullscreenModal({
+  file,
+  onClose,
+  title
+}: {
+  file: FilePreview;
+  onClose: () => void;
+  title: string;
+}) {
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="diff-fullscreen-backdrop" role="presentation">
+      <section className="diff-fullscreen-panel" role="dialog" aria-modal="true" aria-label={`${title} 全窗口 diff`}>
+        <div className="modal-header">
+          <div>
+            <p className="eyebrow">{file.exists ? "更新已有文件" : "创建新文件"}</p>
+            <h2>{title}</h2>
+            <code>{file.path}</code>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} title="关闭 diff">
+            <X />
+          </button>
+        </div>
+
+        <div className="diff-fullscreen-grid">
+          <label>
+            <span>当前</span>
+            <textarea readOnly value={file.before || "(文件不存在或为空)"} />
+          </label>
+          <label>
+            <span>写入后</span>
+            <textarea readOnly value={file.after} />
+          </label>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -1483,4 +1575,3 @@ function getUrlPath(value: string) {
 }
 
 export default App;
-

@@ -40,7 +40,6 @@ export type AccountProviderConfig = {
     loginStatusLabel: string;
     loginDescription: string;
     authServiceUrl: string;
-    keysUrl: string;
   };
   platforms: Record<string, PlatformDefinition>;
 };
@@ -60,7 +59,7 @@ export class TakoProviderConfigService {
   static getDefaultProvider(catalog: ProviderCatalog) {
     const provider = catalog.providers.find((item) => item.id === catalog.defaultProviderId);
     if (!provider) {
-      throw new Error(`Default account provider not found: ${catalog.defaultProviderId}`);
+      throw new Error(`未找到默认服务商：${catalog.defaultProviderId}`);
     }
     return provider;
   }
@@ -68,7 +67,7 @@ export class TakoProviderConfigService {
   static getPlatform(provider: AccountProviderConfig, platformId: "codex" | "claude") {
     const platform = provider.platforms[platformId];
     if (!platform) {
-      throw new Error(`Provider ${provider.id} does not support ${platformId}`);
+      throw new Error(`服务商 ${provider.id} 不支持 ${platformId}。`);
     }
     return platform;
   }

@@ -10,12 +10,12 @@ pub fn write_user_env_var(name: &str, value: &str) -> Result<String, String> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (environment, _) = hkcu
         .create_subkey("Environment")
-        .map_err(|err| format!("Failed to open user environment registry key: {err}"))?;
+        .map_err(|err| format!("打开 Windows 用户环境变量注册表失败：{err}"))?;
     environment
         .set_value(name, &value)
-        .map_err(|err| format!("Failed to write user environment variable: {err}"))?;
+        .map_err(|err| format!("写入 Windows 用户环境变量失败：{err}"))?;
     Ok(format!(
-        "{name} has been written to the Windows user environment. Open a new terminal before running Codex."
+        "{name} 已写入 Windows 用户环境变量；请新开终端后再运行 Codex。"
     ))
 }
 
@@ -28,7 +28,7 @@ pub fn write_user_env_var(name: &str, value: &str) -> Result<String, String> {
     }
 
     Ok(format!(
-        "{name} has been written to {}. Open a new terminal before running Codex.",
+        "{name} 已写入 {}；请新开终端后再运行 Codex。",
         touched.join(", ")
     ))
 }
@@ -52,11 +52,9 @@ fn upsert_env_block(path: &Path, name: &str, value: &str) -> Result<(), String> 
     let updated = replace_marked_block(&existing, &start, &end, &block);
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("Failed to create profile folder: {err}"))?;
+        std::fs::create_dir_all(parent).map_err(|err| format!("创建 shell 配置目录失败：{err}"))?;
     }
-    write_file_atomic(path, &updated)
-        .map_err(|err| format!("Failed to update shell profile: {err}"))
+    write_file_atomic(path, &updated).map_err(|err| format!("更新 shell 配置文件失败：{err}"))
 }
 
 #[cfg(not(windows))]
@@ -90,11 +88,11 @@ fn shell_quote(value: &str) -> String {
 
 pub fn codex_env_note(name: &str) -> String {
     if cfg!(windows) {
-        "Written to the Windows user environment; new terminals pick it up.".to_string()
+        "已写入 Windows 用户环境变量；请新开终端后再运行 Codex。".to_string()
     } else if cfg!(target_os = "macos") {
-        "Written to ~/.profile and ~/.zshrc; new terminals pick it up.".to_string()
+        "已写入 ~/.profile 和 ~/.zshrc；请新开终端后再运行 Codex。".to_string()
     } else {
-        format!("Written {name} to ~/.profile; new login shells pick it up.")
+        format!("已将 {name} 写入 ~/.profile；新的登录 shell 会读取它。")
     }
 }
 
@@ -102,7 +100,7 @@ pub fn profile_warnings(name: &str) -> Vec<String> {
     let mut warnings = Vec::new();
     if !cfg!(windows) {
         warnings.push(format!(
-            "Codex reads {name} from the shell environment; open a new terminal after applying."
+            "Codex 会从 shell 环境读取 {name}；应用配置后请新开终端。"
         ));
     }
     warnings

@@ -15,18 +15,18 @@ pub fn load_provider_catalog_from_disk() -> Result<ProviderCatalog, String> {
                 None,
             )),
             Err(err) => load_default_provider_catalog(Some(format!(
-                "Provider config {} is invalid: {err}. Using built-in defaults.",
+                "服务商配置 {} 无效：{err}。已使用内置默认配置。",
                 display_path(&config_path)
             ))),
         },
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             load_default_provider_catalog(Some(format!(
-                "Provider config {} was not found. Using built-in defaults.",
+                "未找到服务商配置 {}。已使用内置默认配置。",
                 display_path(&config_path)
             )))
         }
         Err(err) => load_default_provider_catalog(Some(format!(
-            "Provider config {} could not be read: {err}. Using built-in defaults.",
+            "读取服务商配置 {} 失败：{err}。已使用内置默认配置。",
             display_path(&config_path)
         ))),
     }
@@ -34,17 +34,17 @@ pub fn load_provider_catalog_from_disk() -> Result<ProviderCatalog, String> {
 
 pub fn load_default_provider_catalog(warning: Option<String>) -> Result<ProviderCatalog, String> {
     let file = parse_provider_catalog_file(DEFAULT_PROVIDER_CONFIG)
-        .map_err(|err| format!("Built-in provider config is invalid: {err}"))?;
+        .map_err(|err| format!("内置服务商配置无效：{err}"))?;
     Ok(provider_catalog_from_file(
         file,
-        "built-in defaults".to_string(),
+        "内置默认配置".to_string(),
         warning,
     ))
 }
 
 pub fn parse_provider_catalog_file(content: &str) -> Result<ProviderCatalogFile, String> {
     let file: ProviderCatalogFile =
-        serde_json::from_str(content).map_err(|err| format!("invalid JSON: {err}"))?;
+        serde_json::from_str(content).map_err(|err| format!("JSON 格式无效：{err}"))?;
     validate_provider_catalog_file(&file)?;
     Ok(file)
 }
@@ -132,7 +132,7 @@ mod tests {
         let catalog = load_provider_catalog_from_disk().unwrap();
 
         assert_eq!(catalog.default_provider_id, "tako");
-        assert!(catalog.warning.unwrap().contains("Using built-in defaults"));
+        assert!(catalog.warning.unwrap().contains("已使用内置默认配置"));
 
         env::remove_var("TAKO_SWITCH_INSTALL_DIR");
         let _ = fs::remove_dir_all(&install_dir);

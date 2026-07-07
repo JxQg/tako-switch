@@ -26,19 +26,15 @@ pub fn restore_backup_file(target: String, backup_path: String) -> Result<Restor
     let target_path = resolve_restore_target(&target)?;
     let backup_path = PathBuf::from(backup_path);
     if !backup_path.exists() {
-        return Err(format!(
-            "Backup file does not exist: {}",
-            display_path(&backup_path)
-        ));
+        return Err(format!("备份文件不存在：{}", display_path(&backup_path)));
     }
 
     let backup_content =
-        fs::read_to_string(&backup_path).map_err(|err| format!("Failed to read backup: {err}"))?;
+        fs::read_to_string(&backup_path).map_err(|err| format!("读取备份文件失败：{err}"))?;
 
     if backup_content == MISSING_SENTINEL {
         if target_path.exists() {
-            fs::remove_file(&target_path)
-                .map_err(|err| format!("Failed to remove restored target: {err}"))?;
+            fs::remove_file(&target_path).map_err(|err| format!("删除恢复目标文件失败：{err}"))?;
         }
 
         clear_latest_apply_result_from_disk()?;
@@ -52,7 +48,7 @@ pub fn restore_backup_file(target: String, backup_path: String) -> Result<Restor
     }
 
     write_file_atomic(&target_path, &backup_content)
-        .map_err(|err| format!("Failed to restore backup: {err}"))?;
+        .map_err(|err| format!("恢复备份失败：{err}"))?;
     clear_latest_apply_result_from_disk()?;
 
     Ok(RestoreResult {
@@ -68,30 +64,24 @@ pub fn write_config_file(target: &str, path: &Path, content: &str) -> Result<App
     let backup_path = make_backup_path(target, path)?;
 
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("Failed to create config folder: {err}"))?;
+        fs::create_dir_all(parent).map_err(|err| format!("创建配置目录失败：{err}"))?;
     }
 
     if let Some(parent) = backup_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("Failed to create backup folder: {err}"))?;
+        fs::create_dir_all(parent).map_err(|err| format!("创建备份目录失败：{err}"))?;
     }
 
     if existed {
-        fs::copy(path, &backup_path).map_err(|err| {
-            format!(
-                "Failed to create backup {}: {err}",
-                display_path(&backup_path)
-            )
-        })?;
+        fs::copy(path, &backup_path)
+            .map_err(|err| format!("创建备份文件 {} 失败：{err}", display_path(&backup_path)))?;
     } else {
         fs::write(&backup_path, MISSING_SENTINEL)
-            .map_err(|err| format!("Failed to create missing-file backup marker: {err}"))?;
+            .map_err(|err| format!("创建缺失文件备份标记失败：{err}"))?;
     }
 
     write_file_atomic(path, content).map_err(|err| {
         let _ = restore_from_backup(path, &backup_path);
-        format!("Failed to write {} config: {err}", target)
+        format!("写入 {target} 配置失败，已尝试回滚：{err}")
     })?;
 
     Ok(AppliedFile {
@@ -178,13 +168,9 @@ pub fn save_latest_apply_result_to_disk(result: &ApplyResult) -> Result<(), Stri
     };
     let content = serde_json::to_string_pretty(&index)
         .map(ensure_trailing_newline)
-        .map_err(|err| format!("Failed to render backup index: {err}"))?;
-    write_file_atomic(&index_path, &content).map_err(|err| {
-        format!(
-            "Failed to save backup index {}: {err}",
-            display_path(&index_path)
-        )
-    })
+        .map_err(|err| format!("生成备份索引失败：{err}"))?;
+    write_file_atomic(&index_path, &content)
+        .map_err(|err| format!("保存备份索引 {} 失败：{err}", display_path(&index_path)))
 }
 
 pub fn load_latest_apply_result_from_disk() -> Result<Option<ApplyResult>, String> {
@@ -193,15 +179,11 @@ pub fn load_latest_apply_result_from_disk() -> Result<Option<ApplyResult>, Strin
         return Ok(None);
     }
 
-    let content = fs::read_to_string(&index_path).map_err(|err| {
-        format!(
-            "Failed to read backup index {}: {err}",
-            display_path(&index_path)
-        )
-    })?;
+    let content = fs::read_to_string(&index_path)
+        .map_err(|err| format!("读取备份索引 {} 失败：{err}", display_path(&index_path)))?;
     let index: BackupIndex = serde_json::from_str(&content).map_err(|err| {
         format!(
-            "Backup index {} is not valid JSON: {err}",
+            "备份索引 {} 不是有效的 JSON：{err}",
             display_path(&index_path)
         )
     })?;
@@ -216,12 +198,8 @@ pub fn load_latest_apply_result_from_disk() -> Result<Option<ApplyResult>, Strin
 pub fn clear_latest_apply_result_from_disk() -> Result<(), String> {
     let index_path = backup_index_path()?;
     if index_path.exists() {
-        fs::remove_file(&index_path).map_err(|err| {
-            format!(
-                "Failed to clear backup index {}: {err}",
-                display_path(&index_path)
-            )
-        })?;
+        fs::remove_file(&index_path)
+            .map_err(|err| format!("清理备份索引 {} 失败：{err}", display_path(&index_path)))?;
     }
     Ok(())
 }

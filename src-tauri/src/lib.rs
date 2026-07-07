@@ -33,7 +33,7 @@ pub fn run() {
             #[cfg(all(debug_assertions, windows))]
             {
                 if let Err(err) = app.deep_link().register_all() {
-                    eprintln!("Failed to register deep-link schemes: {err}");
+                    eprintln!("注册 deep-link 协议失败：{err}");
                 }
             }
 
@@ -65,5 +65,5 @@ pub fn run() {
             providers::tako::tako_list_models
         ])
         .run(tauri::generate_context!())
-        .expect("error while running Tako Switch");
+        .expect("运行 Tako Switch 时出错");
 }

@@ -65,7 +65,7 @@ The Tako integration lives in `src/integrations/tako/`:
 - `providerConfig.ts`: provider metadata loading.
 - `types.ts`: integration-facing types.
 
-Provider defaults live in `src-tauri/config/providers.default.json`. Packaged builds load editable runtime overrides from `<install directory>/config/providers.json` and fall back to the built-in defaults when that file is missing or invalid.
+Provider defaults live in `src-tauri/config/providers.json`. Packaged builds load editable runtime overrides from `<install directory>/config/providers.json` and fall back to the built-in defaults when that file is missing or invalid.
 
 ## Backend Organization
 
