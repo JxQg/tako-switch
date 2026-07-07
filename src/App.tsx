@@ -24,6 +24,7 @@ import {
   TakoApi,
   AccountProviderConfig,
   TakoAccount,
+  ProviderCatalog,
   TakoProviderConfigService,
   TakoSessionStore,
   startTakoLogin,
@@ -33,13 +34,19 @@ import {
 
 type ActiveTab = "home" | "import" | "current";
 
+type PlatformFormInput = {
+  enabled: boolean;
+  baseUrl: string;
+  model?: string;
+};
+
 type ConfigInput = {
-  gatewayBaseUrl: string;
+  providerId: string;
   apiKey: string;
-  codexModel?: string;
-  claudeModel?: string;
-  configureCodex: boolean;
-  configureClaude: boolean;
+  platforms: {
+    codex: PlatformFormInput;
+    claude: PlatformFormInput;
+  };
 };
 
 type ToolStatus = {
@@ -111,26 +118,39 @@ const emptyPreview: PreviewResult = {
   warnings: []
 };
 
-const defaultAccountProvider = TakoProviderConfigService.getDefaultProvider();
+const emptyConfigInput: ConfigInput = {
+  providerId: "",
+  apiKey: "",
+  platforms: {
+    codex: {
+      enabled: true,
+      baseUrl: "",
+      model: ""
+    },
+    claude: {
+      enabled: true,
+      baseUrl: "",
+      model: ""
+    }
+  }
+};
 
 function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>("home");
   const apiKeyInputRef = useRef<HTMLInputElement | null>(null);
-  const [form, setForm] = useState<ConfigInput>({
-    gatewayBaseUrl: TakoProviderConfigService.getGatewayBaseUrl(defaultAccountProvider),
-    apiKey: "",
-    codexModel: "gpt-5.4",
-    claudeModel: "",
-    configureCodex: true,
-    configureClaude: true
-  });
+  const [providerCatalog, setProviderCatalog] = useState<ProviderCatalog | null>(null);
+  const provider = useMemo(
+    () => (providerCatalog ? TakoProviderConfigService.getDefaultProvider(providerCatalog) : null),
+    [providerCatalog]
+  );
+  const [form, setForm] = useState<ConfigInput>(emptyConfigInput);
   const [tools, setTools] = useState<ToolStatus[]>([]);
   const [configs, setConfigs] = useState<LoadedConfigs | null>(null);
   const [preview, setPreview] = useState<PreviewResult>(emptyPreview);
   const [result, setResult] = useState<ApplyResult | null>(null);
   const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
   const [homeImportOpen, setHomeImportOpen] = useState(false);
-  const [homeImportForm, setHomeImportForm] = useState<ConfigInput>(() => createProviderConfigInput("", []));
+  const [homeImportForm, setHomeImportForm] = useState<ConfigInput>(emptyConfigInput);
   const [homePreview, setHomePreview] = useState<PreviewResult>(emptyPreview);
   const [homeResult, setHomeResult] = useState<ApplyResult | null>(null);
   const [homeRestoreResult, setHomeRestoreResult] = useState<RestoreResult | null>(null);
@@ -146,8 +166,8 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<BusyState>(null);
 
-  const validation = useMemo(() => validateLocal(form), [form]);
-  const homeImportValidation = useMemo(() => validateLocal(homeImportForm), [homeImportForm]);
+  const validation = useMemo(() => validateLocal(form, provider), [form, provider]);
+  const homeImportValidation = useMemo(() => validateLocal(homeImportForm, provider), [homeImportForm, provider]);
   const canSubmit = validation.length === 0 && busy === null;
   const canHomeImportSubmit = homeImportValidation.length === 0 && busy === null;
   const loading = busy !== null;
@@ -157,23 +177,42 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (activeTab === "import" && !form.apiKey.trim()) {
+    if (provider && !form.providerId) {
+      setForm(createProviderConfigInput(provider, form.apiKey, takoModels));
+      setHomeImportForm(createProviderConfigInput(provider, homeImportForm.apiKey, takoModels));
+    }
+  }, [provider, form.providerId, form.apiKey, homeImportForm.apiKey, takoModels]);
+
+  useEffect(() => {
+    if (activeTab === "import" && provider && !form.apiKey.trim()) {
       window.setTimeout(() => apiKeyInputRef.current?.focus(), 50);
     }
-  }, [activeTab, form.apiKey]);
+  }, [activeTab, form.apiKey, provider]);
 
   async function refreshState() {
     setBusy("loading");
     setError(null);
     try {
-      const [toolStatuses, loadedConfigs, storedSession, storedApplyResult] = await Promise.all([
+      const [toolStatuses, loadedConfigs, storedSession, storedApplyResult, loadedProviderCatalog] = await Promise.all([
         invoke<ToolStatus[]>("detect_tools"),
         invoke<LoadedConfigs>("load_current_configs"),
         TakoSessionStore.load(),
-        invoke<ApplyResult | null>("load_latest_apply_result")
+        invoke<ApplyResult | null>("load_latest_apply_result"),
+        TakoProviderConfigService.loadCatalog()
       ]);
+      const loadedProvider = TakoProviderConfigService.getDefaultProvider(loadedProviderCatalog);
+      setProviderCatalog(loadedProviderCatalog);
+      setForm((current) =>
+        current.providerId ? current : createProviderConfigInput(loadedProvider, current.apiKey, takoModels)
+      );
+      setHomeImportForm((current) =>
+        current.providerId ? current : createProviderConfigInput(loadedProvider, current.apiKey, takoModels)
+      );
       setTools(toolStatuses);
       setConfigs(loadedConfigs);
+      if (loadedProviderCatalog.warning) {
+        setError(loadedProviderCatalog.warning);
+      }
       if (storedApplyResult) {
         setResult(storedApplyResult);
         setHomeResult(storedApplyResult);
@@ -285,8 +324,7 @@ function App() {
         offline: false
       });
       setForm((current) => ({
-        ...current,
-        gatewayBaseUrl: TakoProviderConfigService.getGatewayBaseUrl(defaultAccountProvider),
+        ...(provider ? withProviderDefaults(current, provider, takoModels) : current),
         apiKey: loginResult.apiKey || current.apiKey
       }));
       setPreview(emptyPreview);
@@ -306,8 +344,7 @@ function App() {
 
   async function restoreTakoSession(apiKey: string) {
     setForm((current) => ({
-      ...current,
-      gatewayBaseUrl: TakoProviderConfigService.getGatewayBaseUrl(defaultAccountProvider),
+      ...(provider ? withProviderDefaults(current, provider, takoModels) : current),
       apiKey
     }));
 
@@ -393,13 +430,20 @@ function App() {
     if (defaultCodexModel) {
       setForm((current) => ({
         ...current,
-        codexModel: defaultCodexModel
+        platforms: {
+          ...current.platforms,
+          codex: {
+            ...current.platforms.codex,
+            model: defaultCodexModel
+          }
+        }
       }));
     }
   }
 
   function openHomeImportModal(apiKey: string, models = takoModels) {
-    const draft = createProviderConfigInput(apiKey, models);
+    if (!provider) return;
+    const draft = createProviderConfigInput(provider, apiKey, models);
     setHomeImportForm(draft);
     setForm(draft);
     setHomePreview(emptyPreview);
@@ -537,7 +581,9 @@ function App() {
         </div>
       )}
 
-      {activeTab === "home" && (
+      {!provider && <EmptyState text="正在读取服务商配置。" />}
+
+      {activeTab === "home" && provider && (
         <HomeTab
           busy={busy}
           tools={tools}
@@ -546,14 +592,14 @@ function App() {
           onLogin={handleTakoLogin}
           onLogout={handleTakoLogout}
           onRefreshTako={() => refreshTakoDetails()}
-          provider={defaultAccountProvider}
+          provider={provider}
           takoAccount={takoAccount}
           takoModels={takoModels}
           takoUsage={takoUsage}
         />
       )}
 
-      {activeTab === "import" && (
+      {activeTab === "import" && provider && (
         <ImportTab
           apiKeyInputRef={apiKeyInputRef}
           busy={busy}
@@ -565,7 +611,7 @@ function App() {
           validation={validation}
           onApply={applyConfigs}
           onCreatePreview={createPreview}
-          provider={defaultAccountProvider}
+          provider={provider}
           onRestore={restore}
           setForm={setForm}
         />
@@ -573,14 +619,14 @@ function App() {
 
       {activeTab === "current" && <CurrentTab configs={configs} />}
 
-      {homeImportOpen && (
+      {homeImportOpen && provider && (
         <HomeImportModal
           busy={busy}
           canSubmit={canHomeImportSubmit}
           form={homeImportForm}
           models={takoModels}
           preview={homePreview}
-          provider={defaultAccountProvider}
+          provider={provider}
           result={homeResult}
           restoreResult={homeRestoreResult}
           showApiKey={showHomeApiKey}
@@ -658,11 +704,11 @@ function HomeTab({
         </div>
       </div>
 
-      <section className="panel home-main" aria-label={provider.accountLabel}>
+      <section className="panel home-main" aria-label={provider.account.label}>
         <div className="panel-heading">
           <KeyRound />
           <div>
-            <h2>{provider.accountLabel}</h2>
+            <h2>{provider.account.label}</h2>
             <p>通过浏览器授权获取 ApiKey，确认预览后再写入本机配置。</p>
           </div>
         </div>
@@ -670,13 +716,13 @@ function HomeTab({
         <div className={takoAccount.loggedIn ? "status-item tako-account-card installed" : "status-item tako-account-card"}>
           <KeyRound />
           <div>
-            <strong>{takoAccount.loggedIn ? takoAccount.name || "Tako 已登录" : provider.loginStatusLabel}</strong>
+            <strong>{takoAccount.loggedIn ? takoAccount.name || "Tako 已登录" : provider.account.loginStatusLabel}</strong>
             <span>
               {takoAccount.loggedIn
                 ? takoAccount.offline
                   ? "离线模式：已保留当前 ApiKey。"
                   : takoAccount.plan || "ApiKey 已自动填入导入配置。"
-                : provider.loginDescription}
+                : provider.account.loginDescription}
             </span>
           </div>
         </div>
@@ -707,7 +753,7 @@ function HomeTab({
           </button>
           <button className="secondary" type="button" disabled={loading || !takoAccount.loggedIn} onClick={onRefreshTako}>
             {busy === "tako" ? <Loader2 className="spin" /> : <RefreshCw />}
-            <span>刷新账号</span>
+            <span>刷新账户</span>
           </button>
           <button className="secondary" type="button" disabled={loading || !takoAccount.loggedIn} onClick={onLogout}>
             {busy === "logout" ? <Loader2 className="spin" /> : <LogOut />}
@@ -778,31 +824,31 @@ function HomeImportModal({
         <form className="modal-grid" onSubmit={onCreatePreview}>
           <div className="modal-config">
             <fieldset className="target-grid">
-              <label className={form.configureCodex ? "target active" : "target"}>
+              <label className={form.platforms.codex.enabled ? "target active" : "target"}>
                 <input
                   type="checkbox"
-                  checked={form.configureCodex}
+                  checked={form.platforms.codex.enabled}
                   onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      configureCodex: event.target.checked,
-                      codexModel:
-                        event.target.checked && !current.codexModel ? selectDefaultCodexModel(models) : current.codexModel
-                    }))
+                    setForm((current) =>
+                      updatePlatform("codex", {
+                        enabled: event.target.checked,
+                        model:
+                          event.target.checked && !current.platforms.codex.model
+                            ? selectDefaultCodexModel(models)
+                            : current.platforms.codex.model
+                      })(current)
+                    )
                   }
                 />
                 <Terminal />
                 <span>Codex</span>
               </label>
-              <label className={form.configureClaude ? "target active" : "target"}>
+              <label className={form.platforms.claude.enabled ? "target active" : "target"}>
                 <input
                   type="checkbox"
-                  checked={form.configureClaude}
+                  checked={form.platforms.claude.enabled}
                   onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      configureClaude: event.target.checked
-                    }))
+                    setForm(updatePlatform("claude", { enabled: event.target.checked }))
                   }
                 />
                 <Terminal />
@@ -810,10 +856,16 @@ function HomeImportModal({
               </label>
             </fieldset>
 
-            <label className="field">
-              <span>服务商网关地址</span>
-              <input readOnly value={form.gatewayBaseUrl} />
-            </label>
+            <div className="field-grid">
+              <label className="field">
+                <span>Codex OpenAI 兼容地址</span>
+                <input readOnly value={form.platforms.codex.baseUrl} />
+              </label>
+              <label className="field">
+                <span>Claude Code 网关地址</span>
+                <input readOnly value={form.platforms.claude.baseUrl} />
+              </label>
+            </div>
 
             <label className="field">
               <span>API Key</span>
@@ -829,13 +881,10 @@ function HomeImportModal({
             <label className="field">
               <span>Codex 模型</span>
               <select
-                value={form.codexModel || ""}
-                disabled={!form.configureCodex || codexModels.length === 0}
+                value={form.platforms.codex.model || ""}
+                disabled={!form.platforms.codex.enabled || codexModels.length === 0}
                 onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    codexModel: event.target.value
-                  }))
+                  setForm(updatePlatform("codex", { model: event.target.value }))
                 }
               >
                 {codexModels.length === 0 ? (
@@ -844,7 +893,7 @@ function HomeImportModal({
                   codexModels.map((model) => (
                     <option key={model.id} value={model.id}>
                       {model.name || model.id}
-                      {model.provider ? ` · ${model.provider}` : ""}
+                      {model.provider ? `  ${model.provider}` : ""}
                     </option>
                   ))
                 )}
@@ -998,29 +1047,23 @@ function ImportTab({
           </div>
 
           <fieldset className="target-grid">
-            <label className={form.configureCodex ? "target active" : "target"}>
+            <label className={form.platforms.codex.enabled ? "target active" : "target"}>
               <input
                 type="checkbox"
-                checked={form.configureCodex}
+                checked={form.platforms.codex.enabled}
                 onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    configureCodex: event.target.checked
-                  }))
+                  setForm(updatePlatform("codex", { enabled: event.target.checked }))
                 }
               />
               <Terminal />
               <span>Codex</span>
             </label>
-            <label className={form.configureClaude ? "target active" : "target"}>
+            <label className={form.platforms.claude.enabled ? "target active" : "target"}>
               <input
                 type="checkbox"
-                checked={form.configureClaude}
+                checked={form.platforms.claude.enabled}
                 onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    configureClaude: event.target.checked
-                  }))
+                  setForm(updatePlatform("claude", { enabled: event.target.checked }))
                 }
               />
               <Terminal />
@@ -1028,19 +1071,26 @@ function ImportTab({
             </label>
           </fieldset>
 
-          <label className="field">
-            <span>LLM 网关地址</span>
-            <input
-              value={form.gatewayBaseUrl}
-              placeholder={provider.gatewayBaseUrl}
-              onChange={(event) =>
-                setForm((current) => ({
-                  ...current,
-                  gatewayBaseUrl: event.target.value
-                }))
-              }
-            />
-          </label>
+          <div className="field-grid">
+            <label className="field">
+              <span>Codex OpenAI 兼容地址</span>
+              <input
+                value={form.platforms.codex.baseUrl}
+                disabled={!form.platforms.codex.enabled}
+                placeholder={provider.platforms.codex?.defaults.baseUrl || ""}
+                onChange={(event) => setForm(updatePlatform("codex", { baseUrl: event.target.value }))}
+              />
+            </label>
+            <label className="field">
+              <span>Claude Code 网关地址</span>
+              <input
+                value={form.platforms.claude.baseUrl}
+                disabled={!form.platforms.claude.enabled}
+                placeholder={provider.platforms.claude?.defaults.baseUrl || ""}
+                onChange={(event) => setForm(updatePlatform("claude", { baseUrl: event.target.value }))}
+              />
+            </label>
+          </div>
 
           <label className="field">
             <span>API Key / Token</span>
@@ -1065,28 +1115,22 @@ function ImportTab({
             <label className="field">
               <span>Codex 模型</span>
               <input
-                value={form.codexModel || ""}
-                disabled={!form.configureCodex}
-                placeholder="gpt-5.4"
+                value={form.platforms.codex.model || ""}
+                disabled={!form.platforms.codex.enabled}
+                placeholder={provider.platforms.codex?.defaults.model || "gpt-5.4"}
                 onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    codexModel: event.target.value
-                  }))
+                  setForm(updatePlatform("codex", { model: event.target.value }))
                 }
               />
             </label>
             <label className="field">
               <span>Claude 模型</span>
               <input
-                value={form.claudeModel || ""}
-                disabled={!form.configureClaude}
+                value={form.platforms.claude.model || ""}
+                disabled={!form.platforms.claude.enabled}
                 placeholder="留空则使用 Claude Code 默认模型"
                 onChange={(event) =>
-                  setForm((current) => ({
-                    ...current,
-                    claudeModel: event.target.value
-                  }))
+                  setForm(updatePlatform("claude", { model: event.target.value }))
                 }
               />
             </label>
@@ -1156,7 +1200,7 @@ function ImportTab({
           <CheckCircle2 />
           <div>
             <h2>结果与恢复</h2>
-            <p>成功后可从这里查看写入路径，并恢复最近一次备份。</p>
+            <p>成功后可以在这里查看写入路径，并恢复最近一次备份。</p>
           </div>
         </div>
 
@@ -1288,15 +1332,60 @@ function summarizeModelClients(models: TakoModel[]) {
     .join(" / ");
 }
 
-function createProviderConfigInput(apiKey: string, models: TakoModel[]): ConfigInput {
+function createProviderConfigInput(provider: AccountProviderConfig, apiKey: string, models: TakoModel[]): ConfigInput {
+  const codex = TakoProviderConfigService.getPlatform(provider, "codex");
+  const claude = TakoProviderConfigService.getPlatform(provider, "claude");
   return {
-    gatewayBaseUrl: TakoProviderConfigService.getGatewayBaseUrl(defaultAccountProvider),
+    providerId: provider.id,
     apiKey,
-    codexModel: selectDefaultCodexModel(models),
-    claudeModel: "",
-    configureCodex: true,
-    configureClaude: true
+    platforms: {
+      codex: {
+        enabled: codex.enabled,
+        baseUrl: codex.defaults.baseUrl,
+        model: selectDefaultCodexModel(models) || codex.defaults.model || ""
+      },
+      claude: {
+        enabled: claude.enabled,
+        baseUrl: claude.defaults.baseUrl,
+        model: claude.defaults.model || ""
+      }
+    }
   };
+}
+
+function withProviderDefaults(form: ConfigInput, provider: AccountProviderConfig, models: TakoModel[]): ConfigInput {
+  const defaults = createProviderConfigInput(provider, form.apiKey, models);
+  return {
+    ...defaults,
+    ...form,
+    providerId: form.providerId || defaults.providerId,
+    platforms: {
+      codex: {
+        ...defaults.platforms.codex,
+        ...form.platforms.codex
+      },
+      claude: {
+        ...defaults.platforms.claude,
+        ...form.platforms.claude
+      }
+    }
+  };
+}
+
+function updatePlatform(
+  platformId: "codex" | "claude",
+  patch: Partial<PlatformFormInput>
+): (current: ConfigInput) => ConfigInput {
+  return (current) => ({
+    ...current,
+    platforms: {
+      ...current.platforms,
+      [platformId]: {
+        ...current.platforms[platformId],
+        ...patch
+      }
+    }
+  });
 }
 
 function selectDefaultCodexModel(models: TakoModel[]) {
@@ -1353,21 +1442,45 @@ function EmptyState({ text }: { text: string }) {
   return <div className="empty-state">{text}</div>;
 }
 
-function validateLocal(form: ConfigInput) {
+function validateLocal(form: ConfigInput, provider: AccountProviderConfig | null) {
   const errors: string[] = [];
-  if (!form.configureCodex && !form.configureClaude) {
-    errors.push("至少选择 Codex 或 Claude Code。");
+  if (!provider) {
+    errors.push("正在读取服务商配置。");
+    return errors;
   }
-  if (!/^https?:\/\/.+/i.test(form.gatewayBaseUrl.trim())) {
-    errors.push("网关地址必须以 http:// 或 https:// 开头。");
+  if (!form.platforms.codex.enabled && !form.platforms.claude.enabled) {
+    errors.push("至少选择 Codex 或 Claude Code。");
   }
   if (!form.apiKey.trim()) {
     errors.push("API Key / Token 不能为空。");
   }
-  if (form.configureCodex && !form.codexModel?.trim()) {
+  if (form.platforms.codex.enabled && !/^https?:\/\/.+/i.test(form.platforms.codex.baseUrl.trim())) {
+    errors.push("Codex 地址必须以 http:// 或 https:// 开头。");
+  }
+  if (form.platforms.claude.enabled && !/^https?:\/\/.+/i.test(form.platforms.claude.baseUrl.trim())) {
+    errors.push("Claude Code 地址必须以 http:// 或 https:// 开头。");
+  }
+  if (form.platforms.codex.enabled && provider.platforms.codex?.rules.model?.required && !form.platforms.codex.model?.trim()) {
     errors.push("选择 Codex 时必须填写 Codex 模型。");
+  }
+  const forbiddenClaudeSuffixes = provider.platforms.claude?.rules.baseUrl?.forbidPathSuffixes || [];
+  const claudePath = getUrlPath(form.platforms.claude.baseUrl);
+  if (
+    form.platforms.claude.enabled &&
+    forbiddenClaudeSuffixes.some((suffix) => claudePath.endsWith(suffix.replace(/\/+$/, "")))
+  ) {
+    errors.push("Claude Code 网关地址不要包含 /v1，请填写域名根地址。");
   }
   return errors;
 }
 
+function getUrlPath(value: string) {
+  try {
+    return new URL(value.trim()).pathname.replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
 export default App;
+

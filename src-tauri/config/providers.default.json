@@ -1,0 +1,77 @@
+{
+  "defaultProviderId": "tako",
+  "providers": [
+    {
+      "id": "tako",
+      "name": "Tako",
+      "account": {
+        "label": "Tako \u8d26\u6237",
+        "loginStatusLabel": "Tako \u767b\u5f55",
+        "loginDescription": "\u901a\u8fc7\u6d4f\u89c8\u5668\u6388\u6743\u81ea\u52a8\u83b7\u53d6 ApiKey\u3002",
+        "authServiceUrl": "https://tako.shiroha.tech",
+        "keysUrl": "https://tako.shiroha.tech/par/user/keys"
+      },
+      "platforms": {
+        "codex": {
+          "enabled": true,
+          "defaults": {
+            "baseUrl": "https://tako.shiroha.tech/v1",
+            "model": "gpt-5.4"
+          },
+          "rules": {
+            "model": {
+              "required": true
+            }
+          },
+          "writer": {
+            "kind": "codexConfigToml",
+            "bindings": {
+              "apiKey": {
+                "storage": "userEnv",
+                "name": "TAKO_CODEX_API_KEY"
+              }
+            },
+            "constants": {
+              "providerId": "tako_proxy",
+              "providerName": "Tako LLM Gateway",
+              "wireApi": "responses"
+            }
+          }
+        },
+        "claude": {
+          "enabled": true,
+          "defaults": {
+            "baseUrl": "https://tako.shiroha.tech",
+            "model": ""
+          },
+          "rules": {
+            "baseUrl": {
+              "forbidPathSuffixes": ["/v1"]
+            },
+            "model": {
+              "required": false
+            }
+          },
+          "writer": {
+            "kind": "claudeSettingsJson",
+            "bindings": {
+              "baseUrl": {
+                "storage": "settingsEnv",
+                "name": "ANTHROPIC_BASE_URL"
+              },
+              "apiKey": {
+                "storage": "settingsEnv",
+                "name": "ANTHROPIC_AUTH_TOKEN"
+              },
+              "model": {
+                "storage": "settingsEnv",
+                "name": "ANTHROPIC_MODEL"
+              }
+            },
+            "constants": {}
+          }
+        }
+      }
+    }
+  ]
+}

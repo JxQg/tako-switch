@@ -1,52 +1,75 @@
-import accountProvidersConfig from "./config/account-providers.json";
+import { invoke } from "@tauri-apps/api/core";
+
+export type WriterBinding = {
+  storage: string;
+  name: string;
+};
+
+export type PlatformWriter = {
+  kind: string;
+  bindings: Record<string, WriterBinding>;
+  constants: Record<string, string>;
+};
+
+export type PlatformDefaults = {
+  baseUrl: string;
+  model?: string | null;
+};
+
+export type PlatformRules = {
+  baseUrl?: {
+    forbidPathSuffixes?: string[];
+  } | null;
+  model?: {
+    required?: boolean;
+  } | null;
+};
+
+export type PlatformDefinition = {
+  enabled: boolean;
+  defaults: PlatformDefaults;
+  rules: PlatformRules;
+  writer: PlatformWriter;
+};
 
 export type AccountProviderConfig = {
   id: string;
   name: string;
-  accountLabel: string;
-  loginStatusLabel: string;
-  loginDescription: string;
-  gatewayBaseUrl: string;
-  authServiceUrl: string;
-  keysApiUrl: string;
+  account: {
+    label: string;
+    loginStatusLabel: string;
+    loginDescription: string;
+    authServiceUrl: string;
+    keysUrl: string;
+  };
+  platforms: Record<string, PlatformDefinition>;
 };
 
-type AccountProvidersFile = {
+export type ProviderCatalog = {
   defaultProviderId: string;
   providers: AccountProviderConfig[];
+  source: string;
+  warning: string | null;
 };
 
-const config = accountProvidersConfig as AccountProvidersFile;
-
 export class TakoProviderConfigService {
-  static getDefaultProvider() {
-    const provider = config.providers.find((item) => item.id === config.defaultProviderId);
+  static loadCatalog() {
+    return invoke<ProviderCatalog>("load_provider_catalog");
+  }
+
+  static getDefaultProvider(catalog: ProviderCatalog) {
+    const provider = catalog.providers.find((item) => item.id === catalog.defaultProviderId);
     if (!provider) {
-      throw new Error(`Default account provider not found: ${config.defaultProviderId}`);
+      throw new Error(`Default account provider not found: ${catalog.defaultProviderId}`);
     }
-    validateProvider(provider);
     return provider;
   }
 
-  static getGatewayBaseUrl(provider: AccountProviderConfig) {
-    return provider.gatewayBaseUrl;
-  }
-}
-
-function validateProvider(provider: AccountProviderConfig) {
-  const requiredFields: Array<keyof AccountProviderConfig> = [
-    "id",
-    "name",
-    "accountLabel",
-    "loginStatusLabel",
-    "loginDescription",
-    "gatewayBaseUrl",
-    "authServiceUrl"
-  ];
-
-  for (const field of requiredFields) {
-    if (!provider[field]?.trim()) {
-      throw new Error(`Account provider ${provider.id || "(unknown)"} is missing ${field}`);
+  static getPlatform(provider: AccountProviderConfig, platformId: "codex" | "claude") {
+    const platform = provider.platforms[platformId];
+    if (!platform) {
+      throw new Error(`Provider ${provider.id} does not support ${platformId}`);
     }
+    return platform;
   }
 }

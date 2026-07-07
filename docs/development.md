@@ -64,10 +64,28 @@ The Tako integration lives in `src/integrations/tako/`:
 - `auth.ts`: browser authorization and deep-link login flow.
 - `providerConfig.ts`: provider metadata loading.
 - `types.ts`: integration-facing types.
-- `config/account-providers.json`: provider configuration.
+
+Provider defaults live in `src-tauri/config/providers.default.json`. Packaged builds load editable runtime overrides from `<install directory>/config/providers.json` and fall back to the built-in defaults when that file is missing or invalid.
 
 ## Backend Organization
 
-Integration-specific Rust code belongs in focused modules. Tako backend commands and parsing live in `src-tauri/src/tako.rs`, while `src-tauri/src/lib.rs` keeps the Tauri app setup and invoke handler registration.
+`src-tauri/src/lib.rs` should stay as the Tauri app entrypoint: module declarations, plugin setup, deep-link wiring, and invoke handler registration only.
+
+Backend code is split by responsibility:
+
+- `commands.rs`: Tauri command handlers and deep-link parsing.
+- `models.rs`: shared command DTOs returned to the frontend.
+- `config_paths.rs`: user config paths, install directory, and provider config path.
+- `backups.rs`: backup file creation, restore, and latest apply result persistence.
+- `tools.rs`: local Codex / Claude Code command detection.
+- `redaction.rs`: secret masking and preview redaction.
+- `providers/`: service-provider config and remote provider APIs.
+  - `types.rs`: runtime provider catalog schema and unified import input.
+  - `loader.rs`: load `<install directory>/config/providers.json` with built-in fallback.
+  - `validation.rs`: provider schema validation and unified input normalization.
+  - `tako.rs`: Tako-specific login, identity, usage, and model-list APIs.
+- `platforms/`: local client writers.
+  - `codex.rs`: Codex TOML and user environment writer.
+  - `claude.rs`: Claude Code `settings.json` writer.
 
 Keep the existing preview/apply/backup/restore command surface stable unless a larger migration is intentionally planned.

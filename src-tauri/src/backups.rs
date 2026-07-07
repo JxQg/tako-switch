@@ -1,0 +1,286 @@
+use crate::{
+    config_paths::{install_dir, resolve_restore_target},
+    models::{AppliedFile, ApplyResult, RestoreResult},
+    utils::{display_path, ensure_trailing_newline},
+};
+use chrono::Local;
+use serde::{Deserialize, Serialize};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
+
+const MISSING_SENTINEL: &str = "TAKO_BACKUP_ORIGINAL_FILE_MISSING\n";
+const BACKUP_INDEX_FILE: &str = "tako-config-backups.json";
+const BACKUP_INDEX_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupIndex {
+    version: u32,
+    saved_at: String,
+    result: ApplyResult,
+}
+
+pub fn restore_backup_file(target: String, backup_path: String) -> Result<RestoreResult, String> {
+    let target_path = resolve_restore_target(&target)?;
+    let backup_path = PathBuf::from(backup_path);
+    if !backup_path.exists() {
+        return Err(format!(
+            "Backup file does not exist: {}",
+            display_path(&backup_path)
+        ));
+    }
+
+    let backup_content =
+        fs::read_to_string(&backup_path).map_err(|err| format!("Failed to read backup: {err}"))?;
+
+    if backup_content == MISSING_SENTINEL {
+        if target_path.exists() {
+            fs::remove_file(&target_path)
+                .map_err(|err| format!("Failed to remove restored target: {err}"))?;
+        }
+
+        clear_latest_apply_result_from_disk()?;
+
+        return Ok(RestoreResult {
+            target,
+            path: display_path(&target_path),
+            restored_from: display_path(&backup_path),
+            deleted_target: true,
+        });
+    }
+
+    write_file_atomic(&target_path, &backup_content)
+        .map_err(|err| format!("Failed to restore backup: {err}"))?;
+    clear_latest_apply_result_from_disk()?;
+
+    Ok(RestoreResult {
+        target,
+        path: display_path(&target_path),
+        restored_from: display_path(&backup_path),
+        deleted_target: false,
+    })
+}
+
+pub fn write_config_file(target: &str, path: &Path, content: &str) -> Result<AppliedFile, String> {
+    let existed = path.exists();
+    let backup_path = make_backup_path(target, path)?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create config folder: {err}"))?;
+    }
+
+    if let Some(parent) = backup_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create backup folder: {err}"))?;
+    }
+
+    if existed {
+        fs::copy(path, &backup_path).map_err(|err| {
+            format!(
+                "Failed to create backup {}: {err}",
+                display_path(&backup_path)
+            )
+        })?;
+    } else {
+        fs::write(&backup_path, MISSING_SENTINEL)
+            .map_err(|err| format!("Failed to create missing-file backup marker: {err}"))?;
+    }
+
+    write_file_atomic(path, content).map_err(|err| {
+        let _ = restore_from_backup(path, &backup_path);
+        format!("Failed to write {} config: {err}", target)
+    })?;
+
+    Ok(AppliedFile {
+        target: target.to_string(),
+        path: display_path(path),
+        backup_path: display_path(&backup_path),
+        created: !existed,
+    })
+}
+
+pub fn write_file_atomic(path: &Path, content: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.tako-tmp-{}",
+        Local::now().format("%Y%m%d%H%M%S%3f")
+    ));
+
+    fs::write(&temp_path, content)?;
+
+    match fs::rename(&temp_path, path) {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            if path.exists() {
+                fs::remove_file(path)?;
+                fs::rename(&temp_path, path)
+            } else {
+                Err(first_error)
+            }
+        }
+    }
+}
+
+fn restore_from_backup(path: &Path, backup_path: &Path) -> io::Result<()> {
+    let content = fs::read_to_string(backup_path)?;
+    if content == MISSING_SENTINEL {
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        return Ok(());
+    }
+    write_file_atomic(path, &content)
+}
+
+pub fn make_backup_path(target: &str, path: &Path) -> Result<PathBuf, String> {
+    let timestamp = Local::now().format("%Y%m%d-%H%M%S");
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    Ok(backup_root()?
+        .join(backup_target_dir(target))
+        .join(format!("{file_name}.tako-backup-{timestamp}")))
+}
+
+fn backup_target_dir(target: &str) -> &'static str {
+    match target {
+        "codex" => "codex",
+        "claude" => "claude-code",
+        _ => "other",
+    }
+}
+
+fn backup_root() -> Result<PathBuf, String> {
+    Ok(install_dir()?.join("backups"))
+}
+
+fn backup_index_path() -> Result<PathBuf, String> {
+    Ok(install_dir()?.join(BACKUP_INDEX_FILE))
+}
+
+pub fn save_latest_apply_result_to_disk(result: &ApplyResult) -> Result<(), String> {
+    let index_path = backup_index_path()?;
+    let index = BackupIndex {
+        version: BACKUP_INDEX_VERSION,
+        saved_at: Local::now().to_rfc3339(),
+        result: result.clone(),
+    };
+    let content = serde_json::to_string_pretty(&index)
+        .map(ensure_trailing_newline)
+        .map_err(|err| format!("Failed to render backup index: {err}"))?;
+    write_file_atomic(&index_path, &content).map_err(|err| {
+        format!(
+            "Failed to save backup index {}: {err}",
+            display_path(&index_path)
+        )
+    })
+}
+
+pub fn load_latest_apply_result_from_disk() -> Result<Option<ApplyResult>, String> {
+    let index_path = backup_index_path()?;
+    if !index_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&index_path).map_err(|err| {
+        format!(
+            "Failed to read backup index {}: {err}",
+            display_path(&index_path)
+        )
+    })?;
+    let index: BackupIndex = serde_json::from_str(&content).map_err(|err| {
+        format!(
+            "Backup index {} is not valid JSON: {err}",
+            display_path(&index_path)
+        )
+    })?;
+
+    if index.version != BACKUP_INDEX_VERSION {
+        return Ok(None);
+    }
+
+    Ok(Some(index.result))
+}
+
+pub fn clear_latest_apply_result_from_disk() -> Result<(), String> {
+    let index_path = backup_index_path()?;
+    if index_path.exists() {
+        fs::remove_file(&index_path).map_err(|err| {
+            format!(
+                "Failed to clear backup index {}: {err}",
+                display_path(&index_path)
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config_paths::install_dir_test_lock, models::ToolStatus};
+    use std::env;
+
+    #[test]
+    fn backups_and_latest_apply_result_use_install_folder() {
+        let _lock = install_dir_test_lock();
+        let install_dir = env::temp_dir().join(format!(
+            "tako-switch-index-test-{}",
+            Local::now().format("%Y%m%d%H%M%S%3f")
+        ));
+        fs::create_dir_all(&install_dir).unwrap();
+        env::set_var("TAKO_SWITCH_INSTALL_DIR", &install_dir);
+
+        let codex_backup = make_backup_path("codex", Path::new("config.toml")).unwrap();
+        let claude_backup = make_backup_path("claude", Path::new("settings.json")).unwrap();
+        let index = backup_index_path().unwrap();
+
+        assert!(codex_backup.starts_with(install_dir.join("backups").join("codex")));
+        assert!(claude_backup.starts_with(install_dir.join("backups").join("claude-code")));
+        assert_eq!(index, install_dir.join(BACKUP_INDEX_FILE));
+
+        let result = ApplyResult {
+            files: vec![AppliedFile {
+                target: "codex".to_string(),
+                path: "C:\\Users\\demo\\.codex\\config.toml".to_string(),
+                backup_path: display_path(
+                    &install_dir
+                        .join("backups")
+                        .join("codex")
+                        .join("config.toml.tako-backup-test"),
+                ),
+                created: false,
+            }],
+            env_updates: vec!["env updated".to_string()],
+            tools: vec![ToolStatus {
+                name: "Codex".to_string(),
+                installed: true,
+                version: Some("codex 1.0.0".to_string()),
+                error: None,
+            }],
+            warnings: vec!["warning".to_string()],
+        };
+
+        save_latest_apply_result_to_disk(&result).unwrap();
+        assert!(install_dir.join(BACKUP_INDEX_FILE).exists());
+        let loaded = load_latest_apply_result_from_disk().unwrap().unwrap();
+        assert_eq!(loaded.files[0].backup_path, result.files[0].backup_path);
+
+        clear_latest_apply_result_from_disk().unwrap();
+        assert!(load_latest_apply_result_from_disk().unwrap().is_none());
+
+        env::remove_var("TAKO_SWITCH_INSTALL_DIR");
+        let _ = fs::remove_dir_all(&install_dir);
+    }
+}

@@ -26,6 +26,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "config/providers.default.json": "config/providers.json"
+    },
     "icon": [
       "icons/icon.ico",
       "icons/icon.icns",
