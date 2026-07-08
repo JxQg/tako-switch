@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::sync::{Mutex, MutexGuard};
 use std::{
     env,
     ffi::OsString,
@@ -105,15 +103,11 @@ pub fn resolve_restore_target(target: &str) -> Result<PathBuf, String> {
 }
 
 #[cfg(test)]
-pub const TEST_PROVIDER_CONFIG_DIR: &str = PROVIDER_CONFIG_DIR;
+pub fn test_provider_config_dir() -> &'static str {
+    PROVIDER_CONFIG_DIR
+}
 
 #[cfg(test)]
-pub const TEST_PROVIDER_CONFIG_FILE: &str = PROVIDER_CONFIG_FILE;
-
-#[cfg(test)]
-static INSTALL_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-#[cfg(test)]
-pub fn install_dir_test_lock() -> MutexGuard<'static, ()> {
-    INSTALL_DIR_TEST_LOCK.lock().unwrap()
+pub fn test_provider_config_file() -> &'static str {
+    PROVIDER_CONFIG_FILE
 }

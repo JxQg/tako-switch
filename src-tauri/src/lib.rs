@@ -6,6 +6,9 @@ mod models;
 mod platforms;
 mod providers;
 mod redaction;
+#[cfg(test)]
+#[path = "tests/mod.rs"]
+mod tests;
 mod tools;
 mod utils;
 
