@@ -5,6 +5,7 @@ import {
   Eye,
   EyeOff,
   FileText,
+  Github,
   Home,
   KeyRound,
   Loader2,
@@ -32,6 +33,13 @@ import {
   type TakoModel,
   type TakoUsage
 } from "./integrations/tako";
+import {
+  APP_DISPLAY_VERSION,
+  PROJECT_URL,
+  AppUpdateStatus,
+  checkForAppUpdate,
+  getUpdateOpenUrl
+} from "./appUpdates";
 
 type ActiveTab = "home" | "import" | "current";
 
@@ -88,6 +96,16 @@ type PreviewResult = {
   files: FilePreview[];
   envUpdates: EnvPreview[];
   warnings: string[];
+};
+
+type DiffLineKind = "context" | "added" | "removed" | "modified";
+
+type DiffLine = {
+  kind: DiffLineKind;
+  marker: " " | "+" | "-" | "~";
+  text: string;
+  oldLine?: number;
+  newLine?: number;
 };
 
 type AppliedFile = {
@@ -166,6 +184,10 @@ function App() {
   const [takoUsage, setTakoUsage] = useState<TakoUsage | null>(null);
   const [takoModels, setTakoModels] = useState<TakoModel[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [infoMessage, setInfoMessage] = useState<string | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<AppUpdateStatus | null>(null);
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [busy, setBusy] = useState<BusyState>(null);
 
   const validation = useMemo(() => validateLocal(form, provider), [form, provider]);
@@ -176,6 +198,7 @@ function App() {
 
   useEffect(() => {
     void refreshState();
+    void refreshUpdateStatus({ silent: true });
   }, []);
 
   useEffect(() => {
@@ -545,16 +568,87 @@ function App() {
     }
   }
 
+  async function refreshUpdateStatus({ silent = false }: { silent?: boolean } = {}) {
+    if (checkingUpdate) return;
+    setCheckingUpdate(true);
+    if (!silent) {
+      setError(null);
+      setInfoMessage(null);
+    }
+
+    try {
+      const nextStatus = await checkForAppUpdate();
+      setUpdateStatus(nextStatus);
+      if (nextStatus.available) {
+        if (!silent) {
+          setUpdateDialogOpen(true);
+        }
+      } else if (!silent) {
+        setInfoMessage(`已是最新版本：${APP_DISPLAY_VERSION}`);
+      }
+    } catch (err) {
+      if (!silent) {
+        setError(`检查更新失败：${String(err)}`);
+      }
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+
+  async function handleUpdateButtonClick() {
+    if (updateStatus?.available) {
+      setUpdateDialogOpen(true);
+      return;
+    }
+
+    await refreshUpdateStatus();
+  }
+
+  async function openProjectHome() {
+    setError(null);
+    setInfoMessage(null);
+    try {
+      await TakoApi.openExternal(PROJECT_URL);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function openUpdateDownload() {
+    if (!updateStatus) return;
+    setError(null);
+    setInfoMessage(null);
+    try {
+      await TakoApi.openExternal(getUpdateOpenUrl(updateStatus));
+      setUpdateDialogOpen(false);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
   return (
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">Tako Switch</p>
+          <p className="eyebrow app-brand">
+            <span>Tako Switch</span>
+            <span className="version-badge">{APP_DISPLAY_VERSION}</span>
+          </p>
           <h1>Codex / Claude Code 一键配置</h1>
         </div>
-        <button className="icon-button" onClick={refreshState} disabled={loading} title="重新检测">
-          {busy === "loading" ? <Loader2 className="spin" /> : <RefreshCw />}
-        </button>
+        <div className="topbar-actions">
+          <button className="update-button" type="button" onClick={handleUpdateButtonClick} disabled={checkingUpdate}>
+            {checkingUpdate ? <Loader2 className="spin" /> : <RefreshCw />}
+            <span>更新</span>
+            {updateStatus?.available && <span className="new-badge">NEW</span>}
+          </button>
+          <button className="icon-button" type="button" onClick={openProjectHome} title="打开 GitHub 项目主页">
+            <Github />
+          </button>
+          <button className="icon-button" type="button" onClick={refreshState} disabled={loading} title="重新检测">
+            {busy === "loading" ? <Loader2 className="spin" /> : <RefreshCw />}
+          </button>
+        </div>
       </header>
 
       <nav className="tabs" aria-label="主要页面">
@@ -581,6 +675,13 @@ function App() {
         <div className="notice error" role="alert">
           <AlertTriangle />
           <span>{error}</span>
+        </div>
+      )}
+
+      {infoMessage && (
+        <div className="notice success" role="status">
+          <CheckCircle2 />
+          <span>{infoMessage}</span>
         </div>
       )}
 
@@ -644,6 +745,14 @@ function App() {
           onRestore={restoreHome}
           onToggleApiKey={() => setShowHomeApiKey((current) => !current)}
           setForm={setHomeImportForm}
+        />
+      )}
+
+      {updateDialogOpen && updateStatus && (
+        <UpdateModal
+          update={updateStatus}
+          onClose={() => setUpdateDialogOpen(false)}
+          onOpenDownload={openUpdateDownload}
         />
       )}
     </main>
@@ -813,6 +922,8 @@ function HomeImportModal({
   onToggleApiKey: () => void;
   setForm: React.Dispatch<React.SetStateAction<ConfigInput>>;
 }) {
+  const showPreview = hasPreviewContent(preview);
+
   return (
     <div className="modal-backdrop" role="presentation">
       <section className="modal-panel" role="dialog" aria-modal="true" aria-label={`一键导入 ${provider.name} 配置`}>
@@ -839,7 +950,7 @@ function HomeImportModal({
           />
         )}
 
-        <div className="modal-grid modal-flow-grid">
+        <div className={showPreview ? "modal-grid modal-flow-grid" : "modal-grid modal-flow-grid preview-hidden"}>
           <ProviderConfigForm
             apiKeyReadOnly
             baseUrlsReadOnly
@@ -859,12 +970,7 @@ function HomeImportModal({
             onToggleApiKey={onToggleApiKey}
             setForm={setForm}
           />
-          <PreviewPanel
-            compact
-            className="modal-preview"
-            emptyText="点击“应用配置”会自动生成预览并保存；也可以先生成预览查看差异。"
-            preview={preview}
-          />
+          {showPreview && <PreviewPanel compact className="modal-preview" preview={preview} />}
         </div>
       </section>
     </div>
@@ -906,9 +1012,11 @@ function ImportTab({
   onToggleApiKey: () => void;
   setForm: React.Dispatch<React.SetStateAction<ConfigInput>>;
 }) {
+  const showPreview = hasPreviewContent(preview);
+
   return (
     <>
-      <div className="workspace">
+      <div className={showPreview ? "workspace import-workspace has-preview" : "workspace import-workspace"}>
         <ProviderConfigForm
           apiKeyInputRef={apiKeyInputRef}
           busy={busy}
@@ -928,11 +1036,7 @@ function ImportTab({
           setForm={setForm}
         />
 
-        <PreviewPanel
-          className="panel"
-          emptyText="点击“生成预览”查看将写入的配置，或直接点击“应用配置”。"
-          preview={preview}
-        />
+        <PreviewPanel className="panel" preview={preview} />
       </div>
 
       <ResultsPanel
@@ -987,8 +1091,35 @@ function ProviderConfigForm({
   setForm: React.Dispatch<React.SetStateAction<ConfigInput>>;
 }) {
   const codexModels = models.filter(isCodexModel);
+  const claudeModels = models.filter(isClaudeModel);
   const codexModel = form.platforms.codex.model || "";
+  const claudeModel = form.platforms.claude.model || "";
   const codexModelNotInList = codexModel && codexModels.every((model) => model.id !== codexModel);
+  const claudeModelNotInList = claudeModel && claudeModels.every((model) => model.id !== claudeModel);
+  const [codexModelMenuOpen, setCodexModelMenuOpen] = useState(false);
+  const [claudeModelMenuOpen, setClaudeModelMenuOpen] = useState(false);
+
+  useEffect(() => {
+    if (!codexModelMenuOpen && !claudeModelMenuOpen) return;
+
+    function closeMenus() {
+      setCodexModelMenuOpen(false);
+      setClaudeModelMenuOpen(false);
+    }
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        closeMenus();
+      }
+    }
+
+    window.addEventListener("click", closeMenus);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("click", closeMenus);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [codexModelMenuOpen, claudeModelMenuOpen]);
 
   function toggleCodex(enabled: boolean) {
     setForm((current) =>
@@ -1031,7 +1162,7 @@ function ProviderConfigForm({
 
       <div className="field-grid">
         <label className="field">
-          <span>Codex OpenAI 兼容地址</span>
+          <span>Codex OpenAI 网关地址</span>
           <input
             readOnly={baseUrlsReadOnly}
             value={form.platforms.codex.baseUrl}
@@ -1084,19 +1215,16 @@ function ProviderConfigForm({
         <label className="field">
           <span>Codex 模型</span>
           {codexModels.length > 0 ? (
-            <select
-              value={codexModel}
+            <ModelSelect
+              open={codexModelMenuOpen}
+              selectedModelId={codexModel}
+              models={codexModels}
               disabled={!form.platforms.codex.enabled}
-              onChange={(event) => setForm(updatePlatform("codex", { model: event.target.value }))}
-            >
-              {codexModelNotInList && <option value={codexModel}>{codexModel}</option>}
-              {codexModels.map((model) => (
-                <option key={model.id} value={model.id}>
-                  {model.name || model.id}
-                  {model.provider ? `  ${model.provider}` : ""}
-                </option>
-              ))}
-            </select>
+              customModelId={codexModelNotInList ? codexModel : ""}
+              placeholder="选择 Codex 模型"
+              onOpenChange={setCodexModelMenuOpen}
+              onSelect={(modelId) => setForm(updatePlatform("codex", { model: modelId }))}
+            />
           ) : (
             <input
               value={codexModel}
@@ -1108,12 +1236,26 @@ function ProviderConfigForm({
         </label>
         <label className="field">
           <span>Claude 模型</span>
-          <input
-            value={form.platforms.claude.model || ""}
-            disabled={!form.platforms.claude.enabled}
-            placeholder="留空则使用 Claude Code 默认模型"
-            onChange={(event) => setForm(updatePlatform("claude", { model: event.target.value }))}
-          />
+          {claudeModels.length > 0 ? (
+            <ModelSelect
+              open={claudeModelMenuOpen}
+              selectedModelId={claudeModel}
+              models={claudeModels}
+              disabled={!form.platforms.claude.enabled}
+              customModelId={claudeModelNotInList ? claudeModel : ""}
+              placeholder="留空则使用 Claude Code 默认模型"
+              clearLabel="使用 Claude Code 默认模型"
+              onOpenChange={setClaudeModelMenuOpen}
+              onSelect={(modelId) => setForm(updatePlatform("claude", { model: modelId }))}
+            />
+          ) : (
+            <input
+              value={claudeModel}
+              disabled={!form.platforms.claude.enabled}
+              placeholder="留空则使用 Claude Code 默认模型"
+              onChange={(event) => setForm(updatePlatform("claude", { model: event.target.value }))}
+            />
+          )}
         </label>
       </div>
 
@@ -1141,14 +1283,14 @@ function ProviderConfigForm({
 function PreviewPanel({
   className,
   compact = false,
-  emptyText,
   preview
 }: {
   className: string;
   compact?: boolean;
-  emptyText: string;
   preview: PreviewResult;
 }) {
+  if (!hasPreviewContent(preview)) return null;
+
   return (
     <section className={className} aria-label="写入预览">
       <div className="panel-heading compact-heading">
@@ -1178,9 +1320,7 @@ function PreviewPanel({
         </div>
       ))}
 
-      {preview.files.length === 0 ? (
-        <EmptyState text={emptyText} />
-      ) : (
+      {preview.files.length > 0 && (
         <div className={compact ? "preview-stack compact-preview" : "preview-stack"}>
           {preview.files.map((file) => (
             <PreviewBlock key={file.target} file={file} />
@@ -1342,6 +1482,114 @@ function StatusItem({
   );
 }
 
+function ModelSelect({
+  clearLabel,
+  customModelId,
+  disabled,
+  models,
+  onOpenChange,
+  onSelect,
+  open,
+  placeholder,
+  selectedModelId
+}: {
+  clearLabel?: string;
+  customModelId: string;
+  disabled: boolean;
+  models: TakoModel[];
+  onOpenChange: (open: boolean) => void;
+  onSelect: (modelId: string) => void;
+  open: boolean;
+  placeholder: string;
+  selectedModelId: string;
+}) {
+  const selectRef = useRef<HTMLDivElement | null>(null);
+  const [dropUp, setDropUp] = useState(false);
+  const selectedModel = models.find((model) => model.id === selectedModelId);
+  const selectedLabel = selectedModel?.name || selectedModel?.id || selectedModelId || placeholder;
+  const modelOptions = customModelId
+    ? [{ id: customModelId, name: customModelId, provider: "", clients: [] }, ...models]
+    : models;
+
+  useEffect(() => {
+    if (!open) return;
+
+    function updateMenuDirection() {
+      const bounds = selectRef.current?.getBoundingClientRect();
+      if (!bounds) return;
+
+      const spaceBelow = window.innerHeight - bounds.bottom;
+      const spaceAbove = bounds.top;
+      setDropUp(spaceBelow < 300 && spaceAbove > spaceBelow);
+    }
+
+    updateMenuDirection();
+    window.addEventListener("resize", updateMenuDirection);
+    window.addEventListener("scroll", updateMenuDirection, true);
+    return () => {
+      window.removeEventListener("resize", updateMenuDirection);
+      window.removeEventListener("scroll", updateMenuDirection, true);
+    };
+  }, [open]);
+
+  function handleSelect(modelId: string) {
+    onSelect(modelId);
+    onOpenChange(false);
+  }
+
+  return (
+    <div
+      ref={selectRef}
+      className={["model-select", open ? "open" : "", dropUp ? "drop-up" : ""].filter(Boolean).join(" ")}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <button
+        className="model-select-trigger"
+        type="button"
+        disabled={disabled}
+        aria-expanded={open}
+        onClick={() => onOpenChange(!open)}
+      >
+        <span>{selectedLabel}</span>
+      </button>
+
+      {open && (
+        <div className="model-select-menu" role="listbox">
+          {clearLabel && (
+            <button
+              className={!selectedModelId ? "model-option selected" : "model-option"}
+              type="button"
+              role="option"
+              aria-selected={!selectedModelId}
+              onClick={() => handleSelect("")}
+            >
+              <span className="model-option-name muted">{clearLabel}</span>
+            </button>
+          )}
+          {modelOptions.map((model) => {
+            const label = model.name || model.id;
+            const selected = model.id === selectedModelId;
+
+            return (
+              <button
+                className={selected ? "model-option selected" : "model-option"}
+                type="button"
+                role="option"
+                aria-selected={selected}
+                key={`${model.id}-${model.provider}`}
+                onClick={() => handleSelect(model.id)}
+              >
+                <span className="model-option-name">{label}</span>
+                {model.provider && <span className="provider-tag">{model.provider}</span>}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function UsageTile({ label, window }: { label: string; window: { used: number; limit: number } }) {
   const percent = window.limit > 0 ? Math.min(100, Math.max(0, (window.used / window.limit) * 100)) : 0;
   return (
@@ -1433,13 +1681,129 @@ function isCodexModel(model: TakoModel) {
   return model.clients.includes("codex") || model.provider.toLowerCase().includes("openai");
 }
 
+function isClaudeModel(model: TakoModel) {
+  const providerName = model.provider.toLowerCase();
+  return model.clients.includes("claude") || providerName.includes("anthropic") || providerName.includes("claude");
+}
+
+function hasPreviewContent(preview: PreviewResult) {
+  return preview.files.length > 0 || preview.envUpdates.length > 0 || preview.warnings.length > 0;
+}
+
+function buildDiffLines(before: string, after: string): DiffLine[] {
+  const beforeLines = splitLines(before);
+  const afterLines = splitLines(after);
+
+  if (beforeLines.length === 0 && afterLines.length === 0) return [];
+
+  const lcs = buildLcsMatrix(beforeLines, afterLines);
+  const lines: DiffLine[] = [];
+  let oldIndex = 0;
+  let newIndex = 0;
+
+  while (oldIndex < beforeLines.length || newIndex < afterLines.length) {
+    if (oldIndex < beforeLines.length && newIndex < afterLines.length && beforeLines[oldIndex] === afterLines[newIndex]) {
+      lines.push({
+        kind: "context",
+        marker: " ",
+        text: beforeLines[oldIndex],
+        oldLine: oldIndex + 1,
+        newLine: newIndex + 1
+      });
+      oldIndex += 1;
+      newIndex += 1;
+      continue;
+    }
+
+    const removed: DiffLine[] = [];
+    const added: DiffLine[] = [];
+
+    while (
+      oldIndex < beforeLines.length &&
+      (newIndex >= afterLines.length || lcs[oldIndex + 1][newIndex] >= lcs[oldIndex][newIndex + 1])
+    ) {
+      removed.push({
+        kind: "removed",
+        marker: "-",
+        text: beforeLines[oldIndex],
+        oldLine: oldIndex + 1
+      });
+      oldIndex += 1;
+
+      if (oldIndex < beforeLines.length && newIndex < afterLines.length && beforeLines[oldIndex] === afterLines[newIndex]) {
+        break;
+      }
+    }
+
+    while (
+      newIndex < afterLines.length &&
+      (oldIndex >= beforeLines.length || lcs[oldIndex][newIndex + 1] > lcs[oldIndex + 1][newIndex])
+    ) {
+      added.push({
+        kind: "added",
+        marker: "+",
+        text: afterLines[newIndex],
+        newLine: newIndex + 1
+      });
+      newIndex += 1;
+
+      if (oldIndex < beforeLines.length && newIndex < afterLines.length && beforeLines[oldIndex] === afterLines[newIndex]) {
+        break;
+      }
+    }
+
+    const pairedCount = Math.min(removed.length, added.length);
+    for (let index = 0; index < pairedCount; index += 1) {
+      lines.push({
+        kind: "modified",
+        marker: "~",
+        text: `${removed[index].text} -> ${added[index].text}`,
+        oldLine: removed[index].oldLine,
+        newLine: added[index].newLine
+      });
+    }
+    lines.push(...removed.slice(pairedCount), ...added.slice(pairedCount));
+  }
+
+  return lines;
+}
+
+function buildLcsMatrix(beforeLines: string[], afterLines: string[]) {
+  const rows = beforeLines.length + 1;
+  const columns = afterLines.length + 1;
+  const matrix = Array.from({ length: rows }, () => Array<number>(columns).fill(0));
+
+  for (let row = beforeLines.length - 1; row >= 0; row -= 1) {
+    for (let column = afterLines.length - 1; column >= 0; column -= 1) {
+      matrix[row][column] =
+        beforeLines[row] === afterLines[column]
+          ? matrix[row + 1][column + 1] + 1
+          : Math.max(matrix[row + 1][column], matrix[row][column + 1]);
+    }
+  }
+
+  return matrix;
+}
+
+function splitLines(value: string) {
+  if (!value) return [];
+  return value.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+}
+
 function formatUsage(value: number) {
   return value.toFixed(value >= 10 ? 1 : 2);
+}
+
+function formatDate(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleDateString();
 }
 
 function PreviewBlock({ file }: { file: FilePreview }) {
   const [expanded, setExpanded] = useState(false);
   const title = file.target === "codex" ? "Codex config.toml" : "Claude settings.json";
+  const diffLines = useMemo(() => buildDiffLines(file.before, file.after), [file.after, file.before]);
 
   return (
     <article className="preview-block">
@@ -1455,26 +1819,44 @@ function PreviewBlock({ file }: { file: FilePreview }) {
           <span>展开</span>
         </button>
       </div>
-      <div className="diff-grid">
-        <label>
-          <span>当前</span>
-          <textarea readOnly value={file.before || "(文件不存在或为空)"} />
-        </label>
-        <label>
-          <span>写入后</span>
-          <textarea readOnly value={file.after} />
-        </label>
-      </div>
-      {expanded && <DiffFullscreenModal file={file} title={title} onClose={() => setExpanded(false)} />}
+      <DiffSummary compact lines={diffLines} />
+      {expanded && <DiffFullscreenModal diffLines={diffLines} file={file} title={title} onClose={() => setExpanded(false)} />}
     </article>
   );
 }
 
+function DiffSummary({ compact = false, lines }: { compact?: boolean; lines: DiffLine[] }) {
+  const changedLines = lines.filter((line) => line.kind !== "context");
+  const displayLines = compact ? (changedLines.length > 0 ? changedLines : lines).slice(0, 14) : lines;
+  const hiddenCount = compact ? Math.max(0, (changedLines.length > 0 ? changedLines.length : lines.length) - displayLines.length) : 0;
+
+  if (displayLines.length === 0) {
+    return <EmptyState text="没有检测到内容差异。" />;
+  }
+
+  return (
+    <div className={compact ? "diff-summary compact-diff-summary" : "diff-summary"} role="list">
+      {displayLines.map((line, index) => (
+        <div className={`diff-line ${line.kind}`} role="listitem" key={`${line.kind}-${line.oldLine || 0}-${line.newLine || 0}-${index}`}>
+          <span className="diff-marker" aria-hidden="true">
+            {line.marker}
+          </span>
+          <span className="diff-line-number">{formatDiffLineNumber(line)}</span>
+          <code>{line.text || " "}</code>
+        </div>
+      ))}
+      {hiddenCount > 0 && <div className="diff-more">还有 {hiddenCount} 行变化，展开查看完整 diff。</div>}
+    </div>
+  );
+}
+
 function DiffFullscreenModal({
+  diffLines,
   file,
   onClose,
   title
 }: {
+  diffLines: DiffLine[];
   file: FilePreview;
   onClose: () => void;
   title: string;
@@ -1498,25 +1880,26 @@ function DiffFullscreenModal({
             <p className="eyebrow">{file.exists ? "更新已有文件" : "创建新文件"}</p>
             <h2>{title}</h2>
             <code>{file.path}</code>
+            <small>备份将写入：{file.backupPath}</small>
           </div>
           <button className="icon-button" type="button" onClick={onClose} title="关闭 diff">
             <X />
           </button>
         </div>
 
-        <div className="diff-fullscreen-grid">
-          <label>
-            <span>当前</span>
-            <textarea readOnly value={file.before || "(文件不存在或为空)"} />
-          </label>
-          <label>
-            <span>写入后</span>
-            <textarea readOnly value={file.after} />
-          </label>
+        <div className="diff-fullscreen-body">
+          <DiffSummary lines={diffLines} />
         </div>
       </section>
     </div>
   );
+}
+
+function formatDiffLineNumber(line: DiffLine) {
+  if (line.oldLine && line.newLine) return `${line.oldLine} -> ${line.newLine}`;
+  if (line.oldLine) return String(line.oldLine);
+  if (line.newLine) return String(line.newLine);
+  return "";
 }
 
 function CurrentConfigBlock({ config }: { config: ExistingConfig }) {
@@ -1532,6 +1915,79 @@ function CurrentConfigBlock({ config }: { config: ExistingConfig }) {
 
 function EmptyState({ text }: { text: string }) {
   return <div className="empty-state">{text}</div>;
+}
+
+function UpdateModal({
+  onClose,
+  onOpenDownload,
+  update
+}: {
+  onClose: () => void;
+  onOpenDownload: () => void;
+  update: AppUpdateStatus;
+}) {
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section className="modal-panel update-modal" role="dialog" aria-modal="true" aria-label="应用更新">
+        <div className="modal-header">
+          <div>
+            <p className="eyebrow">Tako Switch 更新</p>
+            <h2>发现新版本 v{update.latestVersion}</h2>
+            <p className="update-summary">
+              当前版本 {APP_DISPLAY_VERSION}
+              {update.publishedAt ? ` · 发布于 ${formatDate(update.publishedAt)}` : ""}
+            </p>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} title="关闭更新">
+            <X />
+          </button>
+        </div>
+
+        <div className="update-details">
+          <div className="update-version-grid">
+            <div>
+              <span>当前版本</span>
+              <strong>{APP_DISPLAY_VERSION}</strong>
+            </div>
+            <div>
+              <span>最新版本</span>
+              <strong>v{update.latestVersion}</strong>
+            </div>
+          </div>
+
+          <div className="notice soft">
+            <AlertTriangle />
+            <span>
+              当前阶段会打开 GitHub Release 安装包，由系统或浏览器完成下载与安装。后续可切换到 Tauri 官方自动更新。
+            </span>
+          </div>
+
+          <div className="update-asset">
+            <strong>{update.asset ? "将打开当前平台安装包" : "未找到当前平台安装包"}</strong>
+            <span>{update.asset?.name || "将打开 GitHub Release 页面手动选择下载。"}</span>
+          </div>
+
+          {update.releaseNotes && (
+            <label className="update-notes">
+              <span>Release Notes</span>
+              <textarea readOnly value={update.releaseNotes} />
+            </label>
+          )}
+        </div>
+
+        <div className="button-row result-actions">
+          <button className="secondary" type="button" onClick={onClose}>
+            <X />
+            <span>稍后</span>
+          </button>
+          <button className="primary" type="button" onClick={onOpenDownload}>
+            <RefreshCw />
+            <span>{update.asset ? "打开安装包" : "打开 Release"}</span>
+          </button>
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function validateLocal(form: ConfigInput, provider: AccountProviderConfig | null) {

@@ -50,6 +50,7 @@ bun run tauri:build
 - `src/main.tsx`：React 启动入口。
 - `src/App.tsx`：主界面、标签页状态和导入流程编排。
 - `src/App.css`：应用样式。
+- `src/appUpdates.ts`：应用版本展示、GitHub Releases 检查、semver 比较和平台安装包选择。
 
 Tako 前端集成放在 `src/integrations/tako/`：
 
@@ -60,6 +61,12 @@ Tako 前端集成放在 `src/integrations/tako/`：
 - `types.ts`：前端集成类型。
 
 前端组件负责渲染、交互和流程编排。网络请求、Tauri 调用、服务商解析和配置写入规则不要堆进组件里。
+
+Codex 和 Claude 模型列表使用同一套自定义下拉组件：选中状态只展示模型名称，展开项右侧用 provider tag 展示模型提供商。Codex 过滤 OpenAI / Codex 可用模型并保持必选；Claude 过滤 Anthropic / Claude 可用模型，默认保持空值，并提供清空选项以继续使用 Claude Code 默认模型。没有模型列表时保留手动输入框。下拉层宽度跟随输入框，靠近弹窗或页面底部时自动向上展开；长模型名和长 provider tag 必须省略，不允许撑宽表单。
+
+导入配置布局默认以表单为主：`ImportTab` 和 `HomeImportModal` 在没有预览内容时使用单栏宽表单；网关地址字段和模型字段都使用两列表单，确保横向布局一致。只有当 `preview.files`、`preview.envUpdates` 或 `preview.warnings` 非空时才渲染写入预览；结果与恢复区继续按已有写入/恢复结果显示。
+
+预览 diff 是前端基于后端 `preview_changes` 返回的 `before` / `after` 文本生成的展示辅助，不改变实际写入内容。默认预览卡使用紧凑统一 diff 摘要，`+` 表示新增行，`-` 表示删除行，`~` 表示修改行；全屏展开优先展示完整统一 diff，并保留文件路径、备份路径和创建/更新状态。
 
 ## 后端结构
 
@@ -210,6 +217,21 @@ Release Notes 由 `scripts/generate-release-notes.mjs` 根据 Conventional Commi
 破坏性变更使用 `!` 或 `BREAKING CHANGE:` footer。
 
 macOS 签名优先读取仓库密钥 `APPLE_SIGNING_IDENTITY`。如果密钥为空，CI 会使用 `APPLE_SIGNING_IDENTITY=-` 进行 ad-hoc signing。
+
+## 应用更新
+
+当前更新能力是分阶段 MVP：
+
+- 顶部版本号读取 `src-tauri/tauri.conf.json` 的 `version`，显示为 `v<version>`。
+- 应用启动后会静默请求 `https://api.github.com/repos/JxQg/tako-switch/releases/latest`。
+- 版本比较使用 semver 规则，只有远端版本严格高于本地版本才提示更新；无法解析版本时保守地不提示。
+- Windows 优先选择 Release asset 中的 `windows-x64-setup.exe`，缺失时回退到 `.msi`。
+- macOS 选择 `darwin-universal.dmg`。
+- 找不到当前平台安装包时，打开 GitHub Release 页面。
+
+当前阶段不会静默安装。确认更新后只通过现有 `open_external` 命令打开安装包或 Release 页面，让浏览器和系统安装器接管。
+
+后续如果切换到 Tauri 官方自动更新，应接入 `tauri-plugin-updater` / `@tauri-apps/plugin-updater`，在 `tauri.conf.json` 配置 updater `pubkey`、endpoint 和 `bundle.createUpdaterArtifacts`，并在 CI 中配置 `TAURI_SIGNING_PRIVATE_KEY` 生成签名产物与 updater JSON。
 
 ## 维护原则
 

@@ -1,6 +1,6 @@
 {
   "name": "tako-switch",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "packageManager": "bun@1.3.14",
@@ -13,7 +13,9 @@
     "tauri:info": "tauri info",
     "icons:generate": "bun scripts/generate-icon.mjs",
     "rust:test": "cargo test --manifest-path src-tauri/Cargo.toml",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "version:set": "bun scripts/sync-version-from-tag.mjs",
+    "version:check": "bun scripts/sync-version-from-tag.mjs --check"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",
