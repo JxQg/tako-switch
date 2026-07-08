@@ -125,12 +125,6 @@ jobs:
       - name: Sync version from tag
         run: bun scripts/sync-version-from-tag.mjs "${{ github.ref_name }}"
 
-      - name: Sync Cargo lockfile version
-        shell: bash
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          cargo update --manifest-path src-tauri/Cargo.toml --package tako-switch --precise "$version"
-
       - name: Typecheck
         run: bun run typecheck
 

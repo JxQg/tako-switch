@@ -192,8 +192,11 @@ bun run tauri:build
 发布由 `.github/workflows/release.yml` 负责，触发条件是推送语义化版本 tag：
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+# 同步 package.json / tauri.conf.json / Cargo.toml / Cargo.lock
+bun run version:set v0.3.0
+
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 流程会先校验 tag，再生成 Release Notes，并创建或更新同名 GitHub Release。构建任务会从 tag 同步版本号到：

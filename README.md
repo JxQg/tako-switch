@@ -28,9 +28,7 @@ bun run typecheck
 bun run build
 bun run rust:test
 bun run tauri:build
-bun run version:set v0.3.0   # 同步 package.json / tauri.conf.json / Cargo.toml
-cargo update --manifest-path src-tauri/Cargo.toml --package tako-switch --precise 0.3.0   # 顺手同步 Cargo.lock
-bun run version:check          # 只校验是否一致，不写文件
+bun run version:check          
 ```
 
 ## 配置目标

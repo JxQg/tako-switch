@@ -1,23 +1,27 @@
 #!/usr/bin/env bun
 
+import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 
-const [, , rawTag, ...flags] = process.argv;
-const checkOnly = flags.includes("--check");
-const validateOnly = flags.includes("--validate-only");
-const tag = rawTag || process.env.GITHUB_REF_NAME || "";
+const args = process.argv.slice(2);
+const flags = new Set(args.filter((arg) => arg.startsWith("--")));
+const positionalArgs = args.filter((arg) => !arg.startsWith("--"));
+const rawTag = positionalArgs[0] || process.env.GITHUB_REF_NAME || "";
+const tag = rawTag;
+const checkOnly = flags.has("--check");
+const validateOnly = flags.has("--validate-only");
 const semverPattern =
   /^v(?<version>(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$/;
 const match = semverPattern.exec(tag);
 
-if (!match?.groups?.version) {
+if (!match?.groups?.version && !(checkOnly && !tag)) {
   console.error(
     `Expected a release tag like v0.1.0, received "${tag || "<empty>"}".`,
   );
   process.exit(1);
 }
 
-const version = match.groups.version;
+const version = match?.groups?.version || readJson("package.json").version;
 
 if (validateOnly) {
   console.log(`Validated app version ${version} from tag ${tag}.`);
@@ -30,6 +34,31 @@ function readJson(path) {
 
 function writeJson(path, value) {
   writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function runCargoLockUpdate() {
+  const result = spawnSync(
+    "cargo",
+    [
+      "update",
+      "--manifest-path",
+      "src-tauri/Cargo.toml",
+      "--package",
+      "tako-switch",
+      "--precise",
+      version,
+    ],
+    { stdio: "inherit" },
+  );
+
+  if (result.error) {
+    console.error(`Failed to run cargo update: ${result.error.message}`);
+    process.exit(1);
+  }
+
+  if (result.status !== 0) {
+    process.exit(result.status ?? 1);
+  }
 }
 
 function planJsonVersion(path) {
@@ -88,10 +117,44 @@ function planCargoVersion(path) {
   };
 }
 
+function readCargoLockPackageVersion(path, packageName) {
+  const source = readFileSync(path, "utf8");
+  const packages = source.split(/\r?\n\[\[package\]\]\r?\n/);
+
+  for (const packageSource of packages) {
+    const packageNameLine = /^name\s*=\s*"([^"]+)"\s*$/m.exec(packageSource);
+
+    if (packageNameLine?.[1] !== packageName) {
+      continue;
+    }
+
+    const versionLine = /^version\s*=\s*"([^"]+)"\s*$/m.exec(packageSource);
+
+    if (!versionLine?.[1]) {
+      throw new Error(`Could not find ${packageName} version in ${path}.`);
+    }
+
+    return versionLine[1];
+  }
+
+  throw new Error(`Could not find ${packageName} package in ${path}.`);
+}
+
+function planCargoLockVersion(path) {
+  const currentVersion = readCargoLockPackageVersion(path, "tako-switch");
+
+  if (currentVersion === version) {
+    return null;
+  }
+
+  return { path };
+}
+
 const plannedChanges = [
   planJsonVersion("package.json"),
   planJsonVersion("src-tauri/tauri.conf.json"),
   planCargoVersion("src-tauri/Cargo.toml"),
+  planCargoLockVersion("src-tauri/Cargo.lock"),
 ].filter(Boolean);
 
 if (checkOnly && plannedChanges.length > 0) {
@@ -105,9 +168,12 @@ if (checkOnly && plannedChanges.length > 0) {
 
 if (!checkOnly) {
   for (const change of plannedChanges) {
-    change.write();
+    change.write?.();
   }
+
+  runCargoLockUpdate();
 }
 
 const action = checkOnly ? "Verified" : "Synchronized";
-console.log(`${action} app version ${version} from tag ${tag}.`);
+const source = tag ? `tag ${tag}` : "package.json";
+console.log(`${action} app version ${version} from ${source}.`);
