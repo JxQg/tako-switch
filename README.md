@@ -37,6 +37,5 @@ bun run version:check          # 只校验是否一致，不写文件
 
 - Codex：`$CODEX_HOME/config.toml`，未设置 `CODEX_HOME` 时使用 `~/.codex/config.toml`。
 - Claude Code：`~/.claude/settings.json`。
-- Codex 密钥：写入用户环境变量 `TAKO_CODEX_API_KEY`，需要新开终端后生效。
 
 详细说明见 [操作文档](docs/user-guide.md) 和 [开发文档](docs/development.md)。

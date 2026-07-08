@@ -26,8 +26,8 @@
             "kind": "codexConfigToml",
             "bindings": {
               "apiKey": {
-                "storage": "userEnv",
-                "name": "TAKO_CODEX_API_KEY"
+                "storage": "configToml",
+                "name": "experimental_bearer_token"
               }
             },
             "constants": {

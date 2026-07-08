@@ -218,12 +218,17 @@ function App() {
     setBusy("loading");
     setError(null);
     try {
-      const [toolStatuses, loadedConfigs, storedSession, storedApplyResult, loadedProviderCatalog] = await Promise.all([
+      const [storedSession, loadedProviderCatalog] = await Promise.all([
+        TakoSessionStore.load(),
+        TakoProviderConfigService.loadCatalog()
+      ]);
+      const migrationResult = await invoke<ApplyResult | null>("migrate_legacy_codex_config", {
+        apiKey: storedSession?.apiKey
+      });
+      const [toolStatuses, loadedConfigs, storedApplyResult] = await Promise.all([
         invoke<ToolStatus[]>("detect_tools"),
         invoke<LoadedConfigs>("load_current_configs"),
-        TakoSessionStore.load(),
-        invoke<ApplyResult | null>("load_latest_apply_result"),
-        TakoProviderConfigService.loadCatalog()
+        invoke<ApplyResult | null>("load_latest_apply_result")
       ]);
       const loadedProvider = TakoProviderConfigService.getDefaultProvider(loadedProviderCatalog);
       setProviderCatalog(loadedProviderCatalog);
@@ -238,9 +243,10 @@ function App() {
       if (loadedProviderCatalog.warning) {
         setError(loadedProviderCatalog.warning);
       }
-      if (storedApplyResult) {
-        setResult(storedApplyResult);
-        setHomeResult(storedApplyResult);
+      const latestResult = migrationResult ?? storedApplyResult;
+      if (latestResult) {
+        setResult(latestResult);
+        setHomeResult(latestResult);
       }
       if (storedSession) {
         await restoreTakoSession(storedSession.apiKey);
@@ -1358,7 +1364,7 @@ function ResultsPanel({
         <CheckCircle2 />
         <div>
           <h2>结果与恢复</h2>
-          <p>查看写入路径、环境变量提示和最近一次备份。</p>
+          <p>查看写入路径和最近一次备份。</p>
         </div>
       </div>
 
@@ -1385,15 +1391,6 @@ function ResultsPanel({
                 {busy === "restore" ? <Loader2 className="spin" /> : <RotateCcw />}
                 <span>恢复</span>
               </button>
-            </div>
-          ))}
-
-          {result?.envUpdates.map((item) => (
-            <div className="result-row" key={item}>
-              <div>
-                <strong>环境变量</strong>
-                <span>{item}</span>
-              </div>
             </div>
           ))}
 

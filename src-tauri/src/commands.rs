@@ -4,10 +4,10 @@ use crate::{
     },
     config_paths::{claude_settings_path, codex_config_path},
     models::{ApplyResult, ExistingConfig, LoadedConfigs, PreviewResult, RestoreResult},
-    platforms::{apply_platform, preview_platform},
+    platforms::{apply_platform, codex, preview_platform},
     providers::{
-        load_provider_catalog_from_disk, validation::parse_http_url, validation::validate_input,
-        ConfigInput, ProviderCatalog,
+        load_provider_catalog_from_disk, types::PLATFORM_CODEX, validation::parse_http_url,
+        validation::validate_input, ConfigInput, ProviderCatalog,
     },
     redaction::{redact_json_text, redact_plain_text},
     tools,
@@ -94,6 +94,44 @@ pub fn apply_configs(input: ConfigInput) -> Result<ApplyResult, String> {
     };
     save_latest_apply_result_to_disk(&result)?;
     Ok(result)
+}
+
+#[tauri::command]
+pub fn migrate_legacy_codex_config(api_key: Option<String>) -> Result<Option<ApplyResult>, String> {
+    let catalog = load_provider_catalog_from_disk()?;
+    let Some(provider) = catalog
+        .providers
+        .iter()
+        .find(|provider| provider.id == catalog.default_provider_id)
+    else {
+        return Ok(None);
+    };
+    let Some(platform) = provider.platforms.get(PLATFORM_CODEX) else {
+        return Ok(None);
+    };
+
+    let mut files = Vec::new();
+    let mut warnings = catalog.warning.into_iter().collect::<Vec<_>>();
+    let migrated = codex::migrate_legacy_config(
+        &platform.writer,
+        platform.defaults.model.as_deref(),
+        &platform.defaults.base_url,
+        api_key.as_deref(),
+        &mut files,
+        &mut warnings,
+    )?;
+    if !migrated {
+        return Ok(None);
+    }
+
+    let result = ApplyResult {
+        files,
+        env_updates: Vec::new(),
+        tools: tools::detect_tools(),
+        warnings,
+    };
+    save_latest_apply_result_to_disk(&result)?;
+    Ok(Some(result))
 }
 
 #[tauri::command]

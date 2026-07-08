@@ -53,6 +53,7 @@ pub fn run() {
             commands::load_current_configs,
             commands::load_latest_apply_result,
             commands::load_provider_catalog,
+            commands::migrate_legacy_codex_config,
             commands::preview_changes,
             commands::apply_configs,
             commands::restore_backup,

@@ -64,7 +64,7 @@ Tako 前端集成放在 `src/integrations/tako/`：
 
 Codex 和 Claude 模型列表使用同一套自定义下拉组件：选中状态只展示模型名称，展开项右侧用 provider tag 展示模型提供商。Codex 过滤 OpenAI / Codex 可用模型并保持必选；Claude 过滤 Anthropic / Claude 可用模型，默认保持空值，并提供清空选项以继续使用 Claude Code 默认模型。没有模型列表时保留手动输入框。下拉层宽度跟随输入框，靠近弹窗或页面底部时自动向上展开；长模型名和长 provider tag 必须省略，不允许撑宽表单。
 
-导入配置布局默认以表单为主：`ImportTab` 和 `HomeImportModal` 在没有预览内容时使用单栏宽表单；网关地址字段和模型字段都使用两列表单，确保横向布局一致。只有当 `preview.files`、`preview.envUpdates` 或 `preview.warnings` 非空时才渲染写入预览；结果与恢复区继续按已有写入/恢复结果显示。
+导入配置布局默认以表单为主：`ImportTab` 和 `HomeImportModal` 在没有预览内容时使用单栏宽表单；网关地址字段和模型字段都使用两列表单，确保横向布局一致。只有当 `preview.files`、`preview.envUpdates` 或 `preview.warnings` 非空时才渲染写入预览；Codex 新写入路径只产生文件预览，`envUpdates` 字段仅保留为结果兼容字段。
 
 预览 diff 是前端基于后端 `preview_changes` 返回的 `before` / `after` 文本生成的展示辅助，不改变实际写入内容。默认预览卡使用紧凑统一 diff 摘要，`+` 表示新增行，`-` 表示删除行，`~` 表示修改行；全屏展开优先展示完整统一 diff，并保留文件路径、备份路径和创建/更新状态。
 
@@ -78,7 +78,7 @@ Tauri 后端位于 `src-tauri/src/`。
 - `config_paths.rs`：用户配置路径、程序目录和服务商配置路径。
 - `backups.rs`：备份、恢复、最近一次写入结果持久化。
 - `tools.rs`：Codex / Claude Code 本机命令检测。
-- `env_vars.rs`：Codex 用户环境变量写入。
+- `env_vars.rs`：旧版 Codex 用户环境变量清理。
 - `redaction.rs`：密钥遮罩和配置脱敏。
 - `platforms/`：本机客户端写入器。
 - `providers/`：服务商配置、校验和 Tako 远程 API。
@@ -104,8 +104,10 @@ Codex 写入器在 `src-tauri/src/platforms/codex.rs`。
 
 - 目标路径：`$CODEX_HOME/config.toml`，未设置时为 `~/.codex/config.toml`。
 - 写入内容：`model`、`model_provider`、`model_providers.<provider>`。
-- 密钥来源：`env_key = "TAKO_CODEX_API_KEY"`。
-- Windows 上通过用户环境变量注册表写入；macOS / Linux 上写入 shell 配置文件。
+- 密钥写入：`model_providers.<provider>.experimental_bearer_token`。
+- 为避免继续走官方 OAuth 或旧环境变量路径，写入 Tako 管理的 provider 时会移除同表下的 `auth`、`env_key`、`env_key_instructions`、`requires_openai_auth`。
+- 应用 Codex 配置成功后会尝试清理旧版 `TAKO_CODEX_API_KEY`：Windows 删除当前用户环境变量；macOS / Linux 只删除 Tako Switch 标记块，不删除用户手写环境变量。
+- 启动时会调用 `migrate_legacy_codex_config` 做一次旧配置兼容迁移；只迁移 `tako_proxy.env_key = "TAKO_CODEX_API_KEY"` 且尚未写入新密钥字段的配置。
 
 Codex 配置使用 `toml_edit` 合并，目标是保留用户已有配置并保持幂等。
 
