@@ -1,18 +1,63 @@
 use crate::models::ToolStatus;
+#[cfg(any(windows, target_os = "macos"))]
+use std::env;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::process::Command;
-#[cfg(target_os = "macos")]
-use std::{collections::BTreeSet, env, path::PathBuf};
+use std::{collections::BTreeSet, path::PathBuf};
+#[cfg(windows)]
+use winreg::{
+    enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE},
+    RegKey,
+};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 pub fn detect_tools() -> Vec<ToolStatus> {
-    vec![
-        detect_tool("Codex", tool_command_candidates("codex")),
-        detect_tool("Claude Code", tool_command_candidates("claude")),
-    ]
+    vec![detect_codex_tool(), detect_claude_tool()]
+}
+
+fn detect_codex_tool() -> ToolStatus {
+    let status = detect_tool("Codex", codex_command_candidates());
+    if status.installed {
+        return status;
+    }
+
+    detect_codex_app_status().unwrap_or(status)
+}
+
+fn codex_command_candidates() -> Vec<String> {
+    let mut candidates = tool_command_candidates("codex");
+    candidates.extend(
+        codex_app_command_candidates()
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string()),
+    );
+    unique_non_empty(candidates)
+}
+
+fn detect_claude_tool() -> ToolStatus {
+    let status = detect_tool_with_version_validator(
+        "Claude Code",
+        claude_command_candidates(),
+        is_claude_code_version_output,
+    );
+    if status.installed {
+        return status;
+    }
+
+    detect_claude_app_status().unwrap_or(status)
+}
+
+fn claude_command_candidates() -> Vec<String> {
+    let mut candidates = tool_command_candidates("claude");
+    candidates.extend(
+        claude_cli_command_candidates()
+            .into_iter()
+            .map(|path| path.to_string_lossy().to_string()),
+    );
+    unique_non_empty(candidates)
 }
 
 fn tool_command_candidates(command: &str) -> Vec<String> {
@@ -49,11 +94,30 @@ fn macos_tool_command_candidates(command: &str) -> Vec<String> {
 }
 
 fn detect_tool(name: &str, commands: Vec<String>) -> ToolStatus {
+    detect_tool_with_version_validator(name, commands, |_| true)
+}
+
+fn detect_tool_with_version_validator<F>(
+    name: &str,
+    commands: Vec<String>,
+    is_valid_version: F,
+) -> ToolStatus
+where
+    F: Fn(Option<&str>) -> bool,
+{
     let mut errors = Vec::new();
 
     for command in &commands {
         match command_version(command) {
             Ok((version, None)) => {
+                if !is_valid_version(version.as_deref()) {
+                    let details = version
+                        .map(|value| format!("版本输出不符合 {name}：{value}"))
+                        .unwrap_or_else(|| format!("版本输出不符合 {name}。"));
+                    errors.push(format!("{command}: {details}"));
+                    continue;
+                }
+
                 return ToolStatus {
                     name: name.to_string(),
                     installed: true,
@@ -84,6 +148,152 @@ fn detect_tool(name: &str, commands: Vec<String>) -> ToolStatus {
                 .unwrap_or_else(|| "没有可用的命令候选。".to_string())
         )),
     }
+}
+
+fn is_claude_code_version_output(version: Option<&str>) -> bool {
+    version
+        .map(|value| value.to_lowercase().contains("claude code"))
+        .unwrap_or(false)
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn detect_claude_app_status() -> Option<ToolStatus> {
+    detect_claude_app_status_from_markers(claude_app_install_markers())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn detect_claude_app_status() -> Option<ToolStatus> {
+    None
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn detect_claude_app_status_from_markers(markers: Vec<PathBuf>) -> Option<ToolStatus> {
+    markers
+        .into_iter()
+        .find(|path| path.exists())
+        .map(|_| ToolStatus {
+            name: "Claude Code".to_string(),
+            installed: true,
+            version: Some("Claude Desktop 已安装（未检测到 claude 命令）".to_string()),
+            error: None,
+        })
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn detect_codex_app_status() -> Option<ToolStatus> {
+    detect_codex_app_status_from_markers(codex_app_install_markers())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn detect_codex_app_status() -> Option<ToolStatus> {
+    None
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn detect_codex_app_status_from_markers(markers: Vec<PathBuf>) -> Option<ToolStatus> {
+    markers
+        .into_iter()
+        .find(|path| path.exists())
+        .map(|_| ToolStatus {
+            name: "Codex".to_string(),
+            installed: true,
+            version: Some("Codex App 已安装（未检测到 codex 命令）".to_string()),
+            error: None,
+        })
+}
+
+#[cfg(windows)]
+fn codex_app_command_candidates() -> Vec<PathBuf> {
+    let mut candidates =
+        windows_codex_app_command_candidates_from_base_dirs(windows_codex_app_base_dirs());
+
+    for install_dir in windows_codex_registry_install_dirs() {
+        candidates.push(install_dir.join("bin").join("codex.exe"));
+        candidates.push(install_dir.join("codex.exe"));
+    }
+
+    unique_paths(candidates)
+}
+
+#[cfg(target_os = "macos")]
+fn codex_app_command_candidates() -> Vec<PathBuf> {
+    codex_app_install_markers()
+        .into_iter()
+        .map(|path| path.join("Contents").join("MacOS").join("Codex"))
+        .collect()
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn codex_app_command_candidates() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn codex_app_install_markers() -> Vec<PathBuf> {
+    let mut markers = windows_codex_app_marker_candidates_from_base_dirs(
+        windows_codex_app_base_dirs(),
+        windows_start_menu_program_dirs(),
+    );
+    markers.extend(windows_codex_registry_install_dirs());
+    unique_paths(markers)
+}
+
+#[cfg(windows)]
+fn claude_app_install_markers() -> Vec<PathBuf> {
+    unique_paths(windows_claude_app_marker_candidates_from_base_dirs(
+        windows_claude_app_base_dirs(),
+        windows_start_menu_program_dirs(),
+    ))
+}
+
+#[cfg(windows)]
+fn claude_cli_command_candidates() -> Vec<PathBuf> {
+    let mut candidates =
+        windows_claude_cli_command_candidates_from_base_dirs(windows_claude_cli_base_dirs());
+
+    for install_dir in windows_tool_registry_install_dirs("Claude Code") {
+        candidates.push(install_dir.join("claude.exe"));
+        candidates.push(install_dir.join("bin").join("claude.exe"));
+    }
+
+    unique_paths(candidates)
+}
+
+#[cfg(target_os = "macos")]
+fn codex_app_install_markers() -> Vec<PathBuf> {
+    let mut markers = vec![PathBuf::from("/Applications/Codex.app")];
+    if let Some(home) = env::var_os("HOME") {
+        markers.push(PathBuf::from(home).join("Applications").join("Codex.app"));
+    }
+    unique_paths(markers)
+}
+
+#[cfg(target_os = "macos")]
+fn claude_app_install_markers() -> Vec<PathBuf> {
+    let mut markers = vec![PathBuf::from("/Applications/Claude.app")];
+    if let Some(home) = env::var_os("HOME") {
+        markers.push(PathBuf::from(home).join("Applications").join("Claude.app"));
+    }
+    unique_paths(markers)
+}
+
+#[cfg(target_os = "macos")]
+fn claude_cli_command_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(home) = env::var_os("HOME") {
+        candidates.push(
+            PathBuf::from(home)
+                .join(".local")
+                .join("bin")
+                .join("claude"),
+        );
+    }
+    unique_paths(candidates)
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn claude_cli_command_candidates() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 fn command_version(command: &str) -> Result<(Option<String>, Option<String>), String> {
@@ -150,6 +360,229 @@ fn command_version_from_macos_login_shell(
 }
 
 #[cfg(windows)]
+fn windows_codex_app_base_dirs() -> Vec<PathBuf> {
+    [
+        env::var_os("LOCALAPPDATA"),
+        env::var_os("APPDATA"),
+        env::var_os("ProgramFiles"),
+        env::var_os("ProgramFiles(x86)"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(PathBuf::from)
+    .collect()
+}
+
+#[cfg(windows)]
+fn windows_start_menu_program_dirs() -> Vec<PathBuf> {
+    [
+        env::var_os("APPDATA").map(|path| {
+            PathBuf::from(path)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+        }),
+        env::var_os("ProgramData").map(|path| {
+            PathBuf::from(path)
+                .join("Microsoft")
+                .join("Windows")
+                .join("Start Menu")
+                .join("Programs")
+        }),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+#[cfg(windows)]
+fn windows_claude_cli_base_dirs() -> Vec<PathBuf> {
+    [
+        env::var_os("USERPROFILE"),
+        env::var_os("HOME"),
+        env::var_os("LOCALAPPDATA"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(PathBuf::from)
+    .collect()
+}
+
+#[cfg(windows)]
+fn windows_claude_app_base_dirs() -> Vec<PathBuf> {
+    [
+        env::var_os("LOCALAPPDATA"),
+        env::var_os("ProgramFiles"),
+        env::var_os("ProgramFiles(x86)"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(PathBuf::from)
+    .collect()
+}
+
+#[cfg(windows)]
+fn windows_codex_app_command_candidates_from_base_dirs(base_dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    base_dirs
+        .into_iter()
+        .flat_map(|base_dir| {
+            [
+                base_dir
+                    .join("OpenAI")
+                    .join("Codex")
+                    .join("bin")
+                    .join("codex.exe"),
+                base_dir.join("Codex").join("bin").join("codex.exe"),
+            ]
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn windows_claude_cli_command_candidates_from_base_dirs(base_dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    base_dirs
+        .into_iter()
+        .flat_map(|base_dir| {
+            [
+                base_dir.join(".local").join("bin").join("claude.exe"),
+                base_dir.join(".local").join("bin").join("claude"),
+                base_dir
+                    .join("Microsoft")
+                    .join("WinGet")
+                    .join("Links")
+                    .join("claude.exe"),
+                base_dir
+                    .join("Microsoft")
+                    .join("WinGet")
+                    .join("Packages")
+                    .join("Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe")
+                    .join("claude.exe"),
+            ]
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn windows_claude_app_marker_candidates_from_base_dirs(
+    base_dirs: Vec<PathBuf>,
+    start_menu_dirs: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut markers: Vec<PathBuf> = base_dirs
+        .into_iter()
+        .flat_map(|base_dir| {
+            [
+                base_dir.join("Claude"),
+                base_dir.join("Claude").join("Claude.exe"),
+                base_dir.join("Programs").join("Claude"),
+                base_dir.join("Programs").join("Claude").join("Claude.exe"),
+                base_dir.join("Anthropic").join("Claude"),
+                base_dir.join("Anthropic").join("Claude").join("Claude.exe"),
+                base_dir
+                    .join("Microsoft")
+                    .join("WindowsApps")
+                    .join("Claude.exe"),
+                base_dir.join("Packages").join("Claude_pzs8sxrjxfjjc"),
+            ]
+        })
+        .collect();
+
+    markers.extend(start_menu_dirs.into_iter().flat_map(|dir| {
+        [
+            dir.join("Claude.lnk"),
+            dir.join("Anthropic").join("Claude.lnk"),
+        ]
+    }));
+
+    markers
+}
+
+#[cfg(windows)]
+fn windows_codex_app_marker_candidates_from_base_dirs(
+    base_dirs: Vec<PathBuf>,
+    start_menu_dirs: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut markers: Vec<PathBuf> = base_dirs
+        .into_iter()
+        .flat_map(|base_dir| {
+            [
+                base_dir.join("OpenAI").join("Codex"),
+                base_dir
+                    .join("OpenAI")
+                    .join("Codex")
+                    .join("bin")
+                    .join("codex.exe"),
+                base_dir.join("Codex"),
+                base_dir.join("Codex").join("bin").join("codex.exe"),
+            ]
+        })
+        .collect();
+
+    markers.extend(
+        start_menu_dirs
+            .into_iter()
+            .flat_map(|dir| [dir.join("Codex.lnk"), dir.join("OpenAI").join("Codex.lnk")]),
+    );
+
+    markers
+}
+
+#[cfg(windows)]
+fn windows_codex_registry_install_dirs() -> Vec<PathBuf> {
+    windows_tool_registry_install_dirs("Codex")
+}
+
+#[cfg(windows)]
+fn windows_tool_registry_install_dirs(display_name_keyword: &str) -> Vec<PathBuf> {
+    [
+        (
+            HKEY_CURRENT_USER,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        ),
+    ]
+    .into_iter()
+    .flat_map(|(hkey, subkey)| {
+        windows_uninstall_tool_install_dirs(hkey, subkey, display_name_keyword)
+    })
+    .collect()
+}
+
+#[cfg(windows)]
+fn windows_uninstall_tool_install_dirs(
+    hkey: winreg::HKEY,
+    subkey: &str,
+    display_name_keyword: &str,
+) -> Vec<PathBuf> {
+    let root = RegKey::predef(hkey);
+    let Ok(uninstall) = root.open_subkey(subkey) else {
+        return Vec::new();
+    };
+
+    let display_name_keyword = display_name_keyword.to_lowercase();
+    uninstall
+        .enum_keys()
+        .flatten()
+        .filter_map(|key| uninstall.open_subkey(key).ok())
+        .filter(|app| {
+            app.get_value::<String, _>("DisplayName")
+                .map(|name| name.to_lowercase().contains(&display_name_keyword))
+                .unwrap_or(false)
+        })
+        .filter_map(|app| app.get_value::<String, _>("InstallLocation").ok())
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect()
+}
+
+#[cfg(windows)]
 fn configure_detection_command(command: &mut Command) {
     command.creation_flags(CREATE_NO_WINDOW);
 }
@@ -193,7 +626,6 @@ fn is_path_like_command(command: &str) -> bool {
     command.contains('/') || command.contains('\\')
 }
 
-#[cfg(target_os = "macos")]
 fn unique_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut seen = BTreeSet::new();
     paths
@@ -202,7 +634,6 @@ fn unique_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
         .collect()
 }
 
-#[cfg(target_os = "macos")]
 fn unique_non_empty(values: Vec<String>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     values

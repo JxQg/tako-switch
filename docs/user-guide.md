@@ -6,8 +6,8 @@
 
 请先确认已经安装需要配置的客户端：
 
-- Codex：命令行里可以运行 `codex`。
-- Claude Code：命令行里可以运行 `claude`。
+- Codex：安装 Codex App，或命令行里可以运行 `codex`。
+- Claude Code：命令行里可以运行 `claude`，或已安装带 Code 功能的 Claude Desktop。
 - Tako 账号：用于获取或授权 ApiKey。
 
 打开 Tako Switch 后，首页会自动检测 Codex 和 Claude Code 的本机状态。如果显示未检测到，可以点击右上角的刷新按钮重新检测。
@@ -132,6 +132,8 @@ Tako Switch 会写入：
 
 ### 已安装 Codex / Claude Code，但首页显示未检测到
 
+Tako Switch 会优先检测命令行工具；Windows / macOS 上如果只安装了 Codex App，也会尝试识别桌面应用。Claude Code 会检测 `claude` 命令、官方安装器写入的 `~/.local/bin/claude`、Windows 上的 WinGet 安装位置，以及 Claude Desktop 应用。
+
 请先新开一个终端确认命令是否能运行：
 
 ```bash
@@ -139,7 +141,9 @@ codex --version
 claude --version
 ```
 
-如果终端也无法识别命令，请检查安装路径是否加入了 `PATH`。如果终端可以识别，回到 Tako Switch 点击刷新重新检测。
+如果终端也无法识别 `codex`，但已经安装 Codex App，请回到 Tako Switch 点击刷新重新检测。应用会尝试通过 Codex App 的安装目录识别它；如果需要在终端直接运行 Codex，再检查安装路径是否加入了 `PATH`。
+
+如果 `claude` 无法识别，但确认已通过 Claude Code 官方安装器、WinGet 或 Claude Desktop 安装，请回到 Tako Switch 点击刷新重新检测。如果 Claude Desktop 版本较旧且没有 Code 功能，请先更新到支持 Claude Code 的版本。
 
 ### 应用配置后 Codex 仍然没有使用新 ApiKey
 
