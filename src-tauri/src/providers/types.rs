@@ -129,6 +129,38 @@ pub struct PlatformConfigInput {
     pub enabled: bool,
     pub base_url: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub options: PlatformOptionsInput,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformOptionsInput {
+    #[serde(default)]
+    pub sandbox_mode: Option<String>,
+    #[serde(default)]
+    pub approval_policy: Option<String>,
+    #[serde(default)]
+    pub windows_sandbox: Option<String>,
+    #[serde(default)]
+    pub features: CodexFeatureOptionsInput,
+    #[serde(default)]
+    pub permissions_default_mode: Option<String>,
+    #[serde(default)]
+    pub skip_dangerous_mode_permission_prompt: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexFeatureOptionsInput {
+    #[serde(default)]
+    pub js_repl: Option<bool>,
+    #[serde(default)]
+    pub unified_exec: Option<bool>,
+    #[serde(default)]
+    pub shell_snapshot: Option<bool>,
+    #[serde(default)]
+    pub memories: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -143,5 +175,6 @@ pub struct NormalizedPlatformInput {
     pub id: String,
     pub base_url: String,
     pub model: Option<String>,
+    pub options: PlatformOptionsInput,
     pub definition: PlatformDefinition,
 }

@@ -23,6 +23,7 @@ pub fn preview(
         api_key,
         platform.model.as_deref(),
         &platform.definition.writer,
+        &platform.options,
     )?;
 
     files.push(FilePreview {
@@ -49,6 +50,7 @@ pub fn apply(
         api_key,
         platform.model.as_deref(),
         &platform.definition.writer,
+        &platform.options,
     )?;
     files.push(write_config_file(&platform.id, &path, &after)?);
     Ok(())
@@ -60,6 +62,7 @@ pub fn merge_settings(
     api_key: &str,
     claude_model: Option<&str>,
     writer: &PlatformWriter,
+    options: &crate::providers::types::PlatformOptionsInput,
 ) -> Result<String, String> {
     let base_url_key = binding_name(writer, "baseUrl")?;
     let api_key_key = binding_name(writer, "apiKey")?;
@@ -94,6 +97,29 @@ pub fn merge_settings(
         env_object.insert(model_key.to_string(), Value::String(model.to_string()));
     } else {
         env_object.remove(model_key);
+    }
+
+    if let Some(default_mode) = options.permissions_default_mode.as_deref() {
+        let permissions_value = object
+            .entry("permissions".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !permissions_value.is_object() {
+            *permissions_value = Value::Object(Map::new());
+        }
+        permissions_value
+            .as_object_mut()
+            .expect("object checked")
+            .insert(
+                "defaultMode".to_string(),
+                Value::String(default_mode.to_string()),
+            );
+    }
+
+    if let Some(enabled) = options.skip_dangerous_mode_permission_prompt {
+        object.insert(
+            "skipDangerousModePermissionPrompt".to_string(),
+            Value::Bool(enabled),
+        );
     }
 
     serde_json::to_string_pretty(&root)

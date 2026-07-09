@@ -50,7 +50,7 @@
 - 点击“生成预览”查看写入前后差异。
 - 点击“应用配置”真正写入配置文件。
 
-导入配置页和首页的一键导入窗口都会优先展示配置表单。写入预览默认隐藏；生成预览或应用配置后，如果存在文件变更或警告，预览区才会显示。两个网关地址和模型选择一样使用双列表单，默认 Tako 地址有足够空间阅读。
+导入配置页和首页的一键导入窗口都会优先展示配置表单。点击“生成预览”后，写入预览会在独立窗口中展示，不会挤压原有页面；可以在预览窗口中继续导入/应用配置，也可以直接关闭。两个网关地址和模型选择一样使用双列表单，默认 Tako 地址有足够空间阅读。
 
 ### 当前配置
 
@@ -92,6 +92,23 @@ Claude Code 的地址不要包含 `/v1`。如果填写成 `https://tako.shiroha.
 
 Claude 模型可以留空。留空时，Claude Code 会继续使用自己的默认模型。登录 Tako 后，如果能读取到 Anthropic / Claude 可用模型，Claude 模型也可以从下拉框选择；下拉框中提供“使用 Claude Code 默认模型”用于清空选择。
 
+### 高级配置
+
+导入配置页和首页的一键导入窗口都会提供“高级配置”。这些项目默认不强制写入：下拉框选择“不修改”、功能开关不勾选时，Tako Switch 会保留你原来的配置。
+
+Codex 高级配置包括：
+
+- “Codex 沙箱权限”写入 `sandbox_mode`，可选择只读、工作区写入或完全访问。
+- “审批策略”写入 `approval_policy`，可选择不受信任时询问、需要时询问或从不询问。
+- “开启完全访问权限”会同时写入 `sandbox_mode = "danger-full-access"` 和 `approval_policy = "never"`，风险较高，默认不会开启。
+- “Windows 沙箱模式”写入 `[windows].sandbox`，只影响 Windows 原生沙箱模式，不等于完全访问权限。
+- “JavaScript REPL”“统一执行器”“Shell 快照”“记忆功能”写入 `[features]` 下对应布尔值；勾选项目后可以选择写入“开”或“关”。
+
+Claude Code 高级配置包括：
+
+- “Claude Code 权限模式”写入 `permissions.defaultMode`，可选择默认询问、自动接受编辑、计划模式、自动模式、减少询问或绕过权限检查。
+- “跳过危险模式确认提示”写入 `skipDangerousModePermissionPrompt`，只有选择“绕过权限检查”时才能勾选，默认不会开启。
+
 ## 写入内容
 
 ### Codex
@@ -101,7 +118,7 @@ Tako Switch 会写入：
 - 配置文件：`$CODEX_HOME/config.toml`。
 - 如果没有设置 `CODEX_HOME`，则写入 `~/.codex/config.toml`。
 
-写入后的 Codex 配置会设置模型、模型服务商、Tako 网关地址和 ApiKey。相关内容会随 `config.toml` 一起预览、备份和恢复。
+写入后的 Codex 配置会设置模型、模型服务商、Tako 网关地址和 ApiKey。你在高级配置中明确选择的 `sandbox_mode`、`approval_policy`、`[windows]`、`[features]` 选项也会写入同一个 `config.toml`。相关内容会随 `config.toml` 一起预览、备份和恢复。
 
 ### Claude Code
 
@@ -112,7 +129,7 @@ Tako Switch 会写入：
 - `env.ANTHROPIC_AUTH_TOKEN`：ApiKey。
 - `env.ANTHROPIC_MODEL`：可选模型；留空时会移除此项。
 
-如果原来的 `settings.json` 里还有其他字段，应用会尽量保留。
+如果你在高级配置中选择了 Claude Code 权限模式或危险模式确认提示，应用也会写入 `permissions.defaultMode` 和 `skipDangerousModePermissionPrompt`。如果原来的 `settings.json` 里还有其他字段，应用会尽量保留。
 
 ## 预览、备份与恢复
 

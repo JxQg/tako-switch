@@ -27,6 +27,7 @@ pub fn preview(
         &platform.base_url,
         api_key,
         &platform.definition.writer,
+        &platform.options,
     )?;
 
     files.push(FilePreview {
@@ -58,6 +59,7 @@ pub fn apply(
         &platform.base_url,
         api_key,
         &platform.definition.writer,
+        &platform.options,
     )?;
     files.push(write_config_file(&platform.id, &path, &after)?);
     if let Err(err) = cleanup_legacy_codex_api_key() {
@@ -74,6 +76,7 @@ pub fn merge_config(
     gateway_base_url: &str,
     api_key: &str,
     writer: &PlatformWriter,
+    options: &crate::providers::types::PlatformOptionsInput,
 ) -> Result<String, String> {
     let provider_id = constant_value(writer, "providerId")?;
     let provider_name = constant_value(writer, "providerName")?;
@@ -90,6 +93,12 @@ pub fn merge_config(
 
     document["model"] = value(codex_model);
     document["model_provider"] = value(provider_id);
+    if let Some(sandbox_mode) = options.sandbox_mode.as_deref() {
+        document["sandbox_mode"] = value(sandbox_mode);
+    }
+    if let Some(approval_policy) = options.approval_policy.as_deref() {
+        document["approval_policy"] = value(approval_policy);
+    }
 
     let providers = document
         .as_table_mut()
@@ -116,6 +125,47 @@ pub fn merge_config(
     provider_table.insert("base_url", value(gateway_base_url));
     provider_table.insert("wire_api", value(wire_api));
     provider_table.insert(api_key_field, value(api_key));
+
+    if let Some(windows_sandbox) = options.windows_sandbox.as_deref() {
+        let windows = document
+            .as_table_mut()
+            .entry("windows")
+            .or_insert(Item::Table(Table::new()));
+        if !windows.is_table() {
+            *windows = Item::Table(Table::new());
+        }
+        windows
+            .as_table_mut()
+            .expect("table checked")
+            .insert("sandbox", value(windows_sandbox));
+    }
+
+    if options.features.js_repl.is_some()
+        || options.features.unified_exec.is_some()
+        || options.features.shell_snapshot.is_some()
+        || options.features.memories.is_some()
+    {
+        let features = document
+            .as_table_mut()
+            .entry("features")
+            .or_insert(Item::Table(Table::new()));
+        if !features.is_table() {
+            *features = Item::Table(Table::new());
+        }
+        let features_table = features.as_table_mut().expect("table checked");
+        if let Some(enabled) = options.features.js_repl {
+            features_table.insert("js_repl", value(enabled));
+        }
+        if let Some(enabled) = options.features.unified_exec {
+            features_table.insert("unified_exec", value(enabled));
+        }
+        if let Some(enabled) = options.features.shell_snapshot {
+            features_table.insert("shell_snapshot", value(enabled));
+        }
+        if let Some(enabled) = options.features.memories {
+            features_table.insert("memories", value(enabled));
+        }
+    }
 
     Ok(ensure_trailing_newline(document.to_string()))
 }
@@ -150,7 +200,14 @@ pub fn migrate_legacy_config(
         return Ok(false);
     }
 
-    let after = merge_config(&before, &legacy.model, &legacy.base_url, &api_key, writer)?;
+    let after = merge_config(
+        &before,
+        &legacy.model,
+        &legacy.base_url,
+        &api_key,
+        writer,
+        &Default::default(),
+    )?;
     if after == before {
         return Ok(false);
     }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    providers::types::PLATFORM_CODEX,
+    providers::types::{CodexFeatureOptionsInput, PlatformOptionsInput, PLATFORM_CODEX},
     tests::{default_platform_writer, install_dir_test_lock, unique_temp_dir},
 };
 use std::{env, fs};
@@ -35,6 +35,7 @@ name = "Other"
         "http://127.0.0.1:3000/v1",
         "sk-test-123456",
         &writer,
+        &Default::default(),
     )
     .unwrap();
     let second = merge_config(
@@ -43,6 +44,7 @@ name = "Other"
         "http://127.0.0.1:3000/v1",
         "sk-test-123456",
         &writer,
+        &Default::default(),
     )
     .unwrap();
 
@@ -76,6 +78,7 @@ command = "fetch-token"
         "https://tako.shiroha.tech/v1",
         "sk-new-123456",
         &writer,
+        &Default::default(),
     )
     .unwrap();
 
@@ -84,6 +87,81 @@ command = "fetch-token"
     assert!(!merged.contains("env_key_instructions"));
     assert!(!merged.contains("requires_openai_auth"));
     assert!(!merged.contains("[model_providers.tako_proxy.auth]"));
+}
+
+#[test]
+fn merge_applies_advanced_options_and_preserves_unselected_values() {
+    let existing = r#"
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[windows]
+sandbox = "unelevated"
+
+[features]
+memories = false
+shell_snapshot = false
+multi_agent = true
+"#;
+    let writer = default_platform_writer(PLATFORM_CODEX);
+    let options = PlatformOptionsInput {
+        sandbox_mode: Some("danger-full-access".to_string()),
+        approval_policy: Some("never".to_string()),
+        windows_sandbox: Some("elevated".to_string()),
+        features: CodexFeatureOptionsInput {
+            js_repl: Some(false),
+            unified_exec: Some(false),
+            shell_snapshot: Some(true),
+            memories: None,
+        },
+        ..Default::default()
+    };
+    let merged = merge_config(
+        existing,
+        "gpt-5.4",
+        "https://tako.shiroha.tech/v1",
+        "sk-new-123456",
+        &writer,
+        &options,
+    )
+    .unwrap();
+
+    assert!(merged.contains("sandbox_mode = \"danger-full-access\""));
+    assert!(merged.contains("approval_policy = \"never\""));
+    assert!(merged.contains("[windows]"));
+    assert!(merged.contains("sandbox = \"elevated\""));
+    assert!(merged.contains("js_repl = false"));
+    assert!(merged.contains("unified_exec = false"));
+    assert!(merged.contains("shell_snapshot = true"));
+    assert!(merged.contains("memories = false"));
+    assert!(merged.contains("multi_agent = true"));
+}
+
+#[test]
+fn merge_leaves_advanced_options_unchanged_when_unselected() {
+    let existing = r#"
+sandbox_mode = "workspace-write"
+
+[windows]
+sandbox = "unelevated"
+
+[features]
+shell_snapshot = false
+"#;
+    let writer = default_platform_writer(PLATFORM_CODEX);
+    let merged = merge_config(
+        existing,
+        "gpt-5.4",
+        "https://tako.shiroha.tech/v1",
+        "sk-new-123456",
+        &writer,
+        &Default::default(),
+    )
+    .unwrap();
+
+    assert!(merged.contains("sandbox_mode = \"workspace-write\""));
+    assert!(merged.contains("sandbox = \"unelevated\""));
+    assert!(merged.contains("shell_snapshot = false"));
 }
 
 #[test]

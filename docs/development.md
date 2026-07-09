@@ -64,7 +64,7 @@ Tako 前端集成放在 `src/integrations/tako/`：
 
 Codex 和 Claude 模型列表使用同一套自定义下拉组件：选中状态只展示模型名称，展开项右侧用 provider tag 展示模型提供商。Codex 过滤 OpenAI / Codex 可用模型并保持必选；Claude 过滤 Anthropic / Claude 可用模型，默认保持空值，并提供清空选项以继续使用 Claude Code 默认模型。没有模型列表时保留手动输入框。下拉层宽度跟随输入框，靠近弹窗或页面底部时自动向上展开；长模型名和长 provider tag 必须省略，不允许撑宽表单。
 
-导入配置布局默认以表单为主：`ImportTab` 和 `HomeImportModal` 在没有预览内容时使用单栏宽表单；网关地址字段和模型字段都使用两列表单，确保横向布局一致。只有当 `preview.files`、`preview.envUpdates` 或 `preview.warnings` 非空时才渲染写入预览；Codex 新写入路径只产生文件预览，`envUpdates` 字段仅保留为结果兼容字段。
+导入配置布局默认以表单为主：`ImportTab` 和 `HomeImportModal` 使用单栏宽表单；网关地址字段和模型字段都使用两列表单，确保横向布局一致。点击“生成预览”时使用 `PreviewModal` 展示写入预览，不要再把预览作为右侧栏挤压导入页面。Codex 新写入路径只产生文件预览，`envUpdates` 字段仅保留为结果兼容字段。
 
 预览 diff 是前端基于后端 `preview_changes` 返回的 `before` / `after` 文本生成的展示辅助，不改变实际写入内容。默认预览卡使用紧凑统一 diff 摘要，`+` 表示新增行，`-` 表示删除行，`~` 表示修改行；全屏展开优先展示完整统一 diff，并保留文件路径、备份路径和创建/更新状态。
 
@@ -111,6 +111,15 @@ Codex 写入器在 `src-tauri/src/platforms/codex.rs`。
 
 Codex 配置使用 `toml_edit` 合并，目标是保留用户已有配置并保持幂等。
 
+导入高级配置通过 `ConfigInput.platforms.codex.options` 传入。`null` 表示不修改用户已有值，不能当作 `false` 处理。当前支持：
+
+- 顶层 `sandbox_mode`：`read-only`、`workspace-write`、`danger-full-access`。
+- 顶层 `approval_policy`：`untrusted`、`on-request`、`never`。
+- `[windows].sandbox`：`elevated`、`unelevated`。
+- `[features]`：`js_repl`、`unified_exec`、`shell_snapshot`、`memories`。
+
+“开启完全访问权限”只是前端快捷项，最终仍然写入 `sandbox_mode = "danger-full-access"` 和 `approval_policy = "never"`。不要把 `[windows].sandbox = "elevated"` 当作完全访问权限。
+
 ### Claude Code 写入
 
 Claude Code 写入器在 `src-tauri/src/platforms/claude.rs`。
@@ -120,6 +129,8 @@ Claude Code 写入器在 `src-tauri/src/platforms/claude.rs`。
 - 模型留空时会移除 `ANTHROPIC_MODEL`，让 Claude Code 使用默认模型。
 
 Claude 设置使用 JSON 合并，目标是保留用户已有字段。
+
+导入高级配置通过 `ConfigInput.platforms.claude.options` 传入。`permissions.defaultMode` 是枚举值，当前允许 `default`、`acceptEdits`、`plan`、`auto`、`dontAsk`、`bypassPermissions`；`skipDangerousModePermissionPrompt` 是布尔值。未传入时必须保留用户原来的 `permissions` 和顶层危险提示字段。
 
 ## 服务商配置
 

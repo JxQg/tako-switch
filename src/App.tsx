@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
   Eye,
   EyeOff,
   FileText,
@@ -43,10 +44,32 @@ import {
 
 type ActiveTab = "home" | "import" | "current";
 
+type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+type CodexApprovalPolicy = "untrusted" | "on-request" | "never";
+type CodexWindowsSandbox = "elevated" | "unelevated";
+type ClaudePermissionMode = "default" | "acceptEdits" | "plan" | "auto" | "dontAsk" | "bypassPermissions";
+
+type CodexFeatureOptions = {
+  jsRepl: boolean | null;
+  unifiedExec: boolean | null;
+  shellSnapshot: boolean | null;
+  memories: boolean | null;
+};
+
+type PlatformOptionsInput = {
+  sandboxMode?: CodexSandboxMode | null;
+  approvalPolicy?: CodexApprovalPolicy | null;
+  windowsSandbox?: CodexWindowsSandbox | null;
+  features?: CodexFeatureOptions;
+  permissionsDefaultMode?: ClaudePermissionMode | null;
+  skipDangerousModePermissionPrompt?: boolean | null;
+};
+
 type PlatformFormInput = {
   enabled: boolean;
   baseUrl: string;
   model?: string;
+  options: PlatformOptionsInput;
 };
 
 type ConfigInput = {
@@ -130,6 +153,7 @@ type RestoreResult = {
 };
 
 type BusyState = "loading" | "login" | "logout" | "tako" | "preview" | "apply" | "restore" | null;
+type PreviewModalContext = "import" | "home" | null;
 
 const emptyPreview: PreviewResult = {
   files: [],
@@ -144,12 +168,27 @@ const emptyConfigInput: ConfigInput = {
     codex: {
       enabled: true,
       baseUrl: "",
-      model: ""
+      model: "",
+      options: {
+        sandboxMode: null,
+        approvalPolicy: null,
+        windowsSandbox: null,
+        features: {
+          jsRepl: null,
+          unifiedExec: null,
+          shellSnapshot: null,
+          memories: null
+        }
+      }
     },
     claude: {
       enabled: true,
       baseUrl: "",
-      model: ""
+      model: "",
+      options: {
+        permissionsDefaultMode: null,
+        skipDangerousModePermissionPrompt: null
+      }
     }
   }
 };
@@ -166,6 +205,7 @@ function App() {
   const [tools, setTools] = useState<ToolStatus[]>([]);
   const [configs, setConfigs] = useState<LoadedConfigs | null>(null);
   const [preview, setPreview] = useState<PreviewResult>(emptyPreview);
+  const [previewModalContext, setPreviewModalContext] = useState<PreviewModalContext>(null);
   const [result, setResult] = useState<ApplyResult | null>(null);
   const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
   const [homeImportOpen, setHomeImportOpen] = useState(false);
@@ -195,6 +235,8 @@ function App() {
   const canSubmit = validation.length === 0 && busy === null;
   const canHomeImportSubmit = homeImportValidation.length === 0 && busy === null;
   const loading = busy !== null;
+  const modalOpen = homeImportOpen || previewModalContext !== null || updateDialogOpen;
+  useBodyScrollLock(modalOpen);
 
   useEffect(() => {
     void refreshState();
@@ -268,10 +310,12 @@ function App() {
     try {
       const nextPreview = await invoke<PreviewResult>("preview_changes", { input: form });
       setPreview(nextPreview);
+      setPreviewModalContext("import");
       setActiveTab("import");
     } catch (err) {
       setError(String(err));
       setPreview(emptyPreview);
+      setPreviewModalContext(null);
     } finally {
       setBusy(null);
     }
@@ -285,6 +329,7 @@ function App() {
     try {
       const nextPreview = await invoke<PreviewResult>("preview_changes", { input: form });
       setPreview(nextPreview);
+      setPreviewModalContext(null);
       const applyResult = await invoke<ApplyResult>("apply_configs", { input: form });
       setResult(applyResult);
       setHomeResult(applyResult);
@@ -359,6 +404,7 @@ function App() {
         apiKey: loginResult.apiKey || current.apiKey
       }));
       setPreview(emptyPreview);
+      setPreviewModalContext(null);
       const details = await loadTakoDetails(loginResult.apiKey);
       applyTakoDetails(details);
       if (options.openImportModal) {
@@ -479,6 +525,7 @@ function App() {
     setForm(draft);
     setHomePreview(emptyPreview);
     setPreview(emptyPreview);
+    setPreviewModalContext(null);
     setHomeResult(null);
     setHomeRestoreResult(null);
     setRestoreResult(null);
@@ -500,10 +547,12 @@ function App() {
       setForm(homeImportForm);
       setHomePreview(nextPreview);
       setPreview(nextPreview);
+      setPreviewModalContext("home");
     } catch (err) {
       setError(String(err));
       setHomePreview(emptyPreview);
       setPreview(emptyPreview);
+      setPreviewModalContext(null);
     } finally {
       setBusy(null);
     }
@@ -519,6 +568,7 @@ function App() {
       setForm(homeImportForm);
       setHomePreview(nextPreview);
       setPreview(nextPreview);
+      setPreviewModalContext(null);
       const applyResult = await invoke<ApplyResult>("apply_configs", { input: homeImportForm });
       setHomeResult(applyResult);
       setResult(applyResult);
@@ -564,6 +614,7 @@ function App() {
       setForm((current) => ({ ...current, apiKey: "" }));
       setPreview(emptyPreview);
       setHomePreview(emptyPreview);
+      setPreviewModalContext(null);
       setHomeResult(null);
       setHomeRestoreResult(null);
       setHomeImportOpen(false);
@@ -716,7 +767,6 @@ function App() {
           canSubmit={canSubmit}
           form={form}
           models={takoModels}
-          preview={preview}
           result={result}
           restoreResult={restoreResult}
           showApiKey={showImportApiKey}
@@ -738,7 +788,6 @@ function App() {
           canSubmit={canHomeImportSubmit}
           form={homeImportForm}
           models={takoModels}
-          preview={homePreview}
           provider={provider}
           result={homeResult}
           restoreResult={homeRestoreResult}
@@ -751,6 +800,16 @@ function App() {
           onRestore={restoreHome}
           onToggleApiKey={() => setShowHomeApiKey((current) => !current)}
           setForm={setHomeImportForm}
+        />
+      )}
+
+      {previewModalContext && hasPreviewContent(previewModalContext === "home" ? homePreview : preview) && (
+        <PreviewModal
+          busy={busy}
+          preview={previewModalContext === "home" ? homePreview : preview}
+          primaryLabel={previewModalContext === "home" ? "导入配置" : "应用配置"}
+          onApply={previewModalContext === "home" ? applyHomeConfigs : applyConfigs}
+          onClose={() => setPreviewModalContext(null)}
         />
       )}
 
@@ -896,7 +955,6 @@ function HomeImportModal({
   canSubmit,
   form,
   models,
-  preview,
   provider,
   result,
   restoreResult,
@@ -914,7 +972,6 @@ function HomeImportModal({
   canSubmit: boolean;
   form: ConfigInput;
   models: TakoModel[];
-  preview: PreviewResult;
   provider: AccountProviderConfig;
   result: ApplyResult | null;
   restoreResult: RestoreResult | null;
@@ -928,11 +985,18 @@ function HomeImportModal({
   onToggleApiKey: () => void;
   setForm: React.Dispatch<React.SetStateAction<ConfigInput>>;
 }) {
-  const showPreview = hasPreviewContent(preview);
+  const modalPanelRef = useRef<HTMLElement | null>(null);
+  useScrollBoundaryGuard(modalPanelRef);
 
   return (
     <div className="modal-backdrop" role="presentation">
-      <section className="modal-panel" role="dialog" aria-modal="true" aria-label={`一键导入 ${provider.name} 配置`}>
+      <section
+        ref={modalPanelRef}
+        className="modal-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`一键导入 ${provider.name} 配置`}
+      >
         <div className="modal-header">
           <div>
             <p className="eyebrow">{provider.name}</p>
@@ -956,7 +1020,7 @@ function HomeImportModal({
           />
         )}
 
-        <div className={showPreview ? "modal-grid modal-flow-grid" : "modal-grid modal-flow-grid preview-hidden"}>
+        <div className="modal-grid modal-flow-grid preview-hidden">
           <ProviderConfigForm
             apiKeyReadOnly
             baseUrlsReadOnly
@@ -976,7 +1040,6 @@ function HomeImportModal({
             onToggleApiKey={onToggleApiKey}
             setForm={setForm}
           />
-          {showPreview && <PreviewPanel compact className="modal-preview" preview={preview} />}
         </div>
       </section>
     </div>
@@ -989,7 +1052,6 @@ function ImportTab({
   canSubmit,
   form,
   models,
-  preview,
   result,
   restoreResult,
   showApiKey,
@@ -1006,7 +1068,6 @@ function ImportTab({
   canSubmit: boolean;
   form: ConfigInput;
   models: TakoModel[];
-  preview: PreviewResult;
   result: ApplyResult | null;
   restoreResult: RestoreResult | null;
   showApiKey: boolean;
@@ -1018,11 +1079,9 @@ function ImportTab({
   onToggleApiKey: () => void;
   setForm: React.Dispatch<React.SetStateAction<ConfigInput>>;
 }) {
-  const showPreview = hasPreviewContent(preview);
-
   return (
     <>
-      <div className={showPreview ? "workspace import-workspace has-preview" : "workspace import-workspace"}>
+      <div className="workspace import-workspace">
         <ProviderConfigForm
           apiKeyInputRef={apiKeyInputRef}
           busy={busy}
@@ -1041,8 +1100,6 @@ function ImportTab({
           onToggleApiKey={onToggleApiKey}
           setForm={setForm}
         />
-
-        <PreviewPanel className="panel" preview={preview} />
       </div>
 
       <ResultsPanel
@@ -1096,7 +1153,7 @@ function ProviderConfigForm({
   onToggleApiKey: () => void;
   setForm: React.Dispatch<React.SetStateAction<ConfigInput>>;
 }) {
-  const codexModels = models.filter(isCodexModel);
+  const codexModels = sortCodexModels(models.filter(isCodexModel));
   const claudeModels = models.filter(isClaudeModel);
   const codexModel = form.platforms.codex.model || "";
   const claudeModel = form.platforms.claude.model || "";
@@ -1152,6 +1209,7 @@ function ProviderConfigForm({
       <fieldset className="target-grid">
         <label className={form.platforms.codex.enabled ? "target active" : "target"}>
           <input type="checkbox" checked={form.platforms.codex.enabled} onChange={(event) => toggleCodex(event.target.checked)} />
+          <span className="switch-track" aria-hidden="true" />
           <Terminal />
           <span>Codex</span>
         </label>
@@ -1161,6 +1219,7 @@ function ProviderConfigForm({
             checked={form.platforms.claude.enabled}
             onChange={(event) => setForm(updatePlatform("claude", { enabled: event.target.checked }))}
           />
+          <span className="switch-track" aria-hidden="true" />
           <Terminal />
           <span>Claude Code</span>
         </label>
@@ -1265,6 +1324,8 @@ function ProviderConfigForm({
         </label>
       </div>
 
+      <AdvancedConfigSection form={form} setForm={setForm} />
+
       {validation.length > 0 && (
         <div className="notice soft">
           <AlertTriangle />
@@ -1284,6 +1345,335 @@ function ProviderConfigForm({
       </div>
     </form>
   );
+}
+
+const CODEX_SANDBOX_OPTIONS: Array<{ label: string; value: CodexSandboxMode }> = [
+  { label: "只读", value: "read-only" },
+  { label: "工作区写入", value: "workspace-write" },
+  { label: "完全访问", value: "danger-full-access" }
+];
+
+const CODEX_APPROVAL_OPTIONS: Array<{ label: string; value: CodexApprovalPolicy }> = [
+  { label: "不受信任时询问", value: "untrusted" },
+  { label: "需要时询问", value: "on-request" },
+  { label: "从不询问", value: "never" }
+];
+
+const CODEX_WINDOWS_SANDBOX_OPTIONS: Array<{ label: string; value: CodexWindowsSandbox }> = [
+  { label: "提升权限模式", value: "elevated" },
+  { label: "非提升权限模式", value: "unelevated" }
+];
+
+const CLAUDE_PERMISSION_OPTIONS: Array<{ label: string; value: ClaudePermissionMode }> = [
+  { label: "默认询问", value: "default" },
+  { label: "自动接受编辑", value: "acceptEdits" },
+  { label: "计划模式", value: "plan" },
+  { label: "自动模式", value: "auto" },
+  { label: "减少询问", value: "dontAsk" },
+  { label: "绕过权限检查", value: "bypassPermissions" }
+];
+
+function AdvancedConfigSection({
+  form,
+  setForm
+}: {
+  form: ConfigInput;
+  setForm: React.Dispatch<React.SetStateAction<ConfigInput>>;
+}) {
+  const codexOptions = normalizeCodexOptions(form.platforms.codex.options);
+  const claudeOptions = normalizeClaudeOptions(form.platforms.claude.options);
+  const codexFullAccess =
+    codexOptions.sandboxMode === "danger-full-access" && codexOptions.approvalPolicy === "never";
+  const claudeBypassPermissions = claudeOptions.permissionsDefaultMode === "bypassPermissions";
+
+  function updateCodexOptions(options: PlatformOptionsInput) {
+    setForm(updatePlatform("codex", { options }));
+  }
+
+  function updateClaudeOptions(options: PlatformOptionsInput) {
+    setForm(updatePlatform("claude", { options }));
+  }
+
+  function setCodexFeature(feature: keyof CodexFeatureOptions, value: boolean | null) {
+    updateCodexOptions({
+      features: {
+        ...codexOptions.features,
+        [feature]: value
+      }
+    });
+  }
+
+  function toggleCodexFullAccess(enabled: boolean) {
+    updateCodexOptions({
+      sandboxMode: enabled ? "danger-full-access" : null,
+      approvalPolicy: enabled ? "never" : null
+    });
+  }
+
+  function setClaudePermissionMode(value: ClaudePermissionMode | null) {
+    updateClaudeOptions({
+      permissionsDefaultMode: value,
+      skipDangerousModePermissionPrompt:
+        value === "bypassPermissions" ? claudeOptions.skipDangerousModePermissionPrompt : null
+    });
+  }
+
+  return (
+    <section className="advanced-config" aria-label="高级配置">
+      <div className="advanced-config-heading">
+        <div>
+          <h3>高级配置</h3>
+          <p>未选择的项目不会修改现有配置；生成预览后可以查看实际写入内容。</p>
+        </div>
+      </div>
+
+      <div className="advanced-config-grid">
+        <div className={!form.platforms.codex.enabled ? "advanced-group disabled" : "advanced-group"}>
+          <div className="advanced-group-title">
+            <strong>Codex</strong>
+            <code>~/.codex/config.toml</code>
+          </div>
+
+          <label className="danger-check">
+            <input
+              type="checkbox"
+              checked={codexFullAccess}
+              disabled={!form.platforms.codex.enabled}
+              onChange={(event) => toggleCodexFullAccess(event.target.checked)}
+            />
+            <span className="switch-track" aria-hidden="true" />
+            <span>开启完全访问权限</span>
+          </label>
+          {codexFullAccess && (
+            <div className="notice danger compact-notice">
+              <AlertTriangle />
+              <span>会写入完全访问和从不询问，Codex 可跨目录和网络执行操作。</span>
+            </div>
+          )}
+
+          <div className="advanced-select-grid">
+            <TypedSelect<CodexSandboxMode>
+              code="sandbox_mode"
+              disabled={!form.platforms.codex.enabled}
+              label="Codex 沙箱权限"
+              options={CODEX_SANDBOX_OPTIONS}
+              value={codexOptions.sandboxMode}
+              onChange={(value) => updateCodexOptions({ sandboxMode: value })}
+            />
+            <TypedSelect<CodexApprovalPolicy>
+              code="approval_policy"
+              disabled={!form.platforms.codex.enabled}
+              label="审批策略"
+              options={CODEX_APPROVAL_OPTIONS}
+              value={codexOptions.approvalPolicy}
+              onChange={(value) => updateCodexOptions({ approvalPolicy: value })}
+            />
+            <TypedSelect<CodexWindowsSandbox>
+              code="[windows].sandbox"
+              disabled={!form.platforms.codex.enabled}
+              label="Windows 沙箱模式"
+              options={CODEX_WINDOWS_SANDBOX_OPTIONS}
+              value={codexOptions.windowsSandbox}
+              onChange={(value) => updateCodexOptions({ windowsSandbox: value })}
+            />
+          </div>
+
+          <p className="advanced-help">Windows 沙箱模式不是完全访问权限，只影响 Windows 原生沙箱运行方式。</p>
+
+          <div className="feature-list">
+            <FeatureToggle
+              code="[features].js_repl"
+              defaultValue={false}
+              disabled={!form.platforms.codex.enabled}
+              label="JavaScript REPL"
+              value={codexOptions.features.jsRepl}
+              onChange={(value) => setCodexFeature("jsRepl", value)}
+            />
+            <FeatureToggle
+              code="[features].unified_exec"
+              defaultValue={false}
+              disabled={!form.platforms.codex.enabled}
+              label="统一执行器"
+              value={codexOptions.features.unifiedExec}
+              onChange={(value) => setCodexFeature("unifiedExec", value)}
+            />
+            <FeatureToggle
+              code="[features].shell_snapshot"
+              defaultValue={true}
+              disabled={!form.platforms.codex.enabled}
+              label="Shell 快照"
+              value={codexOptions.features.shellSnapshot}
+              onChange={(value) => setCodexFeature("shellSnapshot", value)}
+            />
+            <FeatureToggle
+              code="[features].memories"
+              defaultValue={true}
+              disabled={!form.platforms.codex.enabled}
+              label="记忆功能"
+              value={codexOptions.features.memories}
+              onChange={(value) => setCodexFeature("memories", value)}
+            />
+          </div>
+        </div>
+
+        <div className={!form.platforms.claude.enabled ? "advanced-group disabled" : "advanced-group"}>
+          <div className="advanced-group-title">
+            <strong>Claude Code</strong>
+            <code>~/.claude/settings.json</code>
+          </div>
+
+          <TypedSelect<ClaudePermissionMode>
+            code="permissions.defaultMode"
+            disabled={!form.platforms.claude.enabled}
+            label="Claude Code 权限模式"
+            options={CLAUDE_PERMISSION_OPTIONS}
+            value={claudeOptions.permissionsDefaultMode}
+            onChange={setClaudePermissionMode}
+          />
+
+          <label className="danger-check">
+            <input
+              type="checkbox"
+              checked={claudeOptions.skipDangerousModePermissionPrompt === true}
+              disabled={!form.platforms.claude.enabled || !claudeBypassPermissions}
+              onChange={(event) =>
+                updateClaudeOptions({
+                  skipDangerousModePermissionPrompt: event.target.checked
+                })
+              }
+            />
+            <span className="switch-track" aria-hidden="true" />
+            <span>跳过危险模式确认提示</span>
+          </label>
+          <p className="advanced-help">
+            仅选择“绕过权限检查”时可用；未选择时不会修改现有
+            <code>skipDangerousModePermissionPrompt</code>。
+          </p>
+          {claudeBypassPermissions && (
+            <div className="notice danger compact-notice">
+              <AlertTriangle />
+              <span>绕过权限检查会减少安全确认，只建议在可信目录中使用。</span>
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function TypedSelect<T extends string>({
+  code,
+  disabled,
+  label,
+  options,
+  value,
+  onChange
+}: {
+  code: string;
+  disabled?: boolean;
+  label: string;
+  options: Array<{ label: string; value: T }>;
+  value: T | null | undefined;
+  onChange: (value: T | null) => void;
+}) {
+  return (
+    <label className="advanced-select">
+      <span>{label}</span>
+      <code>{code}</code>
+      <div className="select-shell">
+        <select
+          disabled={disabled}
+          value={value || ""}
+          onChange={(event) => onChange((event.target.value || null) as T | null)}
+        >
+          <option value="">不修改</option>
+          {options.map((option) => (
+            <option value={option.value} key={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+        <ChevronDown />
+      </div>
+    </label>
+  );
+}
+
+function FeatureToggle({
+  code,
+  defaultValue,
+  disabled,
+  label,
+  value,
+  onChange
+}: {
+  code: string;
+  defaultValue: boolean;
+  disabled?: boolean;
+  label: string;
+  value: boolean | null | undefined;
+  onChange: (value: boolean | null) => void;
+}) {
+  const selected = value !== null && value !== undefined;
+
+  return (
+    <div className={selected ? "feature-toggle selected" : "feature-toggle"}>
+      <label className="feature-toggle-check">
+        <input
+          type="checkbox"
+          checked={selected}
+          disabled={disabled}
+          onChange={(event) => onChange(event.target.checked ? defaultValue : null)}
+        />
+        <span className="switch-track" aria-hidden="true" />
+        <span>{label}</span>
+      </label>
+      <code>{code}</code>
+      <div className="segmented-toggle" aria-label={`${label} 写入值`}>
+        <button
+          type="button"
+          disabled={disabled || !selected}
+          className={selected && value === true ? "active" : ""}
+          onClick={() => onChange(true)}
+        >
+          开
+        </button>
+        <button
+          type="button"
+          disabled={disabled || !selected}
+          className={selected && value === false ? "active" : ""}
+          onClick={() => onChange(false)}
+        >
+          关
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function normalizeCodexOptions(options: PlatformOptionsInput): Required<Pick<PlatformOptionsInput, "features">> &
+  Pick<PlatformOptionsInput, "sandboxMode" | "approvalPolicy" | "windowsSandbox"> {
+  return {
+    sandboxMode: options.sandboxMode ?? null,
+    approvalPolicy: options.approvalPolicy ?? null,
+    windowsSandbox: options.windowsSandbox ?? null,
+    features: {
+      jsRepl: options.features?.jsRepl ?? null,
+      unifiedExec: options.features?.unifiedExec ?? null,
+      shellSnapshot: options.features?.shellSnapshot ?? null,
+      memories: options.features?.memories ?? null
+    }
+  };
+}
+
+function normalizeClaudeOptions(options: PlatformOptionsInput): Pick<
+  PlatformOptionsInput,
+  "permissionsDefaultMode" | "skipDangerousModePermissionPrompt"
+> {
+  return {
+    permissionsDefaultMode: options.permissionsDefaultMode ?? null,
+    skipDangerousModePermissionPrompt: options.skipDangerousModePermissionPrompt ?? null
+  };
 }
 
 function PreviewPanel({
@@ -1334,6 +1724,65 @@ function PreviewPanel({
         </div>
       )}
     </section>
+  );
+}
+
+function PreviewModal({
+  busy,
+  onApply,
+  onClose,
+  preview,
+  primaryLabel
+}: {
+  busy: BusyState;
+  onApply: () => void;
+  onClose: () => void;
+  preview: PreviewResult;
+  primaryLabel: string;
+}) {
+  const modalPanelRef = useRef<HTMLElement | null>(null);
+  const applying = busy === "apply";
+  const loading = busy !== null;
+  useScrollBoundaryGuard(modalPanelRef);
+
+  function handleApply() {
+    onClose();
+    onApply();
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section
+        ref={modalPanelRef}
+        className="modal-panel preview-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="写入预览"
+      >
+        <div className="modal-header">
+          <div>
+            <p className="eyebrow">写入确认</p>
+            <h2>写入预览</h2>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} title="关闭预览" disabled={loading}>
+            <X />
+          </button>
+        </div>
+
+        <PreviewPanel compact className="modal-preview preview-modal-body" preview={preview} />
+
+        <div className="button-row result-actions">
+          <button className="primary" type="button" disabled={loading} onClick={handleApply}>
+            {applying ? <Loader2 className="spin" /> : <Save />}
+            <span>{primaryLabel}</span>
+          </button>
+          <button className="secondary" type="button" disabled={loading} onClick={onClose}>
+            <X />
+            <span>关闭</span>
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -1620,12 +2069,27 @@ function createProviderConfigInput(provider: AccountProviderConfig, apiKey: stri
       codex: {
         enabled: codex.enabled,
         baseUrl: codex.defaults.baseUrl,
-        model: selectDefaultCodexModel(models) || codex.defaults.model || ""
+        model: selectDefaultCodexModel(models) || codex.defaults.model || "",
+        options: {
+          sandboxMode: null,
+          approvalPolicy: null,
+          windowsSandbox: null,
+          features: {
+            jsRepl: null,
+            unifiedExec: null,
+            shellSnapshot: null,
+            memories: null
+          }
+        }
       },
       claude: {
         enabled: claude.enabled,
         baseUrl: claude.defaults.baseUrl,
-        model: claude.defaults.model || ""
+        model: claude.defaults.model || "",
+        options: {
+          permissionsDefaultMode: null,
+          skipDangerousModePermissionPrompt: null
+        }
       }
     }
   };
@@ -1640,12 +2104,30 @@ function withProviderDefaults(form: ConfigInput, provider: AccountProviderConfig
     platforms: {
       codex: {
         ...defaults.platforms.codex,
-        ...form.platforms.codex
+        ...form.platforms.codex,
+        options: mergePlatformOptions(defaults.platforms.codex.options, form.platforms.codex.options)
       },
       claude: {
         ...defaults.platforms.claude,
-        ...form.platforms.claude
+        ...form.platforms.claude,
+        options: mergePlatformOptions(defaults.platforms.claude.options, form.platforms.claude.options)
       }
+    }
+  };
+}
+
+function mergePlatformOptions(defaults: PlatformOptionsInput, current?: PlatformOptionsInput): PlatformOptionsInput {
+  return {
+    ...defaults,
+    ...current,
+    features: {
+      ...(defaults.features || {
+        jsRepl: null,
+        unifiedExec: null,
+        shellSnapshot: null,
+        memories: null
+      }),
+      ...(current?.features || {})
     }
   };
 }
@@ -1660,22 +2142,81 @@ function updatePlatform(
       ...current.platforms,
       [platformId]: {
         ...current.platforms[platformId],
-        ...patch
+        ...patch,
+        options:
+          patch.options === undefined
+            ? current.platforms[platformId].options
+            : mergePlatformOptions(current.platforms[platformId].options, patch.options)
       }
     }
   });
 }
 
 function selectDefaultCodexModel(models: TakoModel[]) {
-  return (
-    models.find((model) => model.provider.toLowerCase().includes("openai"))?.id ||
-    models.find(isCodexModel)?.id ||
-    ""
-  );
+  const sortedModels = sortCodexModels(models.filter(isCodexModel));
+  return sortedModels.find((model) => model.provider.toLowerCase().includes("openai"))?.id || sortedModels[0]?.id || "";
 }
 
 function isCodexModel(model: TakoModel) {
   return model.clients.includes("codex") || model.provider.toLowerCase().includes("openai");
+}
+
+function sortCodexModels(models: TakoModel[]) {
+  return [...models].sort(compareCodexModels);
+}
+
+function compareCodexModels(left: TakoModel, right: TakoModel) {
+  const leftKey = parseCodexModelSortKey(left.id || left.name);
+  const rightKey = parseCodexModelSortKey(right.id || right.name);
+
+  if (leftKey.familyRank !== rightKey.familyRank) {
+    return leftKey.familyRank - rightKey.familyRank;
+  }
+
+  if (leftKey.hasVersion !== rightKey.hasVersion) {
+    return leftKey.hasVersion ? -1 : 1;
+  }
+
+  const maxLength = Math.max(leftKey.numbers.length, rightKey.numbers.length);
+  for (let index = 0; index < maxLength; index += 1) {
+    const leftNumber = leftKey.numbers[index] ?? -1;
+    const rightNumber = rightKey.numbers[index] ?? -1;
+    if (leftNumber !== rightNumber) {
+      return rightNumber - leftNumber;
+    }
+  }
+
+  if (leftKey.hasLetters !== rightKey.hasLetters) {
+    return leftKey.hasLetters ? 1 : -1;
+  }
+
+  const letterCompare = leftKey.letters.localeCompare(rightKey.letters, undefined, {
+    numeric: true,
+    sensitivity: "base"
+  });
+  if (letterCompare !== 0) return letterCompare;
+
+  return leftKey.normalized.localeCompare(rightKey.normalized, undefined, {
+    numeric: true,
+    sensitivity: "base"
+  });
+}
+
+function parseCodexModelSortKey(value: string) {
+  const normalized = value.trim().toLowerCase();
+  const afterGpt = normalized.replace(/^gpt[-_]?/, "");
+  const numbers = Array.from(afterGpt.matchAll(/\d+/g), (match) => Number(match[0]));
+  const letters = afterGpt.replace(/\d+/g, "").replace(/[._-]+/g, "");
+  const familyRank = normalized.startsWith("gpt-image") ? 1 : 0;
+
+  return {
+    familyRank,
+    hasVersion: numbers.length > 0,
+    hasLetters: letters.length > 0,
+    letters,
+    normalized,
+    numbers
+  };
 }
 
 function isClaudeModel(model: TakoModel) {
@@ -1900,18 +2441,176 @@ function formatDiffLineNumber(line: DiffLine) {
 }
 
 function CurrentConfigBlock({ config }: { config: ExistingConfig }) {
+  const [expanded, setExpanded] = useState(false);
+  const title = config.target === "codex" ? "Codex" : "Claude Code";
+  const status = config.exists ? "已存在" : "未创建";
+  const content = config.content || "(文件不存在或为空)";
+
   return (
-    <article className="current-block">
-      <strong>{config.target === "codex" ? "Codex" : "Claude Code"}</strong>
-      <span>{config.exists ? "已存在" : "未创建"}</span>
-      <code>{config.path}</code>
-      <textarea readOnly value={config.content || "(文件不存在或为空)"} />
-    </article>
+    <>
+      <article className="current-block">
+        <div className="current-block-header">
+          <div>
+            <strong>{title}</strong>
+            <span>{status}</span>
+          </div>
+          <button className="icon-button" type="button" onClick={() => setExpanded(true)} title={`展开查看 ${title} 配置`}>
+            <Maximize2 />
+          </button>
+        </div>
+        <code>{config.path}</code>
+        <ReadOnlyConfigViewer content={content} />
+      </article>
+
+      {expanded && (
+        <CurrentConfigFullscreenModal
+          config={config}
+          content={content}
+          status={status}
+          title={title}
+          onClose={() => setExpanded(false)}
+        />
+      )}
+    </>
   );
 }
 
 function EmptyState({ text }: { text: string }) {
   return <div className="empty-state">{text}</div>;
+}
+
+function ReadOnlyConfigViewer({ content, expanded = false }: { content: string; expanded?: boolean }) {
+  return (
+    <pre className={expanded ? "current-config-view expanded" : "current-config-view"} tabIndex={0}>
+      <code>{content}</code>
+    </pre>
+  );
+}
+
+function CurrentConfigFullscreenModal({
+  config,
+  content,
+  onClose,
+  status,
+  title
+}: {
+  config: ExistingConfig;
+  content: string;
+  onClose: () => void;
+  status: string;
+  title: string;
+}) {
+  const modalPanelRef = useRef<HTMLElement | null>(null);
+  useBodyScrollLock(true);
+  useScrollBoundaryGuard(modalPanelRef);
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="diff-fullscreen-backdrop" role="presentation">
+      <section
+        ref={modalPanelRef}
+        className="diff-fullscreen-panel current-fullscreen-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`${title} 当前配置`}
+      >
+        <div className="modal-header current-fullscreen-header">
+          <div>
+            <p className="eyebrow">只读配置</p>
+            <h2>{title}</h2>
+            <span>{status}</span>
+            <code>{config.path}</code>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} title="关闭当前配置">
+            <X />
+          </button>
+        </div>
+
+        <div className="diff-fullscreen-body current-fullscreen-body">
+          <ReadOnlyConfigViewer content={content} expanded />
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function useBodyScrollLock(locked: boolean) {
+  useEffect(() => {
+    if (!locked) return;
+
+    const { body, documentElement } = document;
+    const previousBodyOverflow = body.style.overflow;
+    const previousBodyPaddingRight = body.style.paddingRight;
+    const previousHtmlOverscroll = documentElement.style.overscrollBehavior;
+    const scrollbarWidth = window.innerWidth - documentElement.clientWidth;
+
+    body.style.overflow = "hidden";
+    if (scrollbarWidth > 0) {
+      body.style.paddingRight = `${scrollbarWidth}px`;
+    }
+    documentElement.style.overscrollBehavior = "none";
+
+    return () => {
+      body.style.overflow = previousBodyOverflow;
+      body.style.paddingRight = previousBodyPaddingRight;
+      documentElement.style.overscrollBehavior = previousHtmlOverscroll;
+    };
+  }, [locked]);
+}
+
+function useScrollBoundaryGuard(ref: React.RefObject<HTMLElement>) {
+  useEffect(() => {
+    const panelElement = ref.current;
+    if (!panelElement) return;
+    const panel: HTMLElement = panelElement;
+
+    function handleWheel(event: WheelEvent) {
+      const { deltaY } = event;
+      if (deltaY === 0) return;
+      const scrollTarget = findScrollableAncestor(event.target, panel) ?? panel;
+      const canScroll = scrollTarget.scrollHeight > scrollTarget.clientHeight + 1;
+      if (!canScroll) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+
+      const scrollingDown = deltaY > 0;
+      const atTop = scrollTarget.scrollTop <= 0;
+      const atBottom = scrollTarget.scrollTop + scrollTarget.clientHeight >= scrollTarget.scrollHeight - 1;
+
+      if ((scrollingDown && atBottom) || (!scrollingDown && atTop)) {
+        event.preventDefault();
+      }
+      event.stopPropagation();
+    }
+
+    panel.addEventListener("wheel", handleWheel, { passive: false });
+    return () => panel.removeEventListener("wheel", handleWheel);
+  }, [ref]);
+}
+
+function findScrollableAncestor(target: EventTarget | null, boundary: HTMLElement) {
+  let element = target instanceof HTMLElement ? target : null;
+  while (element && boundary.contains(element)) {
+    const style = window.getComputedStyle(element);
+    const canScrollY =
+      /(auto|scroll|overlay)/.test(style.overflowY) && element.scrollHeight > element.clientHeight + 1;
+    if (canScrollY) return element;
+    if (element === boundary) break;
+    element = element.parentElement;
+  }
+  return null;
 }
 
 function UpdateModal({
@@ -1923,9 +2622,18 @@ function UpdateModal({
   onOpenDownload: () => void;
   update: AppUpdateStatus;
 }) {
+  const modalPanelRef = useRef<HTMLElement | null>(null);
+  useScrollBoundaryGuard(modalPanelRef);
+
   return (
     <div className="modal-backdrop" role="presentation">
-      <section className="modal-panel update-modal" role="dialog" aria-modal="true" aria-label="应用更新">
+      <section
+        ref={modalPanelRef}
+        className="modal-panel update-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="应用更新"
+      >
         <div className="modal-header">
           <div>
             <p className="eyebrow">Tako Switch 更新</p>
@@ -2007,6 +2715,27 @@ function validateLocal(form: ConfigInput, provider: AccountProviderConfig | null
   }
   if (form.platforms.codex.enabled && provider.platforms.codex?.rules.model?.required && !form.platforms.codex.model?.trim()) {
     errors.push("选择 Codex 时必须填写 Codex 模型。");
+  }
+  if (form.platforms.codex.enabled) {
+    const codexOptions = normalizeCodexOptions(form.platforms.codex.options);
+    if (codexOptions.sandboxMode && !CODEX_SANDBOX_OPTIONS.some((option) => option.value === codexOptions.sandboxMode)) {
+      errors.push("Codex 沙箱权限不是有效选项。");
+    }
+    if (codexOptions.approvalPolicy && !CODEX_APPROVAL_OPTIONS.some((option) => option.value === codexOptions.approvalPolicy)) {
+      errors.push("Codex 审批策略不是有效选项。");
+    }
+    if (codexOptions.windowsSandbox && !CODEX_WINDOWS_SANDBOX_OPTIONS.some((option) => option.value === codexOptions.windowsSandbox)) {
+      errors.push("Windows 沙箱模式不是有效选项。");
+    }
+  }
+  if (form.platforms.claude.enabled) {
+    const claudeOptions = normalizeClaudeOptions(form.platforms.claude.options);
+    if (
+      claudeOptions.permissionsDefaultMode &&
+      !CLAUDE_PERMISSION_OPTIONS.some((option) => option.value === claudeOptions.permissionsDefaultMode)
+    ) {
+      errors.push("Claude Code 权限模式不是有效选项。");
+    }
   }
   const forbiddenClaudeSuffixes = provider.platforms.claude?.rules.baseUrl?.forbidPathSuffixes || [];
   const claudePath = getUrlPath(form.platforms.claude.baseUrl);

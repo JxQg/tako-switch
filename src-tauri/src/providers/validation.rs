@@ -253,8 +253,71 @@ fn normalize_platform_input(
         id: platform_id.to_string(),
         base_url,
         model,
+        options: normalize_platform_options(platform_id, input)?,
         definition,
     })
+}
+
+fn normalize_platform_options(
+    platform_id: &str,
+    input: &PlatformConfigInput,
+) -> Result<super::types::PlatformOptionsInput, String> {
+    let mut options = input.options.clone();
+
+    match platform_id {
+        PLATFORM_CODEX => {
+            if let Some(value) = normalize_optional_string(&options.sandbox_mode) {
+                match value.as_str() {
+                    "read-only" | "workspace-write" | "danger-full-access" => {
+                        options.sandbox_mode = Some(value)
+                    }
+                    _ => return Err("Codex 沙箱权限不是有效选项。".to_string()),
+                }
+            } else {
+                options.sandbox_mode = None;
+            }
+
+            if let Some(value) = normalize_optional_string(&options.approval_policy) {
+                match value.as_str() {
+                    "untrusted" | "on-request" | "never" => options.approval_policy = Some(value),
+                    _ => return Err("Codex 审批策略不是有效选项。".to_string()),
+                }
+            } else {
+                options.approval_policy = None;
+            }
+
+            if let Some(value) = normalize_optional_string(&options.windows_sandbox) {
+                match value.as_str() {
+                    "elevated" | "unelevated" => options.windows_sandbox = Some(value),
+                    _ => return Err("Windows 沙箱模式不是有效选项。".to_string()),
+                }
+            } else {
+                options.windows_sandbox = None;
+            }
+
+            options.permissions_default_mode = None;
+            options.skip_dangerous_mode_permission_prompt = None;
+        }
+        PLATFORM_CLAUDE => {
+            if let Some(value) = normalize_optional_string(&options.permissions_default_mode) {
+                match value.as_str() {
+                    "default" | "acceptEdits" | "plan" | "auto" | "dontAsk"
+                    | "bypassPermissions" => options.permissions_default_mode = Some(value),
+                    _ => return Err("Claude Code 权限模式不是有效选项。".to_string()),
+                }
+            } else {
+                options.permissions_default_mode = None;
+            }
+
+            options.sandbox_mode = None;
+            options.approval_policy = None;
+            options.windows_sandbox = None;
+            options.features = Default::default();
+        }
+        _ => {}
+    }
+
+    Ok(options)
 }
 
 fn normalize_base_url(value: &str, platform_id: &str) -> Result<String, String> {
@@ -304,6 +367,14 @@ fn trim_optional(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_optional_string(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 [package]
 name = "tako-switch"
-version = "0.3.1"
+version = "0.4.0"
 description = "One-click Codex and Claude Code configuration importer"
 authors = ["Tako"]
 edition = "2021"

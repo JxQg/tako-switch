@@ -13,6 +13,7 @@ fn platform_input(
         enabled,
         base_url: base_url.to_string(),
         model: model.map(str::to_string),
+        options: Default::default(),
     })
 }
 
