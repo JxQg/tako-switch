@@ -6,11 +6,11 @@ use app_detection::{
     codex_app_command_candidates, codex_app_install_marker_candidates, codex_app_supported,
     detect_app_from_markers,
 };
-use std::collections::BTreeSet;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::path::Path;
-use std::process::Command;
+use std::{collections::BTreeSet, path::Path, process::Command};
+#[cfg(not(windows))]
+use std::{env, path::PathBuf};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -396,6 +396,15 @@ fn macos_login_shell_candidates() -> Vec<PathBuf> {
     shells.push(PathBuf::from("/bin/zsh"));
     shells.push(PathBuf::from("/bin/bash"));
     unique_paths(shells)
+}
+
+#[cfg(target_os = "macos")]
+fn unique_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = BTreeSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
 }
 
 fn is_path_like_command(command: &str) -> bool {
