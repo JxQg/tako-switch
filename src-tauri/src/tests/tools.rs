@@ -1,9 +1,14 @@
 #[cfg(windows)]
 use super::app_detection::{
+    codex_app_install_marker_candidates, codex_app_install_markers,
+    is_allowed_store_app_id,
+    windows_claude_app_launch_targets_from_base_dirs,
     windows_claude_app_marker_candidates_from_base_dirs,
     windows_claude_cli_command_candidates_from_base_dirs,
     windows_codex_app_command_candidates_from_base_dirs,
-    windows_codex_app_marker_candidates_from_base_dirs,
+    windows_codex_app_launch_targets_from_base_dirs,
+    windows_codex_app_marker_candidates_from_base_dirs, AppInstallMarker, WindowsAppLaunchTarget,
+    WindowsStoreApp,
 };
 use super::*;
 #[cfg(windows)]
@@ -95,12 +100,51 @@ fn windows_claude_app_markers_include_desktop_app_locations() {
     assert!(markers.contains(&PathBuf::from(
         "C:\\Users\\demo\\AppData\\Local\\Programs\\Claude\\Claude.exe"
     )));
-    assert!(markers.contains(&PathBuf::from(
+    assert!(!markers.contains(&PathBuf::from(
         "C:\\Users\\demo\\AppData\\Local\\Microsoft\\WindowsApps\\Claude.exe"
     )));
     assert!(markers.contains(&PathBuf::from(
         "C:\\Users\\demo\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Claude.lnk"
     )));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_claude_launch_targets_use_shared_desktop_app_shape() {
+    let local_app_data = PathBuf::from("C:\\Users\\demo\\AppData\\Local");
+    let start_menu_dir = PathBuf::from(
+        "C:\\Users\\demo\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs",
+    );
+
+    let targets =
+        windows_claude_app_launch_targets_from_base_dirs(vec![local_app_data], vec![start_menu_dir]);
+
+    assert!(targets.contains(&WindowsAppLaunchTarget::Path(PathBuf::from(
+        "C:\\Users\\demo\\AppData\\Local\\Programs\\Claude\\Claude.exe"
+    ))));
+    assert!(!targets.contains(&WindowsAppLaunchTarget::Path(PathBuf::from(
+        "C:\\Users\\demo\\AppData\\Local\\Microsoft\\WindowsApps\\Claude.exe"
+    ))));
+    assert!(targets.contains(&WindowsAppLaunchTarget::Path(PathBuf::from(
+        "C:\\Users\\demo\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Claude.lnk"
+    ))));
+}
+
+#[cfg(windows)]
+#[test]
+fn invalid_store_app_text_is_not_allowed_as_app_id() {
+    assert!(!is_allowed_store_app_id(
+        "What would you like to know about Anthropic or Claude? I can help with:",
+        &["OpenAI.Codex"],
+    ));
+    assert!(!is_allowed_store_app_id(
+        "shell:AppsFolder\\What would you like to know about Anthropic or Claude?",
+        &["OpenAI.Codex"],
+    ));
+    assert!(is_allowed_store_app_id(
+        "OpenAI.Codex_2p2nqsd0c76g0!App",
+        &["OpenAI.Codex"],
+    ));
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -142,8 +186,11 @@ fn windows_codex_markers_include_app_directory_and_start_menu_shortcut() {
     let markers =
         windows_codex_app_marker_candidates_from_base_dirs(vec![base_dir], vec![start_menu_dir]);
 
-    assert!(markers.contains(&PathBuf::from(
+    assert!(!markers.contains(&PathBuf::from(
         "C:\\Users\\demo\\AppData\\Local\\OpenAI\\Codex"
+    )));
+    assert!(!markers.contains(&PathBuf::from(
+        "C:\\Users\\demo\\AppData\\Local\\OpenAI\\Codex\\bin\\codex.exe"
     )));
     assert!(markers.contains(&PathBuf::from("C:\\Users\\demo\\AppData\\Local\\ChatGPT")));
     assert!(markers.contains(&PathBuf::from(
@@ -155,6 +202,96 @@ fn windows_codex_markers_include_app_directory_and_start_menu_shortcut() {
     assert!(markers.contains(&PathBuf::from(
         "C:\\Users\\demo\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\ChatGPT.lnk"
     )));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_codex_cli_path_is_not_a_desktop_app_marker() {
+    let base_dir = PathBuf::from("C:\\Users\\demo\\AppData\\Local");
+
+    let markers = codex_app_install_markers();
+    let synthetic_markers =
+        windows_codex_app_marker_candidates_from_base_dirs(vec![base_dir], Vec::new());
+
+    assert!(!synthetic_markers.contains(&PathBuf::from(
+        "C:\\Users\\demo\\AppData\\Local\\OpenAI\\Codex\\bin\\codex.exe"
+    )));
+    assert!(!markers.iter().any(|path| path.ends_with("bin\\codex.exe")));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_codex_app_id_marker_reports_apps_folder_target() {
+    let app_id = "OpenAI.Codex_2p2nqsd0c76g0!App".to_string();
+
+    let detected = detect_app_from_markers(vec![AppInstallMarker::WindowsStoreApp(
+        WindowsStoreApp {
+            app_id: app_id.clone(),
+            install_location: None,
+        },
+    )])
+    .unwrap();
+
+    assert_eq!(
+        detected,
+        "shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_codex_store_marker_reports_install_location_when_available() {
+    let detected = detect_app_from_markers(vec![AppInstallMarker::WindowsStoreApp(
+        WindowsStoreApp {
+            app_id: "OpenAI.Codex_2p2nqsd0c76g0!App".to_string(),
+            install_location: Some(PathBuf::from(
+                "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.707.3748.0_x64__2p2nqsd0c76g0",
+            )),
+        },
+    )])
+    .unwrap();
+
+    assert_eq!(
+        detected,
+        "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.707.3748.0_x64__2p2nqsd0c76g0"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_codex_launch_targets_keep_app_id_before_paths() {
+    let app_id = "OpenAI.Codex_2p2nqsd0c76g0!App".to_string();
+    let local_app_data = PathBuf::from("C:\\Users\\demo\\AppData\\Local");
+
+    let mut targets = vec![WindowsAppLaunchTarget::AppId(app_id.clone())];
+    targets.extend(windows_codex_app_launch_targets_from_base_dirs(
+        vec![local_app_data],
+        Vec::new(),
+    ));
+
+    assert_eq!(targets.first(), Some(&WindowsAppLaunchTarget::AppId(app_id)));
+    assert!(targets.contains(&WindowsAppLaunchTarget::Path(PathBuf::from(
+        "C:\\Users\\demo\\AppData\\Local\\Programs\\ChatGPT\\ChatGPT.exe"
+    ))));
+    assert!(!targets.contains(&WindowsAppLaunchTarget::Path(PathBuf::from(
+        "C:\\Users\\demo\\AppData\\Local\\OpenAI\\Codex\\bin\\codex.exe"
+    ))));
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_live_codex_app_marker_prefers_store_app_when_present() {
+    let markers = codex_app_install_marker_candidates();
+
+    if markers
+        .iter()
+        .any(|marker| matches!(marker, AppInstallMarker::WindowsStoreApp(app) if app.app_id.contains("OpenAI.Codex")))
+    {
+        assert!(matches!(
+            markers.first(),
+            Some(AppInstallMarker::WindowsStoreApp(app)) if app.app_id.contains("OpenAI.Codex")
+        ));
+    }
 }
 
 #[cfg(any(windows, target_os = "macos"))]

@@ -2,8 +2,8 @@ use crate::models::ToolStatus;
 mod app_detection;
 
 use app_detection::{
-    claude_app_install_markers, claude_app_supported, claude_cli_command_candidates,
-    codex_app_command_candidates, codex_app_install_markers, codex_app_supported,
+    claude_app_install_marker_candidates, claude_app_supported, claude_cli_command_candidates,
+    codex_app_command_candidates, codex_app_install_marker_candidates, codex_app_supported,
     detect_app_from_markers,
 };
 use std::collections::BTreeSet;
@@ -39,7 +39,7 @@ fn detect_codex_tool() -> ToolStatus {
     let cli = detect_command_tool("Codex", codex_command_candidates(), |_| true);
     let app_supported = codex_app_supported();
     let app_path = app_supported
-        .then(|| detect_app_from_markers(codex_app_install_markers()))
+        .then(|| detect_app_from_markers(codex_app_install_marker_candidates()))
         .flatten();
 
     merge_tool_status(
@@ -60,7 +60,7 @@ fn detect_claude_tool() -> ToolStatus {
     );
     let app_supported = claude_app_supported();
     let app_path = app_supported
-        .then(|| detect_app_from_markers(claude_app_install_markers()))
+        .then(|| detect_app_from_markers(claude_app_install_marker_candidates()))
         .flatten();
 
     merge_tool_status(
@@ -78,7 +78,7 @@ fn merge_tool_status(
     command_name: &str,
     app_label: &str,
     cli: CommandDetection,
-    app_path: Option<std::path::PathBuf>,
+    app_path: Option<String>,
     app_supported: bool,
 ) -> ToolStatus {
     let app_installed = app_path.is_some();
@@ -113,7 +113,7 @@ fn merge_tool_status(
         app_supported: Some(app_supported),
         detected_by: Some(detected_by.to_string()),
         cli_path: cli.path,
-        app_path: app_path.map(|path| path.to_string_lossy().to_string()),
+        app_path,
     }
 }
 
