@@ -295,6 +295,17 @@ fn normalize_platform_options(
                 options.windows_sandbox = None;
             }
 
+            if let Some(value) = normalize_optional_string(&options.default_permissions) {
+                match value.as_str() {
+                    ":read-only" | ":workspace" | ":danger-full-access" => {
+                        options.default_permissions = Some(value)
+                    }
+                    _ => return Err("Codex 权限 profile 不是有效选项。".to_string()),
+                }
+            } else {
+                options.default_permissions = None;
+            }
+
             options.permissions_default_mode = None;
             options.skip_dangerous_mode_permission_prompt = None;
         }
@@ -309,9 +320,18 @@ fn normalize_platform_options(
                 options.permissions_default_mode = None;
             }
 
+            if options.skip_dangerous_mode_permission_prompt == Some(true)
+                && options.permissions_default_mode.as_deref() != Some("bypassPermissions")
+            {
+                return Err(
+                    "只有选择 Claude Code 绕过权限检查时，才能跳过危险模式确认提示。".to_string(),
+                );
+            }
+
             options.sandbox_mode = None;
             options.approval_policy = None;
             options.windows_sandbox = None;
+            options.default_permissions = None;
             options.features = Default::default();
         }
         _ => {}

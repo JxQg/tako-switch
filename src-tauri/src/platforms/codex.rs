@@ -99,6 +99,9 @@ pub fn merge_config(
     if let Some(approval_policy) = options.approval_policy.as_deref() {
         document["approval_policy"] = value(approval_policy);
     }
+    if let Some(default_permissions) = options.default_permissions.as_deref() {
+        document["default_permissions"] = value(default_permissions);
+    }
 
     let providers = document
         .as_table_mut()

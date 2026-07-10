@@ -47,6 +47,7 @@ type ActiveTab = "home" | "import" | "current";
 type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 type CodexApprovalPolicy = "untrusted" | "on-request" | "never";
 type CodexWindowsSandbox = "elevated" | "unelevated";
+type CodexDefaultPermissions = ":read-only" | ":workspace" | ":danger-full-access";
 type ClaudePermissionMode = "default" | "acceptEdits" | "plan" | "auto" | "dontAsk" | "bypassPermissions";
 
 type CodexFeatureOptions = {
@@ -60,6 +61,7 @@ type PlatformOptionsInput = {
   sandboxMode?: CodexSandboxMode | null;
   approvalPolicy?: CodexApprovalPolicy | null;
   windowsSandbox?: CodexWindowsSandbox | null;
+  defaultPermissions?: CodexDefaultPermissions | null;
   features?: CodexFeatureOptions;
   permissionsDefaultMode?: ClaudePermissionMode | null;
   skipDangerousModePermissionPrompt?: boolean | null;
@@ -173,6 +175,7 @@ const emptyConfigInput: ConfigInput = {
         sandboxMode: null,
         approvalPolicy: null,
         windowsSandbox: null,
+        defaultPermissions: null,
         features: {
           jsRepl: null,
           unifiedExec: null,
@@ -1364,6 +1367,12 @@ const CODEX_WINDOWS_SANDBOX_OPTIONS: Array<{ label: string; value: CodexWindowsS
   { label: "非提升权限模式", value: "unelevated" }
 ];
 
+const CODEX_DEFAULT_PERMISSIONS_OPTIONS: Array<{ label: string; value: CodexDefaultPermissions }> = [
+  { label: "只读 profile", value: ":read-only" },
+  { label: "工作区 profile", value: ":workspace" },
+  { label: "完全访问 profile", value: ":danger-full-access" }
+];
+
 const CLAUDE_PERMISSION_OPTIONS: Array<{ label: string; value: ClaudePermissionMode }> = [
   { label: "默认询问", value: "default" },
   { label: "自动接受编辑", value: "acceptEdits" },
@@ -1383,7 +1392,8 @@ function AdvancedConfigSection({
   const codexOptions = normalizeCodexOptions(form.platforms.codex.options);
   const claudeOptions = normalizeClaudeOptions(form.platforms.claude.options);
   const codexFullAccess =
-    codexOptions.sandboxMode === "danger-full-access" && codexOptions.approvalPolicy === "never";
+    codexOptions.defaultPermissions === ":danger-full-access" ||
+    (codexOptions.sandboxMode === "danger-full-access" && codexOptions.approvalPolicy === "never");
   const claudeBypassPermissions = claudeOptions.permissionsDefaultMode === "bypassPermissions";
 
   function updateCodexOptions(options: PlatformOptionsInput) {
@@ -1404,10 +1414,25 @@ function AdvancedConfigSection({
   }
 
   function toggleCodexFullAccess(enabled: boolean) {
-    updateCodexOptions({
-      sandboxMode: enabled ? "danger-full-access" : null,
-      approvalPolicy: enabled ? "never" : null
-    });
+    if (codexOptions.defaultPermissions) {
+      updateCodexOptions({
+        defaultPermissions: enabled ? ":danger-full-access" : null
+      });
+      return;
+    }
+
+    updateCodexOptions(
+      enabled
+        ? {
+            sandboxMode: "danger-full-access",
+            approvalPolicy: "never"
+          }
+        : {
+            sandboxMode: null,
+            approvalPolicy: null,
+            defaultPermissions: null
+          }
+    );
   }
 
   function setClaudePermissionMode(value: ClaudePermissionMode | null) {
@@ -1447,11 +1472,21 @@ function AdvancedConfigSection({
           {codexFullAccess && (
             <div className="notice danger compact-notice">
               <AlertTriangle />
-              <span>会写入完全访问和从不询问，Codex 可跨目录和网络执行操作。</span>
+              <span>
+                会写入完全访问配置，Codex 将不再受项目目录和网络沙箱限制；只建议在可信项目中使用。
+              </span>
             </div>
           )}
 
           <div className="advanced-select-grid">
+            <TypedSelect<CodexDefaultPermissions>
+              code="default_permissions"
+              disabled={!form.platforms.codex.enabled}
+              label="Codex 权限 profile"
+              options={CODEX_DEFAULT_PERMISSIONS_OPTIONS}
+              value={codexOptions.defaultPermissions}
+              onChange={(value) => updateCodexOptions({ defaultPermissions: value })}
+            />
             <TypedSelect<CodexSandboxMode>
               code="sandbox_mode"
               disabled={!form.platforms.codex.enabled}
@@ -1478,7 +1513,14 @@ function AdvancedConfigSection({
             />
           </div>
 
-          <p className="advanced-help">Windows 沙箱模式不是完全访问权限，只影响 Windows 原生沙箱运行方式。</p>
+          <p className="advanced-help">
+            新版 <code>default_permissions</code> 与旧版 <code>sandbox_mode</code> / <code>approval_policy</code>{" "}
+            都可用于设置 Codex 权限；未选择的字段不会被改动。
+          </p>
+          <p className="advanced-help">
+            Windows 沙箱模式只选择 Windows 原生沙箱实现，不等于完全访问；macOS 不需要写入该项，Full Disk
+            Access、Accessibility、Screen Recording 属于系统隐私权限，需要在系统设置中手动授权。
+          </p>
 
           <div className="feature-list">
             <FeatureToggle
@@ -1552,7 +1594,9 @@ function AdvancedConfigSection({
           {claudeBypassPermissions && (
             <div className="notice danger compact-notice">
               <AlertTriangle />
-              <span>绕过权限检查会减少安全确认，只建议在可信目录中使用。</span>
+              <span>
+                绕过权限检查会减少安全确认；如果同时跳过危险模式确认提示，Claude Code 将更少停下来确认高风险操作。
+              </span>
             </div>
           )}
         </div>
@@ -1652,11 +1696,12 @@ function FeatureToggle({
 }
 
 function normalizeCodexOptions(options: PlatformOptionsInput): Required<Pick<PlatformOptionsInput, "features">> &
-  Pick<PlatformOptionsInput, "sandboxMode" | "approvalPolicy" | "windowsSandbox"> {
+  Pick<PlatformOptionsInput, "sandboxMode" | "approvalPolicy" | "windowsSandbox" | "defaultPermissions"> {
   return {
     sandboxMode: options.sandboxMode ?? null,
     approvalPolicy: options.approvalPolicy ?? null,
     windowsSandbox: options.windowsSandbox ?? null,
+    defaultPermissions: options.defaultPermissions ?? null,
     features: {
       jsRepl: options.features?.jsRepl ?? null,
       unifiedExec: options.features?.unifiedExec ?? null,
@@ -2074,6 +2119,7 @@ function createProviderConfigInput(provider: AccountProviderConfig, apiKey: stri
           sandboxMode: null,
           approvalPolicy: null,
           windowsSandbox: null,
+          defaultPermissions: null,
           features: {
             jsRepl: null,
             unifiedExec: null,
@@ -2726,6 +2772,12 @@ function validateLocal(form: ConfigInput, provider: AccountProviderConfig | null
     }
     if (codexOptions.windowsSandbox && !CODEX_WINDOWS_SANDBOX_OPTIONS.some((option) => option.value === codexOptions.windowsSandbox)) {
       errors.push("Windows 沙箱模式不是有效选项。");
+    }
+    if (
+      codexOptions.defaultPermissions &&
+      !CODEX_DEFAULT_PERMISSIONS_OPTIONS.some((option) => option.value === codexOptions.defaultPermissions)
+    ) {
+      errors.push("Codex 权限 profile 不是有效选项。");
     }
   }
   if (form.platforms.claude.enabled) {

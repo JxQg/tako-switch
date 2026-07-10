@@ -92,6 +92,7 @@ command = "fetch-token"
 #[test]
 fn merge_applies_advanced_options_and_preserves_unselected_values() {
     let existing = r#"
+default_permissions = ":workspace"
 sandbox_mode = "workspace-write"
 approval_policy = "on-request"
 
@@ -108,6 +109,7 @@ multi_agent = true
         sandbox_mode: Some("danger-full-access".to_string()),
         approval_policy: Some("never".to_string()),
         windows_sandbox: Some("elevated".to_string()),
+        default_permissions: Some(":danger-full-access".to_string()),
         features: CodexFeatureOptionsInput {
             js_repl: Some(false),
             unified_exec: Some(false),
@@ -128,6 +130,7 @@ multi_agent = true
 
     assert!(merged.contains("sandbox_mode = \"danger-full-access\""));
     assert!(merged.contains("approval_policy = \"never\""));
+    assert!(merged.contains("default_permissions = \":danger-full-access\""));
     assert!(merged.contains("[windows]"));
     assert!(merged.contains("sandbox = \"elevated\""));
     assert!(merged.contains("js_repl = false"));
@@ -140,6 +143,7 @@ multi_agent = true
 #[test]
 fn merge_leaves_advanced_options_unchanged_when_unselected() {
     let existing = r#"
+default_permissions = ":workspace"
 sandbox_mode = "workspace-write"
 
 [windows]
@@ -160,6 +164,7 @@ shell_snapshot = false
     .unwrap();
 
     assert!(merged.contains("sandbox_mode = \"workspace-write\""));
+    assert!(merged.contains("default_permissions = \":workspace\""));
     assert!(merged.contains("sandbox = \"unelevated\""));
     assert!(merged.contains("shell_snapshot = false"));
 }

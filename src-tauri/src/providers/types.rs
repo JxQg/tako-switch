@@ -143,6 +143,8 @@ pub struct PlatformOptionsInput {
     #[serde(default)]
     pub windows_sandbox: Option<String>,
     #[serde(default)]
+    pub default_permissions: Option<String>,
+    #[serde(default)]
     pub features: CodexFeatureOptionsInput,
     #[serde(default)]
     pub permissions_default_mode: Option<String>,
