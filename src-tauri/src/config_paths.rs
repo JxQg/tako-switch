@@ -20,16 +20,16 @@ pub fn claude_settings_path() -> Result<PathBuf, String> {
 }
 
 pub fn provider_config_path() -> Result<PathBuf, String> {
-    Ok(provider_config_base_dir()?
+    Ok(user_provider_config_base_dir()?
         .join(PROVIDER_CONFIG_DIR)
         .join(PROVIDER_CONFIG_FILE))
 }
 
-fn provider_config_base_dir() -> Result<PathBuf, String> {
-    if cfg!(test) && env::var_os("TAKO_SWITCH_DATA_DIR").is_some() {
-        return app_data_dir();
-    }
+pub fn bundled_provider_config_relative_path() -> PathBuf {
+    PathBuf::from(PROVIDER_CONFIG_DIR).join(PROVIDER_CONFIG_FILE)
+}
 
+fn user_provider_config_base_dir() -> Result<PathBuf, String> {
     if cfg!(target_os = "macos") {
         return app_data_dir();
     }

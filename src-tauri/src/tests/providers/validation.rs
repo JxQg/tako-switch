@@ -1,6 +1,9 @@
 use super::*;
 use crate::{
-    providers::types::{ConfigPlatforms, PlatformOptionsInput, DEFAULT_PROVIDER_CONFIG},
+    providers::{
+        loader::load_default_provider_catalog,
+        types::{ConfigPlatforms, PlatformOptionsInput, DEFAULT_PROVIDER_CONFIG},
+    },
     tests::install_dir_test_lock,
 };
 
@@ -26,6 +29,10 @@ fn platform_input_with_options(
     })
 }
 
+fn validate_default_input(input: ConfigInput) -> Result<NormalizedInput, String> {
+    validate_input(input, load_default_provider_catalog(None).unwrap())
+}
+
 #[test]
 fn validation_rejects_empty_secret_and_bad_url() {
     let _lock = install_dir_test_lock();
@@ -38,7 +45,7 @@ fn validation_rejects_empty_secret_and_bad_url() {
         },
     };
 
-    assert!(validate_input(input).is_err());
+    assert!(validate_default_input(input).is_err());
 }
 
 #[test]
@@ -53,7 +60,7 @@ fn validation_rejects_claude_v1_suffix_from_config_rule() {
         },
     };
 
-    let error = validate_input(input).unwrap_err();
+    let error = validate_default_input(input).unwrap_err();
     assert!(error.contains("/v1"));
 }
 
@@ -77,7 +84,7 @@ fn validation_rejects_invalid_codex_default_permissions() {
         },
     };
 
-    let error = validate_input(input).unwrap_err();
+    let error = validate_default_input(input).unwrap_err();
     assert!(error.contains("Codex 权限 profile"));
 }
 
@@ -106,7 +113,7 @@ fn validation_clears_codex_options_from_claude_input() {
         },
     };
 
-    let normalized = validate_input(input).unwrap();
+    let normalized = validate_default_input(input).unwrap();
     let options = &normalized.platforms[0].options;
     assert!(options.sandbox_mode.is_none());
     assert!(options.approval_policy.is_none());
@@ -140,7 +147,7 @@ fn validation_rejects_dangerous_prompt_skip_without_claude_bypass() {
         },
     };
 
-    let error = validate_input(input).unwrap_err();
+    let error = validate_default_input(input).unwrap_err();
     assert!(error.contains("绕过权限检查"));
 }
 

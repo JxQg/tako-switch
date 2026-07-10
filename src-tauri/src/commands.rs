@@ -6,7 +6,7 @@ use crate::{
     models::{ApplyResult, ExistingConfig, LoadedConfigs, PreviewResult, RestoreResult},
     platforms::{apply_platform, codex, preview_platform},
     providers::{
-        load_provider_catalog_from_disk, types::PLATFORM_CODEX, validation::parse_http_url,
+        load_provider_catalog_from_app, types::PLATFORM_CODEX, validation::parse_http_url,
         validation::validate_input, ConfigInput, ProviderCatalog,
     },
     redaction::{redact_json_text, redact_plain_text},
@@ -14,7 +14,7 @@ use crate::{
     utils::display_path,
 };
 use serde::Serialize;
-use tauri::{Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use url::Url;
 
 #[derive(Debug, Clone, Serialize)]
@@ -41,13 +41,14 @@ pub fn load_current_configs() -> Result<LoadedConfigs, String> {
 }
 
 #[tauri::command]
-pub fn load_provider_catalog() -> Result<ProviderCatalog, String> {
-    load_provider_catalog_from_disk()
+pub fn load_provider_catalog(app: AppHandle) -> Result<ProviderCatalog, String> {
+    load_provider_catalog_from_app(&app)
 }
 
 #[tauri::command]
-pub fn preview_changes(input: ConfigInput) -> Result<PreviewResult, String> {
-    let normalized = validate_input(input)?;
+pub fn preview_changes(app: AppHandle, input: ConfigInput) -> Result<PreviewResult, String> {
+    let catalog = load_provider_catalog_from_app(&app)?;
+    let normalized = validate_input(input, catalog)?;
     let mut files = Vec::new();
     let mut env_updates = Vec::new();
     let mut warnings = normalized.warnings.clone();
@@ -70,8 +71,9 @@ pub fn preview_changes(input: ConfigInput) -> Result<PreviewResult, String> {
 }
 
 #[tauri::command]
-pub fn apply_configs(input: ConfigInput) -> Result<ApplyResult, String> {
-    let normalized = validate_input(input)?;
+pub fn apply_configs(app: AppHandle, input: ConfigInput) -> Result<ApplyResult, String> {
+    let catalog = load_provider_catalog_from_app(&app)?;
+    let normalized = validate_input(input, catalog)?;
     let mut files = Vec::new();
     let mut env_updates = Vec::new();
     let mut warnings = normalized.warnings.clone();
@@ -97,8 +99,11 @@ pub fn apply_configs(input: ConfigInput) -> Result<ApplyResult, String> {
 }
 
 #[tauri::command]
-pub fn migrate_legacy_codex_config(api_key: Option<String>) -> Result<Option<ApplyResult>, String> {
-    let catalog = load_provider_catalog_from_disk()?;
+pub fn migrate_legacy_codex_config(
+    app: AppHandle,
+    api_key: Option<String>,
+) -> Result<Option<ApplyResult>, String> {
+    let catalog = load_provider_catalog_from_app(&app)?;
     let Some(provider) = catalog
         .providers
         .iter()

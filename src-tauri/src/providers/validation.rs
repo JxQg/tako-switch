@@ -1,8 +1,7 @@
-use super::load_provider_catalog_from_disk;
 use super::types::{
     BaseUrlRules, ConfigInput, NormalizedInput, NormalizedPlatformInput, PlatformConfigInput,
-    PlatformDefinition, PlatformWriter, ProviderCatalogFile, ProviderDefinition, WriterBinding,
-    PLATFORM_CLAUDE, PLATFORM_CODEX, PLATFORM_ORDER, WRITER_CLAUDE_SETTINGS_JSON,
+    PlatformDefinition, PlatformWriter, ProviderCatalog, ProviderCatalogFile, ProviderDefinition,
+    WriterBinding, PLATFORM_CLAUDE, PLATFORM_CODEX, PLATFORM_ORDER, WRITER_CLAUDE_SETTINGS_JSON,
     WRITER_CODEX_CONFIG_TOML,
 };
 use url::Url;
@@ -166,8 +165,10 @@ pub fn parse_http_url(value: &str, field: &str) -> Result<Url, String> {
     Ok(parsed)
 }
 
-pub fn validate_input(input: ConfigInput) -> Result<NormalizedInput, String> {
-    let catalog = load_provider_catalog_from_disk()?;
+pub fn validate_input(
+    input: ConfigInput,
+    catalog: ProviderCatalog,
+) -> Result<NormalizedInput, String> {
     let provider_id = input.provider_id.trim();
     let provider_id = if provider_id.is_empty() {
         catalog.default_provider_id.as_str()
