@@ -200,19 +200,45 @@ h2 {
   margin-bottom: 0;
 }
 
+.status-heading {
+  align-items: center;
+  justify-content: space-between;
+}
+
+.status-heading-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+}
+
+.status-heading-title svg {
+  width: 22px;
+  height: 22px;
+  color: #40536b;
+  flex: 0 0 auto;
+}
+
+.refresh-inline {
+  margin-left: auto;
+  min-height: 34px;
+  padding: 7px 11px;
+  white-space: nowrap;
+}
+
 .status-strip {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
-  margin-bottom: 18px;
+  margin-bottom: 0;
 }
 
 .status-item {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
-  min-height: 70px;
-  padding: 14px;
+  min-height: 0;
+  padding: 12px;
   border: 1px solid #e5d6b8;
   border-radius: 8px;
   background: #fff8e8;
@@ -230,8 +256,8 @@ h2 {
 }
 
 .status-item svg {
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
   color: #b7791f;
   flex: 0 0 auto;
 }
@@ -249,11 +275,130 @@ h2 {
   display: block;
 }
 
+.status-item > div {
+  min-width: 0;
+  width: 100%;
+}
+
 .status-item span {
   margin-top: 3px;
   color: #5f6f83;
   font-size: 13px;
   overflow-wrap: anywhere;
+}
+
+.status-item-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.status-item-heading strong {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.tool-install-breakdown {
+  display: grid;
+  gap: 7px;
+  margin-top: 8px;
+}
+
+.tool-status-tags,
+.tool-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.tool-status-tags {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.tool-action-row {
+  padding-top: 1px;
+}
+
+.tool-status-detail {
+  margin-top: 0;
+}
+
+.tool-install-line,
+.recommended-tag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 24px;
+  padding: 3px 8px;
+  border: 1px solid #d8a12a;
+  border-radius: 999px;
+  background: #fff7df;
+  color: #8a5d16;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+.tool-install-line {
+  flex: 0 0 auto;
+  cursor: pointer;
+}
+
+.tool-install-line.installed,
+.recommended-tag {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
+.tool-install-line.unsupported {
+  border-color: #d7dde7;
+  background: #f6f8fb;
+  color: #64748b;
+}
+
+.tool-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.tool-action svg {
+  width: 15px;
+  height: 15px;
+}
+
+.tool-action.primary-lite {
+  border-color: #bfdbfe;
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
+.tool-action.warning-lite {
+  border-color: #ead29b;
+  background: #fff7df;
+  color: #8a5d16;
+}
+
+.tool-action:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px rgba(23, 40, 61, 0.08);
 }
 
 .tako-detail-grid {
@@ -1006,6 +1151,10 @@ button svg {
   width: min(720px, calc(100vw - 32px));
 }
 
+.cli-install-modal {
+  width: min(760px, calc(100vw - 32px));
+}
+
 .update-summary {
   margin-top: 6px;
   color: #627187;
@@ -1055,6 +1204,52 @@ button svg {
   max-height: 260px;
 }
 
+.cli-install-list {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.cli-install-command {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #dce5ef;
+  border-radius: 8px;
+  background: #fbfdff;
+}
+
+.cli-install-command-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.cli-install-command code {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 10px 12px;
+  border: 1px solid #dbe4ef;
+  border-radius: 8px;
+  background: #17283d;
+  color: #f8fbff;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.compact-action {
+  width: fit-content;
+  min-height: 32px;
+  padding: 7px 10px;
+}
+
+.cli-install-note {
+  margin-bottom: 14px;
+}
+
 .compact-heading {
   margin-bottom: 14px;
 }
@@ -1069,10 +1264,40 @@ button svg {
   font-size: 14px;
 }
 
+.notice > span {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
+}
+
 .notice svg {
   width: 18px;
   height: 18px;
   flex: 0 0 auto;
+}
+
+.notice-close {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  min-height: 24px;
+  margin: -3px -3px -3px auto;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: currentColor;
+}
+
+.notice-close svg {
+  width: 14px;
+  height: 14px;
+}
+
+.notice-close:hover {
+  background: rgba(15, 23, 42, 0.08);
 }
 
 .notice.error {
@@ -1498,6 +1723,10 @@ textarea {
 
   .compact-row {
     justify-content: flex-start;
+  }
+
+  .tool-action {
+    width: 100%;
   }
 
 }

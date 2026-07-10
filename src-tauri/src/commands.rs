@@ -151,6 +151,11 @@ pub fn open_external(url: String) -> Result<(), String> {
         .map_err(|err| format!("打开浏览器失败：{err}"))
 }
 
+#[tauri::command]
+pub fn open_tool_app(tool: String) -> Result<(), String> {
+    tools::open_tool_app(&tool)
+}
+
 pub fn validate_external_url(raw: &str) -> Result<Url, String> {
     parse_http_url(raw, "外部链接")
 }

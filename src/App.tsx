@@ -3,8 +3,11 @@ import {
   AlertTriangle,
   CheckCircle2,
   ChevronDown,
+  Clipboard,
+  Download,
   Eye,
   EyeOff,
+  ExternalLink,
   FileText,
   Github,
   Home,
@@ -88,6 +91,13 @@ type ToolStatus = {
   installed: boolean;
   version?: string;
   error?: string;
+  detail?: string;
+  cliInstalled?: boolean;
+  appInstalled?: boolean;
+  appSupported?: boolean;
+  detectedBy?: "cli" | "app" | "none";
+  cliPath?: string;
+  appPath?: string;
 };
 
 type ExistingConfig = {
@@ -156,6 +166,116 @@ type RestoreResult = {
 
 type BusyState = "loading" | "login" | "logout" | "tako" | "preview" | "apply" | "restore" | null;
 type PreviewModalContext = "import" | "home" | null;
+type ToolKey = "codex" | "claude";
+type InstallPlatform = "windows" | "macos" | "linux" | "unknown";
+type NoticeState = {
+  kind: "success" | "error";
+  message: string;
+  sticky?: boolean;
+};
+
+type ToolInstallCommand = {
+  label: string;
+  command: string;
+  recommended?: boolean;
+};
+
+type ToolInstallProfile = {
+  appLabel: string;
+  appDownloadUrl: string;
+  cliDocsUrl: string;
+  commands: Record<InstallPlatform, ToolInstallCommand[]>;
+};
+
+const TOOL_INSTALL_PROFILES: Record<ToolKey, ToolInstallProfile> = {
+  codex: {
+    appLabel: "ChatGPT 中的 Codex",
+    appDownloadUrl: "https://openai.com/zh-Hans-CN/codex/",
+    cliDocsUrl: "https://developers.openai.com/codex/cli",
+    commands: {
+      windows: [
+        {
+          label: "PowerShell",
+          command: 'powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"',
+          recommended: true
+        },
+        { label: "npm", command: "npm install -g @openai/codex" }
+      ],
+      macos: [
+        {
+          label: "standalone",
+          command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+          recommended: true
+        },
+        { label: "Homebrew", command: "brew install --cask codex" },
+        { label: "npm", command: "npm install -g @openai/codex" }
+      ],
+      linux: [
+        {
+          label: "standalone",
+          command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+          recommended: true
+        },
+        { label: "npm", command: "npm install -g @openai/codex" }
+      ],
+      unknown: [
+        {
+          label: "macOS / Linux",
+          command: "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+          recommended: true
+        },
+        {
+          label: "Windows PowerShell",
+          command: 'powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"'
+        }
+      ]
+    }
+  },
+  claude: {
+    appLabel: "Claude 桌面端",
+    appDownloadUrl: "https://claude.com/download",
+    cliDocsUrl: "https://docs.anthropic.com/en/docs/claude-code/setup",
+    commands: {
+      windows: [
+        {
+          label: "PowerShell",
+          command: "irm https://claude.ai/install.ps1 | iex",
+          recommended: true
+        },
+        { label: "WinGet", command: "winget install Anthropic.ClaudeCode" },
+        {
+          label: "CMD",
+          command: "curl -fsSL https://claude.ai/install.cmd -o install.cmd && install.cmd && del install.cmd"
+        }
+      ],
+      macos: [
+        {
+          label: "native",
+          command: "curl -fsSL https://claude.ai/install.sh | bash",
+          recommended: true
+        },
+        { label: "Homebrew", command: "brew install --cask claude-code" },
+        { label: "npm", command: "npm install -g @anthropic-ai/claude-code" }
+      ],
+      linux: [
+        {
+          label: "native",
+          command: "curl -fsSL https://claude.ai/install.sh | bash",
+          recommended: true
+        },
+        { label: "npm", command: "npm install -g @anthropic-ai/claude-code" }
+      ],
+      unknown: [
+        {
+          label: "macOS / Linux",
+          command: "curl -fsSL https://claude.ai/install.sh | bash",
+          recommended: true
+        },
+        { label: "Windows PowerShell", command: "irm https://claude.ai/install.ps1 | iex" }
+      ]
+    }
+  }
+};
 
 const emptyPreview: PreviewResult = {
   files: [],
@@ -216,6 +336,7 @@ function App() {
   const [homePreview, setHomePreview] = useState<PreviewResult>(emptyPreview);
   const [homeResult, setHomeResult] = useState<ApplyResult | null>(null);
   const [homeRestoreResult, setHomeRestoreResult] = useState<RestoreResult | null>(null);
+  const [homeImportScrollToken, setHomeImportScrollToken] = useState(0);
   const [showImportApiKey, setShowImportApiKey] = useState(false);
   const [showHomeApiKey, setShowHomeApiKey] = useState(false);
   const [takoAccount, setTakoAccount] = useState<TakoAccount>({
@@ -227,9 +348,10 @@ function App() {
   const [takoUsage, setTakoUsage] = useState<TakoUsage | null>(null);
   const [takoModels, setTakoModels] = useState<TakoModel[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [infoMessage, setInfoMessage] = useState<string | null>(null);
+  const [notice, setNotice] = useState<NoticeState | null>(null);
   const [updateStatus, setUpdateStatus] = useState<AppUpdateStatus | null>(null);
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
+  const [cliInstallTarget, setCliInstallTarget] = useState<ToolStatus | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [busy, setBusy] = useState<BusyState>(null);
 
@@ -238,11 +360,12 @@ function App() {
   const canSubmit = validation.length === 0 && busy === null;
   const canHomeImportSubmit = homeImportValidation.length === 0 && busy === null;
   const loading = busy !== null;
-  const modalOpen = homeImportOpen || previewModalContext !== null || updateDialogOpen;
+  const modalOpen =
+    homeImportOpen || previewModalContext !== null || updateDialogOpen || cliInstallTarget !== null;
   useBodyScrollLock(modalOpen);
 
   useEffect(() => {
-    void refreshState();
+    void refreshState({ silent: true });
     void refreshUpdateStatus({ silent: true });
   }, []);
 
@@ -259,7 +382,23 @@ function App() {
     }
   }, [activeTab, form.apiKey, provider]);
 
-  async function refreshState() {
+  useEffect(() => {
+    if (error) {
+      setNotice({ kind: "error", message: error });
+    }
+  }, [error]);
+
+  useEffect(() => {
+    if (!notice || notice.kind !== "success" || notice.sticky) return;
+    const timer = window.setTimeout(() => setNotice(null), 3000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  function showSuccess(message: string) {
+    setNotice({ kind: "success", message });
+  }
+
+  async function refreshState({ silent = false }: { silent?: boolean } = {}) {
     setBusy("loading");
     setError(null);
     try {
@@ -287,6 +426,8 @@ function App() {
       setConfigs(loadedConfigs);
       if (loadedProviderCatalog.warning) {
         setError(loadedProviderCatalog.warning);
+      } else if (!silent) {
+        showSuccess("本机客户端状态已更新。");
       }
       const latestResult = migrationResult ?? storedApplyResult;
       if (latestResult) {
@@ -338,6 +479,8 @@ function App() {
       setHomeResult(applyResult);
       setTools(applyResult.tools);
       await refreshConfigsOnly();
+      setActiveTab("import");
+      scrollWindowToTop();
     } catch (err) {
       setError(String(err));
     } finally {
@@ -577,6 +720,8 @@ function App() {
       setResult(applyResult);
       setTools(applyResult.tools);
       await refreshConfigsOnly();
+      setHomeImportOpen(true);
+      setHomeImportScrollToken((current) => current + 1);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -633,7 +778,6 @@ function App() {
     setCheckingUpdate(true);
     if (!silent) {
       setError(null);
-      setInfoMessage(null);
     }
 
     try {
@@ -644,7 +788,7 @@ function App() {
           setUpdateDialogOpen(true);
         }
       } else if (!silent) {
-        setInfoMessage(`已是最新版本：${APP_DISPLAY_VERSION}`);
+        showSuccess(`已是最新版本：${APP_DISPLAY_VERSION}`);
       }
     } catch (err) {
       if (!silent) {
@@ -666,9 +810,9 @@ function App() {
 
   async function openProjectHome() {
     setError(null);
-    setInfoMessage(null);
     try {
       await TakoApi.openExternal(PROJECT_URL);
+      showSuccess("已打开 GitHub 项目主页。");
     } catch (err) {
       setError(String(err));
     }
@@ -677,10 +821,30 @@ function App() {
   async function openUpdateDownload() {
     if (!updateStatus) return;
     setError(null);
-    setInfoMessage(null);
     try {
       await TakoApi.openExternal(getUpdateOpenUrl(updateStatus));
       setUpdateDialogOpen(false);
+      showSuccess("已打开更新下载页面。");
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function openDetectedToolApp(tool: ToolStatus) {
+    setError(null);
+    try {
+      await TakoApi.openToolApp(tool.name);
+      showSuccess(`正在打开 ${getToolInstallProfile(tool).appLabel}。`);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function openToolAppDownload(tool: ToolStatus) {
+    setError(null);
+    try {
+      await TakoApi.openExternal(getToolInstallProfile(tool).appDownloadUrl);
+      showSuccess("已打开官方下载页面。");
     } catch (err) {
       setError(String(err));
     }
@@ -705,9 +869,6 @@ function App() {
           <button className="icon-button" type="button" onClick={openProjectHome} title="打开 GitHub 项目主页">
             <Github />
           </button>
-          <button className="icon-button" type="button" onClick={refreshState} disabled={loading} title="重新检测">
-            {busy === "loading" ? <Loader2 className="spin" /> : <RefreshCw />}
-          </button>
         </div>
       </header>
 
@@ -731,17 +892,13 @@ function App() {
         </TabButton>
       </nav>
 
-      {error && (
-        <div className="notice error" role="alert">
-          <AlertTriangle />
-          <span>{error}</span>
-        </div>
-      )}
-
-      {infoMessage && (
-        <div className="notice success" role="status">
-          <CheckCircle2 />
-          <span>{infoMessage}</span>
+      {notice && (
+        <div className={`notice ${notice.kind}`} role={notice.kind === "error" ? "alert" : "status"}>
+          {notice.kind === "error" ? <AlertTriangle /> : <CheckCircle2 />}
+          <span>{notice.message}</span>
+          <button className="notice-close" type="button" onClick={() => setNotice(null)} title="关闭提示">
+            <X />
+          </button>
         </div>
       )}
 
@@ -753,6 +910,10 @@ function App() {
           tools={tools}
           onRefresh={refreshState}
           onImport={handleHomeImport}
+          onOpenApp={openDetectedToolApp}
+          onOpenAppDownload={openToolAppDownload}
+          onOpenCliInstall={setCliInstallTarget}
+          onShowToolDetail={(message) => setNotice({ kind: "success", message, sticky: true })}
           onLogin={handleTakoLogin}
           onLogout={handleTakoLogout}
           onRefreshTako={() => refreshTakoDetails()}
@@ -794,6 +955,7 @@ function App() {
           provider={provider}
           result={homeResult}
           restoreResult={homeRestoreResult}
+          scrollToken={homeImportScrollToken}
           showApiKey={showHomeApiKey}
           validation={homeImportValidation}
           onApply={applyHomeConfigs}
@@ -823,6 +985,18 @@ function App() {
           onOpenDownload={openUpdateDownload}
         />
       )}
+
+      {cliInstallTarget && (
+        <CliInstallModal
+          tool={cliInstallTarget}
+          onClose={() => setCliInstallTarget(null)}
+          onOpenDocs={() => {
+            void TakoApi.openExternal(getToolInstallProfile(cliInstallTarget).cliDocsUrl).catch((err) =>
+              setError(String(err))
+            );
+          }}
+        />
+      )}
     </main>
   );
 }
@@ -836,6 +1010,10 @@ function HomeTab({
   onImport,
   onLogin,
   onLogout,
+  onOpenApp,
+  onOpenAppDownload,
+  onOpenCliInstall,
+  onShowToolDetail,
   onRefresh,
   onRefreshTako,
   provider
@@ -848,6 +1026,10 @@ function HomeTab({
   onImport: () => void;
   onLogin: () => void;
   onLogout: () => void;
+  onOpenApp: (tool: ToolStatus) => void;
+  onOpenAppDownload: (tool: ToolStatus) => void;
+  onOpenCliInstall: (tool: ToolStatus) => void;
+  onShowToolDetail: (message: string) => void;
   onRefresh: () => void;
   onRefreshTako: () => void;
   provider: AccountProviderConfig;
@@ -857,35 +1039,62 @@ function HomeTab({
   return (
     <section className="home-layout">
       <div className="panel home-main">
-        <div className="panel-heading">
-          <ShieldCheck />
-          <div>
-            <h2>本机客户端状态</h2>
-            <p>确认工具是否已安装，然后进入安全预览导入流程。</p>
+        <div className="panel-heading status-heading">
+          <div className="status-heading-title">
+            <ShieldCheck />
+            <div>
+              <h2>本机客户端状态</h2>
+              <p>确认工具是否已安装，然后进入安全预览导入流程。</p>
+            </div>
           </div>
+          <button className="secondary refresh-inline" type="button" disabled={loading} onClick={onRefresh}>
+            {busy === "loading" ? <Loader2 className="spin" /> : <RefreshCw />}
+            <span>重新检测</span>
+          </button>
         </div>
 
         <section className="status-strip" aria-label="工具检测状态">
           {tools.length === 0 ? (
             <StatusItem label="检测中" detail="正在读取本机状态" installed={false} />
           ) : (
-            tools.map((tool) => (
-              <StatusItem
-                key={tool.name}
-                label={tool.name}
-                detail={tool.version || tool.error || "未检测到命令"}
-                installed={tool.installed}
-              />
-            ))
+            tools.map((tool) => {
+              const appSupported = tool.appSupported !== false;
+              const appInstalled = tool.appInstalled === true;
+              const cliInstalled = tool.cliInstalled === true || (!!tool.version && tool.cliInstalled !== false);
+              const profile = getToolInstallProfile(tool);
+
+              return (
+                <StatusItem
+                  key={tool.name}
+                  label={tool.name}
+                  detail={tool.detail || tool.version || "未检测到命令"}
+                  installed={tool.installed}
+                  titleExtra={
+                    <ToolInstallTags
+                      appDetail={getToolAppDetail(tool, profile)}
+                      appInstalled={appInstalled}
+                      appSupported={appSupported}
+                      cliDetail={getToolCliDetail(tool)}
+                      cliInstalled={cliInstalled}
+                      onShowDetail={onShowToolDetail}
+                    />
+                  }
+                >
+                  <ToolInstallBreakdown
+                    tool={tool}
+                    appInstalled={appInstalled}
+                    appSupported={appSupported}
+                    cliInstalled={cliInstalled}
+                    onOpenApp={onOpenApp}
+                    onOpenAppDownload={onOpenAppDownload}
+                    onOpenCliInstall={onOpenCliInstall}
+                  />
+                </StatusItem>
+              );
+            })
           )}
         </section>
 
-        <div className="button-row">
-          <button className="secondary" type="button" disabled={loading} onClick={onRefresh}>
-            {busy === "loading" ? <Loader2 className="spin" /> : <RefreshCw />}
-            <span>重新检测</span>
-          </button>
-        </div>
       </div>
 
       <section className="panel home-main" aria-label={provider.account.label}>
@@ -961,6 +1170,7 @@ function HomeImportModal({
   provider,
   result,
   restoreResult,
+  scrollToken,
   showApiKey,
   validation,
   onApply,
@@ -978,6 +1188,7 @@ function HomeImportModal({
   provider: AccountProviderConfig;
   result: ApplyResult | null;
   restoreResult: RestoreResult | null;
+  scrollToken: number;
   showApiKey: boolean;
   validation: string[];
   onApply: () => void;
@@ -990,6 +1201,11 @@ function HomeImportModal({
 }) {
   const modalPanelRef = useRef<HTMLElement | null>(null);
   useScrollBoundaryGuard(modalPanelRef);
+
+  useEffect(() => {
+    if (scrollToken === 0) return;
+    scrollElementToTop(modalPanelRef.current);
+  }, [scrollToken]);
 
   return (
     <div className="modal-backdrop" role="presentation">
@@ -1954,23 +2170,165 @@ function TabButton({
 }
 
 function StatusItem({
+  children,
   label,
   detail,
-  installed
+  installed,
+  titleExtra
 }: {
+  children?: React.ReactNode;
   label: string;
   detail: string;
   installed: boolean;
+  titleExtra?: React.ReactNode;
 }) {
   return (
     <div className={installed ? "status-item installed" : "status-item"}>
       {installed ? <CheckCircle2 /> : <AlertTriangle />}
       <div>
-        <strong>{label}</strong>
-        <span>{detail}</span>
+        <div className="status-item-heading">
+          <strong>{label}</strong>
+          {titleExtra}
+        </div>
+        {children || <span>{detail}</span>}
       </div>
     </div>
   );
+}
+
+function ToolInstallBreakdown({
+  onOpenApp,
+  onOpenAppDownload,
+  onOpenCliInstall,
+  appInstalled,
+  appSupported,
+  cliInstalled,
+  tool
+}: {
+  tool: ToolStatus;
+  appInstalled: boolean;
+  appSupported: boolean;
+  cliInstalled: boolean;
+  onOpenApp: (tool: ToolStatus) => void;
+  onOpenAppDownload: (tool: ToolStatus) => void;
+  onOpenCliInstall: (tool: ToolStatus) => void;
+}) {
+  return (
+    <div className="tool-install-breakdown">
+      <span className="tool-status-detail">{tool.detail || tool.version || "未检测到命令"}</span>
+      <div className="tool-action-row">
+        {appSupported ? (
+          <button
+            className={appInstalled ? "tool-action primary-lite" : "tool-action warning-lite"}
+            type="button"
+            onClick={() => (appInstalled ? onOpenApp(tool) : onOpenAppDownload(tool))}
+          >
+            {appInstalled ? <ExternalLink /> : <Download />}
+            <span>{appInstalled ? "打开App" : "前往下载"}</span>
+          </button>
+        ) : null}
+        {cliInstalled ? null : (
+          <button className="tool-action warning-lite" type="button" onClick={() => onOpenCliInstall(tool)}>
+            <Terminal />
+            <span>安装方法</span>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ToolInstallTags({
+  appDetail,
+  appInstalled,
+  appSupported,
+  cliDetail,
+  cliInstalled,
+  onShowDetail
+}: {
+  appDetail: string;
+  appInstalled: boolean;
+  appSupported: boolean;
+  cliDetail: string;
+  cliInstalled: boolean;
+  onShowDetail: (message: string) => void;
+}) {
+  return (
+    <div className="tool-status-tags" aria-label="安装状态">
+      <ToolInstallLine
+        label="APP"
+        detail={appDetail}
+        installed={appInstalled}
+        supported={appSupported}
+        onShowDetail={onShowDetail}
+      />
+      <ToolInstallLine label="CLI" detail={cliDetail} installed={cliInstalled} onShowDetail={onShowDetail} />
+    </div>
+  );
+}
+
+function ToolInstallLine({
+  detail,
+  installed,
+  label,
+  onShowDetail,
+  supported = true
+}: {
+  detail?: string;
+  installed: boolean;
+  label: string;
+  onShowDetail?: (message: string) => void;
+  supported?: boolean;
+}) {
+  const text = !supported ? "暂不适用" : installed ? "已安装" : "未检测到";
+  const stateClass = !supported ? "unsupported" : installed ? "installed" : "missing";
+
+  return (
+    <button
+      className={`tool-install-line ${stateClass}`}
+      type="button"
+      title={detail || `${label} ${text}`}
+      onClick={() => onShowDetail?.(detail || `${label} ${text}`)}
+    >
+      {label} {text}
+    </button>
+  );
+}
+
+function getToolAppDetail(tool: ToolStatus, profile: ToolInstallProfile) {
+  if (tool.appSupported === false) {
+    return `APP 暂不适用；当前平台暂无 ${profile.appLabel}。`;
+  }
+  if (tool.appInstalled) {
+    return `APP 已安装；安装路径：${tool.appPath || "未返回路径"}`;
+  }
+  return `APP 未检测到；可前往下载 ${profile.appLabel}。`;
+}
+
+function getToolCliDetail(tool: ToolStatus) {
+  const cliInstalled = tool.cliInstalled === true || (!!tool.version && tool.cliInstalled !== false);
+  if (!cliInstalled) {
+    return "CLI 未检测到；可查看安装方法后重新检测。";
+  }
+
+  return `CLI 已安装；版本号：${tool.version || "未返回版本号"}；安装路径：${tool.cliPath || "未返回路径"}`;
+}
+
+function getToolKey(tool: ToolStatus): ToolKey {
+  return tool.name.toLowerCase().includes("claude") ? "claude" : "codex";
+}
+
+function getToolInstallProfile(tool: ToolStatus): ToolInstallProfile {
+  return TOOL_INSTALL_PROFILES[getToolKey(tool)];
+}
+
+function detectInstallPlatform(): InstallPlatform {
+  const platform = navigator.platform.toLowerCase();
+  const userAgent = navigator.userAgent.toLowerCase();
+  if (platform.includes("win") || userAgent.includes("windows")) return "windows";
+  if (platform.includes("mac")) return "macos";
+  if (platform.includes("linux") || userAgent.includes("linux")) return "linux";
+  return "unknown";
 }
 
 function ModelSelect({
@@ -2590,6 +2948,19 @@ function CurrentConfigFullscreenModal({
   );
 }
 
+function scrollWindowToTop() {
+  window.requestAnimationFrame(() => {
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  });
+}
+
+function scrollElementToTop(element: HTMLElement | null) {
+  if (!element) return;
+  window.requestAnimationFrame(() => {
+    element.scrollTo({ top: 0, behavior: "smooth" });
+  });
+}
+
 function useBodyScrollLock(locked: boolean) {
   useEffect(() => {
     if (!locked) return;
@@ -2657,6 +3028,88 @@ function findScrollableAncestor(target: EventTarget | null, boundary: HTMLElemen
     element = element.parentElement;
   }
   return null;
+}
+
+function CliInstallModal({
+  onClose,
+  onOpenDocs,
+  tool
+}: {
+  onClose: () => void;
+  onOpenDocs: () => void;
+  tool: ToolStatus;
+}) {
+  const modalPanelRef = useRef<HTMLElement | null>(null);
+  const [copiedCommand, setCopiedCommand] = useState<string | null>(null);
+  const profile = getToolInstallProfile(tool);
+  const platform = detectInstallPlatform();
+  const commands = profile.commands[platform].length ? profile.commands[platform] : profile.commands.unknown;
+  useScrollBoundaryGuard(modalPanelRef);
+
+  async function copyCommand(command: string) {
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopiedCommand(command);
+      window.setTimeout(() => setCopiedCommand(null), 1800);
+    } catch {
+      setCopiedCommand(null);
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <section
+        ref={modalPanelRef}
+        className="modal-panel cli-install-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`${tool.name} CLI 安装方法`}
+      >
+        <div className="modal-header">
+          <div>
+            <p className="eyebrow">CLI 安装</p>
+            <h2>{tool.name} CLI 未检测到</h2>
+            <p className="update-summary">选择当前系统的安装命令，复制后在终端中运行。</p>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} title="关闭">
+            <X />
+          </button>
+        </div>
+
+        <div className="cli-install-list">
+          {commands.map((item) => (
+            <div className="cli-install-command" key={`${item.label}-${item.command}`}>
+              <div className="cli-install-command-top">
+                <strong>{item.label}</strong>
+                {item.recommended ? <span className="recommended-tag">推荐</span> : null}
+              </div>
+              <code>{item.command}</code>
+              <button className="secondary compact-action" type="button" onClick={() => void copyCommand(item.command)}>
+                <Clipboard />
+                <span>{copiedCommand === item.command ? "已复制" : "复制命令"}</span>
+              </button>
+            </div>
+          ))}
+        </div>
+
+        <div className="notice soft cli-install-note">
+          <AlertTriangle />
+          <span>安装后请重新打开终端，回到首页点“重新检测”。如命令变化，请以官方文档为准。</span>
+        </div>
+
+        <div className="button-row result-actions">
+          <button className="secondary" type="button" onClick={onClose}>
+            <X />
+            <span>关闭</span>
+          </button>
+          <button className="primary" type="button" onClick={onOpenDocs}>
+            <ExternalLink />
+            <span>打开官方文档</span>
+          </button>
+        </div>
+      </section>
+    </div>
+  );
 }
 
 function UpdateModal({

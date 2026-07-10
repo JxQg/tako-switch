@@ -38,6 +38,13 @@ fn backups_and_latest_apply_result_use_app_data_folder() {
             installed: true,
             version: Some("codex 1.0.0".to_string()),
             error: None,
+            detail: Some("codex 1.0.0".to_string()),
+            cli_installed: Some(true),
+            app_installed: Some(false),
+            app_supported: Some(true),
+            detected_by: Some("cli".to_string()),
+            cli_path: Some("codex".to_string()),
+            app_path: None,
         }],
         warnings: vec!["warning".to_string()],
     };

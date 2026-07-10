@@ -44,6 +44,10 @@ export class TakoApi {
     return invoke<void>("open_external", { url });
   }
 
+  static openToolApp(tool: string) {
+    return invoke<void>("open_tool_app", { tool });
+  }
+
   static login(apiKey: string) {
     return invoke<TakoLoginResult>("tako_login", { apiKey });
   }

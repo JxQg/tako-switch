@@ -1,4 +1,13 @@
+#[cfg(windows)]
+use super::app_detection::{
+    windows_claude_app_marker_candidates_from_base_dirs,
+    windows_claude_cli_command_candidates_from_base_dirs,
+    windows_codex_app_command_candidates_from_base_dirs,
+    windows_codex_app_marker_candidates_from_base_dirs,
+};
 use super::*;
+#[cfg(windows)]
+use std::path::PathBuf;
 
 #[cfg(windows)]
 #[test]
@@ -29,6 +38,20 @@ fn windows_codex_candidates_include_desktop_app_cli() {
     assert!(candidates.contains(&PathBuf::from(
         "C:\\Users\\demo\\AppData\\Local\\OpenAI\\Codex\\bin\\codex.exe"
     )));
+}
+
+#[test]
+fn missing_absolute_command_reports_clean_diagnostic() {
+    let missing = crate::tests::unique_temp_dir("missing-command").join("missing-tool");
+
+    let status = detect_tool("Missing Tool", vec![missing.to_string_lossy().to_string()]);
+
+    assert!(!status.installed);
+    assert_eq!(
+        status.detail,
+        Some("未检测到 Missing Tool 命令".to_string())
+    );
+    assert!(status.error.unwrap().contains("路径不存在"));
 }
 
 #[cfg(windows)]
@@ -92,10 +115,19 @@ fn claude_app_marker_status_reports_installed_without_command() {
 
     assert!(status.installed);
     assert_eq!(status.name, "Claude Code");
+    assert_eq!(status.version, None);
     assert_eq!(
-        status.version,
-        Some("Claude Desktop 已安装（未检测到 claude 命令）".to_string())
+        status.detail,
+        Some("Claude Code 桌面端已安装，CLI 未检测到".to_string())
     );
+    assert_eq!(status.cli_installed, Some(false));
+    assert_eq!(status.app_installed, Some(true));
+    assert_eq!(status.detected_by, Some("app".to_string()));
+    assert_eq!(
+        status.app_path,
+        Some(test_dir.to_string_lossy().to_string())
+    );
+    assert_eq!(status.cli_path, None);
     assert!(status.error.is_none());
 }
 
@@ -113,8 +145,15 @@ fn windows_codex_markers_include_app_directory_and_start_menu_shortcut() {
     assert!(markers.contains(&PathBuf::from(
         "C:\\Users\\demo\\AppData\\Local\\OpenAI\\Codex"
     )));
+    assert!(markers.contains(&PathBuf::from("C:\\Users\\demo\\AppData\\Local\\ChatGPT")));
+    assert!(markers.contains(&PathBuf::from(
+        "C:\\Users\\demo\\AppData\\Local\\Programs\\ChatGPT\\ChatGPT.exe"
+    )));
     assert!(markers.contains(&PathBuf::from(
         "C:\\Users\\demo\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Codex.lnk"
+    )));
+    assert!(markers.contains(&PathBuf::from(
+        "C:\\Users\\demo\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\ChatGPT.lnk"
     )));
 }
 
@@ -130,10 +169,19 @@ fn codex_app_marker_status_reports_installed_without_command() {
 
     assert!(status.installed);
     assert_eq!(status.name, "Codex");
+    assert_eq!(status.version, None);
     assert_eq!(
-        status.version,
-        Some("Codex App 已安装（未检测到 codex 命令）".to_string())
+        status.detail,
+        Some("Codex 桌面端已安装，CLI 未检测到".to_string())
     );
+    assert_eq!(status.cli_installed, Some(false));
+    assert_eq!(status.app_installed, Some(true));
+    assert_eq!(status.detected_by, Some("app".to_string()));
+    assert_eq!(
+        status.app_path,
+        Some(test_dir.to_string_lossy().to_string())
+    );
+    assert_eq!(status.cli_path, None);
     assert!(status.error.is_none());
 }
 
@@ -161,5 +209,13 @@ fn detect_tool_tries_later_windows_candidates() {
 
     assert!(status.installed);
     assert_eq!(status.version, Some("fake-tool 1.2.3".to_string()));
+    assert_eq!(status.detail, Some("fake-tool 1.2.3".to_string()));
+    assert_eq!(status.cli_installed, Some(true));
+    assert_eq!(status.detected_by, Some("cli".to_string()));
+    assert_eq!(
+        status.cli_path,
+        Some(command_path.to_string_lossy().to_string())
+    );
+    assert_eq!(status.app_path, None);
     assert!(status.error.is_none());
 }

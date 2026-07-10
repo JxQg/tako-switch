@@ -151,7 +151,11 @@ Tako Switch 会写入：
 
 ### 已安装 Codex / Claude Code，但首页显示未检测到
 
-Tako Switch 会优先检测命令行工具；Windows / macOS 上如果只安装了 Codex App，也会尝试识别桌面应用。Claude Code 会检测 `claude` 命令、官方安装器写入的 `~/.local/bin/claude`、Windows 上的 WinGet 安装位置，以及 Claude Desktop 应用。
+Tako Switch 会把“命令行工具”和“桌面应用”作为两个信号检测。首页只显示简短状态，例如“桌面端已安装，CLI 未检测到”或“未检测到命令”，不会显示底层命令探测错误。
+
+Codex 会检测 `codex` 命令、常见命令安装目录，以及 Windows / macOS 上的 Codex 或 ChatGPT 桌面应用。Linux 上 Codex 以 CLI 检测为主。
+
+Claude Code 会检测 `claude` 命令、官方安装器写入的 `~/.local/bin/claude`、Windows 上的 WinGet 安装位置，以及 Claude Desktop / Claude Code 桌面应用标记。命令命中后还会校验版本输出，避免把普通 Claude 应用误判为 Claude Code CLI。
 
 请先新开一个终端确认命令是否能运行：
 
@@ -160,7 +164,7 @@ codex --version
 claude --version
 ```
 
-如果终端也无法识别 `codex`，但已经安装 Codex App，请回到 Tako Switch 点击刷新重新检测。应用会尝试通过 Codex App 的安装目录识别它；如果需要在终端直接运行 Codex，再检查安装路径是否加入了 `PATH`。
+如果终端也无法识别 `codex`，但已经安装 Codex 或 ChatGPT 桌面应用，请回到 Tako Switch 点击刷新重新检测。应用会尝试通过桌面应用的安装目录识别它；如果需要在终端直接运行 Codex，再检查安装路径是否加入了 `PATH`。
 
 如果 `claude` 无法识别，但确认已通过 Claude Code 官方安装器、WinGet 或 Claude Desktop 安装，请回到 Tako Switch 点击刷新重新检测。如果 Claude Desktop 版本较旧且没有 Code 功能，请先更新到支持 Claude Code 的版本。
 

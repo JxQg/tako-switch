@@ -61,6 +61,7 @@ pub fn run() {
             commands::apply_configs,
             commands::restore_backup,
             commands::open_external,
+            commands::open_tool_app,
             providers::tako::tako_login,
             providers::tako::tako_apply_key,
             providers::tako::tako_current_identity,

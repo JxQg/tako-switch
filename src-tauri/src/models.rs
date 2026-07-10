@@ -7,6 +7,20 @@ pub struct ToolStatus {
     pub installed: bool,
     pub version: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_installed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_installed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_supported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
