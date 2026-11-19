@@ -1,7 +1,7 @@
 use crate::adapters::{get_adapter, AppId, AppMode};
-use crate::config::{
-    effective_agy_api_key, read_main_api_key, read_switch_state, write_atomic, AppPaths,
-};
+#[cfg(not(target_os = "windows"))]
+use crate::config::write_atomic;
+use crate::config::{effective_agy_api_key, read_main_api_key, read_switch_state, AppPaths};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -336,8 +336,456 @@ fn title_case_token(tok: &str) -> String {
     out
 }
 
-fn codex_model_priority(id: &str) -> i64 {
+fn format_general_token(tok: &str) -> String {
+    let lower = tok.to_ascii_lowercase();
+    if lower.is_empty() {
+        return String::new();
+    }
+    if lower.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return lower;
+    }
+    if let Some(rest) = lower.strip_prefix('v') {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return format!("V{rest}");
+        }
+    }
+    if let Some(rest) = lower.strip_prefix('m') {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return format!("M{rest}");
+        }
+    }
+    if let Some(rest) = lower.strip_prefix('k') {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return format!("K{rest}");
+        }
+    }
+    if let Some(num) = lower.strip_suffix('b') {
+        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return format!("{num}B");
+        }
+    }
+    if lower == "oss" {
+        return "OSS".to_string();
+    }
+    title_case_token(&lower)
+}
+
+fn extract_endpoint_types(item: &Value) -> Vec<String> {
+    item.get("supported_endpoint_types")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(|s| s.trim().to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_non_chat_or_noise_model(id: &str, eps: &[String]) -> bool {
+    let lower = id.trim().to_ascii_lowercase();
+    if lower.is_empty()
+        || lower == "hy4flash-free"
+        || lower.starts_with("jev-")
+        || lower.contains("image")
+        || lower.contains("video")
+        || lower.contains("audio")
+        || lower.contains("tts")
+        || lower.contains("whisper")
+        || lower.contains("embedding")
+        || lower.contains("speech")
+        || lower.contains("asr")
+        || lower.contains("rerank")
+        || lower.contains("moderation")
+        || lower.contains("systemone")
+    {
+        return true;
+    }
+    if !eps.is_empty() {
+        let has_chat_ep = eps.iter().any(|ep| {
+            matches!(
+                ep.as_str(),
+                "openai" | "openai-response" | "anthropic" | "gemini"
+            )
+        });
+        if !has_chat_ep {
+            return true;
+        }
+    }
+    false
+}
+
+fn strip_dated_snapshot_suffix(id: &str) -> Option<&str> {
+    let idx = id.rfind('-')?;
+    let suffix = &id[idx + 1..];
+    if !suffix.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if suffix.len() == 8 {
+        return Some(&id[..idx]);
+    }
+    if suffix.len() == 4 {
+        let mm: u32 = suffix[..2].parse().ok()?;
+        let dd: u32 = suffix[2..].parse().ok()?;
+        if (1..=12).contains(&mm) && (1..=31).contains(&dd) {
+            return Some(&id[..idx]);
+        }
+    }
+    None
+}
+
+fn is_duplicate_alias(id: &str, all_ids: &HashSet<String>) -> bool {
+    if id.eq_ignore_ascii_case("k3") && all_ids.contains("kimi-k3") {
+        return true;
+    }
+    if let Some(base) = strip_dated_snapshot_suffix(id) {
+        if all_ids.contains(base) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn pretty_model_display_name(id: &str) -> String {
+    let lower = id.trim().to_ascii_lowercase();
+    if lower.starts_with("claude-") {
+        let (tier, major, minor) = parse_claude_tier_and_version(&lower);
+        return claude_display_name(id, tier, major, minor);
+    }
+    if let Some(rest) = lower.strip_prefix("gpt-") {
+        let parts: Vec<String> = rest
+            .split('-')
+            .map(|seg| match seg {
+                "4o" => "4o".to_string(),
+                _ => format_general_token(seg),
+            })
+            .collect();
+        if parts.is_empty() {
+            return "GPT".to_string();
+        }
+        let first_is_ver = parts[0].chars().any(|c| c.is_ascii_digit());
+        if parts.len() == 1 || !first_is_ver {
+            return format!("GPT-{}", parts.join(" "));
+        }
+        return format!("GPT-{} {}", parts[0], parts[1..].join(" "));
+    }
+    if let Some(rest) = lower.strip_prefix("deepseek-") {
+        let parts: Vec<String> = rest.split('-').map(format_general_token).collect();
+        return format!("DeepSeek {}", parts.join(" "));
+    }
+    match lower.as_str() {
+        "gemini-3.1-pro-preview" | "gemini-3.1-pro" => return "Gemini 3.1 Pro".to_string(),
+        "gemini-3.8-flash" => return "Gemini 3.8 Flash".to_string(),
+        "gemini-3.5-flash-lite" => return "Gemini 3.5 Flash Lite".to_string(),
+        "gemma-4-31b-it" => return "Gemma 4 31B".to_string(),
+        "swe-2" => return "SWE-2".to_string(),
+        "swe-2-flash" => return "SWE-2 Flash".to_string(),
+        "hy3" => return "Hunyuan Hy3".to_string(),
+        "composer-2.5" => return "Composer 2.5".to_string(),
+        "tako-auto" => return "Tako Auto".to_string(),
+        _ => {}
+    }
+    if let Some(rest) = lower.strip_prefix("gemini-") {
+        let parts: Vec<String> = rest.split('-').map(format_general_token).collect();
+        return format!("Gemini {}", parts.join(" "));
+    }
+    if let Some(rest) = lower.strip_prefix("gemma-") {
+        let parts: Vec<String> = rest.split('-').map(format_general_token).collect();
+        return format!("Gemma {}", parts.join(" "));
+    }
+    if let Some(rest) = lower.strip_prefix("glm-") {
+        let parts: Vec<String> = rest.split('-').map(format_general_token).collect();
+        if parts.len() <= 1 {
+            return format!("GLM-{}", parts.join(" "));
+        }
+        return format!("GLM-{} {}", parts[0], parts[1..].join(" "));
+    }
+    if let Some(rest) = lower.strip_prefix("kimi-") {
+        let parts: Vec<String> = rest.split('-').map(format_general_token).collect();
+        return format!("Kimi {}", parts.join(" "));
+    }
+    if let Some(rest) = lower.strip_prefix("grok-") {
+        let parts: Vec<String> = rest.split('-').map(format_general_token).collect();
+        return format!("Grok {}", parts.join(" "));
+    }
+    if let Some(rest) = lower.strip_prefix("minimax-") {
+        let parts: Vec<String> = rest.split('-').map(format_general_token).collect();
+        return format!("MiniMax {}", parts.join(" "));
+    }
+    if let Some(rest) = lower.strip_prefix("mimo-") {
+        let parts: Vec<String> = rest.split('-').map(format_general_token).collect();
+        return format!("MiMo {}", parts.join(" "));
+    }
+    id.split('-')
+        .map(format_general_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn model_context_window(id: &str) -> u64 {
+    let lower = id.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "claude-haiku-4-5" => 200_000,
+        "hy3" => 256_000,
+        "swe-2" | "swe-2-flash" => 262_000,
+        "gpt-5.5" => 1_100_000,
+        "gpt-6-astra" | "gpt-6.1-terra" => 1_050_000,
+        "gpt-4o-mini" => 128_000,
+        _ if lower.starts_with("gpt-5.6") => 272_000,
+        _ if lower.starts_with("grok-4.") => 500_000,
+        _ if lower.starts_with("gemma-") => 128_000,
+        _ => 1_000_000,
+    }
+}
+
+fn is_boilerplate_clause(clause: &str) -> bool {
+    let trimmed = clause.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    const BOILERPLATE_SUBSTRINGS: &[&str] = &[
+        "仅支持 Claude Code",
+        "其他客户端上游会报错",
+        "反代渠道",
+        "订阅池渠道",
+        "不要和",
+        "挂在官方订阅渠道",
+        "官方与自部署",
+        "官方价",
+        "缓存输入",
+        "缓存读",
+        "价格更便宜",
+        "上游短名",
+        "优先用",
+        "同一模型",
+    ];
+    if BOILERPLATE_SUBSTRINGS
+        .iter()
+        .any(|pat| trimmed.contains(pat))
+    {
+        return true;
+    }
+    // Pure context-length suffix like "上下文 1M" or "上下文 1.05M" or "1M 上下文"
+    if (trimmed.starts_with("上下文") || trimmed.ends_with("上下文"))
+        && trimmed.chars().count() <= 14
+    {
+        return true;
+    }
+    false
+}
+
+fn looks_like_model_name_prefix(clause: &str, id: &str) -> bool {
+    let trimmed = clause.trim();
+    if trimmed.is_empty() || trimmed.len() > 48 {
+        return false;
+    }
+    let has_cjk = trimmed
+        .chars()
+        .any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c));
+    if !has_cjk {
+        return true;
+    }
+    let id_head = id
+        .split(['-', '.', '_'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    !id_head.is_empty()
+        && trimmed.to_ascii_lowercase().starts_with(&id_head)
+        && trimmed.chars().count() <= 24
+}
+
+pub fn concise_model_description(id: &str, raw_desc: Option<&str>) -> String {
+    let lower = id.trim().to_ascii_lowercase();
+    let curated = match lower.as_str() {
+        "claude-opus-5-5" => Some("1M · 最新旗舰推理与编码"),
+        "claude-opus-5" => Some("1M · 旗舰推理与编码"),
+        "claude-opus-4-8" => Some("1M · 攻坚推理与长程智能体"),
+        "claude-opus-4-7" => Some("1M · 软件工程与高阶推理"),
+        "claude-opus-4-6" => Some("1M · 高阶编码与规划"),
+        "claude-sonnet-5-5" => Some("1M · 最新均衡主力档"),
+        "claude-sonnet-5" => Some("1M · 日常编码与规划主力"),
+        "claude-sonnet-4-6" => Some("1M · 生产向编码智能体"),
+        "claude-fable-5-2" | "claude-fable-5-1" | "claude-fable-5" => {
+            Some("1M · 创作、写作与分析")
+        }
+        "claude-haiku-5-5" => Some("1M · 轻量高速响应"),
+        "claude-haiku-4-5" => Some("200K · 极速轻量助手"),
+        "deepseek-v4-pro" => Some("1M · 开源 MoE 旗舰编码"),
+        "deepseek-v4.1-flash" => Some("1M · 视觉与工具调用高速档"),
+        "deepseek-v4-flash" => Some("1M · 高性价比推理编码"),
+        "gpt-6.2-sol" => Some("1M · 6.2 编程与智能体主力"),
+        "gpt-6.2-astra" => Some("1M · 6.2 端到端旗舰"),
+        "gpt-6.1-sol" => Some("1M · 6.1 编程与智能体主力"),
+        "gpt-6.1-terra" => Some("1M · 视觉与电脑操控档"),
+        "gpt-6-astra" => Some("1M · 端到端复杂工作旗舰"),
+        "gpt-6-sol" => Some("1M · 6 代编程主力档"),
+        "gpt-6-luna" => Some("1M · 6 代高性价比日常档"),
+        "gpt-5.6-sol" => Some("272K · 5.6 专业编码主力"),
+        "gpt-5.6-terra" => Some("272K · 5.6 均衡日常档"),
+        "gpt-5.6-luna" => Some("272K · 5.6 高性价比档"),
+        "gpt-5.6" => Some("272K · 5.6 综合编码档"),
+        "gpt-5.5" => Some("1.1M · 编码与研究通用档"),
+        "gpt-4o-mini" => Some("轻量通用快速档"),
+        "gemini-3.8-flash" => Some("1M · 高效多模态与编码"),
+        "gemini-3.1-pro-preview" | "gemini-3.1-pro" => Some("1M · 高阶推理与多模态"),
+        "gemini-3.5-flash-lite" => Some("1M · 轻量高吞吐日常档"),
+        "gemma-4-31b-it" => Some("开源指令模型（免费档）"),
+        "glm-5.3" => Some("1M · 旗舰长程编码与交付"),
+        "glm-5.3-flash" => Some("1M · 多模态高效编码"),
+        "kimi-k3.1-pro" => Some("1M · 长上下文深度推理"),
+        "kimi-k3.1-pro-highspeed" => Some("1M · 高速深度推理"),
+        "kimi-k3" => Some("1M · 多模态长程智能体"),
+        "grok-4.7" => Some("500K · 最新前沿编码与看图"),
+        "grok-4.6" => Some("500K · 长程智能体与看图"),
+        "grok-4.5" => Some("500K · 低幻觉对话与编码"),
+        "minimax-m3" => Some("1M · 多模态编码与推理"),
+        "mimo-v2.6-pro" => Some("1M · 旗舰长程智能体"),
+        "mimo-v2.6-flash" => Some("1M · 高性价比 MoE 档"),
+        "swe-2" => Some("262K · 专精编码智能体"),
+        "swe-2-flash" => Some("262K · 快速编码智能体"),
+        "composer-2.5" => Some("高速代码编辑与生成"),
+        "hy3" => Some("256K · 混元 MoE 通用档"),
+        "tako-auto" => Some("免费模型自动调度池"),
+        "codex-auto-review" => Some("代码评审自动路由"),
+        _ => None,
+    };
+    if let Some(text) = curated {
+        return text.to_string();
+    }
+
+    if let Some(raw) = raw_desc.map(str::trim).filter(|s| !s.is_empty()) {
+        for (idx, sent) in raw.split('。').enumerate() {
+            let trimmed = sent.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if idx == 0 && looks_like_model_name_prefix(trimmed, &lower) {
+                continue;
+            }
+            if is_boilerplate_clause(trimmed) {
+                continue;
+            }
+            for sub in trimmed.split(['，', ',']) {
+                let s = sub.trim();
+                if idx == 0 && looks_like_model_name_prefix(s, &lower) {
+                    continue;
+                }
+                if is_boilerplate_clause(s) {
+                    continue;
+                }
+                return s.chars().take(26).collect();
+            }
+        }
+    }
+
+    "Tako 托管模型".to_string()
+}
+
+fn third_party_family_order(id: &str) -> (i64, String) {
+    let lower = id.trim().to_ascii_lowercase();
+    if lower.starts_with("deepseek-") {
+        let sub = match lower.as_str() {
+            "deepseek-v4-pro" => 0,
+            "deepseek-v4.1-flash" => 1,
+            "deepseek-v4-flash" => 2,
+            _ => 9,
+        };
+        return (10, format!("{sub:02}_{lower}"));
+    }
+    if lower.starts_with("gpt-") {
+        let prio = gpt_model_sub_priority(&lower);
+        return (20, format!("{prio:03}_{lower}"));
+    }
+    if lower.starts_with("gemini-") || lower.starts_with("gemma-") {
+        let sub = match lower.as_str() {
+            "gemini-3.8-flash" => 0,
+            "gemini-3.1-pro-preview" | "gemini-3.1-pro" => 1,
+            "gemini-3.5-flash-lite" => 2,
+            "gemma-4-31b-it" => 3,
+            _ => 9,
+        };
+        return (30, format!("{sub:02}_{lower}"));
+    }
+    if lower.starts_with("glm-") {
+        let sub = match lower.as_str() {
+            "glm-5.3" => 0,
+            "glm-5.3-flash" => 1,
+            _ => 9,
+        };
+        return (40, format!("{sub:02}_{lower}"));
+    }
+    if lower.starts_with("kimi-") {
+        let sub = match lower.as_str() {
+            "kimi-k3.1-pro" => 0,
+            "kimi-k3.1-pro-highspeed" => 1,
+            "kimi-k3" => 2,
+            _ => 9,
+        };
+        return (50, format!("{sub:02}_{lower}"));
+    }
+    if lower.starts_with("grok-") {
+        let sub = match lower.as_str() {
+            "grok-4.7" => 0,
+            "grok-4.6" => 1,
+            "grok-4.5" => 2,
+            _ => 9,
+        };
+        return (60, format!("{sub:02}_{lower}"));
+    }
+    if lower.starts_with("minimax-") {
+        return (70, lower);
+    }
+    if lower.starts_with("mimo-") {
+        let sub = match lower.as_str() {
+            "mimo-v2.6-pro" => 0,
+            "mimo-v2.6-flash" => 1,
+            _ => 9,
+        };
+        return (80, format!("{sub:02}_{lower}"));
+    }
+    if lower.starts_with("swe-") {
+        let sub = match lower.as_str() {
+            "swe-2" => 0,
+            "swe-2-flash" => 1,
+            _ => 9,
+        };
+        return (90, format!("{sub:02}_{lower}"));
+    }
+    if lower.starts_with("composer-") {
+        return (95, lower);
+    }
+    if lower == "hy3" {
+        return (96, lower);
+    }
+    if lower == "tako-auto" {
+        return (98, lower);
+    }
+    (99, lower)
+}
+
+fn gpt_model_sub_priority(id: &str) -> i64 {
     match id {
+        "gpt-6.2-sol" => 1,
+        "gpt-6.2-astra" => 2,
+        "gpt-6.1-sol" => 3,
+        "gpt-6-astra" => 4,
+        "gpt-6.1-terra" => 5,
+        "gpt-6-sol" => 6,
+        "gpt-6-luna" => 9,
+        "gpt-5.6-sol" => 10,
+        "gpt-5.6-terra" => 11,
+        "gpt-5.6-luna" => 12,
+        "gpt-5.6" => 13,
+        "gpt-5.5" => 14,
+        "gpt-4o-mini" => 17,
+        _ => 18,
+    }
+}
+
+fn codex_model_sort_key(id: &str) -> (i64, u8, Reverse<u32>, Reverse<u32>, String) {
+    let lower = id.trim().to_ascii_lowercase();
+    let prio = match lower.as_str() {
         "gpt-6.2-sol" => 1,
         "gpt-6.2-astra" => 2,
         "gpt-6.1-sol" => 3,
@@ -352,38 +800,34 @@ fn codex_model_priority(id: &str) -> i64 {
         "gpt-5.6-luna" => 12,
         "gpt-5.6" => 13,
         "gpt-5.5" => 14,
+        "gpt-4o-mini" => 17,
         "codex-auto-review" => 99,
-        _ if id.starts_with("gpt-") => 18,
-        _ if id == "tako-auto" => 19,
-        _ => 25,
-    }
-}
-
-fn codex_display_name(id: &str) -> String {
-    if let Some(rest) = id.strip_prefix("gpt-") {
-        let parts: Vec<String> = rest
-            .split('-')
-            .map(|seg| match seg.to_ascii_lowercase().as_str() {
-                "oss" => "OSS".to_string(),
-                "4o" => "4o".to_string(),
-                "mini" => "Mini".to_string(),
-                _ if seg.chars().all(|c| c.is_ascii_digit() || c == '.') => seg.to_string(),
-                _ => title_case_token(seg),
-            })
-            .collect();
-        return format!("GPT-{}", parts.join("-"));
-    }
-    if id == "swe-2" {
-        return "SWE-2".to_string();
-    }
-    if let Some(rest) = id.strip_prefix("swe-2-") {
-        let parts: Vec<String> = rest.split('-').map(title_case_token).collect();
-        return format!("SWE-2 {}", parts.join(" "));
-    }
-    id.split('-')
-        .map(title_case_token)
-        .collect::<Vec<_>>()
-        .join(" ")
+        _ if lower.starts_with("gpt-") => 18,
+        _ if lower.starts_with("claude-") => {
+            let (tier, major, minor) = parse_claude_tier_and_version(&lower);
+            return (
+                20,
+                claude_tier_rank(tier),
+                Reverse(major),
+                Reverse(minor),
+                lower,
+            );
+        }
+        _ if lower.starts_with("deepseek-") => 25,
+        _ if lower.starts_with("gemini-") || lower.starts_with("gemma-") => 28,
+        _ if lower.starts_with("glm-") => 30,
+        _ if lower.starts_with("kimi-") => 32,
+        _ if lower.starts_with("grok-") => 34,
+        _ if lower.starts_with("minimax-") => 36,
+        _ if lower.starts_with("mimo-") => 38,
+        _ if lower.starts_with("composer-") => 40,
+        _ if lower == "hy3" => 42,
+        _ if lower == "tako-auto" => 45,
+        _ => 50,
+    };
+    let (fam, sub) = third_party_family_order(&lower);
+    let _ = fam;
+    (prio, 0, Reverse(0), Reverse(0), sub)
 }
 
 fn effort_description(effort: &str) -> &'static str {
@@ -445,51 +889,44 @@ pub fn build_codex_models_catalog(
     pricing: &PricingCache,
     cached_model_messages: Option<&Value>,
 ) -> Value {
-    let mut ids: Vec<String> = upstream_models
+    let raw_items = upstream_models
         .get("data")
         .and_then(Value::as_array)
-        .map(|arr| {
-            let mut seen = HashSet::new();
-            let mut out = Vec::new();
-            for item in arr {
-                let Some(id) = item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                else {
-                    continue;
-                };
-                let supports_responses = item
-                    .get("supported_endpoint_types")
-                    .and_then(Value::as_array)
-                    .map(|eps| {
-                        eps.iter()
-                            .any(|ep| ep.as_str() == Some("openai-response"))
-                    })
-                    .unwrap_or(false);
-                if !supports_responses {
-                    continue;
-                }
-                let lower = id.to_ascii_lowercase();
-                if lower.contains("image")
-                    || lower.contains("video")
-                    || lower.contains("audio")
-                    || lower.contains("tts")
-                    || lower.contains("whisper")
-                    || lower.contains("embedding")
-                {
-                    continue;
-                }
-                if seen.insert(id.to_string()) {
-                    out.push(id.to_string());
-                }
-            }
-            out
-        })
+        .cloned()
         .unwrap_or_default();
 
-    ids.sort_by(|a, b| codex_model_priority(a).cmp(&codex_model_priority(b)).then_with(|| a.cmp(b)));
+    let mut all_ids = HashSet::new();
+    let mut candidate_ids = Vec::new();
+    for item in &raw_items {
+        let Some(id) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let eps = extract_endpoint_types(item);
+        let supports_chat_or_responses = eps.iter().any(|ep| {
+            matches!(
+                ep.as_str(),
+                "openai-response" | "openai" | "anthropic" | "gemini"
+            )
+        });
+        if !supports_chat_or_responses || is_non_chat_or_noise_model(id, &eps) {
+            continue;
+        }
+        if all_ids.insert(id.to_string()) {
+            candidate_ids.push(id.to_string());
+        }
+    }
+
+    let mut ids: Vec<String> = candidate_ids
+        .into_iter()
+        .filter(|id| !is_duplicate_alias(id, &all_ids))
+        .collect();
+
+    ids.sort_by_key(|a| codex_model_sort_key(a));
 
     let valid_mm = cached_model_messages.filter(|mm| {
         mm.as_object()
@@ -500,7 +937,7 @@ pub fn build_codex_models_catalog(
     let models: Vec<Value> = ids
         .into_iter()
         .map(|id| {
-            let priority = codex_model_priority(&id);
+            let priority = codex_model_sort_key(&id).0;
             let visibility = if id == "codex-auto-review" {
                 "hide"
             } else {
@@ -516,22 +953,19 @@ pub fn build_codex_models_catalog(
                     })
                 })
                 .collect();
-            let description = pricing
-                .descriptions
-                .get(&id)
-                .map(String::as_str)
-                .unwrap_or("Tako AI model");
+            let description = concise_model_description(
+                &id,
+                pricing.descriptions.get(&id).map(String::as_str),
+            );
+            let ctx_window = model_context_window(&id);
 
             let mut obj = Map::new();
             obj.insert("slug".to_string(), Value::String(id.clone()));
             obj.insert(
                 "display_name".to_string(),
-                Value::String(codex_display_name(&id)),
+                Value::String(pretty_model_display_name(&id)),
             );
-            obj.insert(
-                "description".to_string(),
-                Value::String(description.to_string()),
-            );
+            obj.insert("description".to_string(), Value::String(description));
             obj.insert(
                 "default_reasoning_level".to_string(),
                 Value::String(default_lvl.to_string()),
@@ -571,7 +1005,7 @@ pub fn build_codex_models_catalog(
                 "web_search_tool_type".to_string(),
                 Value::String("text_and_image".to_string()),
             );
-            obj.insert("context_window".to_string(), json!(400_000));
+            obj.insert("context_window".to_string(), json!(ctx_window));
             obj.insert("effective_context_window_percent".to_string(), json!(95));
             obj.insert("support_verbosity".to_string(), Value::Bool(true));
             obj.insert("default_verbosity".to_string(), Value::String("low".to_string()));
@@ -589,16 +1023,6 @@ pub fn build_codex_models_catalog(
         .collect();
 
     json!({ "models": models })
-}
-
-fn strip_dated_snapshot_suffix(id: &str) -> Option<&str> {
-    let idx = id.rfind('-')?;
-    let suffix = &id[idx + 1..];
-    if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
-        Some(&id[..idx])
-    } else {
-        None
-    }
 }
 
 fn parse_claude_tier_and_version(id: &str) -> (Option<&'static str>, u32, u32) {
@@ -649,7 +1073,7 @@ fn claude_display_name(id: &str, tier: Option<&str>, major: u32, minor: u32) -> 
         return format!("Claude {tier_title}");
     }
     id.split('-')
-        .map(title_case_token)
+        .map(format_general_token)
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -663,7 +1087,7 @@ pub fn build_claude_models_catalog(upstream_models: &Value, pricing: &PricingCac
         .unwrap_or_default();
 
     let mut all_ids = HashSet::new();
-    let mut claude_ids = Vec::new();
+    let mut candidate_entries: Vec<(String, bool)> = Vec::new();
     for item in &raw_items {
         let Some(id) = item
             .get("id")
@@ -673,77 +1097,123 @@ pub fn build_claude_models_catalog(upstream_models: &Value, pricing: &PricingCac
         else {
             continue;
         };
+        if id == "codex-auto-review" {
+            continue;
+        }
         let owned_by = item
             .get("owned_by")
             .and_then(Value::as_str)
             .unwrap_or("");
-        if (id.starts_with("claude-") || owned_by.eq_ignore_ascii_case("claude"))
-            && all_ids.insert(id.to_string())
-        {
-            claude_ids.push(id.to_string());
+        let eps = extract_endpoint_types(item);
+        if is_non_chat_or_noise_model(id, &eps) {
+            continue;
+        }
+        let is_claude = id.starts_with("claude-") || owned_by.eq_ignore_ascii_case("claude");
+        let supports_anthropic = eps.iter().any(|ep| ep == "anthropic");
+        if (is_claude || supports_anthropic) && all_ids.insert(id.to_string()) {
+            candidate_entries.push((id.to_string(), is_claude));
         }
     }
 
-    let mut parsed: Vec<(String, Option<&'static str>, u32, u32)> = claude_ids
+    struct ClaudeCatalogItem {
+        id: String,
+        is_claude: bool,
+        tier: Option<&'static str>,
+        major: u32,
+        minor: u32,
+        third_party_rank: i64,
+        third_party_key: String,
+    }
+
+    let mut parsed: Vec<ClaudeCatalogItem> = candidate_entries
         .into_iter()
-        .filter(|id| {
-            if let Some(base) = strip_dated_snapshot_suffix(id) {
-                !all_ids.contains(base)
+        .filter(|(id, _)| !is_duplicate_alias(id, &all_ids))
+        .map(|(id, is_claude)| {
+            if is_claude {
+                let (tier, major, minor) = parse_claude_tier_and_version(&id);
+                ClaudeCatalogItem {
+                    id,
+                    is_claude: true,
+                    tier,
+                    major,
+                    minor,
+                    third_party_rank: 0,
+                    third_party_key: String::new(),
+                }
             } else {
-                true
+                let (rank, key) = third_party_family_order(&id);
+                ClaudeCatalogItem {
+                    id,
+                    is_claude: false,
+                    tier: None,
+                    major: 0,
+                    minor: 0,
+                    third_party_rank: rank,
+                    third_party_key: key,
+                }
             }
-        })
-        .map(|id| {
-            let (tier, major, minor) = parse_claude_tier_and_version(&id);
-            (id, tier, major, minor)
         })
         .collect();
 
     parsed.sort_by(|a, b| {
-        claude_tier_rank(a.1)
-            .cmp(&claude_tier_rank(b.1))
-            .then_with(|| Reverse(a.2).cmp(&Reverse(b.2)))
-            .then_with(|| Reverse(a.3).cmp(&Reverse(b.3)))
-            .then_with(|| a.0.cmp(&b.0))
+        if a.is_claude != b.is_claude {
+            return b.is_claude.cmp(&a.is_claude);
+        }
+        if a.is_claude {
+            claude_tier_rank(a.tier)
+                .cmp(&claude_tier_rank(b.tier))
+                .then_with(|| Reverse(a.major).cmp(&Reverse(b.major)))
+                .then_with(|| Reverse(a.minor).cmp(&Reverse(b.minor)))
+                .then_with(|| a.id.cmp(&b.id))
+        } else {
+            a.third_party_rank
+                .cmp(&b.third_party_rank)
+                .then_with(|| a.third_party_key.cmp(&b.third_party_key))
+        }
     });
 
     let mut seen_tiers: HashSet<&'static str> = HashSet::new();
     let data: Vec<Value> = parsed
         .into_iter()
-        .map(|(id, tier, major, minor)| {
-            let is_family_default = tier
-                .map(|t| seen_tiers.insert(t))
-                .unwrap_or(false);
-            let supports_1m = tier != Some("haiku")
-                && (major > 4 || (major == 4 && minor >= 6));
-            let max_input_tokens: u64 = if supports_1m { 1_000_000 } else { 200_000 };
-            let display_name = claude_display_name(&id, tier, major, minor);
+        .map(|item| {
+            let is_family_default = if item.is_claude {
+                item.tier
+                    .map(|t| seen_tiers.insert(t))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
+            let tier_for_gateway = if item.is_claude {
+                item.tier.unwrap_or("sonnet")
+            } else {
+                "sonnet"
+            };
+            let max_input_tokens = model_context_window(&item.id);
+            let display_name = pretty_model_display_name(&item.id);
+            let description = concise_model_description(
+                &item.id,
+                pricing.descriptions.get(&item.id).map(String::as_str),
+            );
 
             let mut obj = Map::new();
-            obj.insert("id".to_string(), Value::String(id.clone()));
+            obj.insert("id".to_string(), Value::String(item.id));
             obj.insert("type".to_string(), Value::String("model".to_string()));
             obj.insert("display_name".to_string(), Value::String(display_name));
             obj.insert(
                 "created_at".to_string(),
                 Value::String("2026-01-01T00:00:00Z".to_string()),
             );
-            if let Some(t) = tier {
-                obj.insert(
-                    "anthropic_family_tier".to_string(),
-                    Value::String(t.to_string()),
-                );
-            }
+            obj.insert(
+                "anthropic_family_tier".to_string(),
+                Value::String(tier_for_gateway.to_string()),
+            );
             if is_family_default {
                 obj.insert("is_family_default".to_string(), Value::Bool(true));
             }
-            obj.insert("supports_1m".to_string(), Value::Bool(supports_1m));
+            // Always set supports_1m = false so Claude Desktop does not duplicate every 1M model row.
+            obj.insert("supports_1m".to_string(), Value::Bool(false));
             obj.insert("max_input_tokens".to_string(), json!(max_input_tokens));
-            if let Some(desc) = pricing.descriptions.get(&id) {
-                let clipped: String = desc.chars().take(100).collect();
-                if !clipped.is_empty() {
-                    obj.insert("description".to_string(), Value::String(clipped));
-                }
-            }
+            obj.insert("description".to_string(), Value::String(description));
             Value::Object(obj)
         })
         .collect();
@@ -1804,12 +2274,20 @@ mod tests {
     fn build_codex_models_catalog_maps_openai_response_models_and_efforts() {
         let pricing = parse_pricing_metadata(&json!({
             "data": [
-                {"model_name": "swe-2", "reasoning_levels": ["medium", "high", "max"]}
+                {"model_name": "swe-2", "reasoning_levels": ["medium", "high", "max"]},
+                {"model_name": "deepseek-v4-pro", "description": "DeepSeek V4 Pro。开源 MoE 旗舰，长程编码与智能体。 上下文 1M。"}
             ]
         }));
         let upstream = json!({
             "data": [
                 {"id": "claude-opus-4-8", "supported_endpoint_types": ["anthropic", "openai"]},
+                {"id": "gemini-3.8-flash", "supported_endpoint_types": ["gemini", "openai", "anthropic"]},
+                {"id": "deepseek-v4-pro", "supported_endpoint_types": ["openai", "openai-response", "anthropic"]},
+                {"id": "deepseek-v4.1-flash", "supported_endpoint_types": ["openai", "openai-response"]},
+                {"id": "deepseek-v4.1-flash-1017", "supported_endpoint_types": ["openai", "openai-response"]},
+                {"id": "kimi-k3", "supported_endpoint_types": ["openai", "openai-response"]},
+                {"id": "k3", "supported_endpoint_types": ["openai", "openai-response"]},
+                {"id": "hy4flash-free", "supported_endpoint_types": ["openai", "openai-response"]},
                 {"id": "gpt-image-2", "supported_endpoint_types": ["openai-response"]},
                 {"id": "codex-auto-review", "supported_endpoint_types": ["openai-response"]},
                 {"id": "swe-2", "supported_endpoint_types": ["openai", "openai-response"]},
@@ -1821,17 +2299,34 @@ mod tests {
         let models = catalog["models"].as_array().unwrap();
         let slugs: Vec<&str> = models.iter().map(|m| m["slug"].as_str().unwrap()).collect();
 
-        assert_eq!(slugs, vec!["gpt-6.2-sol", "swe-2", "codex-auto-review"]);
-        assert!(!slugs.contains(&"claude-opus-4-8"));
+        assert_eq!(
+            slugs,
+            vec![
+                "gpt-6.2-sol",
+                "swe-2",
+                "claude-opus-4-8",
+                "deepseek-v4-pro",
+                "deepseek-v4.1-flash",
+                "gemini-3.8-flash",
+                "kimi-k3",
+                "codex-auto-review"
+            ]
+        );
+        assert!(!slugs.contains(&"deepseek-v4.1-flash-1017"));
+        assert!(!slugs.contains(&"k3"));
+        assert!(!slugs.contains(&"hy4flash-free"));
         assert!(!slugs.contains(&"gpt-image-2"));
 
         let sol = &models[0];
-        assert_eq!(sol["display_name"].as_str(), Some("GPT-6.2-Sol"));
+        assert_eq!(sol["display_name"].as_str(), Some("GPT-6.2 Sol"));
+        assert_eq!(sol["description"].as_str(), Some("1M · 6.2 编程与智能体主力"));
+        assert_eq!(sol["context_window"].as_u64(), Some(1_000_000));
         assert_eq!(sol["visibility"].as_str(), Some("list"));
         assert_eq!(sol["experimental_supported_tools"], json!([]));
         assert!(!sol["base_instructions"].as_str().unwrap().is_empty());
 
         let swe = &models[1];
+        assert_eq!(swe["context_window"].as_u64(), Some(262_000));
         let swe_efforts: Vec<&str> = swe["supported_reasoning_levels"]
             .as_array()
             .unwrap()
@@ -1840,27 +2335,42 @@ mod tests {
             .collect();
         assert_eq!(swe_efforts, vec!["medium", "high", "max"]);
 
-        let review = &models[2];
+        let ds = &models[3];
+        assert_eq!(ds["display_name"].as_str(), Some("DeepSeek V4 Pro"));
+
+        let review = models.last().unwrap();
         assert_eq!(review["visibility"].as_str(), Some("hide"));
     }
 
     #[test]
-    fn build_claude_models_catalog_enriches_tiers_defaults_and_1m() {
+    fn build_claude_models_catalog_deduplicates_and_includes_third_party() {
         let pricing = parse_pricing_metadata(&json!({
             "data": [
-                {"model_name": "claude-opus-5-5", "description": "Flagship Opus"}
+                {
+                    "model_name": "claude-opus-5",
+                    "description": "Claude Opus 5。仅支持 Claude Code 客户端使用，其他客户端上游会报错。反代渠道，价格更便宜。最强 Claude 档的反代入口。 上下文 1M。"
+                }
             ]
         }));
         let upstream = json!({
             "data": [
-                {"id": "gpt-6.2-sol", "owned_by": "openai"},
-                {"id": "claude-haiku-4-5-20251001", "owned_by": "claude"},
-                {"id": "claude-haiku-4-5", "owned_by": "claude"},
-                {"id": "claude-haiku-5-5", "owned_by": "claude"},
-                {"id": "claude-sonnet-5-5", "owned_by": "claude"},
-                {"id": "claude-opus-4-8", "owned_by": "claude"},
-                {"id": "claude-opus-5-5", "owned_by": "claude"},
-                {"id": "claude-fable-5-2", "owned_by": "claude"}
+                {"id": "gpt-6.2-sol", "owned_by": "openai", "supported_endpoint_types": ["openai", "anthropic"]},
+                {"id": "deepseek-v4-pro", "owned_by": "openai", "supported_endpoint_types": ["openai", "anthropic"]},
+                {"id": "deepseek-v4.1-flash", "owned_by": "openai", "supported_endpoint_types": ["openai", "anthropic"]},
+                {"id": "deepseek-v4.1-flash-1017", "owned_by": "openai", "supported_endpoint_types": ["openai", "anthropic"]},
+                {"id": "gemini-3.8-flash", "owned_by": "google gemini", "supported_endpoint_types": ["gemini", "anthropic"]},
+                {"id": "kimi-k3", "owned_by": "openai", "supported_endpoint_types": ["openai", "anthropic"]},
+                {"id": "k3", "owned_by": "openai", "supported_endpoint_types": ["openai", "anthropic"]},
+                {"id": "gpt-image-2", "owned_by": "openai", "supported_endpoint_types": ["image-generation", "anthropic"]},
+                {"id": "jev-latest", "owned_by": "systemone", "supported_endpoint_types": ["systemone", "anthropic"]},
+                {"id": "hy4flash-free", "owned_by": "openai", "supported_endpoint_types": ["openai", "anthropic"]},
+                {"id": "claude-haiku-4-5-20251001", "owned_by": "claude", "supported_endpoint_types": ["anthropic"]},
+                {"id": "claude-haiku-4-5", "owned_by": "claude", "supported_endpoint_types": ["anthropic"]},
+                {"id": "claude-haiku-5-5", "owned_by": "claude", "supported_endpoint_types": ["anthropic"]},
+                {"id": "claude-sonnet-5-5", "owned_by": "claude", "supported_endpoint_types": ["anthropic"]},
+                {"id": "claude-opus-5", "owned_by": "claude", "supported_endpoint_types": ["anthropic"]},
+                {"id": "claude-opus-5-5", "owned_by": "claude", "supported_endpoint_types": ["anthropic"]},
+                {"id": "claude-fable-5-2", "owned_by": "claude", "supported_endpoint_types": ["anthropic"]}
             ]
         });
 
@@ -1872,25 +2382,63 @@ mod tests {
             ids,
             vec![
                 "claude-opus-5-5",
-                "claude-opus-4-8",
+                "claude-opus-5",
                 "claude-sonnet-5-5",
                 "claude-fable-5-2",
                 "claude-haiku-5-5",
-                "claude-haiku-4-5"
+                "claude-haiku-4-5",
+                "deepseek-v4-pro",
+                "deepseek-v4.1-flash",
+                "gpt-6.2-sol",
+                "gemini-3.8-flash",
+                "kimi-k3"
             ]
         );
         assert!(!ids.contains(&"claude-haiku-4-5-20251001"));
-        assert!(!ids.contains(&"gpt-6.2-sol"));
+        assert!(!ids.contains(&"deepseek-v4.1-flash-1017"));
+        assert!(!ids.contains(&"k3"));
+        assert!(!ids.contains(&"gpt-image-2"));
+        assert!(!ids.contains(&"jev-latest"));
+        assert!(!ids.contains(&"hy4flash-free"));
+
+        // Every entry sets supports_1m = false to eliminate duplicate "[1m]" rows in Claude Desktop.
+        assert!(data.iter().all(|m| m["supports_1m"].as_bool() == Some(false)));
 
         assert_eq!(data[0]["display_name"].as_str(), Some("Claude Opus 5.5"));
         assert_eq!(data[0]["is_family_default"].as_bool(), Some(true));
-        assert_eq!(data[0]["supports_1m"].as_bool(), Some(true));
         assert_eq!(data[0]["max_input_tokens"].as_u64(), Some(1_000_000));
+        assert_eq!(data[1]["description"].as_str(), Some("1M · 旗舰推理与编码"));
         assert!(data[1].get("is_family_default").is_none());
         assert_eq!(data[2]["is_family_default"].as_bool(), Some(true));
-        assert_eq!(data[3]["is_family_default"].as_bool(), Some(true));
-        assert_eq!(data[4]["is_family_default"].as_bool(), Some(true));
-        assert_eq!(data[4]["supports_1m"].as_bool(), Some(false));
+        assert_eq!(data[5]["max_input_tokens"].as_u64(), Some(200_000));
+
+        // Third-party models pass gateway filter via anthropic_family_tier="sonnet" without overriding defaults.
+        assert_eq!(data[6]["display_name"].as_str(), Some("DeepSeek V4 Pro"));
+        assert_eq!(data[6]["anthropic_family_tier"].as_str(), Some("sonnet"));
+        assert!(data[6].get("is_family_default").is_none());
+        assert_eq!(data[8]["display_name"].as_str(), Some("GPT-6.2 Sol"));
+        assert_eq!(data[9]["display_name"].as_str(), Some("Gemini 3.8 Flash"));
+    }
+
+    #[test]
+    fn snapshot_suffix_and_concise_descriptions_behave_cleanly() {
+        assert_eq!(
+            strip_dated_snapshot_suffix("claude-haiku-4-5-20251001"),
+            Some("claude-haiku-4-5")
+        );
+        assert_eq!(
+            strip_dated_snapshot_suffix("deepseek-v4.1-flash-1017"),
+            Some("deepseek-v4.1-flash")
+        );
+        assert_eq!(strip_dated_snapshot_suffix("gpt-6.2-sol"), None);
+        assert_eq!(strip_dated_snapshot_suffix("model-9999"), None);
+
+        let sanitized = concise_model_description(
+            "future-model-x",
+            Some("Future Model X。仅支持 Claude Code 客户端使用，其他客户端上游会报错。反代渠道，价格更便宜。专注超快代码重构与单测生成。上下文 1M。"),
+        );
+        assert_eq!(sanitized, "专注超快代码重构与单测生成");
+        assert_eq!(concise_model_description("unknown-empty", None), "Tako 托管模型");
     }
 
     #[test]

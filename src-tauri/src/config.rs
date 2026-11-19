@@ -165,7 +165,7 @@ impl McpToolsConfig {
             search: true,
             consult: true,
             output_dir: paths.default_media_output_dir().to_string_lossy().to_string(),
-            consult_model: "gpt-5.4".to_string(),
+            consult_model: "gpt-6.2-sol".to_string(),
         }
     }
 }
@@ -179,7 +179,7 @@ impl Default for McpToolsConfig {
             search: true,
             consult: true,
             output_dir: "~/Downloads/Tako".to_string(),
-            consult_model: "gpt-5.4".to_string(),
+            consult_model: "gpt-6.2-sol".to_string(),
         }
     }
 }

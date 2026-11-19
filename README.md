@@ -12,7 +12,7 @@
   - `官方`：彻底还原原厂直连状态。
   - `Tako`：主模型与 Tako 超级 MCP 全量走 Tako 企业网关，直接免官方登录使用。
 - **内置 Rust stdio MCP 服务器 (`tako-switch mcp-server`)**：
-  - 5 合 1 工具：`tako_generate_image`、`tako_generate_video`、`tako_audio`、`tako_web_search`、`tako_consult`。
+  - 6 合 1 工具：`tako_generate_image`、`tako_generate_video`、`tako_generate_audio`、`tako_web_search`、`tako_consult`、`tako_account_status`，参数与调用约定对齐 [tako-skill](https://github.com/Barrierml/tako-skill) 与 Tako 语音 API。
   - 每次 `tools/list` / `tools/call` 动态读取 `~/.tako/switch/auth.json` 与 `~/.tako/switch/state.json`，开关即时生效，无需重装 MCP。
 - **双层自动化更新 & 成本收敛策略**：
   1. `tako-switch` 自身自更新：基于 `tauri-plugin-updater`（Ed25519 minisign）优先检查国内上海 OSS 加速节点 `https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/tako-switch/latest.json`，自动回退 GitHub Releases。**OSS 桶与 GitHub v2 Release 严格仅保留最新单一版本**，自动清理历史旧包，避免存储费用累积。

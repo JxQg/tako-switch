@@ -326,9 +326,9 @@ impl DesktopAppAdapter for ClaudeAdapter {
                     (None, None) => None,
                 };
                 let instructions = if state.prefer_chinese_ui {
-                    "默认使用简体中文回复用户（除非用户明确要求其他语言）。当需要生成/编辑图片、生成视频、合成语音、联网搜索、咨询第二个大模型，或查询当前 Tako 钱包余额/套餐额度时，优先调用已挂载的 Tako MCP 工具（tako_generate_image / tako_generate_video / tako_generate_audio / tako_web_search / tako_consult / tako_account_status）。"
+                    "默认使用简体中文回复用户（除非用户明确要求其他语言）。需要生图/改图、生成视频、语音合成、联网搜索、多模型参谋或查询 Tako 账户余额/额度时，优先调用已挂载的 Tako MCP 工具（tako_generate_image / tako_generate_video / tako_generate_audio / tako_web_search / tako_consult / tako_account_status）。遵循 tako-skill 规范：保留用户指定模型；生图/视频超时或报错时切勿自动盲目重试（先查 tako_account_status，视频超时应传 resume_task_id 恢复）；联网搜索须引用实际返回的 results[].url，未返回来源时不要编造链接。"
                 } else {
-                    "When generating/editing images, generating videos, synthesizing audio, searching the web, consulting a second frontier model, or checking current Tako balance/quota, prefer the mounted Tako MCP tools (tako_generate_image / tako_generate_video / tako_generate_audio / tako_web_search / tako_consult / tako_account_status)."
+                    "When generating/editing images, generating videos, synthesizing audio, searching the web, consulting a second frontier model, or checking current Tako balance/quota, prefer the mounted Tako MCP tools (tako_generate_image / tako_generate_video / tako_generate_audio / tako_web_search / tako_consult / tako_account_status). Follow tako-skill guardrails: preserve user-selected models; never blindly auto-retry paid image/video calls on timeout or failure (check tako_account_status first and pass resume_task_id for video recovery); cite actual results[].url in web searches without fabricating URLs."
                 };
 
                 let mut profile = Map::new();
