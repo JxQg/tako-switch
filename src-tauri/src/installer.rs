@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256, Sha512};
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
@@ -403,29 +405,18 @@ fn install_platform_package(
                 .output()
                 .map_err(|e| format!("运行安装程序失败: {e}"))?;
             if !out.status.success() {
+                let code = out
+                    .status
+                    .code()
+                    .map_or_else(|| "unknown".to_string(), |c| c.to_string());
                 return Err(format!(
-                    "静默安装失败 (exit {:?}): {}",
-                    out.code_or_unknown(),
+                    "静默安装失败 (exit {code}): {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 ));
             }
             Ok(())
         }
         other => Err(format!("Windows 不支持的包格式: {other}")),
-    }
-}
-
-#[cfg(target_os = "windows")]
-trait ExitCodeHelper {
-    fn code_or_unknown(&self) -> String;
-}
-
-#[cfg(target_os = "windows")]
-impl ExitCodeHelper for std::process::ExitStatus {
-    fn code_or_unknown(&self) -> String {
-        self.code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "unknown".to_string())
     }
 }
 

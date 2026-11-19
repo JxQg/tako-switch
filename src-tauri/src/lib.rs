@@ -372,7 +372,7 @@ pub fn run() {
             let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
             let menu = build_tray_menu(app.handle(), &paths).map_err(std::io::Error::other)?;
 
-            let mut builder = TrayIconBuilder::with_id(TRAY_ID)
+            let builder = TrayIconBuilder::with_id(TRAY_ID)
                 .icon(tray_icon)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
@@ -406,9 +406,7 @@ pub fn run() {
                 });
 
             #[cfg(target_os = "macos")]
-            {
-                builder = builder.icon_as_template(true);
-            }
+            let builder = builder.icon_as_template(true);
 
             builder.build(app)?;
 

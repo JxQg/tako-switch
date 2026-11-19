@@ -15,6 +15,7 @@ use crate::adapters::{
     read_macos_app_bundle_version,
 };
 
+#[cfg(not(target_os = "windows"))]
 const AGY_ENV_PLIST_NAME: &str = "tech.shiroha.tako-switch.agy-env.plist";
 #[cfg(target_os = "macos")]
 const AGY_ENV_PLIST_LABEL: &str = "tech.shiroha.tako-switch.agy-env";
@@ -28,6 +29,7 @@ impl AntigravityAdapter {
         paths.agy_gemini_config_dir.join("mcp_config.json")
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn plist_path(paths: &AppPaths) -> PathBuf {
         paths.launch_agents_dir.join(AGY_ENV_PLIST_NAME)
     }
@@ -43,12 +45,10 @@ impl AntigravityAdapter {
             if !paths.is_test {
                 return read_windows_hkcu_env();
             }
-            if let Ok(raw) = fs::read_to_string(Self::windows_test_env_path(paths)) {
-                if let Ok(map) = serde_json::from_str::<BTreeMap<String, String>>(&raw) {
-                    return map;
-                }
-            }
-            return BTreeMap::new();
+            fs::read_to_string(Self::windows_test_env_path(paths))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<BTreeMap<String, String>>(&raw).ok())
+                .unwrap_or_default()
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -81,7 +81,7 @@ impl AntigravityAdapter {
                     .map_err(|e| format!("序列化测试环境失败: {e}"))?;
                 return write_atomic(&Self::windows_test_env_path(paths), &bytes, true);
             }
-            return write_windows_hkcu_env(base_url, api_key);
+            write_windows_hkcu_env(base_url, api_key)
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -106,7 +106,7 @@ impl AntigravityAdapter {
                 }
                 return Ok(());
             }
-            return clear_windows_hkcu_env();
+            clear_windows_hkcu_env()
         }
         #[cfg(not(target_os = "windows"))]
         {
