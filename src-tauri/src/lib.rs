@@ -26,9 +26,15 @@ use serde::{Deserialize, Serialize};
 use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Mutex;
 
 const TRAY_ID: &str = "main-tray";
+const SELF_UPDATE_OSS_ENDPOINT: &str =
+    "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/tako-switch/latest.json";
+const SELF_UPDATE_GITHUB_ENDPOINT: &str =
+    "https://github.com/Barrierml/tako-switch/releases/latest/download/latest.json";
+const SELF_UPDATE_BG_INTERVAL_SECS: u64 = 1800;
 
 pub struct InstallGuard {
     lock: Mutex<()>,
@@ -38,6 +44,27 @@ pub struct InstallGuard {
 }
 
 pub struct CachedAccount(std::sync::Mutex<Option<AccountStatus>>);
+
+pub struct PendingSelfUpdate(Mutex<Option<tauri_plugin_updater::Update>>);
+
+pub struct TrayUpdateNotice(std::sync::Mutex<Option<String>>);
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfUpdateCheckResult {
+    pub available: bool,
+    pub version: Option<String>,
+    pub notes: Option<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SelfUpdateProgressEvent {
+    stage: String,
+    downloaded: u64,
+    total: Option<u64>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -77,6 +104,130 @@ fn current_cached_account(app: &AppHandle, paths: &AppPaths) -> Option<AccountSt
         }
     }
     read_balance_cache(paths).map(|c| c.status)
+}
+
+fn current_tray_update_version(app: &AppHandle) -> Option<String> {
+    app.try_state::<TrayUpdateNotice>()
+        .and_then(|st| st.0.lock().ok().and_then(|g| g.clone()))
+        .filter(|v| v != env!("CARGO_PKG_VERSION"))
+}
+
+fn set_tray_update_version(app: &AppHandle, version: Option<String>) {
+    if let Some(st) = app.try_state::<TrayUpdateNotice>() {
+        if let Ok(mut guard) = st.0.lock() {
+            *guard = version;
+        }
+    }
+}
+
+fn parse_semver_tuple(raw: &str) -> Option<(u64, u64, u64)> {
+    let trimmed = raw.trim().trim_start_matches(['v', 'V']);
+    let core = trimmed.split(['-', '+']).next()?.trim();
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+    let patch = parts.next().unwrap_or("0").parse::<u64>().ok()?;
+    Some((major, minor, patch))
+}
+
+fn choose_self_update_endpoints(
+    oss_ver: Option<(u64, u64, u64)>,
+    gh_ver: Option<(u64, u64, u64)>,
+) -> (&'static str, Vec<&'static str>) {
+    match (oss_ver, gh_ver) {
+        (Some(o), Some(g)) if g > o => (
+            "github",
+            vec![SELF_UPDATE_GITHUB_ENDPOINT, SELF_UPDATE_OSS_ENDPOINT],
+        ),
+        (None, Some(_)) => (
+            "github",
+            vec![SELF_UPDATE_GITHUB_ENDPOINT, SELF_UPDATE_OSS_ENDPOINT],
+        ),
+        _ => (
+            "oss",
+            vec![SELF_UPDATE_OSS_ENDPOINT, SELF_UPDATE_GITHUB_ENDPOINT],
+        ),
+    }
+}
+
+async fn probe_release_version(client: &reqwest::Client, url: &str) -> Option<(u64, u64, u64)> {
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        client.get(url).send(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body = resp.json::<serde_json::Value>().await.ok()?;
+    body.get("version")
+        .and_then(|v| v.as_str())
+        .and_then(parse_semver_tuple)
+}
+
+async fn perform_self_update_check(app: &AppHandle) -> Result<SelfUpdateCheckResult, String> {
+    let probe_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .user_agent(concat!("tako-switch/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("创建更新探测客户端失败: {e}"))?;
+
+    let (oss_ver, gh_ver) = tokio::join!(
+        probe_release_version(&probe_client, SELF_UPDATE_OSS_ENDPOINT),
+        probe_release_version(&probe_client, SELF_UPDATE_GITHUB_ENDPOINT),
+    );
+    let (source, ordered_urls) = choose_self_update_endpoints(oss_ver, gh_ver);
+    let endpoints: Vec<tauri::Url> = ordered_urls
+        .iter()
+        .filter_map(|u| tauri::Url::parse(u).ok())
+        .collect();
+
+    let updater = app
+        .updater_builder()
+        .endpoints(endpoints)
+        .map_err(|e| format!("配置软件更新源失败: {e}"))?
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("初始化软件更新器失败: {e}"))?;
+
+    let update_opt = updater
+        .check()
+        .await
+        .map_err(|e| format!("检查 Tako Switch 更新失败: {e}"))?;
+
+    if let Some(pending) = app.try_state::<PendingSelfUpdate>() {
+        let mut guard = pending.0.lock().await;
+        *guard = update_opt.clone();
+    }
+
+    let result = match update_opt {
+        Some(ref upd) => {
+            set_tray_update_version(app, Some(upd.version.clone()));
+            SelfUpdateCheckResult {
+                available: true,
+                version: Some(upd.version.clone()),
+                notes: upd.body.clone(),
+                source: source.to_string(),
+            }
+        }
+        None => {
+            set_tray_update_version(app, None);
+            SelfUpdateCheckResult {
+                available: false,
+                version: None,
+                notes: None,
+                source: source.to_string(),
+            }
+        }
+    };
+
+    if let Ok(paths) = AppPaths::detect() {
+        refresh_tray(app, &paths);
+    }
+
+    Ok(result)
 }
 
 fn pct_round(used: f64, limit: f64) -> u64 {
@@ -175,7 +326,18 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
         submenus.push(sub);
     }
 
-    let check_upd = MenuItem::with_id(app, "tray:updates", "检查更新", true, None::<&str>)
+    let pending_update_ver = current_tray_update_version(app);
+    let update_banner_item = pending_update_ver.as_deref().and_then(|ver| {
+        MenuItem::with_id(
+            app,
+            "tray:updates",
+            format!("⬆ 发现新版 Tako Switch v{ver} · 点击更新"),
+            true,
+            None::<&str>,
+        )
+        .ok()
+    });
+    let check_upd = MenuItem::with_id(app, "tray:updates-check", "检查更新", true, None::<&str>)
         .map_err(|e| format!("创建菜单项失败: {e}"))?;
     let quit = MenuItem::with_id(app, "tray:quit", "退出 Tako Switch", true, None::<&str>)
         .map_err(|e| format!("创建退出菜单失败: {e}"))?;
@@ -189,6 +351,9 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
         items.push(p_item);
     }
     items.push(&sep0);
+    if let Some(ref upd_item) = update_banner_item {
+        items.push(upd_item);
+    }
     items.push(&show);
     items.push(&refresh_bal);
     items.push(&sep1);
@@ -223,6 +388,7 @@ fn refresh_tray(app: &AppHandle, paths: &AppPaths) {
         } else {
             None
         };
+        let update_ver = current_tray_update_version(app);
 
         #[cfg(target_os = "macos")]
         {
@@ -239,9 +405,11 @@ fn refresh_tray(app: &AppHandle, paths: &AppPaths) {
         #[cfg(not(target_os = "macos"))]
         let _ = st.show_tray_balance;
 
-        let tip = match rem_opt {
-            Some(rem) => format!("Tako Switch · 余额 {}", format_usd(rem)),
-            None => "Tako Switch".to_string(),
+        let tip = match (update_ver.as_deref(), rem_opt) {
+            (Some(v), Some(rem)) => format!("Tako Switch (可更新 v{v}) · 余额 {}", format_usd(rem)),
+            (Some(v), None) => format!("Tako Switch · 发现新版 v{v}"),
+            (None, Some(rem)) => format!("Tako Switch · 余额 {}", format_usd(rem)),
+            (None, None) => "Tako Switch".to_string(),
         };
         let _ = tray.set_tooltip(Some(tip));
     }
@@ -561,6 +729,101 @@ fn ensure_local_gateway() -> Result<bool, String> {
 }
 
 #[tauri::command]
+async fn check_self_update_smart(app: AppHandle) -> Result<SelfUpdateCheckResult, String> {
+    perform_self_update_check(&app).await
+}
+
+#[cfg(target_os = "windows")]
+fn stop_auxiliary_windows_gateway_processes() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let current_pid = std::process::id();
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"Name='tako-switch.exe'\" | Where-Object {{ $_.ProcessId -ne {current_pid} -and $_.CommandLine -match 'gateway-proxy|agy-proxy' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+    );
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+#[tauri::command]
+async fn install_self_update(
+    app: AppHandle,
+    pending: tauri::State<'_, PendingSelfUpdate>,
+) -> Result<(), String> {
+    let update = {
+        let guard = pending.0.lock().await;
+        guard.clone()
+    }
+    .ok_or_else(|| "当前没有可安装的新版本，请先检查更新".to_string())?;
+
+    let app_for_chunk = app.clone();
+    let app_for_finish = app.clone();
+    let downloaded = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let total_len = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let started_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dl_chunk = downloaded.clone();
+    let tot_chunk = total_len.clone();
+    let dl_fin = downloaded.clone();
+    let tot_fin = total_len.clone();
+
+    let bytes = update
+        .download(
+            move |chunk_len, content_len| {
+                let tot = content_len.unwrap_or(0);
+                if tot > 0 {
+                    tot_chunk.store(tot, std::sync::atomic::Ordering::Relaxed);
+                }
+                if !started_flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let _ = app_for_chunk.emit(
+                        "self-update-progress",
+                        SelfUpdateProgressEvent {
+                            stage: "started".to_string(),
+                            downloaded: 0,
+                            total: (tot > 0).then_some(tot),
+                        },
+                    );
+                }
+                let prev = dl_chunk.fetch_add(chunk_len as u64, std::sync::atomic::Ordering::Relaxed);
+                let cur = prev + chunk_len as u64;
+                let cur_tot = tot_chunk.load(std::sync::atomic::Ordering::Relaxed);
+                let _ = app_for_chunk.emit(
+                    "self-update-progress",
+                    SelfUpdateProgressEvent {
+                        stage: "progress".to_string(),
+                        downloaded: cur,
+                        total: (cur_tot > 0).then_some(cur_tot),
+                    },
+                );
+            },
+            move || {
+                let cur = dl_fin.load(std::sync::atomic::Ordering::Relaxed);
+                let cur_tot = tot_fin.load(std::sync::atomic::Ordering::Relaxed);
+                let _ = app_for_finish.emit(
+                    "self-update-progress",
+                    SelfUpdateProgressEvent {
+                        stage: "finished".to_string(),
+                        downloaded: cur,
+                        total: (cur_tot > 0).then_some(cur_tot).or(Some(cur)),
+                    },
+                );
+            },
+        )
+        .await
+        .map_err(|e| format!("下载 Tako Switch 更新包失败: {e}"))?;
+
+    #[cfg(target_os = "windows")]
+    stop_auxiliary_windows_gateway_processes();
+
+    update
+        .install(&bytes)
+        .map_err(|e| format!("安装 Tako Switch 更新包失败: {e}"))?;
+
+    app.restart();
+}
+
+#[tauri::command]
 async fn install_or_upgrade_app(
     app: AppHandle,
     guard: tauri::State<'_, InstallGuard>,
@@ -607,6 +870,8 @@ pub fn run() {
             cancels: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
         .manage(CachedAccount(std::sync::Mutex::new(initial_cache)))
+        .manage(PendingSelfUpdate(Mutex::new(None)))
+        .manage(TrayUpdateNotice(std::sync::Mutex::new(None)))
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
@@ -630,7 +895,7 @@ pub fn run() {
                                 update_account_and_tray(&handle, &paths, status, true);
                             }
                         });
-                    } else if id == "tray:updates" {
+                    } else if id == "tray:updates" || id == "tray:updates-check" {
                         show_main_window(app);
                         let _ = app.emit("request-check-updates", ());
                     } else if id == "tray:quit" {
@@ -682,6 +947,26 @@ pub fn run() {
                 }
             });
 
+            // Background self-update watcher so tray badge updates even when window is hidden.
+            let upd_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(SELF_UPDATE_BG_INTERVAL_SECS))
+                    .await;
+                loop {
+                    if let Ok(upd_paths) = AppPaths::detect() {
+                        if read_switch_state(&upd_paths).auto_check_updates {
+                            if let Ok(res) = perform_self_update_check(&upd_handle).await {
+                                let _ = upd_handle.emit("self-update-status", &res);
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        SELF_UPDATE_BG_INTERVAL_SECS,
+                    ))
+                    .await;
+                }
+            });
+
             if let Some(win) = app.get_webview_window("main") {
                 let win_clone = win.clone();
                 win.on_window_event(move |event| {
@@ -710,7 +995,37 @@ pub fn run() {
             install_or_upgrade_app,
             cancel_app_install,
             ensure_local_gateway,
+            check_self_update_smart,
+            install_self_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tako Switch");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn choose_self_update_endpoints_prefers_github_when_ahead() {
+        assert_eq!(parse_semver_tuple("v2.0.3"), Some((2, 0, 3)));
+        assert_eq!(parse_semver_tuple("2.0.2-beta.1"), Some((2, 0, 2)));
+
+        let (src, urls) = choose_self_update_endpoints(Some((2, 0, 2)), Some((2, 0, 3)));
+        assert_eq!(src, "github");
+        assert_eq!(urls[0], SELF_UPDATE_GITHUB_ENDPOINT);
+
+        let (src_equal, urls_equal) =
+            choose_self_update_endpoints(Some((2, 0, 3)), Some((2, 0, 3)));
+        assert_eq!(src_equal, "oss");
+        assert_eq!(urls_equal[0], SELF_UPDATE_OSS_ENDPOINT);
+
+        let (src_oss_only, urls_oss_only) = choose_self_update_endpoints(Some((2, 0, 3)), None);
+        assert_eq!(src_oss_only, "oss");
+        assert_eq!(urls_oss_only[0], SELF_UPDATE_OSS_ENDPOINT);
+
+        let (src_gh_only, urls_gh_only) = choose_self_update_endpoints(None, Some((2, 0, 3)));
+        assert_eq!(src_gh_only, "github");
+        assert_eq!(urls_gh_only[0], SELF_UPDATE_GITHUB_ENDPOINT);
+    }
 }

@@ -46,6 +46,7 @@ const LEGACY_AGY_PROXY_PLIST_LABEL: &str = "tech.shiroha.tako-switch.agy-proxy";
 
 const PRICING_CACHE_TTL: Duration = Duration::from_secs(300);
 const ALLOWED_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const AGY_MAX_CUSTOM_PLACEHOLDERS: usize = 32;
 const DEFAULT_CODEX_BASE_INSTRUCTIONS: &str = "You are Codex, an expert AI software engineering assistant. Follow user instructions carefully, inspect files before editing, and verify changes using available tools.";
 
 static IN_PROCESS_PROXY_STARTED: AtomicBool = AtomicBool::new(false);
@@ -156,19 +157,34 @@ fn strip_effort_display_suffix(raw: &str) -> String {
 }
 
 pub fn display_base_name(base_id: &str, orig_display: Option<&str>) -> String {
-    match base_id {
+    let lower = base_id.trim().to_ascii_lowercase();
+    match lower.as_str() {
+        "gemini-4-argon" => "Gemini 4 Argon".to_string(),
+        "gemini-4-carbon" => "Gemini 4 Carbon".to_string(),
+        "gemini-4-hydrogen" => "Gemini 4 Hydrogen".to_string(),
+        "gemini-4-neon" => "Gemini 4 Neon".to_string(),
         "gemini-3.8-flash" => "Gemini 3.8 Flash".to_string(),
         "gemini-3.7-flash" => "Gemini 3.7 Flash".to_string(),
         "gemini-3.6-flash" => "Gemini 3.6 Flash".to_string(),
         "gemini-3.5-flash" => "Gemini 3.5 Flash".to_string(),
+        "gemini-3.5-flash-lite" => "Gemini 3.5 Flash Lite".to_string(),
         "gemini-3.1-pro-preview" | "gemini-3.1-pro" => "Gemini 3.1 Pro".to_string(),
         "gemini-3-pro-preview" | "gemini-3-pro" => "Gemini 3 Pro".to_string(),
+        "gemini-3.1-flash-image" => "Gemini 3.1 Flash Image".to_string(),
+        "gemini-3-pro-image" => "Gemini 3 Pro Image".to_string(),
+        "claude-opus-5-5" => "Claude Opus 5.5".to_string(),
+        "claude-sonnet-5-5" => "Claude Sonnet 5.5".to_string(),
+        "swe-2" => "SWE-2".to_string(),
+        "swe-2-flash" => "SWE-2 Flash".to_string(),
         _ => {
-            let candidate = orig_display
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or(base_id);
-            strip_effort_display_suffix(candidate)
+            if let Some(cand) = orig_display.map(str::trim).filter(|s| !s.is_empty()) {
+                let stripped = strip_effort_display_suffix(cand);
+                if !stripped.eq_ignore_ascii_case(&lower) && stripped.chars().any(char::is_uppercase)
+                {
+                    return stripped;
+                }
+            }
+            pretty_model_display_name(base_id)
         }
     }
 }
@@ -184,6 +200,119 @@ pub fn effort_label(effort: &str) -> &'static str {
     }
 }
 
+/// Returns true for model slugs that match Antigravity's built-in `geminimodels` catalog or
+/// native gateway image models, which do not consume the 32 custom placeholder slots.
+pub fn is_antigravity_builtin_model(id: &str) -> bool {
+    matches!(
+        id.trim().to_ascii_lowercase().as_str(),
+        "gemini-3.1-pro-low"
+            | "gemini-3.1-pro-high"
+            | "gemini-3.1-pro-preview"
+            | "gemini-3.1-pro-preview-customtools"
+            | "gemini-3.1-flash-lite-preview"
+            | "gemini-3.1-flash-image"
+            | "gemini-3-pro-image"
+            | "gemini-3.5-flash-low"
+            | "gemini-3.5-flash-medium"
+            | "gemini-3.5-flash-high"
+            | "gemini-3.6-flash-low"
+            | "gemini-3.6-flash-medium"
+            | "gemini-3.6-flash-high"
+            | "gemini-3.7-flash-low"
+            | "gemini-3.7-flash-medium"
+            | "gemini-3.7-flash-high"
+            | "gemini-3.8-flash-low"
+            | "gemini-3.8-flash-medium"
+            | "gemini-3.8-flash-high"
+            | "gemini-4-argon-low"
+            | "gemini-4-argon-medium"
+            | "gemini-4-argon-high"
+            | "gemini-4-carbon-low"
+            | "gemini-4-carbon-medium"
+            | "gemini-4-carbon-high"
+            | "gemini-4-hydrogen-low"
+            | "gemini-4-hydrogen-medium"
+            | "gemini-4-hydrogen-high"
+            | "gemini-4-hydrogen-xhigh"
+    )
+}
+
+fn split_effort_slug(id: &str) -> (&str, u8) {
+    let lower = id.trim();
+    for (idx, effort) in ALLOWED_EFFORTS.iter().enumerate() {
+        let suffix_len = effort.len() + 1;
+        if lower.len() > suffix_len
+            && lower.as_bytes()[lower.len() - suffix_len] == b'-'
+            && lower[lower.len() - effort.len()..].eq_ignore_ascii_case(effort)
+        {
+            return (&lower[..lower.len() - suffix_len], idx as u8);
+        }
+    }
+    (lower, 0)
+}
+
+fn antigravity_model_sort_key(id: &str) -> (u16, u8, String) {
+    let lower_id = id.trim().to_ascii_lowercase();
+    let (base, eff_rank) = split_effort_slug(&lower_id);
+    let family_prio: u16 = match base {
+        "gemini-4-neon" => 10,
+        "gemini-4-hydrogen" => 11,
+        "gemini-4-carbon" => 12,
+        "gemini-4-argon" => 13,
+        "gemini-3.8-flash" => 14,
+        "gemini-3.7-flash" => 15,
+        "gemini-3.6-flash" => 16,
+        "gemini-3.5-flash" => 17,
+        "gemini-3.1-pro" | "gemini-3.1-pro-preview" => 18,
+        "gemini-3-pro" | "gemini-3-pro-preview" => 19,
+        "gemini-3.5-flash-lite" => 20,
+        "claude-opus-5-5" => 30,
+        "claude-opus-5" => 31,
+        "claude-opus-4-8" => 32,
+        "claude-opus-4-7" => 33,
+        "claude-opus-4-6" => 34,
+        "claude-sonnet-5-5" => 35,
+        "claude-sonnet-5" => 36,
+        "claude-sonnet-4-6" => 37,
+        "claude-haiku-5-5" => 38,
+        "claude-fable-5-2" => 39,
+        "claude-haiku-4-5" => 40,
+        "gpt-6.2-sol" => 50,
+        "gpt-6.2-astra" => 51,
+        "gpt-6.1-sol" => 52,
+        "gpt-6-astra" => 53,
+        "gpt-6.1-terra" => 54,
+        "gpt-6-sol" => 55,
+        "gpt-6-luna" => 56,
+        "deepseek-v4-pro" => 60,
+        "deepseek-v4.1-flash" => 61,
+        "deepseek-v4-flash" => 62,
+        "kimi-k3.1-pro" => 65,
+        "kimi-k3.1-pro-highspeed" => 66,
+        "kimi-k3" => 67,
+        "glm-5.3" => 70,
+        "glm-5.3-flash" => 71,
+        "grok-4.7" => 75,
+        "grok-4.6" => 76,
+        "grok-4.5" => 77,
+        "minimax-m3" => 80,
+        "mimo-v2.6-pro" => 81,
+        "mimo-v2.6-flash" => 82,
+        "swe-2" => 85,
+        "swe-2-flash" => 86,
+        "composer-2.5" => 88,
+        "hy3" => 89,
+        "gemma-4-31b-it" => 90,
+        "tako-auto" => 91,
+        "gemini-3.1-flash-image" | "gemini-3-pro-image" => 98,
+        _ if base.starts_with("claude-") => 45,
+        _ if base.starts_with("gpt-") => 58,
+        _ if base.starts_with("deepseek-") => 63,
+        _ => 94,
+    };
+    (family_prio, eff_rank, base.to_string())
+}
+
 pub fn expand_models_catalog(
     mut body: Value,
     pricing: &PricingCache,
@@ -193,17 +322,48 @@ pub fn expand_models_catalog(
         return (body, routes);
     };
 
-    let mut expanded = Vec::with_capacity(models.len() + 8);
+    let mut all_base_ids = HashSet::new();
+    for item in models {
+        if let Some(raw_name) = item
+            .as_object()
+            .and_then(|o| o.get("name"))
+            .and_then(Value::as_str)
+        {
+            let base_id = raw_name.strip_prefix("models/").unwrap_or(raw_name).trim();
+            if !base_id.is_empty() {
+                all_base_ids.insert(base_id.to_string());
+            }
+        }
+    }
+
+    struct ExpandedEntry {
+        id: String,
+        value: Value,
+        builtin: bool,
+    }
+
+    let mut entries: Vec<ExpandedEntry> = Vec::with_capacity(models.len() + 8);
+    let mut seen_ids = HashSet::new();
     let mut has_flash_image_entry = false;
 
     for item in models {
         let Some(obj) = item.as_object() else {
-            expanded.push(item.clone());
             continue;
         };
         let raw_name = obj.get("name").and_then(Value::as_str).unwrap_or("");
-        let base_id = raw_name.strip_prefix("models/").unwrap_or(raw_name);
-        if base_id == "gemini-3.1-flash-image" {
+        let base_id = raw_name.strip_prefix("models/").unwrap_or(raw_name).trim();
+        if base_id.is_empty() {
+            continue;
+        }
+        let lower_base = base_id.to_ascii_lowercase();
+        if lower_base == "codex-auto-review"
+            || lower_base == "hy4flash-free"
+            || lower_base.starts_with("jev-")
+            || is_duplicate_alias(base_id, &all_base_ids)
+        {
+            continue;
+        }
+        if lower_base == "gemini-3.1-flash-image" {
             has_flash_image_entry = true;
         }
 
@@ -212,36 +372,89 @@ pub fn expand_models_catalog(
                 base_id,
                 obj.get("displayName").and_then(Value::as_str),
             );
+            // Emit Antigravity's built-in slug `gemini-3.1-pro-{low,high}` for
+            // `gemini-3.1-pro-preview` so it takes 0 custom placeholder slots.
+            let variant_prefix = if base_id == "gemini-3.1-pro-preview" {
+                "gemini-3.1-pro"
+            } else {
+                base_id
+            };
             for effort in levels {
                 let mut variant = obj.clone();
-                let synth_id = format!("{base_id}-{effort}");
+                let synth_id = format!("{variant_prefix}-{effort}");
                 variant.insert("name".to_string(), Value::String(format!("models/{synth_id}")));
                 variant.insert(
                     "displayName".to_string(),
                     Value::String(format!("{base_display} ({})", effort_label(&effort))),
                 );
                 variant.insert("thinking".to_string(), Value::Bool(true));
-                expanded.push(Value::Object(variant));
-                routes.insert(
-                    synth_id,
-                    SyntheticRoute {
-                        base_model: base_id.to_string(),
-                        effort,
-                    },
-                );
+                if seen_ids.insert(synth_id.clone()) {
+                    entries.push(ExpandedEntry {
+                        builtin: is_antigravity_builtin_model(&synth_id),
+                        id: synth_id.clone(),
+                        value: Value::Object(variant),
+                    });
+                }
+                let route = SyntheticRoute {
+                    base_model: base_id.to_string(),
+                    effort: effort.clone(),
+                };
+                routes.insert(synth_id, route.clone());
+                if variant_prefix != base_id {
+                    routes.insert(format!("{base_id}-{effort}"), route);
+                }
             }
-        } else {
-            expanded.push(Value::Object(obj.clone()));
+        } else if seen_ids.insert(base_id.to_string()) {
+            let mut next_obj = obj.clone();
+            let pretty = display_base_name(
+                base_id,
+                next_obj.get("displayName").and_then(Value::as_str),
+            );
+            next_obj.insert("displayName".to_string(), Value::String(pretty));
+            entries.push(ExpandedEntry {
+                builtin: is_antigravity_builtin_model(base_id),
+                id: base_id.to_string(),
+                value: Value::Object(next_obj),
+            });
         }
     }
 
-    if pricing.has_flash_image && !has_flash_image_entry {
-        expanded.push(json!({
-            "name": "models/gemini-3.1-flash-image",
-            "displayName": "Gemini 3.1 Flash Image",
-            "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
-        }));
+    if pricing.has_flash_image
+        && !has_flash_image_entry
+        && seen_ids.insert("gemini-3.1-flash-image".to_string())
+    {
+        entries.push(ExpandedEntry {
+            id: "gemini-3.1-flash-image".to_string(),
+            builtin: true,
+            value: json!({
+                "name": "models/gemini-3.1-flash-image",
+                "displayName": "Gemini 3.1 Flash Image",
+                "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
+            }),
+        });
     }
+
+    let mut builtins = Vec::new();
+    let mut customs = Vec::new();
+    for entry in entries {
+        if entry.builtin {
+            builtins.push(entry);
+        } else {
+            customs.push(entry);
+        }
+    }
+
+    // Antigravity language_server allocates at most 32 custom placeholder model enums;
+    // keep the highest-priority custom models so flagship entries are never silently dropped.
+    customs.sort_by_key(|e| antigravity_model_sort_key(&e.id));
+    customs.truncate(AGY_MAX_CUSTOM_PLACEHOLDERS);
+
+    let mut kept: Vec<ExpandedEntry> = Vec::with_capacity(builtins.len() + customs.len());
+    kept.extend(builtins);
+    kept.extend(customs);
+    kept.sort_by_key(|e| antigravity_model_sort_key(&e.id));
+
+    let expanded: Vec<Value> = kept.into_iter().map(|e| e.value).collect();
 
     if let Some(root) = body.as_object_mut() {
         root.insert("models".to_string(), Value::Array(expanded));
@@ -274,8 +487,15 @@ pub fn resolve_synthetic_route(
         if let Some(base) = model.strip_suffix(&suffix) {
             if let Some(levels) = effective_effort_levels(base, pricing) {
                 if levels.iter().any(|l| l == effort) {
+                    let target_base = if base == "gemini-3.1-pro"
+                        && !pricing.descriptions.contains_key("gemini-3.1-pro")
+                    {
+                        "gemini-3.1-pro-preview"
+                    } else {
+                        base
+                    };
                     return Some(SyntheticRoute {
-                        base_model: base.to_string(),
+                        base_model: target_base.to_string(),
                         effort: effort.to_string(),
                     });
                 }
@@ -2180,8 +2400,8 @@ mod tests {
         assert!(names.contains(&"models/gemini-3.8-flash-low"));
         assert!(names.contains(&"models/gemini-3.8-flash-medium"));
         assert!(names.contains(&"models/gemini-3.8-flash-high"));
-        assert!(names.contains(&"models/gemini-3.1-pro-preview-low"));
-        assert!(names.contains(&"models/gemini-3.1-pro-preview-high"));
+        assert!(names.contains(&"models/gemini-3.1-pro-low"));
+        assert!(names.contains(&"models/gemini-3.1-pro-high"));
         assert!(names.contains(&"models/swe-2-medium"));
         assert!(names.contains(&"models/swe-2-high"));
         assert!(names.contains(&"models/swe-2-max"));
@@ -2193,7 +2413,8 @@ mod tests {
         assert!(displays.contains(&"Gemini 3.8 Flash (High)"));
         assert!(displays.contains(&"Gemini 3.1 Pro (Low)"));
         assert!(displays.contains(&"Gemini 3.1 Pro (High)"));
-        assert!(displays.contains(&"swe-2 (Max)"));
+        assert!(displays.contains(&"SWE-2 (Max)"));
+        assert!(displays.contains(&"Claude Opus 4.6"));
 
         assert_eq!(
             routes.get("gemini-3.8-flash-high"),
@@ -2203,10 +2424,100 @@ mod tests {
             })
         );
         assert_eq!(
+            routes.get("gemini-3.1-pro-low"),
+            Some(&SyntheticRoute {
+                base_model: "gemini-3.1-pro-preview".to_string(),
+                effort: "low".to_string()
+            })
+        );
+        assert_eq!(
             routes.get("gemini-3.1-pro-preview-low"),
             Some(&SyntheticRoute {
                 base_model: "gemini-3.1-pro-preview".to_string(),
                 effort: "low".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn expand_models_catalog_prettifies_gemini4_and_enforces_32_custom_cap() {
+        let pricing = parse_pricing_metadata(&json!({
+            "data": [
+                {"model_name": "gemini-4-argon", "reasoning_levels": ["low", "medium", "high"]},
+                {"model_name": "gemini-4-carbon", "reasoning_levels": ["low", "medium", "high"]},
+                {"model_name": "gemini-4-hydrogen", "reasoning_levels": ["low", "medium", "high", "xhigh"]},
+                {"model_name": "gemini-4-neon", "reasoning_levels": ["low", "medium", "high", "xhigh"]},
+                {"model_name": "claude-opus-5-5", "reasoning_levels": ["low", "medium", "high"]},
+                {"model_name": "claude-sonnet-5-5", "reasoning_levels": ["low", "medium", "high"]},
+                {"model_name": "gemini-3.1-flash-image"}
+            ]
+        }));
+
+        let mut upstream_models = vec![
+            json!({"name": "models/gemini-4-argon", "displayName": "gemini-4-argon"}),
+            json!({"name": "models/gemini-4-carbon", "displayName": "gemini-4-carbon"}),
+            json!({"name": "models/gemini-4-hydrogen", "displayName": "gemini-4-hydrogen"}),
+            json!({"name": "models/gemini-4-neon", "displayName": "gemini-4-neon"}),
+            json!({"name": "models/gemini-3.1-pro-preview", "displayName": "gemini-3.1-pro-preview"}),
+            json!({"name": "models/claude-opus-5-5", "displayName": "claude-opus-5-5"}),
+            json!({"name": "models/claude-sonnet-5-5", "displayName": "claude-sonnet-5-5"}),
+            json!({"name": "models/claude-opus-4-8", "displayName": "claude-opus-4-8"}),
+            json!({"name": "models/claude-haiku-4-5", "displayName": "claude-haiku-4-5"}),
+            json!({"name": "models/claude-haiku-4-5-20251001", "displayName": "claude-haiku-4-5-20251001"}),
+            json!({"name": "models/kimi-k3", "displayName": "kimi-k3"}),
+            json!({"name": "models/k3", "displayName": "k3"}),
+            json!({"name": "models/deepseek-v4.1-flash", "displayName": "deepseek-v4.1-flash"}),
+            json!({"name": "models/deepseek-v4.1-flash-1017", "displayName": "deepseek-v4.1-flash-1017"}),
+            json!({"name": "models/gpt-6.2-sol", "displayName": "gpt-6.2-sol"}),
+            json!({"name": "models/hy4flash-free", "displayName": "hy4flash-free"}),
+        ];
+        for i in 0..38 {
+            upstream_models.push(json!({
+                "name": format!("models/z-extra-model-{i:02}"),
+                "displayName": format!("z-extra-model-{i:02}")
+            }));
+        }
+
+        let (expanded, routes) = expand_models_catalog(json!({ "models": upstream_models }), &pricing);
+        let list = expanded["models"].as_array().unwrap();
+        let names: Vec<&str> = list.iter().map(|m| m["name"].as_str().unwrap()).collect();
+        let displays: Vec<&str> = list
+            .iter()
+            .map(|m| m["displayName"].as_str().unwrap())
+            .collect();
+
+        assert!(displays.contains(&"Gemini 4 Argon (Low)"));
+        assert!(displays.contains(&"Gemini 4 Carbon (High)"));
+        assert!(displays.contains(&"Gemini 4 Hydrogen (XHigh)"));
+        assert!(displays.contains(&"Gemini 4 Neon (XHigh)"));
+        assert!(displays.contains(&"Claude Opus 5.5 (High)"));
+        assert!(displays.contains(&"Claude Sonnet 5.5 (Medium)"));
+        assert!(displays.contains(&"Claude Opus 4.8"));
+        assert!(displays.contains(&"GPT-6.2 Sol"));
+        assert!(displays.contains(&"DeepSeek V4.1 Flash"));
+
+        assert!(!names.contains(&"models/claude-haiku-4-5-20251001"));
+        assert!(!names.contains(&"models/deepseek-v4.1-flash-1017"));
+        assert!(!names.contains(&"models/k3"));
+        assert!(!names.contains(&"models/hy4flash-free"));
+        assert!(names.contains(&"models/gemini-3.1-flash-image"));
+        assert!(names.contains(&"models/gemini-3.1-pro-low"));
+
+        let custom_count = names
+            .iter()
+            .filter(|n| !is_antigravity_builtin_model(n.strip_prefix("models/").unwrap_or(n)))
+            .count();
+        assert!(
+            custom_count <= AGY_MAX_CUSTOM_PLACEHOLDERS,
+            "expected <= 32 custom models, got {custom_count}"
+        );
+        assert_eq!(custom_count, AGY_MAX_CUSTOM_PLACEHOLDERS);
+
+        assert_eq!(
+            routes.get("gemini-4-neon-xhigh"),
+            Some(&SyntheticRoute {
+                base_model: "gemini-4-neon".to_string(),
+                effort: "xhigh".to_string()
             })
         );
     }
@@ -2258,6 +2569,13 @@ mod tests {
             Some(SyntheticRoute {
                 base_model: "gemini-3.1-pro-preview".to_string(),
                 effort: "high".to_string()
+            })
+        );
+        assert_eq!(
+            resolve_synthetic_route("gemini-3.1-pro-low", &empty_routes, &pricing),
+            Some(SyntheticRoute {
+                base_model: "gemini-3.1-pro-preview".to_string(),
+                effort: "low".to_string()
             })
         );
         assert_eq!(

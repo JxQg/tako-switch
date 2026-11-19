@@ -146,6 +146,19 @@ export interface InstallOutcome {
   snapshot: AppSnapshot;
 }
 
+export interface SelfUpdateCheckResult {
+  available: boolean;
+  version: string | null;
+  notes: string | null;
+  source: "oss" | "github" | string;
+}
+
+export interface SelfUpdateProgressEvent {
+  stage: string;
+  downloaded: number;
+  total: number | null;
+}
+
 export interface SettingsPatch {
   baseUrl?: string;
   agyApiKey?: string;
@@ -182,4 +195,6 @@ export const api = {
   cancelAppInstall: (appId: AppId) =>
     invoke<void>("cancel_app_install", { appId }),
   ensureLocalGateway: () => invoke<boolean>("ensure_local_gateway"),
+  checkSelfUpdateSmart: () => invoke<SelfUpdateCheckResult>("check_self_update_smart"),
+  installSelfUpdate: () => invoke<void>("install_self_update"),
 };

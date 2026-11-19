@@ -1,7 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { check as checkSelfUpdate, type Update } from "@tauri-apps/plugin-updater";
 import {
   AlertCircle,
   ArrowUpCircle,
@@ -39,6 +37,8 @@ import {
   type DashboardPayload,
   type InstallProgressEvent,
   type McpToolsConfig,
+  type SelfUpdateCheckResult,
+  type SelfUpdateProgressEvent,
 } from "./lib/api";
 import { AppBrandIcon, TakoBrandMark } from "./components/BrandIcons";
 
@@ -52,11 +52,20 @@ type SelfUpdateStatus =
   | "installing"
   | "error";
 
+interface SelfUpdateInfo {
+  version: string;
+  notes: string | null;
+  source: string;
+}
+
 interface SelfUpdateProgress {
   downloaded: number;
   total: number | null;
   percent: number;
 }
+
+const SELF_UPDATE_INTERVAL_MS = 30 * 60 * 1000;
+const FOCUS_RECHECK_THRESHOLD_MS = 10 * 60 * 1000;
 
 interface McpToolItem {
   key: keyof Pick<McpToolsConfig, "image" | "video" | "audio" | "search" | "consult">;
@@ -194,11 +203,12 @@ export default function App() {
   const [savingMcp, setSavingMcp] = useState(false);
   const [loggingIn, setLoggingIn] = useState(false);
 
-  const [selfUpdate, setSelfUpdate] = useState<Update | null>(null);
+  const [selfUpdate, setSelfUpdate] = useState<SelfUpdateInfo | null>(null);
   const [selfUpdateStatus, setSelfUpdateStatus] = useState<SelfUpdateStatus>("idle");
   const [selfUpdateProgress, setSelfUpdateProgress] = useState<SelfUpdateProgress | null>(null);
   const [selfUpdateError, setSelfUpdateError] = useState<string | null>(null);
   const [lastCheckedAt, setLastCheckedAt] = useState<string | null>(null);
+  const lastCheckTsRef = useRef<number>(0);
 
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [statusNote, setStatusNote] = useState<string | null>(null);
@@ -305,56 +315,68 @@ export default function App() {
     }
   }, []);
 
-  const runUpdateChecks = useCallback(async (silent = false) => {
-    setCheckingUpdates(true);
-    setSelfUpdateError(null);
-    setSelfUpdateStatus((prev) =>
-      prev === "downloading" || prev === "installing" ? prev : "checking",
-    );
-
-    try {
-      const [manifestRes, selfRes] = await Promise.allSettled([
-        api.checkAppUpdates(),
-        checkSelfUpdate(),
-      ]);
-
-      if (manifestRes.status === "fulfilled") {
-        const nextMap: Partial<Record<AppId, AppUpdateStatus>> = {};
-        for (const item of manifestRes.value.updates) {
-          nextMap[item.appId] = item;
-        }
-        setUpdatesMap(nextMap);
-      } else if (!silent) {
-        setErrorMsg(`检查客户端更新失败：${String(manifestRes.reason)}`);
-      }
-
-      if (selfRes.status === "fulfilled") {
-        if (selfRes.value) {
-          setSelfUpdate(selfRes.value);
-          setSelfUpdateStatus((prev) =>
-            prev === "downloading" || prev === "installing" ? prev : "available",
-          );
-        } else {
-          setSelfUpdate(null);
-          setSelfUpdateStatus((prev) =>
-            prev === "downloading" || prev === "installing" ? prev : "latest",
-          );
-        }
-      } else {
-        setSelfUpdateStatus((prev) => {
-          if (prev === "downloading" || prev === "installing") return prev;
-          return silent ? "idle" : "error";
-        });
-        if (!silent) {
-          setSelfUpdateError(String(selfRes.reason));
-        }
-      }
-
-      setLastCheckedAt(formatTimeHHMM());
-    } finally {
-      setCheckingUpdates(false);
+  const applySelfUpdateCheckResult = useCallback((res: SelfUpdateCheckResult) => {
+    if (res.available && res.version) {
+      setSelfUpdate({
+        version: res.version,
+        notes: res.notes,
+        source: res.source,
+      });
+      setSelfUpdateStatus((prev) =>
+        prev === "downloading" || prev === "installing" ? prev : "available",
+      );
+    } else {
+      setSelfUpdate(null);
+      setSelfUpdateStatus((prev) =>
+        prev === "downloading" || prev === "installing" ? prev : "latest",
+      );
     }
   }, []);
+
+  const runUpdateChecks = useCallback(
+    async (silent = false) => {
+      setCheckingUpdates(true);
+      setSelfUpdateError(null);
+      setSelfUpdateStatus((prev) =>
+        prev === "downloading" || prev === "installing" ? prev : "checking",
+      );
+
+      try {
+        const [manifestRes, selfRes] = await Promise.allSettled([
+          api.checkAppUpdates(),
+          api.checkSelfUpdateSmart(),
+        ]);
+
+        if (manifestRes.status === "fulfilled") {
+          const nextMap: Partial<Record<AppId, AppUpdateStatus>> = {};
+          for (const item of manifestRes.value.updates) {
+            nextMap[item.appId] = item;
+          }
+          setUpdatesMap(nextMap);
+        } else if (!silent) {
+          setErrorMsg(`检查客户端更新失败：${String(manifestRes.reason)}`);
+        }
+
+        if (selfRes.status === "fulfilled") {
+          applySelfUpdateCheckResult(selfRes.value);
+        } else {
+          setSelfUpdateStatus((prev) => {
+            if (prev === "downloading" || prev === "installing") return prev;
+            return silent ? "idle" : "error";
+          });
+          if (!silent) {
+            setSelfUpdateError(String(selfRes.reason));
+          }
+        }
+
+        lastCheckTsRef.current = Date.now();
+        setLastCheckedAt(formatTimeHHMM());
+      } finally {
+        setCheckingUpdates(false);
+      }
+    },
+    [applySelfUpdateCheckResult],
+  );
 
   useEffect(() => {
     let disposed = false;
@@ -386,6 +408,40 @@ export default function App() {
       }
     });
 
+    const unlistenSelfProgressPromise = listen<SelfUpdateProgressEvent>(
+      "self-update-progress",
+      (event) => {
+        const { stage, downloaded, total } = event.payload;
+        if (stage === "started") {
+          setSelfUpdateStatus("downloading");
+          setSelfUpdateProgress({ downloaded: 0, total, percent: 4 });
+        } else if (stage === "progress") {
+          const pct =
+            total && total > 0
+              ? Math.min(96, Math.max(4, Math.round((downloaded / total) * 96)))
+              : Math.min(90, Math.round(4 + downloaded / 524_288));
+          setSelfUpdateStatus("downloading");
+          setSelfUpdateProgress({ downloaded, total, percent: pct });
+        } else if (stage === "finished") {
+          setSelfUpdateStatus("installing");
+          setSelfUpdateProgress({
+            downloaded,
+            total: total ?? downloaded,
+            percent: 100,
+          });
+        }
+      },
+    );
+
+    const unlistenSelfStatusPromise = listen<SelfUpdateCheckResult>(
+      "self-update-status",
+      (event) => {
+        applySelfUpdateCheckResult(event.payload);
+        lastCheckTsRef.current = Date.now();
+        setLastCheckedAt(formatTimeHHMM());
+      },
+    );
+
     const unlistenStatePromise = listen("state-changed", () => {
       void loadDashboard(false);
     });
@@ -402,11 +458,13 @@ export default function App() {
     return () => {
       disposed = true;
       void unlistenProgressPromise.then((fn) => fn());
+      void unlistenSelfProgressPromise.then((fn) => fn());
+      void unlistenSelfStatusPromise.then((fn) => fn());
       void unlistenStatePromise.then((fn) => fn());
       void unlistenUpdatesPromise.then((fn) => fn());
       void unlistenAccountPromise.then((fn) => fn());
     };
-  }, [loadDashboard, runUpdateChecks]);
+  }, [applySelfUpdateCheckResult, loadDashboard, runUpdateChecks]);
 
   const syncRunningStates = useCallback(async () => {
     if (runningSyncInFlight.current) return;
@@ -445,9 +503,17 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const autoCheck = Boolean(dashboard?.state.autoCheckUpdates);
+    const maybeRecheckOnFocus = () => {
+      if (!autoCheck || document.visibilityState !== "visible") return;
+      if (Date.now() - lastCheckTsRef.current >= FOCUS_RECHECK_THRESHOLD_MS) {
+        void runUpdateChecks(true);
+      }
+    };
     const onFocusOrVisible = () => {
       if (document.visibilityState === "visible") {
         void syncRunningStates();
+        maybeRecheckOnFocus();
       }
     };
     const timer = window.setInterval(() => {
@@ -455,14 +521,22 @@ export default function App() {
         void syncRunningStates();
       }
     }, 2500);
+    const updateTimer = autoCheck
+      ? window.setInterval(() => {
+          void runUpdateChecks(true);
+        }, SELF_UPDATE_INTERVAL_MS)
+      : null;
     window.addEventListener("focus", onFocusOrVisible);
     document.addEventListener("visibilitychange", onFocusOrVisible);
     return () => {
       window.clearInterval(timer);
+      if (updateTimer !== null) {
+        window.clearInterval(updateTimer);
+      }
       window.removeEventListener("focus", onFocusOrVisible);
       document.removeEventListener("visibilitychange", onFocusOrVisible);
     };
-  }, [syncRunningStates]);
+  }, [dashboard?.state.autoCheckUpdates, runUpdateChecks, syncRunningStates]);
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -767,34 +841,11 @@ export default function App() {
     }
     setSelfUpdateStatus("downloading");
     setSelfUpdateError(null);
-    let downloaded = 0;
-    let total: number | null = null;
     setSelfUpdateProgress({ downloaded: 0, total: null, percent: 2 });
 
     try {
-      await selfUpdate.downloadAndInstall((event) => {
-        if (event.event === "Started") {
-          total = event.data.contentLength ?? null;
-          downloaded = 0;
-          setSelfUpdateProgress({ downloaded: 0, total, percent: 4 });
-        } else if (event.event === "Progress") {
-          downloaded += event.data.chunkLength;
-          const pct =
-            total && total > 0
-              ? Math.min(96, Math.max(4, Math.round((downloaded / total) * 96)))
-              : Math.min(90, Math.round(4 + downloaded / 524_288));
-          setSelfUpdateProgress({ downloaded, total, percent: pct });
-        } else if (event.event === "Finished") {
-          setSelfUpdateStatus("installing");
-          setSelfUpdateProgress({
-            downloaded,
-            total: total ?? downloaded,
-            percent: 100,
-          });
-        }
-      });
+      await api.installSelfUpdate();
       setSelfUpdateStatus("installing");
-      await relaunch();
     } catch (err) {
       const msg = String(err);
       setSelfUpdateStatus("error");
@@ -998,10 +1049,10 @@ export default function App() {
                       ? `正在安装 Tako Switch v${selfUpdate?.version ?? ""}，即将重启...`
                       : selfUpdateStatus === "downloading" && selfUpdateProgress
                         ? `正在下载 Tako Switch v${selfUpdate?.version ?? ""} · ${formatBytes(selfUpdateProgress.downloaded)}${selfUpdateProgress.total ? ` / ${formatBytes(selfUpdateProgress.total)}` : ""}`
-                        : `Tako Switch v${selfUpdate?.version ?? ""} 已发布，可一键更新并重启`}
+                        : `Tako Switch v${selfUpdate?.version ?? ""} 已发布${selfUpdate?.source === "github" ? "（GitHub 同步源）" : ""}，可一键更新并重启`}
                   </div>
-                  {selfUpdate?.body && selfUpdateStatus === "available" && (
-                    <div className="text-[11px] opacity-80 truncate">{selfUpdate.body}</div>
+                  {selfUpdate?.notes && selfUpdateStatus === "available" && (
+                    <div className="text-[11px] opacity-80 truncate">{selfUpdate.notes}</div>
                   )}
                 </div>
               </div>
@@ -1689,7 +1740,7 @@ export default function App() {
                             Tako Switch
                           </span>
                           <span className="tabular-nums text-[11px] px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] text-[var(--text-secondary)]">
-                            v{dashboard?.appVersion ?? "2.0.1"}
+                            v{dashboard?.appVersion ?? "2.0.3"}
                           </span>
                           {selfUpdateStatus === "latest" && (
                             <span className="inline-flex items-center gap-1 text-[11px] text-[var(--success)] font-medium">
@@ -1698,8 +1749,11 @@ export default function App() {
                             </span>
                           )}
                           {selfUpdateStatus === "available" && selfUpdate && (
-                            <span className="text-[11px] text-[var(--accent)] font-medium">
-                              新版 v{selfUpdate.version}
+                            <span className="inline-flex items-center gap-1.5 text-[11px] text-[var(--accent)] font-medium">
+                              <span>新版 v{selfUpdate.version}</span>
+                              <span className="px-1.5 py-0.2 rounded bg-[var(--accent-soft)] border border-[var(--accent-border)] text-[10px]">
+                                {selfUpdate.source === "github" ? "GitHub 源" : "国内加速源"}
+                              </span>
                             </span>
                           )}
                         </div>
