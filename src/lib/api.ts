@@ -1,0 +1,159 @@
+import { invoke } from "@tauri-apps/api/core";
+
+export type AppId = "codex" | "claude" | "antigravity";
+export type AppMode = "official" | "hybrid" | "tako";
+
+export interface QuotaSummary {
+  windowCostLimit: number;
+  windowUsed: number;
+  windowMinutes: number;
+  dailyCostLimit: number;
+  dailyUsed: number;
+  weeklyCostLimit: number;
+  weeklyUsed: number;
+}
+
+export interface AccountStatus {
+  loggedIn: boolean;
+  baseUrl: string;
+  maskedKey: string | null;
+  userName: string | null;
+  planName: string | null;
+  walletRemain: number | null;
+  walletUsed: number | null;
+  quota: QuotaSummary | null;
+  error: string | null;
+}
+
+export interface McpToolsConfig {
+  image: boolean;
+  video: boolean;
+  audio: boolean;
+  search: boolean;
+  consult: boolean;
+  outputDir: string;
+  consultModel: string;
+}
+
+export interface SwitchState {
+  baseUrl: string;
+  agyApiKey?: string | null;
+  manifestUrl: string;
+  fallbackManifestUrl: string;
+  autoCheckUpdates: boolean;
+  mcp: McpToolsConfig;
+}
+
+export interface InstallInfo {
+  installed: boolean;
+  version: string | null;
+  installPath: string | null;
+  installKind: string | null;
+}
+
+export interface DiagnosticResult {
+  ok: boolean;
+  issues: string[];
+  notes: string[];
+}
+
+export interface AppSnapshot {
+  id: AppId;
+  name: string;
+  mode: AppMode;
+  mcpEnabled: boolean;
+  hasBackup: boolean;
+  running: boolean;
+  install: InstallInfo;
+  diagnostic: DiagnosticResult;
+}
+
+export interface PlatformArtifact {
+  url: string;
+  fallbackUrl?: string;
+  version?: string;
+  sha256?: string;
+  sha512?: string;
+  size?: number;
+  installType: string;
+  appBundleName?: string;
+}
+
+export interface Manifest {
+  schemaVersion: number;
+  generatedAt: string;
+  apps: Record<
+    string,
+    {
+      displayName: string;
+      version: string;
+      platforms: Record<string, PlatformArtifact>;
+    }
+  >;
+}
+
+export interface AppUpdateStatus {
+  appId: AppId;
+  installed: boolean;
+  installedVersion: string | null;
+  remoteVersion: string | null;
+  hasUpdate: boolean;
+  platformSupported: boolean;
+  artifact: PlatformArtifact | null;
+}
+
+export interface ManifestCheckResult {
+  sourceUrl: string;
+  manifest: Manifest;
+  updates: AppUpdateStatus[];
+}
+
+export interface DashboardPayload {
+  account: AccountStatus;
+  state: SwitchState;
+  apps: AppSnapshot[];
+  cachedManifest: Manifest | null;
+  appVersion: string;
+  os: string;
+}
+
+export interface InstallProgressEvent {
+  appId: AppId;
+  stage: string;
+  percent: number;
+  message: string;
+}
+
+export interface InstallOutcome {
+  appId: AppId;
+  modeReapplied: AppMode;
+  snapshot: AppSnapshot;
+}
+
+export interface SettingsPatch {
+  baseUrl?: string;
+  agyApiKey?: string;
+  manifestUrl?: string;
+  fallbackManifestUrl?: string;
+  autoCheckUpdates?: boolean;
+  mcp?: McpToolsConfig;
+}
+
+export const api = {
+  getDashboard: (refreshAccount: boolean) =>
+    invoke<DashboardPayload>("get_dashboard", { refreshAccount }),
+  loginOAuth: () => invoke<AccountStatus>("login_oauth"),
+  loginWithKey: (key: string) => invoke<AccountStatus>("login_with_key", { key }),
+  logoutAccount: () => invoke<AccountStatus>("logout_account"),
+  openUrl: (url: string) => invoke<void>("open_url", { url }),
+  saveSettings: (input: SettingsPatch) =>
+    invoke<SwitchState>("save_settings", { input }),
+  setAppMode: (appId: AppId, mode: AppMode, autoRestart: boolean) =>
+    invoke<AppSnapshot>("set_app_mode", { appId, mode, autoRestart }),
+  restartApp: (appId: AppId) => invoke<AppSnapshot>("restart_app", { appId }),
+  launchApp: (appId: AppId) => invoke<AppSnapshot>("launch_app", { appId }),
+  diagnoseApp: (appId: AppId) => invoke<DiagnosticResult>("diagnose_app", { appId }),
+  checkAppUpdates: () => invoke<ManifestCheckResult>("check_app_updates"),
+  installOrUpgradeApp: (appId: AppId) =>
+    invoke<InstallOutcome>("install_or_upgrade_app", { appId }),
+};

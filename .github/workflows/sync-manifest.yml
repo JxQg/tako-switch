@@ -1,0 +1,47 @@
+name: Sync App Manifest
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Refresh manifest/manifest.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch latest official upstream releases
+        env:
+          TAKO_MIRROR_BASE: ${{ vars.MIRROR_APPS_BASE }}
+        run: python3 scripts/sync-manifest.py --out manifest/manifest.json
+
+      - name: Commit updated manifest if changed
+        run: |
+          if git diff --quiet manifest/manifest.json; then
+            echo "No upstream changes detected."
+            exit 0
+          fi
+          git config user.name "tako-bot"
+          git config user.email "bot@shiroha.tech"
+          git add manifest/manifest.json
+          git commit -m "chore(manifest): sync desktop app versions [skip ci]"
+          git push
+
+      - name: Sync manifest.json to China mirror bucket (optional)
+        if: env.MIRROR_S3_BUCKET != ''
+        env:
+          MIRROR_S3_BUCKET: ${{ secrets.MIRROR_S3_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.MIRROR_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MIRROR_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.MIRROR_ENDPOINT_URL }}
+        run: |
+          aws s3 cp manifest/manifest.json "s3://${MIRROR_S3_BUCKET}/tako-switch/manifest.json"

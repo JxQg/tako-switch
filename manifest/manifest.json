@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-11-19T08:19:14Z",
+  "apps": {
+    "codex": {
+      "displayName": "Codex Desktop",
+      "version": "26.1111.71704",
+      "platforms": {
+        "macos-arm64": {
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-arm64-26.1111.71704.zip",
+          "version": "26.1111.71704",
+          "installType": "zip",
+          "appBundleName": "ChatGPT.app",
+          "size": 835851598
+        },
+        "macos-x64": {
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-x64-26.1111.71704.zip",
+          "version": "26.1111.71704",
+          "installType": "zip",
+          "appBundleName": "ChatGPT.app",
+          "size": 863552428
+        },
+        "windows-x64": {
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix",
+          "version": "26.1111.2228.0",
+          "installType": "msix",
+          "packageFamilyName": "OpenAI.Codex_2p2nqsd0c76g0",
+          "size": 1057802768
+        }
+      }
+    },
+    "claude": {
+      "displayName": "Claude Desktop",
+      "version": "6.6395.1",
+      "platforms": {
+        "macos-universal": {
+          "url": "https://downloads.claude.ai/releases/darwin/universal/6.6395.1/Claude-8fc566f7b97e371bae421fc79c260de86c6a4106.zip",
+          "version": "6.6395.1",
+          "installType": "zip",
+          "appBundleName": "Claude.app",
+          "size": 399137278
+        },
+        "windows-x64": {
+          "url": "https://downloads.claude.ai/releases/win32/x64/6.6395.1/Claude-8fc566f7b97e371bae421fc79c260de86c6a4106.exe",
+          "version": "6.6395.1",
+          "installType": "exe",
+          "silentArgs": [
+            "--silent"
+          ],
+          "size": 274749088
+        }
+      }
+    },
+    "antigravity": {
+      "displayName": "Google Antigravity",
+      "version": "2.33.0",
+      "platforms": {
+        "macos-arm64": {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.33.0-4731201358004224/darwin-arm/Antigravity.zip",
+          "version": "2.33.0",
+          "installType": "zip",
+          "sha512": "6a418a0680163b166675dad0caf4870f19a70ad69a2e7cfb8da0530e0fbc83cbc6fe5cad06576f2241d13f15c0f965ac9ba5ead853fe7d2cd60ff04a166b01bd",
+          "size": 208556255,
+          "appBundleName": "Antigravity.app"
+        },
+        "macos-x64": {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.33.0-4731201358004224/darwin-x64/Antigravity.zip",
+          "version": "2.33.0",
+          "installType": "zip",
+          "sha512": "44a2b19436a834d5d788eed327092af11f1139f3a85cd2e5ea9c2b4b44e405040544a97f24a21956a280f37e11eac7f4d65ebc3f84e1814adef8e193bf7f893a",
+          "size": 220260763,
+          "appBundleName": "Antigravity.app"
+        },
+        "windows-x64": {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.33.0-4731201358004224/windows-x64/Antigravity-x64.exe",
+          "version": "2.33.0",
+          "installType": "exe",
+          "sha512": "3636c0fe4b477bbc756324dbbf14eab541cf974560093a95c57db409370dd871557497bb9511938eb0408074fd0a0972cb4f2f3024fce54a4d73bdbe2d9c2a1b",
+          "size": 182549552,
+          "silentArgs": [
+            "/VERYSILENT",
+            "/NORESTART",
+            "/CLOSEAPPLICATIONS"
+          ]
+        }
+      }
+    }
+  }
+}

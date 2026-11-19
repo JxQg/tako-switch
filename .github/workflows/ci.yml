@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  frontend-and-scripts:
+    name: Frontend & Manifest Script
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Typecheck and build frontend
+        run: npm run build
+
+      - name: Validate manifest sync unit tests
+        run: python3 -m unittest -v scripts/test_sync_manifest.py
+
+      - name: Validate manifest.json structure
+        run: |
+          python3 -c '
+          import json
+          data = json.load(open("manifest/manifest.json", encoding="utf-8"))
+          assert data["schemaVersion"] == 1
+          assert set(data["apps"].keys()) == {"codex", "claude", "antigravity"}
+          print("manifest.json OK:", list(data["apps"].keys()))
+          '
+
+  rust-check:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux Tauri system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev
+
+      - name: Build frontend dist for Tauri embed check
+        run: |
+          npm ci
+          npm run build
+
+      - name: Run cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Run cargo clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
