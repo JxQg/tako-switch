@@ -1,4 +1,4 @@
-# Tako Switch
+# Tako Switch (v2)
 
 极简跨平台（macOS + Windows）桌面 AI 客户端配置器与内置 **Tako 超级 MCP** 宿主，使用 Tauri v2 (Rust + React/TypeScript/Tailwind v4) 构建。
 
@@ -15,9 +15,9 @@
 - **内置 Rust stdio MCP 服务器 (`tako-switch mcp-server`)**：
   - 5 合 1 工具：`tako_generate_image`、`tako_generate_video`、`tako_generate_audio`、`tako_web_search`、`tako_consult`。
   - 每次 `tools/list` / `tools/call` 动态读取 `~/.tako/config.json` 与 `~/.tako/switch/state.json`，开关即时生效，无需重装 MCP。
-- **双层自动化更新闭环**：
-  1. `tako-switch` 自身通过 `tauri-plugin-updater`（Ed25519 minisign）优先检查镜像 `downloads.tako.shiroha.tech/tako-switch/latest.json`，自动回退至 GitHub Releases。
-  2. GitHub Actions 每 6 小时自动同步 Antigravity / Claude / Codex 官方无墙源生成 `manifest/manifest.json`，客户端支持一键安装与无损覆盖升级。
+- **双层自动化更新 & 成本收敛策略**：
+  1. `tako-switch` 自身自更新：基于 `tauri-plugin-updater`（Ed25519 minisign）优先检查国内上海 OSS 加速节点 `https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/tako-switch/latest.json`，自动回退 GitHub Releases。**OSS 桶与 GitHub v2 Release 严格仅保留最新单一版本**，自动清理历史旧包，避免存储费用累积。
+  2. 三端托管桌面应用追新：GitHub Actions 每 6 小时自动同步 Antigravity / Claude / Codex 官方无墙源至 `manifest/manifest.json`（国内仅镜像该几十 KB 的清单 JSON；3–4 GB 第三方安装包直接从原厂官方无墙 CDN 拉取，不消耗自有 OSS 流量）。
 
 ## 本地开发与验证
 
@@ -39,10 +39,7 @@ npx tauri dev
 npx tauri build --bundles app
 ```
 
-## GitHub Actions Secrets / Variables 说明
+## GitHub Actions Secrets 说明（已配置于 `Barrierml/tako-switch`）
 
-- `TAURI_SIGNING_PRIVATE_KEY`（已配置）：Tauri v2 updater Ed25519 签名私钥（无口令）。
-- macOS 签名与公证（发布签名前从 `tako-dev/dsh-tako-desktop` 复用）：
-  `APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID`、`KEYCHAIN_PASSWORD`。
-- 国内加速镜像（可选，配置 OSS/S3 后自动启用）：
-  Variables: `MIRROR_SELF_BASE`、`MIRROR_APPS_BASE`；Secrets: `MIRROR_S3_BUCKET`、`MIRROR_ACCESS_KEY_ID`、`MIRROR_SECRET_ACCESS_KEY`、`MIRROR_ENDPOINT_URL`。
+- **Tauri 更新器签名**：`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+- **Apple Developer ID 签名与公证（`2UU65K4YLY`）**：`APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID`、`KEYCHAIN_PASSWORD`

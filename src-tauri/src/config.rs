@@ -9,9 +9,9 @@ use std::os::unix::fs::PermissionsExt;
 
 pub const DEFAULT_TAKO_BASE_URL: &str = "https://tako.shiroha.tech";
 pub const DEFAULT_MANIFEST_URL: &str =
-    "https://downloads.tako.shiroha.tech/tako-switch/manifest.json";
+    "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/tako-switch/manifest.json";
 pub const DEFAULT_FALLBACK_MANIFEST_URL: &str =
-    "https://raw.githubusercontent.com/tako-dev/tako-switch/main/manifest/manifest.json";
+    "https://raw.githubusercontent.com/Barrierml/tako-switch/main/manifest/manifest.json";
 
 #[derive(Debug, Clone)]
 pub struct AppPaths {

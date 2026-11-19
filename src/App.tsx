@@ -368,7 +368,7 @@ export default function App() {
             <div className="flex items-center gap-1.5">
               <span className="text-sm font-semibold tracking-tight">Tako Switch</span>
               <span className="rounded bg-slate-200/80 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-400">
-                v{dashboard?.appVersion ?? "0.1.0"}
+                v{dashboard?.appVersion ?? "2.0.0"}
               </span>
             </div>
           </div>
