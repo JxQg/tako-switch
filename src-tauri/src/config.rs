@@ -1,6 +1,5 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -8,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::os::unix::fs::PermissionsExt;
 
 pub const DEFAULT_TAKO_BASE_URL: &str = "https://tako.shiroha.tech";
+pub const DEFAULT_GATEWAY_DISPLAY_NAME: &str = "Tako";
+pub const DEFAULT_GATEWAY_DISPLAY_SUBTITLE: &str = "Tako AI Gateway";
 pub const DEFAULT_MANIFEST_URL: &str =
     "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/tako-switch/manifest.json";
 pub const DEFAULT_FALLBACK_MANIFEST_URL: &str =
@@ -72,16 +73,20 @@ impl AppPaths {
         }
     }
 
-    pub fn tako_config_path(&self) -> PathBuf {
-        self.tako_dir.join("config.json")
-    }
-
     pub fn switch_dir(&self) -> PathBuf {
         self.tako_dir.join("switch")
     }
 
+    pub fn auth_path(&self) -> PathBuf {
+        self.switch_dir().join("auth.json")
+    }
+
     pub fn state_path(&self) -> PathBuf {
         self.switch_dir().join("state.json")
+    }
+
+    pub fn balance_cache_path(&self) -> PathBuf {
+        self.switch_dir().join("balance-cache.json")
     }
 
     pub fn backups_dir(&self, app_id: &str) -> PathBuf {
@@ -179,6 +184,18 @@ impl Default for McpToolsConfig {
     }
 }
 
+fn default_gateway_display_name() -> String {
+    DEFAULT_GATEWAY_DISPLAY_NAME.to_string()
+}
+
+fn default_gateway_display_subtitle() -> String {
+    DEFAULT_GATEWAY_DISPLAY_SUBTITLE.to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchState {
@@ -188,6 +205,16 @@ pub struct SwitchState {
     pub manifest_url: String,
     pub fallback_manifest_url: String,
     pub auto_check_updates: bool,
+    #[serde(default)]
+    pub codex_preserve_official_auth: bool,
+    #[serde(default = "default_gateway_display_name")]
+    pub gateway_display_name: String,
+    #[serde(default = "default_gateway_display_subtitle")]
+    pub gateway_display_subtitle: String,
+    #[serde(default = "default_true")]
+    pub prefer_chinese_ui: bool,
+    #[serde(default = "default_true")]
+    pub show_tray_balance: bool,
     #[serde(default)]
     pub mcp: McpToolsConfig,
 }
@@ -200,6 +227,11 @@ impl SwitchState {
             manifest_url: DEFAULT_MANIFEST_URL.to_string(),
             fallback_manifest_url: DEFAULT_FALLBACK_MANIFEST_URL.to_string(),
             auto_check_updates: true,
+            codex_preserve_official_auth: false,
+            gateway_display_name: DEFAULT_GATEWAY_DISPLAY_NAME.to_string(),
+            gateway_display_subtitle: DEFAULT_GATEWAY_DISPLAY_SUBTITLE.to_string(),
+            prefer_chinese_ui: true,
+            show_tray_balance: true,
             mcp: McpToolsConfig::with_default_dir(paths),
         }
     }
@@ -212,6 +244,25 @@ impl SwitchState {
             DEFAULT_TAKO_BASE_URL.to_string()
         } else {
             trimmed.to_string()
+        }
+    }
+
+    pub fn normalized_gateway_name(&self) -> String {
+        let trimmed = self.gateway_display_name.trim();
+        let effective = if trimmed.is_empty() {
+            DEFAULT_GATEWAY_DISPLAY_NAME
+        } else {
+            trimmed
+        };
+        effective.chars().take(60).collect()
+    }
+
+    pub fn normalized_gateway_subtitle(&self) -> Option<String> {
+        let trimmed = self.gateway_display_subtitle.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.chars().take(60).collect())
         }
     }
 }
@@ -259,69 +310,72 @@ pub fn write_atomic(path: &Path, content: &[u8], secret_mode: bool) -> Result<()
     Ok(())
 }
 
-pub fn read_tako_cli_config(paths: &AppPaths) -> Result<Map<String, Value>, String> {
-    let path = paths.tako_config_path();
-    if !path.exists() {
-        return Ok(Map::new());
-    }
-    let raw = fs::read_to_string(&path)
-        .map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
-    if raw.trim().is_empty() {
-        return Ok(Map::new());
-    }
-    let parsed: Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("解析 {} 失败: {e}", path.display()))?;
-    parsed
-        .as_object()
-        .cloned()
-        .ok_or_else(|| format!("{} 顶层必须是 JSON object", path.display()))
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchAuth {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_source: Option<String>,
 }
 
-pub fn save_tako_cli_credentials(
+pub fn read_switch_auth(paths: &AppPaths) -> SwitchAuth {
+    let path = paths.auth_path();
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return SwitchAuth::default();
+    };
+    serde_json::from_str::<SwitchAuth>(&raw).unwrap_or_default()
+}
+
+pub fn save_switch_auth(
     paths: &AppPaths,
     api_key: Option<&str>,
     api_id: Option<&str>,
+    auth_source: Option<&str>,
 ) -> Result<(), String> {
-    let mut map = read_tako_cli_config(paths)?;
-    match api_key.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(k) => {
-            map.insert("apiKey".to_string(), Value::String(k.to_string()));
+    let Some(key) = api_key.map(str::trim).filter(|s| !s.is_empty()) else {
+        let path = paths.auth_path();
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|e| format!("清理凭据文件 {} 失败: {e}", path.display()))?;
         }
-        None => {
-            map.remove("apiKey");
-        }
-    }
-    match api_id.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(id) => {
-            map.insert("apiId".to_string(), Value::String(id.to_string()));
-        }
-        None => {
-            map.remove("apiId");
-        }
-    }
-    let serialized = serde_json::to_vec_pretty(&Value::Object(map))
-        .map_err(|e| format!("序列化 Tako 配置失败: {e}"))?;
-    write_atomic(&paths.tako_config_path(), &serialized, true)
+        return Ok(());
+    };
+
+    let payload = SwitchAuth {
+        api_key: Some(key.to_string()),
+        api_id: api_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        auth_source: auth_source
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    };
+    let serialized = serde_json::to_vec_pretty(&payload)
+        .map_err(|e| format!("序列化 Tako Switch 凭据失败: {e}"))?;
+    write_atomic(&paths.auth_path(), &serialized, true)
 }
 
 pub fn read_main_api_key(paths: &AppPaths) -> Option<String> {
-    read_tako_cli_config(paths).ok().and_then(|m| {
-        m.get("apiKey")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    })
+    read_switch_auth(paths)
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 pub fn read_main_api_id(paths: &AppPaths) -> Option<String> {
-    read_tako_cli_config(paths).ok().and_then(|m| {
-        m.get("apiId")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    })
+    read_switch_auth(paths)
+        .api_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 pub fn read_switch_state(paths: &AppPaths) -> SwitchState {
@@ -335,6 +389,9 @@ pub fn read_switch_state(paths: &AppPaths) -> SwitchState {
     };
     if state.base_url.trim().is_empty() {
         state.base_url = default.base_url;
+    }
+    if state.gateway_display_name.trim().is_empty() {
+        state.gateway_display_name = default.gateway_display_name;
     }
     if state.manifest_url.trim().is_empty() {
         state.manifest_url = default.manifest_url;
@@ -421,39 +478,36 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn preserves_tako_cli_fields_on_credential_update() {
+    fn switch_auth_is_isolated_from_tako_cli_config() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
         fs::create_dir_all(&paths.tako_dir).unwrap();
-        fs::write(
-            paths.tako_config_path(),
-            r#"{
-              "installedClients": {"agy": {"version": "0.3.60"}},
-              "recentProjects": [{"path": "/tmp/foo", "launchCount": 3}],
-              "clientProviderMap": {"codex": "tako"}
-            }"#,
-        )
-        .unwrap();
+        let cli_cfg_path = paths.tako_dir.join("config.json");
+        let original_cli = r#"{"apiKey":"cr_cli_only_key","recentProjects":[]}"#;
+        fs::write(&cli_cfg_path, original_cli).unwrap();
 
-        save_tako_cli_credentials(&paths, Some("cr_test_key_123"), Some("7")).unwrap();
-        let loaded = read_tako_cli_config(&paths).unwrap();
-        assert_eq!(loaded.get("apiKey").and_then(Value::as_str), Some("cr_test_key_123"));
-        assert_eq!(loaded.get("apiId").and_then(Value::as_str), Some("7"));
-        assert!(loaded.get("installedClients").is_some());
-        assert!(loaded.get("recentProjects").is_some());
-        assert!(loaded.get("clientProviderMap").is_some());
+        assert!(read_main_api_key(&paths).is_none());
 
-        save_tako_cli_credentials(&paths, None, None).unwrap();
-        let cleared = read_tako_cli_config(&paths).unwrap();
-        assert!(cleared.get("apiKey").is_none());
-        assert!(cleared.get("recentProjects").is_some());
+        save_switch_auth(&paths, Some("cr_switch_key"), Some("7"), Some("oauth")).unwrap();
+        assert_eq!(read_main_api_key(&paths).as_deref(), Some("cr_switch_key"));
+        assert_eq!(read_main_api_id(&paths).as_deref(), Some("7"));
+        assert_eq!(
+            read_switch_auth(&paths).auth_source.as_deref(),
+            Some("oauth")
+        );
+        assert_eq!(fs::read_to_string(&cli_cfg_path).unwrap(), original_cli);
+
+        save_switch_auth(&paths, None, None, None).unwrap();
+        assert!(read_main_api_key(&paths).is_none());
+        assert!(!paths.auth_path().exists());
+        assert_eq!(fs::read_to_string(&cli_cfg_path).unwrap(), original_cli);
     }
 
     #[test]
     fn agy_key_falls_back_to_main_key() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
-        save_tako_cli_credentials(&paths, Some("cr_main_key"), Some("1")).unwrap();
+        save_switch_auth(&paths, Some("cr_main_key"), Some("1"), Some("oauth")).unwrap();
         assert_eq!(effective_agy_api_key(&paths).as_deref(), Some("cr_main_key"));
 
         let mut st = read_switch_state(&paths);

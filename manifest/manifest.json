@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-19T08:19:14Z",
+  "generatedAt": "2026-11-19T12:19:21Z",
   "apps": {
     "codex": {
       "displayName": "Codex Desktop",
@@ -22,10 +22,10 @@
         },
         "windows-x64": {
           "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix",
-          "version": "26.1111.2228.0",
+          "version": "26.1111.9664.0",
           "installType": "msix",
           "packageFamilyName": "OpenAI.Codex_2p2nqsd0c76g0",
-          "size": 1057802768
+          "size": 1057886060
         }
       }
     },

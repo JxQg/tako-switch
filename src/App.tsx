@@ -1,411 +1,927 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { relaunch } from "@tauri-apps/plugin-process";
-import { check, type Update } from "@tauri-apps/plugin-updater";
+import { check as checkSelfUpdate, type Update } from "@tauri-apps/plugin-updater";
 import {
-  Activity,
+  AlertCircle,
+  ArrowUpCircle,
+  Brain,
+  CheckCircle2,
+  ChevronDown,
   Download,
   ExternalLink,
+  Film,
+  Globe,
+  Headphones,
+  Image as ImageIcon,
   KeyRound,
-  LogIn,
   LogOut,
+  MessageSquare,
+  Moon,
   RefreshCw,
   RotateCw,
-  Settings,
+  Settings as SettingsIcon,
   Sparkles,
+  Sun,
   X,
 } from "lucide-react";
 import {
   api,
+  DEFAULT_FALLBACK_MANIFEST_URL,
+  DEFAULT_MANIFEST_URL,
+  TAKO_FEEDBACK_URL,
+  TAKO_RELEASES_URL,
+  type AccountStatus,
   type AppId,
   type AppMode,
   type AppSnapshot,
   type AppUpdateStatus,
   type DashboardPayload,
-  type DiagnosticResult,
   type InstallProgressEvent,
   type McpToolsConfig,
 } from "./lib/api";
+import { AppBrandIcon, TakoBrandMark } from "./components/BrandIcons";
 
-const MODES: { id: AppMode; label: string; tip: string }[] = [
-  { id: "official", label: "官方", tip: "纯官方账号与直连端点，无损恢复原始配置" },
-  { id: "hybrid", label: "聚合", tip: "保留官方订阅主模型，注入 Tako 超级 MCP 工具" },
-  { id: "tako", label: "Tako", tip: "主模型与 MCP 全量走 Tako 企业网关" },
-];
+type ThemePref = "system" | "light" | "dark";
+type SelfUpdateStatus =
+  | "idle"
+  | "checking"
+  | "latest"
+  | "available"
+  | "downloading"
+  | "installing"
+  | "error";
 
-const MCP_TOOLS: { key: keyof Pick<McpToolsConfig, "image" | "video" | "audio" | "search" | "consult">; label: string }[] = [
-  { key: "image", label: "生图" },
-  { key: "video", label: "生视频" },
-  { key: "audio", label: "音频" },
-  { key: "search", label: "联网搜索" },
-  { key: "consult", label: "外脑顾问" },
-];
+interface SelfUpdateProgress {
+  downloaded: number;
+  total: number | null;
+  percent: number;
+}
 
-function QuotaPill({
-  label,
-  used,
-  limit,
-}: {
+interface McpToolItem {
+  key: keyof Pick<McpToolsConfig, "image" | "video" | "audio" | "search" | "consult">;
   label: string;
-  used: number;
-  limit: number;
+  desc: string;
+  Icon: typeof ImageIcon;
+}
+
+const MCP_TOOLS: McpToolItem[] = [
+  { key: "image", label: "生图", desc: "tako_generate_image", Icon: ImageIcon },
+  { key: "video", label: "生视频", desc: "tako_generate_video", Icon: Film },
+  { key: "audio", label: "音频", desc: "tako_generate_audio", Icon: Headphones },
+  { key: "search", label: "联网", desc: "tako_web_search", Icon: Globe },
+  { key: "consult", label: "外脑", desc: "tako_consult", Icon: Brain },
+];
+
+const MODE_OPTIONS: { id: AppMode; label: string }[] = [
+  { id: "official", label: "官方" },
+  { id: "tako", label: "Tako" },
+];
+
+const THEME_OPTIONS: { id: ThemePref; label: string }[] = [
+  { id: "system", label: "跟随系统" },
+  { id: "light", label: "浅色" },
+  { id: "dark", label: "深色" },
+];
+
+const APP_DISPLAY_NAMES: Record<AppId, string> = {
+  codex: "Codex Desktop",
+  claude: "Claude Desktop",
+  antigravity: "Google Antigravity",
+};
+
+function calcPercent(used?: number | null, limit?: number | null): number {
+  if (!limit || limit <= 0 || !used || used <= 0) return 0;
+  return Math.min(100, Math.round((used / limit) * 100));
+}
+
+function formatBytes(bytes?: number | null): string {
+  if (!bytes || bytes <= 0) return "";
+  if (bytes >= 1_073_741_824) return `${(bytes / 1_073_741_824).toFixed(2)} GB`;
+  return `${(bytes / 1_048_576).toFixed(0)} MB`;
+}
+
+function formatTimeHHMM(date = new Date()): string {
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
+function installStageLabel(stage: string): string {
+  switch (stage) {
+    case "downloading":
+      return "下载中";
+    case "verifying":
+      return "校验中";
+    case "closing":
+      return "退出旧版";
+    case "installing":
+      return "安装中";
+    case "configuring":
+      return "恢复配置";
+    case "done":
+      return "已完成";
+    case "cancelled":
+      return "已取消";
+    case "error":
+      return "失败";
+    default:
+      return "处理中";
+  }
+}
+
+function modeSummary(app: AppSnapshot): string {
+  if (app.mode === "official") return "官方直连（需官方登录）";
+  return app.mcpEnabled ? "Tako 全接管（免官方登录）· Tako MCP" : "Tako 全接管（免官方登录）";
+}
+
+function loadInitialTheme(): ThemePref {
+  try {
+    const saved = localStorage.getItem("tako-switch-theme");
+    if (saved === "light" || saved === "dark" || saved === "system") return saved;
+  } catch {
+    // ignore storage errors
+  }
+  return "system";
+}
+
+function ToggleSwitch({
+  checked,
+  onChange,
+  disabled = false,
+  ariaLabel,
+}: {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  disabled?: boolean;
+  ariaLabel?: string;
 }) {
-  if (limit <= 0) return null;
-  const pct = Math.min(100, Math.max(0, Math.round((used / limit) * 100)));
-  const barColor =
-    pct >= 90 ? "bg-rose-500" : pct >= 70 ? "bg-amber-500" : "bg-emerald-500";
   return (
-    <div className="flex items-center gap-1.5 text-[11px] text-slate-600 dark:text-slate-300">
-      <span className="font-medium text-slate-500 dark:text-slate-400">{label}</span>
-      <div className="h-1.5 w-12 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-700">
-        <div className={`h-full ${barColor}`} style={{ width: `${pct}%` }} />
-      </div>
-      <span className="tabular-nums">{pct}%</span>
-    </div>
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={ariaLabel}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      className={`relative inline-flex h-[20px] w-[36px] shrink-0 items-center rounded-full transition-colors duration-150 cursor-pointer disabled:opacity-50 ${
+        checked ? "bg-[var(--accent)]" : "bg-[var(--border-strong)]"
+      }`}
+    >
+      <span
+        className={`inline-block h-[16px] w-[16px] rounded-full bg-white shadow-sm transition-transform duration-150 ${
+          checked ? "translate-x-[18px]" : "translate-x-[2px]"
+        }`}
+      />
+    </button>
   );
 }
 
 export default function App() {
   const [dashboard, setDashboard] = useState<DashboardPayload | null>(null);
-  const [updates, setUpdates] = useState<Record<AppId, AppUpdateStatus | undefined>>({
-    codex: undefined,
-    claude: undefined,
-    antigravity: undefined,
-  });
-  const [busyApp, setBusyApp] = useState<AppId | null>(null);
-  const [progressByApp, setProgressByApp] = useState<
+  const [updatesMap, setUpdatesMap] = useState<Partial<Record<AppId, AppUpdateStatus>>>({});
+  const [installProgress, setInstallProgress] = useState<
     Partial<Record<AppId, InstallProgressEvent>>
   >({});
-  const [authBusy, setAuthBusy] = useState(false);
+  const [needsRestart, setNeedsRestart] = useState<Partial<Record<AppId, boolean>>>({});
+  const [expandedApp, setExpandedApp] = useState<AppId | null>(null);
+
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [busyApp, setBusyApp] = useState<AppId | null>(null);
+  const [batchUpdatingApps, setBatchUpdatingApps] = useState(false);
+  const [cancellingApp, setCancellingApp] = useState<AppId | null>(null);
+  const [fixingGateway, setFixingGateway] = useState(false);
+  const [savingMcp, setSavingMcp] = useState(false);
+  const [loggingIn, setLoggingIn] = useState(false);
+
   const [selfUpdate, setSelfUpdate] = useState<Update | null>(null);
-  const [selfUpdating, setSelfUpdating] = useState(false);
+  const [selfUpdateStatus, setSelfUpdateStatus] = useState<SelfUpdateStatus>("idle");
+  const [selfUpdateProgress, setSelfUpdateProgress] = useState<SelfUpdateProgress | null>(null);
+  const [selfUpdateError, setSelfUpdateError] = useState<string | null>(null);
+  const [lastCheckedAt, setLastCheckedAt] = useState<string | null>(null);
 
-  const [banner, setBanner] = useState<{ kind: "err" | "ok"; text: string } | null>(
-    null
-  );
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [statusNote, setStatusNote] = useState<string | null>(null);
+
   const [showKeyModal, setShowKeyModal] = useState(false);
-  const [keyInput, setKeyInput] = useState("");
-  const [showSettingsModal, setShowSettingsModal] = useState(false);
-  const [diagModal, setDiagModal] = useState<{
-    name: string;
-    hasBackup: boolean;
-    result: DiagnosticResult;
-  } | null>(null);
+  const [apiKeyInput, setApiKeyInput] = useState("");
 
+  const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
   const [settingsForm, setSettingsForm] = useState({
     baseUrl: "",
     agyApiKey: "",
     manifestUrl: "",
     fallbackManifestUrl: "",
-    autoCheckUpdates: true,
     outputDir: "",
     consultModel: "",
+    autoCheckUpdates: true,
+    codexPreserveOfficialAuth: false,
+    gatewayDisplayName: "Tako",
+    gatewayDisplaySubtitle: "Tako AI Gateway",
+    preferChineseUi: true,
+    showTrayBalance: true,
   });
+  const [savingSettings, setSavingSettings] = useState(false);
+
+  const [themePref, setThemePref] = useState<ThemePref>(loadInitialTheme);
+  const [systemDark, setSystemDark] = useState<boolean>(() =>
+    typeof window !== "undefined"
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+      : false,
+  );
+
+  const initialAutoCheckDone = useRef(false);
+  const runningSyncInFlight = useRef(false);
+
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = (e: MediaQueryListEvent) => setSystemDark(e.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+
+  const isDark = themePref === "dark" || (themePref === "system" && systemDark);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (themePref === "system") {
+      root.removeAttribute("data-theme");
+    } else {
+      root.setAttribute("data-theme", themePref);
+    }
+    try {
+      localStorage.setItem("tako-switch-theme", themePref);
+    } catch {
+      // ignore storage errors
+    }
+  }, [themePref]);
+
+  const toggleTheme = () => {
+    setThemePref(isDark ? "light" : "dark");
+  };
+
+  const showTransientNote = useCallback((msg: string) => {
+    setStatusNote(msg);
+    setTimeout(() => {
+      setStatusNote((prev) => (prev === msg ? null : prev));
+    }, 3200);
+  }, []);
 
   const loadDashboard = useCallback(async (refreshAccount: boolean) => {
     try {
       const data = await api.getDashboard(refreshAccount);
-      setDashboard(data);
-      setSettingsForm({
-        baseUrl: data.state.baseUrl,
-        agyApiKey: data.state.agyApiKey ?? "",
-        manifestUrl: data.state.manifestUrl,
-        fallbackManifestUrl: data.state.fallbackManifestUrl,
-        autoCheckUpdates: data.state.autoCheckUpdates,
-        outputDir: data.state.mcp.outputDir,
-        consultModel: data.state.mcp.consultModel,
+      setDashboard((prev) => {
+        if (
+          !refreshAccount &&
+          prev?.account.loggedIn &&
+          data.account.loggedIn &&
+          prev.account.maskedKey === data.account.maskedKey &&
+          !data.account.userName
+        ) {
+          return {
+            ...data,
+            account: {
+              ...data.account,
+              userName: prev.account.userName,
+              planName: prev.account.planName,
+              walletRemain: prev.account.walletRemain,
+              walletUsed: prev.account.walletUsed,
+              walletRemainUsd: prev.account.walletRemainUsd,
+              walletUsedUsd: prev.account.walletUsedUsd,
+              quota: prev.account.quota,
+            },
+          };
+        }
+        return data;
       });
+      setErrorMsg(null);
+      return data;
     } catch (err) {
-      setBanner({ kind: "err", text: String(err) });
+      setErrorMsg(String(err));
+      return null;
+    } finally {
+      setLoading(false);
     }
   }, []);
 
-  const runUpdateChecks = useCallback(async () => {
+  const runUpdateChecks = useCallback(async (silent = false) => {
     setCheckingUpdates(true);
+    setSelfUpdateError(null);
+    setSelfUpdateStatus((prev) =>
+      prev === "downloading" || prev === "installing" ? prev : "checking",
+    );
+
     try {
-      const [manifestRes, appUpd] = await Promise.allSettled([
+      const [manifestRes, selfRes] = await Promise.allSettled([
         api.checkAppUpdates(),
-        check(),
+        checkSelfUpdate(),
       ]);
+
       if (manifestRes.status === "fulfilled") {
-        const next: Record<AppId, AppUpdateStatus | undefined> = {
-          codex: undefined,
-          claude: undefined,
-          antigravity: undefined,
-        };
-        for (const u of manifestRes.value.updates) {
-          next[u.appId] = u;
+        const nextMap: Partial<Record<AppId, AppUpdateStatus>> = {};
+        for (const item of manifestRes.value.updates) {
+          nextMap[item.appId] = item;
         }
-        setUpdates(next);
+        setUpdatesMap(nextMap);
+      } else if (!silent) {
+        setErrorMsg(`检查客户端更新失败：${String(manifestRes.reason)}`);
       }
-      if (appUpd.status === "fulfilled" && appUpd.value) {
-        setSelfUpdate(appUpd.value);
+
+      if (selfRes.status === "fulfilled") {
+        if (selfRes.value) {
+          setSelfUpdate(selfRes.value);
+          setSelfUpdateStatus((prev) =>
+            prev === "downloading" || prev === "installing" ? prev : "available",
+          );
+        } else {
+          setSelfUpdate(null);
+          setSelfUpdateStatus((prev) =>
+            prev === "downloading" || prev === "installing" ? prev : "latest",
+          );
+        }
+      } else {
+        setSelfUpdateStatus((prev) => {
+          if (prev === "downloading" || prev === "installing") return prev;
+          return silent ? "idle" : "error";
+        });
+        if (!silent) {
+          setSelfUpdateError(String(selfRes.reason));
+        }
       }
+
+      setLastCheckedAt(formatTimeHHMM());
     } finally {
       setCheckingUpdates(false);
     }
   }, []);
 
   useEffect(() => {
-    void loadDashboard(true);
-    void runUpdateChecks();
+    let disposed = false;
 
-    const unlistenProgress = listen<InstallProgressEvent>("install-progress", (e) => {
-      setProgressByApp((prev) => ({ ...prev, [e.payload.appId]: e.payload }));
+    loadDashboard(true).then((data) => {
+      if (disposed || !data) return;
+      if (data.state.autoCheckUpdates && !initialAutoCheckDone.current) {
+        initialAutoCheckDone.current = true;
+        void runUpdateChecks(true);
+      }
     });
-    const unlistenState = listen("state-changed", () => {
+
+    const unlistenProgressPromise = listen<InstallProgressEvent>("install-progress", (event) => {
+      const payload = event.payload;
+      setInstallProgress((prev) => ({ ...prev, [payload.appId]: payload }));
+      if (
+        payload.stage === "done" ||
+        payload.stage === "error" ||
+        payload.stage === "cancelled"
+      ) {
+        setTimeout(() => {
+          setInstallProgress((prev) => {
+            const copy = { ...prev };
+            delete copy[payload.appId];
+            return copy;
+          });
+        }, payload.stage === "cancelled" ? 500 : 1200);
+        void loadDashboard(false);
+      }
+    });
+
+    const unlistenStatePromise = listen("state-changed", () => {
       void loadDashboard(false);
     });
-    const unlistenUpdates = listen("request-check-updates", () => {
-      void runUpdateChecks();
+
+    const unlistenUpdatesPromise = listen("request-check-updates", () => {
+      void runUpdateChecks(false);
+    });
+
+    const unlistenAccountPromise = listen<AccountStatus>("account-updated", (event) => {
+      const nextAccount = event.payload;
+      setDashboard((prev) => (prev ? { ...prev, account: nextAccount } : prev));
     });
 
     return () => {
-      void unlistenProgress.then((fn) => fn());
-      void unlistenState.then((fn) => fn());
-      void unlistenUpdates.then((fn) => fn());
+      disposed = true;
+      void unlistenProgressPromise.then((fn) => fn());
+      void unlistenStatePromise.then((fn) => fn());
+      void unlistenUpdatesPromise.then((fn) => fn());
+      void unlistenAccountPromise.then((fn) => fn());
     };
   }, [loadDashboard, runUpdateChecks]);
 
-  const handleOAuthLogin = async () => {
-    setAuthBusy(true);
-    setBanner(null);
+  const syncRunningStates = useCallback(async () => {
+    if (runningSyncInFlight.current) return;
+    runningSyncInFlight.current = true;
     try {
-      const account = await api.loginOAuth();
-      setDashboard((prev) => (prev ? { ...prev, account } : prev));
-      setBanner({ kind: "ok", text: "Tako 账号登录成功" });
-    } catch (err) {
-      setBanner({ kind: "err", text: String(err) });
+      const states = await api.getRunningStates();
+      setDashboard((prev) => {
+        if (!prev) return prev;
+        let changed = false;
+        const nextApps = prev.apps.map((app) => {
+          const nextRunning = Boolean(states[app.id]);
+          if (nextRunning !== app.running) {
+            changed = true;
+            return { ...app, running: nextRunning };
+          }
+          return app;
+        });
+        return changed ? { ...prev, apps: nextApps } : prev;
+      });
+      setNeedsRestart((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const id of Object.keys(prev) as AppId[]) {
+          if (prev[id] && !states[id]) {
+            next[id] = false;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+    } catch {
+      // ignore transient polling errors
     } finally {
-      setAuthBusy(false);
+      runningSyncInFlight.current = false;
+    }
+  }, []);
+
+  useEffect(() => {
+    const onFocusOrVisible = () => {
+      if (document.visibilityState === "visible") {
+        void syncRunningStates();
+      }
+    };
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        void syncRunningStates();
+      }
+    }, 2500);
+    window.addEventListener("focus", onFocusOrVisible);
+    document.addEventListener("visibilitychange", onFocusOrVisible);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", onFocusOrVisible);
+      document.removeEventListener("visibilitychange", onFocusOrVisible);
+    };
+  }, [syncRunningStates]);
+
+  const handleRefresh = async () => {
+    setRefreshing(true);
+    await Promise.all([loadDashboard(true), runUpdateChecks(false)]);
+    setRefreshing(false);
+    showTransientNote("状态与版本信息已刷新");
+  };
+
+  const handleEnsureGateway = async () => {
+    if (fixingGateway) return;
+    setFixingGateway(true);
+    try {
+      const ok = await api.ensureLocalGateway();
+      await loadDashboard(false);
+      if (ok) {
+        showTransientNote("本地统一网关已就绪 (127.0.0.1:18419)");
+      } else {
+        setErrorMsg("本地统一网关未能启动，请检查 18419 端口是否被占用");
+      }
+    } catch (err) {
+      setErrorMsg(`拉起本地网关失败：${String(err)}`);
+    } finally {
+      setFixingGateway(false);
     }
   };
 
-  const handleKeySubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!keyInput.trim()) return;
-    setAuthBusy(true);
-    setBanner(null);
+  const handleOAuthLogin = async () => {
+    setLoggingIn(true);
+    setErrorMsg(null);
     try {
-      const account = await api.loginWithKey(keyInput.trim());
-      setDashboard((prev) => (prev ? { ...prev, account } : prev));
-      setKeyInput("");
-      setShowKeyModal(false);
-      setBanner({ kind: "ok", text: "Key 验证成功" });
+      await api.loginOAuth();
+      await loadDashboard(true);
+      showTransientNote("Tako 账号已登录");
     } catch (err) {
-      setBanner({ kind: "err", text: String(err) });
+      setErrorMsg(`登录失败：${String(err)}`);
     } finally {
-      setAuthBusy(false);
+      setLoggingIn(false);
+    }
+  };
+
+  const handleKeyLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = apiKeyInput.trim();
+    if (!trimmed) return;
+    setLoggingIn(true);
+    setErrorMsg(null);
+    try {
+      await api.loginWithKey(trimmed);
+      setApiKeyInput("");
+      setShowKeyModal(false);
+      await loadDashboard(true);
+      showTransientNote("API Key 验证成功");
+    } catch (err) {
+      setErrorMsg(`Key 验证失败：${String(err)}`);
+    } finally {
+      setLoggingIn(false);
     }
   };
 
   const handleLogout = async () => {
-    setAuthBusy(true);
     try {
-      const account = await api.logoutAccount();
-      setDashboard((prev) => (prev ? { ...prev, account } : prev));
+      await api.logoutAccount();
+      await loadDashboard(false);
+      showTransientNote("已退出当前账号");
     } catch (err) {
-      setBanner({ kind: "err", text: String(err) });
-    } finally {
-      setAuthBusy(false);
+      setErrorMsg(String(err));
     }
   };
 
-  const handleModeSwitch = async (appId: AppId, mode: AppMode) => {
-    setBusyApp(appId);
-    setBanner(null);
+  const handleSetMode = async (app: AppSnapshot, mode: AppMode) => {
+    if (app.mode === mode || busyApp === app.id) return;
+    setBusyApp(app.id);
+    setErrorMsg(null);
     try {
-      const updated = await api.setAppMode(appId, mode, false);
+      const updated = await api.setAppMode(app.id, mode, false);
+      const gwOk = updated.mode === "tako" ? await api.ensureLocalGateway().catch(() => true) : undefined;
       setDashboard((prev) =>
         prev
           ? {
               ...prev,
-              apps: prev.apps.map((a) => (a.id === appId ? updated : a)),
+              localGatewayHealthy: gwOk ?? prev.localGatewayHealthy,
+              apps: prev.apps.map((item) => (item.id === app.id ? updated : item)),
             }
-          : prev
+          : prev,
       );
       if (updated.running) {
-        setBanner({
-          kind: "ok",
-          text: `${updated.name} 配置已切换，点击“重启生效”使其应用新模式`,
-        });
+        setNeedsRestart((prev) => ({ ...prev, [app.id]: true }));
+        showTransientNote(`${APP_DISPLAY_NAMES[app.id]} 已切换模式，重启应用后生效`);
       }
     } catch (err) {
-      setBanner({ kind: "err", text: String(err) });
+      setErrorMsg(String(err));
     } finally {
       setBusyApp(null);
     }
   };
 
-  const handleRestartOrLaunch = async (snap: AppSnapshot) => {
-    setBusyApp(snap.id);
-    setBanner(null);
+  const handleRestartApp = async (appId: AppId) => {
+    setBusyApp(appId);
+    setErrorMsg(null);
     try {
-      const updated = snap.running
-        ? await api.restartApp(snap.id)
-        : await api.launchApp(snap.id);
+      const updated = await api.restartApp(appId);
+      setNeedsRestart((prev) => ({ ...prev, [appId]: false }));
       setDashboard((prev) =>
         prev
           ? {
               ...prev,
-              apps: prev.apps.map((a) => (a.id === snap.id ? updated : a)),
+              apps: prev.apps.map((item) => (item.id === appId ? updated : item)),
             }
-          : prev
+          : prev,
       );
+      showTransientNote(`${APP_DISPLAY_NAMES[appId]} 已重启`);
     } catch (err) {
-      setBanner({ kind: "err", text: String(err) });
+      setErrorMsg(String(err));
     } finally {
       setBusyApp(null);
     }
   };
 
-  const handleInstallOrUpgrade = async (appId: AppId) => {
+  const handleLaunchApp = async (appId: AppId) => {
     setBusyApp(appId);
-    setBanner(null);
+    setErrorMsg(null);
+    try {
+      const updated = await api.launchApp(appId);
+      setNeedsRestart((prev) => ({ ...prev, [appId]: false }));
+      setDashboard((prev) =>
+        prev
+          ? {
+              ...prev,
+              apps: prev.apps.map((item) => (item.id === appId ? updated : item)),
+            }
+          : prev,
+      );
+    } catch (err) {
+      setErrorMsg(String(err));
+    } finally {
+      setBusyApp(null);
+    }
+  };
+
+  const handleInstallOrUpgrade = async (appId: AppId): Promise<boolean> => {
+    setBusyApp(appId);
+    setErrorMsg(null);
     try {
       const outcome = await api.installOrUpgradeApp(appId);
+      setNeedsRestart((prev) => ({ ...prev, [appId]: false }));
       setDashboard((prev) =>
         prev
           ? {
               ...prev,
-              apps: prev.apps.map((a) => (a.id === appId ? outcome.snapshot : a)),
+              apps: prev.apps.map((item) => (item.id === appId ? outcome.snapshot : item)),
             }
-          : prev
+          : prev,
       );
-      setUpdates((prev) => ({
-        ...prev,
-        [appId]: prev[appId] ? { ...prev[appId]!, hasUpdate: false, installed: true } : undefined,
-      }));
-      setBanner({
-        kind: "ok",
-        text: `${outcome.snapshot.name} 安装/更新完成`,
-      });
+      await runUpdateChecks(true);
+      showTransientNote(`${APP_DISPLAY_NAMES[appId]} 安装更新完成`);
+      return true;
     } catch (err) {
-      setBanner({ kind: "err", text: String(err) });
+      const msg = String(err);
+      if (msg.includes("已取消下载")) {
+        showTransientNote(`已取消 ${APP_DISPLAY_NAMES[appId]} 下载`);
+      } else {
+        setErrorMsg(msg);
+      }
+      return false;
     } finally {
+      setCancellingApp((prev) => (prev === appId ? null : prev));
       setBusyApp(null);
-      setProgressByApp((prev) => {
-        const next = { ...prev };
-        delete next[appId];
-        return next;
-      });
+    }
+  };
+
+  const handleCancelAppInstall = async (appId: AppId) => {
+    setCancellingApp(appId);
+    try {
+      await api.cancelAppInstall(appId);
+    } catch {
+      // ignore cancel race if install already moved past downloading
+    }
+  };
+
+  const updatableApps = useMemo(() => {
+    if (!dashboard) return [];
+    return dashboard.apps.filter((app) => Boolean(updatesMap[app.id]?.hasUpdate));
+  }, [dashboard, updatesMap]);
+
+  const handleBatchUpgradeApps = async () => {
+    if (batchUpdatingApps || busyApp !== null || updatableApps.length === 0) return;
+    setBatchUpdatingApps(true);
+    try {
+      for (const app of updatableApps) {
+        const ok = await handleInstallOrUpgrade(app.id);
+        if (!ok) break;
+      }
+    } finally {
+      setBatchUpdatingApps(false);
+    }
+  };
+
+  const handleRediagnose = async (appId: AppId) => {
+    try {
+      const result = await api.diagnoseApp(appId);
+      setDashboard((prev) =>
+        prev
+          ? {
+              ...prev,
+              apps: prev.apps.map((item) =>
+                item.id === appId ? { ...item, diagnostic: result } : item,
+              ),
+            }
+          : prev,
+      );
+      showTransientNote(`${APP_DISPLAY_NAMES[appId]} 诊断已完成`);
+    } catch (err) {
+      setErrorMsg(String(err));
     }
   };
 
   const handleToggleMcpTool = async (
-    toolKey: keyof Pick<McpToolsConfig, "image" | "video" | "audio" | "search" | "consult">
+    key: keyof Pick<McpToolsConfig, "image" | "video" | "audio" | "search" | "consult">,
   ) => {
-    if (!dashboard) return;
-    const nextMcp: McpToolsConfig = {
-      ...dashboard.state.mcp,
-      [toolKey]: !dashboard.state.mcp[toolKey],
-    };
+    if (!dashboard || savingMcp) return;
+    const currentMcp = dashboard.state.mcp;
+    const nextMcp: McpToolsConfig = { ...currentMcp, [key]: !currentMcp[key] };
+
+    setSavingMcp(true);
+    setDashboard((prev) =>
+      prev ? { ...prev, state: { ...prev.state, mcp: nextMcp } } : prev,
+    );
+
     try {
-      const nextState = await api.saveSettings({ mcp: nextMcp });
-      setDashboard((prev) => (prev ? { ...prev, state: nextState } : prev));
+      const savedState = await api.saveSettings({ mcp: nextMcp });
+      setDashboard((prev) => (prev ? { ...prev, state: savedState } : prev));
     } catch (err) {
-      setBanner({ kind: "err", text: String(err) });
+      setDashboard((prev) =>
+        prev ? { ...prev, state: { ...prev.state, mcp: currentMcp } } : prev,
+      );
+      setErrorMsg(`更新 MCP 开关失败：${String(err)}`);
+    } finally {
+      setSavingMcp(false);
     }
+  };
+
+  const openSettings = () => {
+    if (!dashboard) return;
+    setSettingsForm({
+      baseUrl: dashboard.state.baseUrl,
+      agyApiKey: dashboard.state.agyApiKey ?? "",
+      manifestUrl: dashboard.state.manifestUrl,
+      fallbackManifestUrl: dashboard.state.fallbackManifestUrl,
+      outputDir: dashboard.state.mcp.outputDir,
+      consultModel: dashboard.state.mcp.consultModel,
+      autoCheckUpdates: dashboard.state.autoCheckUpdates,
+      codexPreserveOfficialAuth: Boolean(dashboard.state.codexPreserveOfficialAuth),
+      gatewayDisplayName: dashboard.state.gatewayDisplayName ?? "Tako",
+      gatewayDisplaySubtitle: dashboard.state.gatewayDisplaySubtitle ?? "Tako AI Gateway",
+      preferChineseUi: dashboard.state.preferChineseUi ?? true,
+      showTrayBalance: dashboard.state.showTrayBalance ?? true,
+    });
+    setShowAdvancedSettings(false);
+    setShowSettingsModal(true);
   };
 
   const handleSaveSettings = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!dashboard) return;
+    setSavingSettings(true);
+    setErrorMsg(null);
     try {
-      const nextState = await api.saveSettings({
-        baseUrl: settingsForm.baseUrl,
+      const saved = await api.saveSettings({
+        baseUrl: settingsForm.baseUrl.trim(),
         agyApiKey: settingsForm.agyApiKey.trim(),
-        manifestUrl: settingsForm.manifestUrl,
-        fallbackManifestUrl: settingsForm.fallbackManifestUrl,
+        manifestUrl: settingsForm.manifestUrl.trim(),
+        fallbackManifestUrl: settingsForm.fallbackManifestUrl.trim(),
         autoCheckUpdates: settingsForm.autoCheckUpdates,
+        codexPreserveOfficialAuth: settingsForm.codexPreserveOfficialAuth,
+        gatewayDisplayName: settingsForm.gatewayDisplayName.trim(),
+        gatewayDisplaySubtitle: settingsForm.gatewayDisplaySubtitle.trim(),
+        preferChineseUi: settingsForm.preferChineseUi,
+        showTrayBalance: settingsForm.showTrayBalance,
         mcp: {
           ...dashboard.state.mcp,
-          outputDir: settingsForm.outputDir,
-          consultModel: settingsForm.consultModel,
+          outputDir: settingsForm.outputDir.trim(),
+          consultModel: settingsForm.consultModel.trim(),
         },
       });
-      setDashboard((prev) => (prev ? { ...prev, state: nextState } : prev));
+      setDashboard((prev) => (prev ? { ...prev, state: saved } : prev));
       setShowSettingsModal(false);
-      setBanner({ kind: "ok", text: "设置已保存" });
+      showTransientNote("设置已保存");
     } catch (err) {
-      setBanner({ kind: "err", text: String(err) });
+      setErrorMsg(`保存设置失败：${String(err)}`);
+    } finally {
+      setSavingSettings(false);
     }
   };
 
-  const handleSelfUpdate = async () => {
-    if (!selfUpdate) return;
-    setSelfUpdating(true);
+  const handleInstallSelfUpdate = async () => {
+    if (
+      !selfUpdate ||
+      selfUpdateStatus === "downloading" ||
+      selfUpdateStatus === "installing"
+    ) {
+      return;
+    }
+    setSelfUpdateStatus("downloading");
+    setSelfUpdateError(null);
+    let downloaded = 0;
+    let total: number | null = null;
+    setSelfUpdateProgress({ downloaded: 0, total: null, percent: 2 });
+
     try {
-      await selfUpdate.downloadAndInstall();
+      await selfUpdate.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength ?? null;
+          downloaded = 0;
+          setSelfUpdateProgress({ downloaded: 0, total, percent: 4 });
+        } else if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          const pct =
+            total && total > 0
+              ? Math.min(96, Math.max(4, Math.round((downloaded / total) * 96)))
+              : Math.min(90, Math.round(4 + downloaded / 524_288));
+          setSelfUpdateProgress({ downloaded, total, percent: pct });
+        } else if (event.event === "Finished") {
+          setSelfUpdateStatus("installing");
+          setSelfUpdateProgress({
+            downloaded,
+            total: total ?? downloaded,
+            percent: 100,
+          });
+        }
+      });
+      setSelfUpdateStatus("installing");
       await relaunch();
     } catch (err) {
-      setBanner({ kind: "err", text: `应用自更新失败: ${String(err)}` });
-      setSelfUpdating(false);
+      const msg = String(err);
+      setSelfUpdateStatus("error");
+      setSelfUpdateError(msg);
+      setErrorMsg(`Tako Switch 更新失败：${msg}`);
     }
   };
 
-  const handleDiagnose = async (snap: AppSnapshot) => {
-    try {
-      const result = await api.diagnoseApp(snap.id);
-      setDiagModal({ name: snap.name, hasBackup: snap.hasBackup, result });
-    } catch (err) {
-      setBanner({ kind: "err", text: String(err) });
-    }
-  };
+  const isMac = useMemo(() => {
+    if (dashboard?.os) return dashboard.os === "macos";
+    return typeof navigator !== "undefined" && navigator.platform.toLowerCase().includes("mac");
+  }, [dashboard?.os]);
 
-  const acct = dashboard?.account;
+  const mcpEnabledCount = useMemo(() => {
+    if (!dashboard) return 0;
+    const mcp = dashboard.state.mcp;
+    return [mcp.image, mcp.video, mcp.audio, mcp.search, mcp.consult].filter(Boolean).length;
+  }, [dashboard]);
+
+  const anyTakoMode = useMemo(
+    () => Boolean(dashboard?.apps.some((a) => a.mode === "tako")),
+    [dashboard?.apps],
+  );
+
+  const hasPendingUpdates =
+    selfUpdateStatus === "available" || updatableApps.length > 0;
+
+  const account = dashboard?.account;
+  const pct5h = calcPercent(account?.quota?.windowUsed, account?.quota?.windowCostLimit);
+  const pct7d = calcPercent(account?.quota?.weeklyUsed, account?.quota?.weeklyCostLimit);
+  const hasSubQuota = Boolean(
+    account?.quota &&
+      (account.quota.windowCostLimit > 0 || account.quota.weeklyCostLimit > 0),
+  );
+  const remainUsd = account?.walletRemainUsd;
+  const usedUsd = account?.walletUsedUsd;
+  const balanceColor =
+    remainUsd !== null && remainUsd !== undefined
+      ? remainUsd < 0.5
+        ? "var(--danger)"
+        : remainUsd < 2.0
+          ? "var(--warning)"
+          : "var(--success)"
+      : "var(--text-primary)";
 
   return (
-    <div className="flex h-screen flex-col justify-between bg-slate-50 px-4 py-3 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
-      {/* Header */}
-      <header className="flex items-center justify-between gap-2 border-b border-slate-200/80 pb-2.5 dark:border-slate-800">
-        <div className="flex items-center gap-2">
-          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-to-br from-sky-500 to-cyan-500 text-xs font-bold text-white shadow-sm">
-            T
+    <div className="h-screen w-screen flex flex-col app-surface overflow-hidden">
+      {/* Unified Native-Integrated Header (52px) */}
+      <header
+        data-tauri-drag-region
+        className={`h-[52px] shrink-0 flex items-center justify-between border-b border-[var(--border)] pr-3.5 ${
+          isMac ? "pl-[82px]" : "pl-4"
+        }`}
+      >
+        {/* Left Brand */}
+        <div data-tauri-drag-region className="flex items-center gap-2.5 shrink-0">
+          <div data-tauri-drag-region className="pointer-events-none">
+            <TakoBrandMark className="h-[26px] w-[26px]" />
           </div>
-          <div>
-            <div className="flex items-center gap-1.5">
-              <span className="text-sm font-semibold tracking-tight">Tako Switch</span>
-              <span className="rounded bg-slate-200/80 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-400">
-                v{dashboard?.appVersion ?? "2.0.0"}
-              </span>
-            </div>
-          </div>
+          <span
+            data-tauri-drag-region
+            className="text-[14px] font-semibold tracking-[-0.015em] text-[var(--text-primary)]"
+          >
+            Tako Switch
+          </span>
+          <span
+            data-tauri-drag-region
+            className="tabular-nums text-[12px] font-medium text-[var(--text-muted)] bg-[var(--bg-subtle)] border border-[var(--border)] rounded-full px-2 py-0.5"
+          >
+            v{dashboard?.appVersion ?? "2.0.1"}
+          </span>
         </div>
 
-        <div className="flex items-center gap-2">
-          {acct?.loggedIn ? (
-            <div className="flex items-center gap-2.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1 shadow-xs dark:border-slate-800 dark:bg-slate-900">
-              <div className="flex flex-col leading-tight">
-                <span className="text-xs font-medium">
-                  {acct.userName || acct.maskedKey || "已登录"}
+        {/* Flexible drag region spacer */}
+        <div data-tauri-drag-region className="flex-1 h-full min-w-[16px]" />
+
+        {/* Right Controls */}
+        <div className="flex items-center gap-1.5 shrink-0">
+          {account?.loggedIn ? (
+            <div className="h-8 px-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] flex items-center gap-2.5 shadow-[var(--shadow-card)]">
+              <div className="flex items-center gap-1.5">
+                <span className="text-[12px] font-medium text-[var(--text-primary)] max-w-[84px] truncate">
+                  {account.userName ?? "Tako 用户"}
                 </span>
-                {acct.planName && (
-                  <span className="text-[10px] text-sky-600 dark:text-sky-400">
-                    {acct.planName}
+                {account.planName && (
+                  <span className="text-[12px] font-medium text-[var(--accent)]">
+                    {account.planName}
                   </span>
                 )}
               </div>
-              {acct.quota && (
-                <div className="flex items-center gap-2 border-l border-slate-200 pl-2 dark:border-slate-700">
-                  <QuotaPill
-                    label="5h"
-                    used={acct.quota.windowUsed}
-                    limit={acct.quota.windowCostLimit}
-                  />
-                  <QuotaPill
-                    label="7d"
-                    used={acct.quota.weeklyUsed}
-                    limit={acct.quota.weeklyCostLimit}
-                  />
-                </div>
+
+              {remainUsd !== null && remainUsd !== undefined && (
+                <>
+                  <span className="h-3.5 w-px bg-[var(--border)]" />
+                  <div
+                    className="flex items-center gap-1 tabular-nums text-[12px]"
+                    title={`钱包余额 $${remainUsd.toFixed(2)}（累计已用 $${(usedUsd ?? 0).toFixed(2)}）`}
+                  >
+                    <span className="text-[var(--text-muted)]">余额</span>
+                    <span className="font-semibold" style={{ color: balanceColor }}>
+                      ${remainUsd.toFixed(2)}
+                    </span>
+                  </div>
+                </>
               )}
+
+              {hasSubQuota && (
+                <>
+                  <span className="h-3.5 w-px bg-[var(--border)]" />
+                  <div className="flex items-center gap-2 tabular-nums text-[12px] text-[var(--text-secondary)]">
+                    <div className="flex items-center gap-1" title={`5 小时窗口已用 ${pct5h}%`}>
+                      <span className="text-[var(--text-muted)]">5h</span>
+                      <span>{pct5h}%</span>
+                    </div>
+                    <div className="flex items-center gap-1" title={`7 天周期已用 ${pct7d}%`}>
+                      <span className="text-[var(--text-muted)]">7d</span>
+                      <span>{pct7d}%</span>
+                    </div>
+                  </div>
+                </>
+              )}
+
               <button
+                type="button"
                 onClick={handleLogout}
-                disabled={authBusy}
                 title="退出登录"
-                className="rounded p-1 text-slate-400 transition hover:bg-slate-100 hover:text-rose-500 dark:hover:bg-slate-800"
+                className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] transition cursor-pointer"
               >
                 <LogOut className="h-3.5 w-3.5" />
               </button>
@@ -413,445 +929,1054 @@ export default function App() {
           ) : (
             <div className="flex items-center gap-1.5">
               <button
+                type="button"
                 onClick={() => setShowKeyModal(true)}
-                disabled={authBusy}
-                className="flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 transition hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                className="h-8 px-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)] flex items-center gap-1.5 transition cursor-pointer"
               >
                 <KeyRound className="h-3.5 w-3.5" />
-                填入 Key
+                <span>Key 登录</span>
               </button>
               <button
+                type="button"
                 onClick={handleOAuthLogin}
-                disabled={authBusy}
-                className="flex items-center gap-1 rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white shadow-xs transition hover:bg-sky-500 disabled:opacity-60"
+                disabled={loggingIn}
+                className="h-8 px-3 rounded-lg bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12px] font-medium transition cursor-pointer disabled:opacity-60"
               >
-                <LogIn className="h-3.5 w-3.5" />
-                {authBusy ? "授权中…" : "登录 Tako"}
+                {loggingIn ? "登录中..." : "登录 Tako"}
               </button>
             </div>
           )}
 
           <button
-            onClick={runUpdateChecks}
-            disabled={checkingUpdates}
-            title="检查应用更新"
-            className="rounded-md border border-slate-200 bg-white p-1.5 text-slate-600 transition hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
+            type="button"
+            onClick={handleRefresh}
+            disabled={refreshing || checkingUpdates}
+            title="刷新状态与版本"
+            className="h-8 w-8 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] flex items-center justify-center transition cursor-pointer disabled:opacity-60"
           >
-            <RefreshCw className={`h-3.5 w-3.5 ${checkingUpdates ? "animate-spin" : ""}`} />
+            <RefreshCw
+              className={`h-3.5 w-3.5 ${refreshing || checkingUpdates ? "animate-spin" : ""}`}
+            />
           </button>
+
           <button
-            onClick={() => setShowSettingsModal(true)}
-            title="高级设置"
-            className="rounded-md border border-slate-200 bg-white p-1.5 text-slate-600 transition hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
+            type="button"
+            onClick={toggleTheme}
+            title={isDark ? "切换浅色模式" : "切换深色模式"}
+            className="h-8 w-8 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] flex items-center justify-center transition cursor-pointer"
           >
-            <Settings className="h-3.5 w-3.5" />
+            {isDark ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
+          </button>
+
+          <button
+            type="button"
+            onClick={openSettings}
+            title="设置与更新"
+            className="relative h-8 w-8 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] flex items-center justify-center transition cursor-pointer"
+          >
+            <SettingsIcon className="h-3.5 w-3.5" />
+            {hasPendingUpdates && (
+              <span className="absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
+            )}
           </button>
         </div>
       </header>
 
-      {/* Self-update or status banner */}
-      {selfUpdate && (
-        <div className="mt-2 flex items-center justify-between rounded-lg border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs text-sky-900 dark:border-sky-800/70 dark:bg-sky-950/60 dark:text-sky-200">
-          <span>
-            发现新版本 <strong>v{selfUpdate.version}</strong> 可用
-          </span>
-          <button
-            onClick={handleSelfUpdate}
-            disabled={selfUpdating}
-            className="rounded bg-sky-600 px-2.5 py-0.5 font-medium text-white hover:bg-sky-500 disabled:opacity-60"
-          >
-            {selfUpdating ? "更新中…" : "立即更新并重启"}
-          </button>
-        </div>
-      )}
-
-      {banner && (
-        <div
-          className={`mt-2 flex items-center justify-between rounded-lg border px-3 py-1.5 text-xs ${
-            banner.kind === "err"
-              ? "border-rose-200 bg-rose-50 text-rose-800 dark:border-rose-800/70 dark:bg-rose-950/50 dark:text-rose-200"
-              : "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-800/70 dark:bg-emerald-950/50 dark:text-emerald-200"
-          }`}
-        >
-          <span className="truncate pr-2">{banner.text}</span>
-          <button onClick={() => setBanner(null)} className="shrink-0 opacity-70 hover:opacity-100">
-            <X className="h-3.5 w-3.5" />
-          </button>
-        </div>
-      )}
-
-      {/* Main 3 Desktop App Cards */}
-      <main className="my-2.5 flex flex-1 flex-col justify-center gap-2.5">
-        {(dashboard?.apps ?? []).map((snap) => {
-          const upd = updates[snap.id];
-          const progress = progressByApp[snap.id];
-          const isBusy = busyApp === snap.id;
-
-          return (
-            <section
-              key={snap.id}
-              className="rounded-xl border border-slate-200/90 bg-white px-3.5 py-2.5 shadow-xs transition dark:border-slate-800 dark:bg-slate-900/90"
-            >
-              <div className="flex items-center justify-between gap-3">
-                {/* Left metadata */}
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <h2 className="text-sm font-semibold">{snap.name}</h2>
-                    {snap.install.installed ? (
-                      <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300">
-                        {snap.install.version ? `v${snap.install.version}` : "已安装"}
-                      </span>
-                    ) : (
-                      <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 dark:bg-amber-900/50 dark:text-amber-200">
-                        未安装
-                      </span>
-                    )}
-                    {snap.running && (
-                      <span className="flex items-center gap-1 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
-                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                        运行中
-                      </span>
-                    )}
+      {/* Main Content Container */}
+      <main className="flex-1 min-h-0 overflow-y-auto subtle-scroll px-4 pt-3 pb-2.5 flex flex-col gap-3">
+        {/* Self-Update Banner */}
+        {(selfUpdate ||
+          selfUpdateStatus === "downloading" ||
+          selfUpdateStatus === "installing") && (
+          <div className="shrink-0 rounded-[12px] px-3.5 py-2.5 text-[12px] flex flex-col gap-2 border bg-[var(--accent-soft)] border-[var(--accent-border)] text-[var(--accent)]">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <ArrowUpCircle className="h-4 w-4 shrink-0" />
+                <div className="min-w-0">
+                  <div className="font-medium truncate">
+                    {selfUpdateStatus === "installing"
+                      ? `正在安装 Tako Switch v${selfUpdate?.version ?? ""}，即将重启...`
+                      : selfUpdateStatus === "downloading" && selfUpdateProgress
+                        ? `正在下载 Tako Switch v${selfUpdate?.version ?? ""} · ${formatBytes(selfUpdateProgress.downloaded)}${selfUpdateProgress.total ? ` / ${formatBytes(selfUpdateProgress.total)}` : ""}`
+                        : `Tako Switch v${selfUpdate?.version ?? ""} 已发布，可一键更新并重启`}
                   </div>
-
-                  <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-500 dark:text-slate-400">
-                    <span>
-                      MCP:{" "}
-                      <strong className="font-medium text-slate-700 dark:text-slate-200">
-                        {snap.mcpEnabled ? "已注入" : "未开启"}
-                      </strong>
-                    </span>
-                    <span>·</span>
-                    <button
-                      onClick={() => handleDiagnose(snap)}
-                      className="inline-flex items-center gap-0.5 text-slate-500 underline-offset-2 hover:text-sky-600 hover:underline dark:text-slate-400 dark:hover:text-sky-400"
-                    >
-                      <Activity className="h-3 w-3" />
-                      {snap.diagnostic.ok ? "配置正常" : "需检查"}
-                    </button>
-                  </div>
-                </div>
-
-                {/* Right controls: 3-mode segmented pill + action buttons */}
-                <div className="flex shrink-0 items-center gap-2">
-                  <div className="inline-flex rounded-lg bg-slate-100 p-0.5 dark:bg-slate-800">
-                    {MODES.map((m) => {
-                      const active = snap.mode === m.id;
-                      return (
-                        <button
-                          key={m.id}
-                          title={m.tip}
-                          disabled={isBusy}
-                          onClick={() => handleModeSwitch(snap.id, m.id)}
-                          className={`rounded-md px-2.5 py-1 text-xs font-medium transition ${
-                            active
-                              ? m.id === "tako"
-                                ? "bg-sky-600 text-white shadow-xs"
-                                : m.id === "hybrid"
-                                  ? "bg-white text-sky-700 shadow-xs dark:bg-slate-700 dark:text-sky-300"
-                                  : "bg-white text-slate-900 shadow-xs dark:bg-slate-700 dark:text-white"
-                              : "text-slate-600 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-200"
-                          }`}
-                        >
-                          {m.label}
-                        </button>
-                      );
-                    })}
-                  </div>
-
-                  {/* Install / Upgrade */}
-                  {!snap.install.installed && upd?.platformSupported && (
-                    <button
-                      disabled={isBusy}
-                      onClick={() => handleInstallOrUpgrade(snap.id)}
-                      className="inline-flex items-center gap-1 rounded-md bg-emerald-600 px-2.5 py-1 text-xs font-medium text-white transition hover:bg-emerald-500 disabled:opacity-60"
-                    >
-                      <Download className="h-3.5 w-3.5" />
-                      一键安装
-                    </button>
-                  )}
-
-                  {snap.install.installed && upd?.hasUpdate && upd.remoteVersion && (
-                    <button
-                      disabled={isBusy}
-                      onClick={() => handleInstallOrUpgrade(snap.id)}
-                      className="inline-flex items-center gap-1 rounded-md bg-amber-500 px-2 py-1 text-xs font-medium text-white transition hover:bg-amber-400 disabled:opacity-60"
-                    >
-                      <Download className="h-3 w-3" />
-                      升级 v{upd.remoteVersion}
-                    </button>
-                  )}
-
-                  {snap.install.installed && (
-                    <button
-                      disabled={isBusy}
-                      onClick={() => handleRestartOrLaunch(snap)}
-                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
-                    >
-                      {snap.running ? (
-                        <>
-                          <RotateCw className="h-3 w-3" />
-                          重启生效
-                        </>
-                      ) : (
-                        <>
-                          <ExternalLink className="h-3 w-3" />
-                          打开
-                        </>
-                      )}
-                    </button>
+                  {selfUpdate?.body && selfUpdateStatus === "available" && (
+                    <div className="text-[11px] opacity-80 truncate">{selfUpdate.body}</div>
                   )}
                 </div>
               </div>
 
-              {progress && (
-                <div className="mt-2">
-                  <div className="mb-0.5 flex justify-between text-[10px] text-slate-500 dark:text-slate-400">
-                    <span>{progress.message}</span>
-                    <span className="tabular-nums">{progress.percent}%</span>
-                  </div>
-                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
-                    <div
-                      className="h-full bg-sky-500 transition-all duration-200"
-                      style={{ width: `${progress.percent}%` }}
-                    />
-                  </div>
+              {selfUpdateStatus === "downloading" || selfUpdateStatus === "installing" ? (
+                <span className="tabular-nums font-semibold shrink-0">
+                  {selfUpdateProgress?.percent ?? 0}%
+                </span>
+              ) : (
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {selfUpdateStatus === "error" && (
+                    <button
+                      type="button"
+                      onClick={() => void api.openUrl(TAKO_RELEASES_URL)}
+                      className="px-2 py-1 rounded-md border border-[var(--accent-border)] text-[12px] font-medium hover:bg-[var(--bg-card)]/40 cursor-pointer"
+                    >
+                      前往下载页
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleInstallSelfUpdate}
+                    className="px-2.5 py-1 rounded-md bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12px] font-medium cursor-pointer"
+                  >
+                    {selfUpdateStatus === "error" ? "重试更新" : "立即更新"}
+                  </button>
                 </div>
               )}
-            </section>
-          );
-        })}
-      </main>
+            </div>
 
-      {/* Bottom Compact Tako Super MCP Bar */}
-      <footer className="rounded-xl border border-slate-200/90 bg-white px-3.5 py-2 shadow-xs dark:border-slate-800 dark:bg-slate-900/90">
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex items-center gap-1.5">
-            <Sparkles className="h-3.5 w-3.5 text-sky-500" />
-            <span className="text-xs font-semibold">Tako 超级 MCP</span>
-            <span className="text-[11px] text-slate-400">
-              “聚合 / Tako”自动接入，开关即时生效
+            {(selfUpdateStatus === "downloading" || selfUpdateStatus === "installing") &&
+              selfUpdateProgress && (
+                <div className="h-1 w-full rounded-full bg-[var(--bg-card)]/60 overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-[var(--accent)] transition-all duration-150"
+                    style={{ width: `${Math.max(4, selfUpdateProgress.percent)}%` }}
+                  />
+                </div>
+              )}
+          </div>
+        )}
+
+        {/* Dismissible Error / Transient Status Bar */}
+        {(errorMsg || statusNote || account?.error) && (
+          <div
+            className="shrink-0 rounded-[11px] px-3 py-2 text-[12px] flex items-center justify-between gap-2 border"
+            style={{
+              backgroundColor:
+                errorMsg || account?.error ? "var(--danger-soft)" : "var(--accent-soft)",
+              borderColor:
+                errorMsg || account?.error
+                  ? "rgba(220, 38, 38, 0.24)"
+                  : "var(--accent-border)",
+              color: errorMsg || account?.error ? "var(--danger)" : "var(--accent)",
+            }}
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+              <span className="truncate">{errorMsg ?? account?.error ?? statusNote}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setErrorMsg(null);
+                setStatusNote(null);
+              }}
+              className="p-0.5 rounded hover:opacity-75 cursor-pointer shrink-0"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
+
+        {/* Client Rows Section */}
+        <section className="flex flex-col gap-2">
+          <div className="flex items-center justify-between px-0.5">
+            <h2 className="text-[12px] font-medium text-[var(--text-secondary)]">
+              桌面客户端
+            </h2>
+            <div className="flex items-center gap-2">
+              {updatableApps.length >= 2 && (
+                <button
+                  type="button"
+                  disabled={batchUpdatingApps || busyApp !== null}
+                  onClick={handleBatchUpgradeApps}
+                  className="px-2 py-0.5 rounded-md bg-[var(--accent-soft)] hover:bg-[var(--accent-border)] text-[var(--accent)] border border-[var(--accent-border)] text-[11px] font-medium flex items-center gap-1 transition cursor-pointer disabled:opacity-60"
+                >
+                  <ArrowUpCircle className="h-3 w-3" />
+                  <span>
+                    {batchUpdatingApps
+                      ? "批量更新中..."
+                      : `全部更新 (${updatableApps.length})`}
+                  </span>
+                </button>
+              )}
+              <span className="text-[12px] text-[var(--text-muted)]">
+                官方直连 · Tako 全接管（免官方登录）
+              </span>
+            </div>
+          </div>
+
+          {loading ? (
+            <div className="rounded-[14px] border border-[var(--border)] bg-[var(--bg-card)] p-6 text-center text-[13px] text-[var(--text-secondary)]">
+              正在读取本机客户端与配置...
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {dashboard?.apps.map((app) => {
+                const update = updatesMap[app.id];
+                const progress = installProgress[app.id];
+                const isBusy = busyApp === app.id;
+                const isExpanded = expandedApp === app.id;
+                const restartRequired = Boolean(needsRestart[app.id]);
+                const artifactSizeLabel = formatBytes(update?.artifact?.size);
+
+                return (
+                  <div
+                    key={app.id}
+                    className="rounded-[14px] border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-card)] transition-colors hover:border-[var(--border-strong)] overflow-hidden"
+                  >
+                    <div className="px-3.5 py-3 flex items-center gap-3.5">
+                      {/* App Brand & Info */}
+                      <div className="flex-1 min-w-0 flex items-center gap-3">
+                        <AppBrandIcon appId={app.id} />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="text-[14px] font-semibold tracking-[-0.01em] text-[var(--text-primary)] truncate">
+                              {APP_DISPLAY_NAMES[app.id] ?? app.name}
+                            </span>
+
+                            {app.install.installed ? (
+                              <span className="tabular-nums text-[12px] font-medium px-2 py-0.5 rounded-md bg-[var(--bg-subtle)] text-[var(--text-secondary)] shrink-0">
+                                {app.install.version
+                                  ? `v${app.install.version.replace(/^v/i, "")}`
+                                  : "已安装"}
+                              </span>
+                            ) : (
+                              <span className="text-[12px] font-medium px-2 py-0.5 rounded-md bg-[var(--bg-subtle)] text-[var(--text-muted)] shrink-0">
+                                未安装
+                              </span>
+                            )}
+
+                            {app.running && (
+                              <span
+                                className="inline-flex items-center gap-1 text-[12px] font-medium text-[var(--success)] shrink-0"
+                                title="应用正在运行"
+                              >
+                                <span className="h-1.5 w-1.5 rounded-full bg-[var(--success)]" />
+                                运行中
+                              </span>
+                            )}
+
+                            {update?.hasUpdate && update.remoteVersion && (
+                              <span
+                                className="tabular-nums text-[12px] font-medium px-2 py-0.5 rounded-md bg-[var(--accent-soft)] text-[var(--accent)] shrink-0"
+                                title={
+                                  artifactSizeLabel
+                                    ? `可更新至 v${update.remoteVersion.replace(/^v/i, "")}（约 ${artifactSizeLabel}）`
+                                    : undefined
+                                }
+                              >
+                                新版 v{update.remoteVersion.replace(/^v/i, "")}
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="mt-0.5 flex items-center gap-2 text-[12px] text-[var(--text-secondary)] min-w-0">
+                            <span className="truncate">{modeSummary(app)}</span>
+                            <span className="text-[var(--text-muted)]">·</span>
+                            <button
+                              type="button"
+                              onClick={() => setExpandedApp(isExpanded ? null : app.id)}
+                              className="inline-flex items-center gap-1 hover:text-[var(--text-primary)] transition cursor-pointer shrink-0"
+                              style={{
+                                color: app.diagnostic.ok ? undefined : "var(--warning)",
+                              }}
+                            >
+                              <span>{app.diagnostic.ok ? "配置正常" : "需检查"}</span>
+                              <ChevronDown
+                                className={`h-3.5 w-3.5 transition-transform duration-150 ${
+                                  isExpanded ? "rotate-180" : ""
+                                }`}
+                              />
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Fixed-Width Mode Switcher (Aligned Across All 3 Rows) */}
+                      <div className="w-[132px] shrink-0 grid grid-cols-2 p-0.5 rounded-[10px] bg-[var(--bg-pill)] border border-[var(--border)]">
+                        {MODE_OPTIONS.map((option) => {
+                          const active = app.mode === option.id;
+                          return (
+                            <button
+                              key={option.id}
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => handleSetMode(app, option.id)}
+                              className={`h-7 rounded-[8px] text-[12px] transition cursor-pointer disabled:opacity-60 ${
+                                active
+                                  ? "bg-[var(--bg-card)] font-medium shadow-[var(--shadow-segment)]"
+                                  : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                              }`}
+                              style={
+                                active
+                                  ? {
+                                      color:
+                                        option.id === "tako"
+                                          ? "var(--accent)"
+                                          : "var(--text-primary)",
+                                    }
+                                  : undefined
+                              }
+                            >
+                              {option.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      {/* Fixed-Width Primary Action Slot (Aligned Across All 3 Rows) */}
+                      <div className="w-[126px] shrink-0 flex items-center justify-end gap-1.5">
+                        {progress ? (
+                          progress.stage === "downloading" ? (
+                            <div className="w-full h-8 px-2 rounded-[9px] bg-[var(--accent-soft)] border border-[var(--accent-border)] flex items-center justify-between gap-1 text-[12px] font-medium text-[var(--accent)] tabular-nums">
+                              <span className="truncate">
+                                {installStageLabel(progress.stage)} {Math.round(progress.percent)}%
+                              </span>
+                              <button
+                                type="button"
+                                disabled={cancellingApp === app.id}
+                                onClick={() => handleCancelAppInstall(app.id)}
+                                className="px-1.5 py-0.5 rounded bg-[var(--bg-card)]/70 hover:bg-[var(--bg-card)] text-[var(--text-secondary)] hover:text-[var(--danger)] text-[11px] shrink-0 cursor-pointer disabled:opacity-50"
+                              >
+                                {cancellingApp === app.id ? "..." : "取消"}
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="w-full h-8 px-2.5 rounded-[9px] bg-[var(--accent-soft)] border border-[var(--accent-border)] flex items-center justify-between text-[12px] font-medium text-[var(--accent)] tabular-nums">
+                              <span className="truncate">{installStageLabel(progress.stage)}</span>
+                              <span>{Math.round(progress.percent)}%</span>
+                            </div>
+                          )
+                        ) : !app.install.installed ? (
+                          update && !update.platformSupported ? (
+                            <span className="w-full h-8 rounded-[9px] bg-[var(--bg-subtle)] text-[var(--text-muted)] text-[12px] font-medium flex items-center justify-center">
+                              暂不支持
+                            </span>
+                          ) : (
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => void handleInstallOrUpgrade(app.id)}
+                              className="w-full h-8 rounded-[9px] text-[12px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60"
+                              style={{
+                                backgroundColor: "var(--btn-dark-bg)",
+                                color: "var(--btn-dark-fg)",
+                              }}
+                            >
+                              <Download className="h-3.5 w-3.5" />
+                              <span>一键安装</span>
+                            </button>
+                          )
+                        ) : update?.hasUpdate ? (
+                          <>
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => void handleInstallOrUpgrade(app.id)}
+                              className="flex-1 h-8 rounded-[9px] bg-[var(--accent-soft)] hover:bg-[var(--accent-border)] text-[var(--accent)] border border-[var(--accent-border)] text-[12px] font-medium flex items-center justify-center gap-1 transition cursor-pointer disabled:opacity-60"
+                            >
+                              <ArrowUpCircle className="h-3.5 w-3.5" />
+                              <span>升级</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() =>
+                                restartRequired
+                                  ? handleRestartApp(app.id)
+                                  : handleLaunchApp(app.id)
+                              }
+                              title={restartRequired ? "重启生效" : "打开应用"}
+                              className="h-8 px-2.5 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] text-[12px] font-medium flex items-center justify-center transition cursor-pointer disabled:opacity-60"
+                            >
+                              {restartRequired ? "重启" : "打开"}
+                            </button>
+                          </>
+                        ) : restartRequired ? (
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => handleRestartApp(app.id)}
+                            className="w-full h-8 rounded-[9px] text-[12px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60"
+                            style={{
+                              backgroundColor: "var(--warning-soft)",
+                              color: "var(--warning)",
+                            }}
+                          >
+                            <RotateCw className="h-3.5 w-3.5" />
+                            <span>重启生效</span>
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => handleLaunchApp(app.id)}
+                            className="w-full h-8 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] text-[12px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60"
+                          >
+                            <ExternalLink className="h-3.5 w-3.5 text-[var(--text-secondary)]" />
+                            <span>打开</span>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Inline Progress Bar */}
+                    {progress && (
+                      <div className="px-3.5 pb-2.5 flex flex-col gap-1">
+                        <div className="h-1 w-full rounded-full bg-[var(--bg-subtle)] overflow-hidden">
+                          <div
+                            className="h-full rounded-full transition-all duration-200"
+                            style={{
+                              width: `${Math.max(4, Math.min(100, progress.percent))}%`,
+                              backgroundColor:
+                                progress.stage === "error"
+                                  ? "var(--danger)"
+                                  : "var(--accent)",
+                            }}
+                          />
+                        </div>
+                        <span className="tabular-nums text-[12px] text-[var(--text-secondary)] truncate">
+                          {progress.message}
+                        </span>
+                      </div>
+                    )}
+
+                    {/* Inline Expandable Detail Strip */}
+                    {isExpanded && (
+                      <div className="border-t border-[var(--border)] bg-[var(--bg-subtle)]/55 px-3.5 py-2.5 text-[12px] flex flex-col gap-1.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="min-w-0 flex items-center gap-2 text-[var(--text-secondary)]">
+                            <span className="text-[var(--text-muted)] shrink-0">安装位置:</span>
+                            <code className="truncate font-mono text-[var(--text-primary)]">
+                              {app.install.installPath ?? "未检测到应用路径"}
+                            </code>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            {update?.hasUpdate && artifactSizeLabel && (
+                              <span className="tabular-nums text-[var(--accent)]">
+                                更新包 {artifactSizeLabel}
+                              </span>
+                            )}
+                            <span className="text-[var(--text-muted)]">
+                              {app.hasBackup ? "已保留配置备份" : "尚无备份"}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleRediagnose(app.id)}
+                              className="text-[var(--accent)] hover:underline cursor-pointer font-medium"
+                            >
+                              重新检测
+                            </button>
+                          </div>
+                        </div>
+
+                        {app.diagnostic.issues.length > 0 && (
+                          <div className="flex flex-col gap-0.5 text-[var(--warning)]">
+                            {app.diagnostic.issues.map((issue, idx) => (
+                              <div key={idx}>• {issue}</div>
+                            ))}
+                          </div>
+                        )}
+
+                        {app.diagnostic.notes.length > 0 && (
+                          <div className="flex flex-col gap-0.5 text-[var(--text-secondary)]">
+                            {app.diagnostic.notes.map((note, idx) => (
+                              <div key={idx} className="truncate">
+                                • {note}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        {/* Super MCP Card */}
+        <section className="rounded-[14px] border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-card)] p-3.5">
+          <div className="flex items-center justify-between mb-2.5">
+            <div className="flex items-center gap-2 min-w-0">
+              <Sparkles className="h-4 w-4 text-[var(--accent)] shrink-0" />
+              <span className="text-[13px] font-semibold text-[var(--text-primary)]">
+                Tako 超级 MCP
+              </span>
+              <span className="text-[12px] text-[var(--text-muted)] truncate">
+                Tako 模式下自动注入，开关即时生效
+              </span>
+            </div>
+            <span className="tabular-nums text-[12px] font-medium text-[var(--text-secondary)] shrink-0">
+              {mcpEnabledCount}/5 已开启
             </span>
           </div>
-          <div className="flex items-center gap-1.5">
-            {MCP_TOOLS.map((tool) => {
-              const on = dashboard?.state.mcp[tool.key] ?? true;
+
+          <div className="grid grid-cols-5 gap-2">
+            {MCP_TOOLS.map(({ key, label, desc, Icon }) => {
+              const enabled = Boolean(dashboard?.state.mcp[key]);
               return (
                 <button
-                  key={tool.key}
-                  onClick={() => handleToggleMcpTool(tool.key)}
-                  className={`rounded-md border px-2 py-0.5 text-[11px] font-medium transition ${
-                    on
-                      ? "border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-800 dark:bg-sky-950/70 dark:text-sky-300"
-                      : "border-slate-200 bg-slate-50 text-slate-400 line-through dark:border-slate-800 dark:bg-slate-950 dark:text-slate-500"
+                  key={key}
+                  type="button"
+                  title={desc}
+                  disabled={!dashboard || savingMcp}
+                  onClick={() => handleToggleMcpTool(key)}
+                  className={`h-9 px-2.5 rounded-[10px] border text-[12px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60 ${
+                    enabled
+                      ? "bg-[var(--accent-soft)] border-[var(--accent-border)] text-[var(--accent)]"
+                      : "bg-[var(--bg-subtle)]/60 border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--text-primary)]"
                   }`}
                 >
-                  {tool.label}
+                  <Icon className="h-3.5 w-3.5 shrink-0" />
+                  <span>{label}</span>
                 </button>
               );
             })}
           </div>
+        </section>
+      </main>
+
+      {/* Slim Bottom Status Bar */}
+      <footer className="h-8 shrink-0 px-4 border-t border-[var(--border)] bg-[var(--bg-card)]/75 flex items-center justify-between text-[12px] text-[var(--text-secondary)]">
+        <div className="flex items-center gap-2 min-w-0">
+          {!anyTakoMode ? (
+            <span className="inline-flex items-center gap-1.5 text-[var(--text-muted)]">
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--text-muted)]" />
+              本地网关待机
+            </span>
+          ) : dashboard?.localGatewayHealthy ? (
+            <span className="inline-flex items-center gap-1.5 text-[var(--text-secondary)] tabular-nums">
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--success)]" />
+              <span>本地网关 127.0.0.1:18419</span>
+              <span className="text-[var(--success)] font-medium">· 运行中</span>
+            </span>
+          ) : (
+            <button
+              type="button"
+              disabled={fixingGateway}
+              onClick={handleEnsureGateway}
+              className="inline-flex items-center gap-1.5 text-[var(--warning)] hover:underline cursor-pointer disabled:opacity-60"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--warning)]" />
+              <span>{fixingGateway ? "正在修复网关..." : "本地网关未运行 · 点击修复"}</span>
+            </button>
+          )}
+        </div>
+
+        <div className="flex items-center gap-3 shrink-0">
+          <button
+            type="button"
+            onClick={openSettings}
+            className="text-[var(--text-muted)] hover:text-[var(--text-primary)] tabular-nums transition cursor-pointer"
+          >
+            {checkingUpdates
+              ? "检查更新中..."
+              : selfUpdateStatus === "available" && selfUpdate
+                ? `Tako Switch v${selfUpdate.version} 可更新`
+                : updatableApps.length > 0
+                  ? `${updatableApps.length} 款客户端可更新`
+                  : lastCheckedAt
+                    ? `${lastCheckedAt} 已检查更新`
+                    : "检查更新"}
+          </button>
+          <span className="h-3 w-px bg-[var(--border)]" />
+          <button
+            type="button"
+            onClick={() => void api.openUrl(TAKO_FEEDBACK_URL)}
+            className="inline-flex items-center gap-1 text-[var(--text-muted)] hover:text-[var(--text-primary)] transition cursor-pointer"
+          >
+            <MessageSquare className="h-3 w-3" />
+            <span>问题反馈</span>
+          </button>
         </div>
       </footer>
 
-      {/* Manual Key Modal */}
+      {/* API Key Login Modal */}
       {showKeyModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-xs">
+        <div
+          className="fixed inset-0 z-50 modal-backdrop flex items-center justify-center p-4"
+          onClick={() => setShowKeyModal(false)}
+        >
           <form
-            onSubmit={handleKeySubmit}
-            className="w-full max-w-sm rounded-xl border border-slate-200 bg-white p-4 shadow-xl dark:border-slate-800 dark:bg-slate-900"
+            onSubmit={handleKeyLogin}
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-[380px] rounded-[16px] border border-[var(--border)] bg-[var(--bg-card)] p-5 shadow-[var(--shadow-modal)] flex flex-col gap-3.5"
           >
-            <div className="mb-3 flex items-center justify-between">
-              <h3 className="text-sm font-semibold">手动填入 Tako Key</h3>
+            <div className="flex items-center justify-between">
+              <h3 className="text-[14px] font-semibold text-[var(--text-primary)]">
+                使用 Tako API Key 登录
+              </h3>
               <button
                 type="button"
                 onClick={() => setShowKeyModal(false)}
-                className="text-slate-400 hover:text-slate-600"
+                className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
               >
                 <X className="h-4 w-4" />
               </button>
             </div>
-            <input
-              type="password"
-              value={keyInput}
-              onChange={(e) => setKeyInput(e.target.value)}
-              placeholder="cr_..."
-              autoFocus
-              className="w-full rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-xs outline-none focus:border-sky-500 dark:border-slate-700 dark:bg-slate-950"
-            />
-            <div className="mt-3 flex justify-end gap-2">
+
+            <div className="flex flex-col gap-1.5">
+              <label className="text-[12px] text-[var(--text-secondary)]">API Key</label>
+              <input
+                type="password"
+                autoFocus
+                placeholder="sk-..."
+                value={apiKeyInput}
+                onChange={(e) => setApiKeyInput(e.target.value)}
+                className="h-9 px-3 rounded-[10px] border border-[var(--border)] bg-[var(--bg-canvas)] text-[13px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-1">
               <button
                 type="button"
                 onClick={() => setShowKeyModal(false)}
-                className="rounded-md px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+                className="h-8 px-3 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-secondary)] cursor-pointer"
               >
                 取消
               </button>
               <button
                 type="submit"
-                disabled={authBusy}
-                className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500 disabled:opacity-60"
+                disabled={loggingIn || !apiKeyInput.trim()}
+                className="h-8 px-3.5 rounded-[9px] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12px] font-medium cursor-pointer disabled:opacity-60"
               >
-                {authBusy ? "验证中…" : "验证并保存"}
+                {loggingIn ? "验证中..." : "确认登录"}
               </button>
             </div>
           </form>
         </div>
       )}
 
-      {/* Settings Modal */}
+      {/* Clean macOS-Style Grouped Settings Modal */}
       {showSettingsModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-xs">
+        <div
+          className="fixed inset-0 z-50 modal-backdrop flex items-center justify-center p-4"
+          onClick={() => setShowSettingsModal(false)}
+        >
           <form
             onSubmit={handleSaveSettings}
-            className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-4 shadow-xl dark:border-slate-800 dark:bg-slate-900"
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-[448px] max-h-[88vh] rounded-[16px] border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-modal)] flex flex-col overflow-hidden"
           >
-            <div className="mb-3 flex items-center justify-between">
-              <h3 className="text-sm font-semibold">高级设置</h3>
+            {/* Modal Header */}
+            <div className="px-5 py-3.5 border-b border-[var(--border)] flex items-center justify-between shrink-0">
+              <h3 className="text-[14px] font-semibold text-[var(--text-primary)]">偏好设置</h3>
               <button
                 type="button"
                 onClick={() => setShowSettingsModal(false)}
-                className="text-slate-400 hover:text-slate-600"
+                className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] cursor-pointer"
               >
                 <X className="h-4 w-4" />
               </button>
             </div>
 
-            <div className="space-y-2.5 text-xs">
-              <label className="block">
-                <span className="mb-1 block font-medium text-slate-600 dark:text-slate-300">
-                  Tako 网关地址
-                </span>
-                <input
-                  value={settingsForm.baseUrl}
-                  onChange={(e) =>
-                    setSettingsForm((s) => ({ ...s, baseUrl: e.target.value }))
-                  }
-                  className="w-full rounded-lg border border-slate-300 bg-slate-50 px-2.5 py-1.5 outline-none focus:border-sky-500 dark:border-slate-700 dark:bg-slate-950"
-                />
-              </label>
+            {/* Scrollable Settings Body */}
+            <div className="flex-1 min-h-0 overflow-y-auto subtle-scroll p-4 flex flex-col gap-4 text-[12px]">
+              {/* Section 1: General & Appearance (Super Simple) */}
+              <div className="flex flex-col gap-1.5">
+                <div className="px-1 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                  外观与常用
+                </div>
+                <div className="settings-group">
+                  <div className="settings-row px-3.5 py-2.5 flex items-center justify-between gap-3">
+                    <span className="text-[13px] text-[var(--text-primary)]">主题外观</span>
+                    <div className="grid grid-cols-3 p-0.5 rounded-[9px] bg-[var(--bg-pill)] border border-[var(--border)]">
+                      {THEME_OPTIONS.map((opt) => {
+                        const active = themePref === opt.id;
+                        return (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            onClick={() => setThemePref(opt.id)}
+                            className={`px-2.5 py-1 rounded-[7px] text-[12px] transition cursor-pointer ${
+                              active
+                                ? "bg-[var(--bg-card)] text-[var(--text-primary)] font-medium shadow-[var(--shadow-segment)]"
+                                : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
 
-              <label className="block">
-                <span className="mb-1 block font-medium text-slate-600 dark:text-slate-300">
-                  专用反重力 Key (留空则复用主 Key)
-                </span>
-                <input
-                  type="password"
-                  value={settingsForm.agyApiKey}
-                  placeholder="可选，例如 cr_..."
-                  onChange={(e) =>
-                    setSettingsForm((s) => ({ ...s, agyApiKey: e.target.value }))
-                  }
-                  className="w-full rounded-lg border border-slate-300 bg-slate-50 px-2.5 py-1.5 outline-none focus:border-sky-500 dark:border-slate-700 dark:bg-slate-950"
-                />
-              </label>
+                  <div className="settings-row px-3.5 py-2.5 flex items-center justify-between gap-3">
+                    <span className="text-[13px] text-[var(--text-primary)]">
+                      菜单栏显示实时余额
+                    </span>
+                    <ToggleSwitch
+                      checked={settingsForm.showTrayBalance}
+                      ariaLabel="菜单栏显示实时余额"
+                      onChange={(next) =>
+                        setSettingsForm((s) => ({ ...s, showTrayBalance: next }))
+                      }
+                    />
+                  </div>
 
-              <div className="grid grid-cols-2 gap-2">
-                <label className="block">
-                  <span className="mb-1 block font-medium text-slate-600 dark:text-slate-300">
-                    生图/视频输出目录
-                  </span>
-                  <input
-                    value={settingsForm.outputDir}
-                    onChange={(e) =>
-                      setSettingsForm((s) => ({ ...s, outputDir: e.target.value }))
-                    }
-                    className="w-full rounded-lg border border-slate-300 bg-slate-50 px-2.5 py-1.5 outline-none focus:border-sky-500 dark:border-slate-700 dark:bg-slate-950"
-                  />
-                </label>
-                <label className="block">
-                  <span className="mb-1 block font-medium text-slate-600 dark:text-slate-300">
-                    外脑默认模型
-                  </span>
-                  <input
-                    value={settingsForm.consultModel}
-                    onChange={(e) =>
-                      setSettingsForm((s) => ({ ...s, consultModel: e.target.value }))
-                    }
-                    className="w-full rounded-lg border border-slate-300 bg-slate-50 px-2.5 py-1.5 outline-none focus:border-sky-500 dark:border-slate-700 dark:bg-slate-950"
-                  />
-                </label>
+                  <div className="settings-row px-3.5 py-2.5 flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-[13px] text-[var(--text-primary)]">
+                        客户端优先简体中文
+                      </div>
+                      <div className="text-[11px] text-[var(--text-muted)]">
+                        Codex 界面 · Claude 菜单与回复
+                      </div>
+                    </div>
+                    <ToggleSwitch
+                      checked={settingsForm.preferChineseUi}
+                      ariaLabel="客户端优先简体中文"
+                      onChange={(next) =>
+                        setSettingsForm((s) => ({ ...s, preferChineseUi: next }))
+                      }
+                    />
+                  </div>
+
+                  <div className="settings-row px-3.5 py-2.5 flex items-center justify-between gap-3">
+                    <span className="text-[13px] text-[var(--text-primary)]">
+                      启动时自动检查更新
+                    </span>
+                    <ToggleSwitch
+                      checked={settingsForm.autoCheckUpdates}
+                      ariaLabel="启动时自动检查更新"
+                      onChange={(next) =>
+                        setSettingsForm((s) => ({ ...s, autoCheckUpdates: next }))
+                      }
+                    />
+                  </div>
+
+                  <div className="settings-row px-3.5 py-2.5 flex items-center justify-between gap-3">
+                    <span className="text-[13px] text-[var(--text-primary)] shrink-0">
+                      网关显示名称
+                    </span>
+                    <input
+                      type="text"
+                      maxLength={60}
+                      placeholder="Tako"
+                      value={settingsForm.gatewayDisplayName}
+                      onChange={(e) =>
+                        setSettingsForm((s) => ({
+                          ...s,
+                          gatewayDisplayName: e.target.value,
+                        }))
+                      }
+                      className="w-[160px] h-7 px-2.5 rounded-[7px] border border-[var(--border)] bg-[var(--bg-card)] text-[12px] text-[var(--text-primary)] text-right focus:outline-none focus:border-[var(--accent)]"
+                    />
+                  </div>
+                </div>
               </div>
 
-              <label className="block">
-                <span className="mb-1 block font-medium text-slate-600 dark:text-slate-300">
-                  国内镜像 Manifest URL
-                </span>
-                <input
-                  value={settingsForm.manifestUrl}
-                  onChange={(e) =>
-                    setSettingsForm((s) => ({ ...s, manifestUrl: e.target.value }))
-                  }
-                  className="w-full rounded-lg border border-slate-300 bg-slate-50 px-2.5 py-1.5 outline-none focus:border-sky-500 dark:border-slate-700 dark:bg-slate-950"
-                />
-              </label>
+              {/* Section 2: Unified Updates Card */}
+              <div className="flex flex-col gap-1.5">
+                <div className="px-1 flex items-center justify-between">
+                  <span className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+                    软件更新
+                  </span>
+                  {lastCheckedAt && (
+                    <span className="text-[11px] text-[var(--text-muted)] tabular-nums">
+                      上次检查 {lastCheckedAt}
+                    </span>
+                  )}
+                </div>
+
+                <div className="settings-group">
+                  {/* Self Update Row */}
+                  <div className="settings-row px-3.5 py-2.5 flex flex-col gap-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[13px] font-medium text-[var(--text-primary)]">
+                            Tako Switch
+                          </span>
+                          <span className="tabular-nums text-[11px] px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] text-[var(--text-secondary)]">
+                            v{dashboard?.appVersion ?? "2.0.1"}
+                          </span>
+                          {selfUpdateStatus === "latest" && (
+                            <span className="inline-flex items-center gap-1 text-[11px] text-[var(--success)] font-medium">
+                              <CheckCircle2 className="h-3 w-3" />
+                              已是最新
+                            </span>
+                          )}
+                          {selfUpdateStatus === "available" && selfUpdate && (
+                            <span className="text-[11px] text-[var(--accent)] font-medium">
+                              新版 v{selfUpdate.version}
+                            </span>
+                          )}
+                        </div>
+                        {selfUpdateError && (
+                          <div className="text-[11px] text-[var(--danger)] truncate mt-0.5">
+                            {selfUpdateError}
+                          </div>
+                        )}
+                      </div>
+
+                      {selfUpdateStatus === "downloading" || selfUpdateStatus === "installing" ? (
+                        <span className="tabular-nums text-[12px] font-medium text-[var(--accent)] shrink-0">
+                          {selfUpdateStatus === "installing"
+                            ? "安装重启中..."
+                            : `${selfUpdateProgress?.percent ?? 0}%`}
+                        </span>
+                      ) : selfUpdate ? (
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {selfUpdateStatus === "error" && (
+                            <button
+                              type="button"
+                              onClick={() => void api.openUrl(TAKO_RELEASES_URL)}
+                              className="h-7 px-2 rounded-[7px] border border-[var(--border)] bg-[var(--bg-card)] text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
+                            >
+                              下载页
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={handleInstallSelfUpdate}
+                            className="h-7 px-2.5 rounded-[7px] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12px] font-medium cursor-pointer"
+                          >
+                            {selfUpdateStatus === "error" ? "重试更新" : "立即更新"}
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={checkingUpdates}
+                          onClick={() => void runUpdateChecks(false)}
+                          className="h-7 px-2.5 rounded-[7px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-primary)] cursor-pointer disabled:opacity-60 shrink-0"
+                        >
+                          {checkingUpdates ? "检查中..." : "检查更新"}
+                        </button>
+                      )}
+                    </div>
+
+                    {(selfUpdateStatus === "downloading" || selfUpdateStatus === "installing") &&
+                      selfUpdateProgress && (
+                        <div className="h-1 w-full rounded-full bg-[var(--bg-subtle)] overflow-hidden">
+                          <div
+                            className="h-full rounded-full bg-[var(--accent)] transition-all duration-150"
+                            style={{ width: `${Math.max(4, selfUpdateProgress.percent)}%` }}
+                          />
+                        </div>
+                      )}
+                  </div>
+
+                  {/* Desktop Apps Row */}
+                  <div className="settings-row px-3.5 py-2.5 flex items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="text-[13px] text-[var(--text-primary)]">
+                        桌面客户端版本
+                      </div>
+                      <div className="text-[11px] text-[var(--text-muted)]">
+                        {updatableApps.length > 0
+                          ? `${updatableApps.map((a) => APP_DISPLAY_NAMES[a.id]).join(" · ")} 可更新`
+                          : Object.keys(updatesMap).length > 0
+                            ? "所有已安装客户端均为最新版"
+                            : "同步官方清单，支持一键覆盖升级"}
+                      </div>
+                    </div>
+
+                    {updatableApps.length > 0 ? (
+                      <button
+                        type="button"
+                        disabled={batchUpdatingApps || busyApp !== null}
+                        onClick={() => {
+                          setShowSettingsModal(false);
+                          void handleBatchUpgradeApps();
+                        }}
+                        className="h-7 px-2.5 rounded-[7px] bg-[var(--accent-soft)] hover:bg-[var(--accent-border)] text-[var(--accent)] border border-[var(--accent-border)] text-[12px] font-medium cursor-pointer disabled:opacity-60 shrink-0"
+                      >
+                        全部更新 ({updatableApps.length})
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={checkingUpdates}
+                        onClick={() => void runUpdateChecks(false)}
+                        className="h-7 px-2.5 rounded-[7px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-primary)] cursor-pointer disabled:opacity-60 shrink-0"
+                      >
+                        {checkingUpdates ? "检查中..." : "检查客户端"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Section 3: Collapsible Advanced Settings */}
+              <div className="flex flex-col gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setShowAdvancedSettings((v) => !v)}
+                  className="px-1 py-0.5 flex items-center justify-between text-[12px] font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
+                >
+                  <span>高级设置（网关地址 · 专用 Key · Manifest 源）</span>
+                  <ChevronDown
+                    className={`h-3.5 w-3.5 transition-transform duration-150 ${
+                      showAdvancedSettings ? "rotate-180" : ""
+                    }`}
+                  />
+                </button>
+
+                {showAdvancedSettings && (
+                  <div className="settings-group p-3 flex flex-col gap-2.5">
+                    <label className="flex flex-col gap-1">
+                      <span className="text-[var(--text-secondary)]">Tako 服务端地址</span>
+                      <input
+                        type="url"
+                        value={settingsForm.baseUrl}
+                        onChange={(e) =>
+                          setSettingsForm((s) => ({ ...s, baseUrl: e.target.value }))
+                        }
+                        className="h-8 px-2.5 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                      />
+                    </label>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[var(--text-secondary)]">Claude 网关副标题</span>
+                        <input
+                          type="text"
+                          maxLength={60}
+                          placeholder="Tako AI Gateway"
+                          value={settingsForm.gatewayDisplaySubtitle}
+                          onChange={(e) =>
+                            setSettingsForm((s) => ({
+                              ...s,
+                              gatewayDisplaySubtitle: e.target.value,
+                            }))
+                          }
+                          className="h-8 px-2.5 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                        />
+                      </label>
+
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[var(--text-secondary)]">
+                          Antigravity 专用 Key
+                        </span>
+                        <input
+                          type="password"
+                          placeholder="留空沿用主 Key"
+                          value={settingsForm.agyApiKey}
+                          onChange={(e) =>
+                            setSettingsForm((s) => ({ ...s, agyApiKey: e.target.value }))
+                          }
+                          className="h-8 px-2.5 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                        />
+                      </label>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[var(--text-secondary)]">媒体输出目录</span>
+                        <input
+                          type="text"
+                          value={settingsForm.outputDir}
+                          onChange={(e) =>
+                            setSettingsForm((s) => ({ ...s, outputDir: e.target.value }))
+                          }
+                          className="h-8 px-2.5 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                        />
+                      </label>
+
+                      <label className="flex flex-col gap-1">
+                        <span className="text-[var(--text-secondary)]">外脑顾问模型</span>
+                        <input
+                          type="text"
+                          value={settingsForm.consultModel}
+                          onChange={(e) =>
+                            setSettingsForm((s) => ({ ...s, consultModel: e.target.value }))
+                          }
+                          className="h-8 px-2.5 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                        />
+                      </label>
+                    </div>
+
+                    <div className="flex items-center justify-between gap-3 pt-1">
+                      <span className="text-[var(--text-secondary)] leading-snug">
+                        Codex 切 Tako 时保留官方 ChatGPT 登录（可保留远程操控/官方插件）
+                      </span>
+                      <ToggleSwitch
+                        checked={settingsForm.codexPreserveOfficialAuth}
+                        ariaLabel="Codex 保留官方 ChatGPT 登录"
+                        onChange={(next) =>
+                          setSettingsForm((s) => ({
+                            ...s,
+                            codexPreserveOfficialAuth: next,
+                          }))
+                        }
+                      />
+                    </div>
+
+                    <div className="pt-1 border-t border-[var(--border)] flex flex-col gap-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[var(--text-secondary)]">客户端 Manifest 更新源</span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setSettingsForm((s) => ({
+                              ...s,
+                              manifestUrl: DEFAULT_MANIFEST_URL,
+                              fallbackManifestUrl: DEFAULT_FALLBACK_MANIFEST_URL,
+                            }))
+                          }
+                          className="text-[11px] text-[var(--accent)] hover:underline cursor-pointer"
+                        >
+                          恢复默认源
+                        </button>
+                      </div>
+                      <input
+                        type="url"
+                        value={settingsForm.manifestUrl}
+                        placeholder="主更新源 URL"
+                        onChange={(e) =>
+                          setSettingsForm((s) => ({ ...s, manifestUrl: e.target.value }))
+                        }
+                        className="h-8 px-2.5 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] text-[11px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                      />
+                      <input
+                        type="url"
+                        value={settingsForm.fallbackManifestUrl}
+                        placeholder="备用更新源 URL"
+                        onChange={(e) =>
+                          setSettingsForm((s) => ({
+                            ...s,
+                            fallbackManifestUrl: e.target.value,
+                          }))
+                        }
+                        className="h-8 px-2.5 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] text-[11px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
 
-            <div className="mt-4 flex justify-end gap-2">
+            {/* Modal Footer */}
+            <div className="px-5 py-3 border-t border-[var(--border)] flex items-center justify-between gap-2 shrink-0 bg-[var(--bg-card)]">
               <button
                 type="button"
-                onClick={() => setShowSettingsModal(false)}
-                className="rounded-md px-3 py-1.5 text-xs text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+                onClick={() => void api.openUrl(TAKO_FEEDBACK_URL)}
+                className="inline-flex items-center gap-1.5 text-[12px] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
               >
-                取消
+                <MessageSquare className="h-3.5 w-3.5" />
+                <span>问题反馈</span>
               </button>
-              <button
-                type="submit"
-                className="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500"
-              >
-                保存设置
-              </button>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowSettingsModal(false)}
+                  className="h-8 px-3 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-secondary)] cursor-pointer"
+                >
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  disabled={savingSettings}
+                  className="h-8 px-3.5 rounded-[9px] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12px] font-medium cursor-pointer disabled:opacity-60"
+                >
+                  {savingSettings ? "保存中..." : "保存设置"}
+                </button>
+              </div>
             </div>
           </form>
-        </div>
-      )}
-
-      {/* Diagnostic Modal */}
-      {diagModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-md rounded-xl border border-slate-200 bg-white p-4 shadow-xl dark:border-slate-800 dark:bg-slate-900">
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className="text-sm font-semibold">{diagModal.name} 配置诊断</h3>
-              <button
-                onClick={() => setDiagModal(null)}
-                className="text-slate-400 hover:text-slate-600"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-            <div className="space-y-2 text-xs">
-              <div className="flex items-center gap-2">
-                <span
-                  className={`rounded px-2 py-0.5 font-medium ${
-                    diagModal.result.ok
-                      ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200"
-                      : "bg-rose-100 text-rose-800 dark:bg-rose-900/50 dark:text-rose-200"
-                  }`}
-                >
-                  {diagModal.result.ok ? "检查通过" : "发现异常"}
-                </span>
-                <span className="text-slate-500">
-                  {diagModal.hasBackup ? "已保留首次无损备份" : "尚未写入过修改"}
-                </span>
-              </div>
-              {diagModal.result.issues.length > 0 && (
-                <ul className="list-disc space-y-1 pl-4 text-rose-600 dark:text-rose-400">
-                  {diagModal.result.issues.map((item, idx) => (
-                    <li key={idx}>{item}</li>
-                  ))}
-                </ul>
-              )}
-              {diagModal.result.notes.length > 0 && (
-                <ul className="space-y-1 rounded-lg bg-slate-50 p-2.5 text-[11px] text-slate-600 dark:bg-slate-950 dark:text-slate-400">
-                  {diagModal.result.notes.map((note, idx) => (
-                    <li key={idx} className="break-all">
-                      {note}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          </div>
         </div>
       )}
     </div>

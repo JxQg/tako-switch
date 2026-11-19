@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type AppId = "codex" | "claude" | "antigravity";
-export type AppMode = "official" | "hybrid" | "tako";
+export type AppMode = "official" | "tako";
 
 export interface QuotaSummary {
   windowCostLimit: number;
@@ -21,6 +21,8 @@ export interface AccountStatus {
   planName: string | null;
   walletRemain: number | null;
   walletUsed: number | null;
+  walletRemainUsd: number | null;
+  walletUsedUsd: number | null;
   quota: QuotaSummary | null;
   error: string | null;
 }
@@ -41,6 +43,11 @@ export interface SwitchState {
   manifestUrl: string;
   fallbackManifestUrl: string;
   autoCheckUpdates: boolean;
+  codexPreserveOfficialAuth?: boolean;
+  gatewayDisplayName?: string;
+  gatewayDisplaySubtitle?: string;
+  preferChineseUi?: boolean;
+  showTrayBalance?: boolean;
   mcp: McpToolsConfig;
 }
 
@@ -113,9 +120,18 @@ export interface DashboardPayload {
   state: SwitchState;
   apps: AppSnapshot[];
   cachedManifest: Manifest | null;
+  localGatewayHealthy: boolean;
+  localGatewayUrl: string;
   appVersion: string;
   os: string;
 }
+
+export const DEFAULT_MANIFEST_URL =
+  "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/tako-switch/manifest.json";
+export const DEFAULT_FALLBACK_MANIFEST_URL =
+  "https://raw.githubusercontent.com/Barrierml/tako-switch/main/manifest/manifest.json";
+export const TAKO_FEEDBACK_URL = "https://github.com/Barrierml/tako-switch/issues";
+export const TAKO_RELEASES_URL = "https://github.com/Barrierml/tako-switch/releases/latest";
 
 export interface InstallProgressEvent {
   appId: AppId;
@@ -136,12 +152,19 @@ export interface SettingsPatch {
   manifestUrl?: string;
   fallbackManifestUrl?: string;
   autoCheckUpdates?: boolean;
+  codexPreserveOfficialAuth?: boolean;
+  gatewayDisplayName?: string;
+  gatewayDisplaySubtitle?: string;
+  preferChineseUi?: boolean;
+  showTrayBalance?: boolean;
   mcp?: McpToolsConfig;
 }
 
 export const api = {
   getDashboard: (refreshAccount: boolean) =>
     invoke<DashboardPayload>("get_dashboard", { refreshAccount }),
+  getRunningStates: () =>
+    invoke<Record<AppId, boolean>>("get_running_states"),
   loginOAuth: () => invoke<AccountStatus>("login_oauth"),
   loginWithKey: (key: string) => invoke<AccountStatus>("login_with_key", { key }),
   logoutAccount: () => invoke<AccountStatus>("logout_account"),
@@ -156,4 +179,7 @@ export const api = {
   checkAppUpdates: () => invoke<ManifestCheckResult>("check_app_updates"),
   installOrUpgradeApp: (appId: AppId) =>
     invoke<InstallOutcome>("install_or_upgrade_app", { appId }),
+  cancelAppInstall: (appId: AppId) =>
+    invoke<void>("cancel_app_install", { appId }),
+  ensureLocalGateway: () => invoke<boolean>("ensure_local_gateway"),
 };

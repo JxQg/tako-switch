@@ -12,7 +12,9 @@ use std::io::Write;
 use std::path::Path;
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,16 +80,31 @@ fn verify_digests(file_path: &Path, artifact: &PlatformArtifact) -> Result<(), S
     Ok(())
 }
 
+fn format_eta(secs: u64) -> String {
+    if secs < 60 {
+        format!("约 {secs}s")
+    } else {
+        format!("约 {}m{}s", secs / 60, secs % 60)
+    }
+}
+
 async fn download_artifact(
     app: Option<&AppHandle>,
     app_id: AppId,
     artifact: &PlatformArtifact,
     dest_path: &Path,
+    cancel_flag: Option<&Arc<AtomicBool>>,
 ) -> Result<(), String> {
     if let Some(parent) = dest_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("创建下载缓存目录失败: {e}"))?;
     }
+
+    let is_cancelled = || {
+        cancel_flag
+            .map(|f| f.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    };
 
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(15))
@@ -102,7 +119,13 @@ async fn download_artifact(
 
     let mut last_err = String::new();
     for url in urls {
-        emit_progress(app, app_id, "downloading", 1, format!("正在下载 {url}"));
+        if is_cancelled() {
+            let _ = fs::remove_file(dest_path);
+            emit_progress(app, app_id, "cancelled", 0, "已取消下载");
+            return Err("已取消下载".to_string());
+        }
+
+        emit_progress(app, app_id, "downloading", 1, "正在连接下载源...");
         let resp = match client.get(&url).send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
@@ -119,11 +142,19 @@ async fn download_artifact(
         let mut out = fs::File::create(dest_path)
             .map_err(|e| format!("创建临时安装包 {} 失败: {e}", dest_path.display()))?;
         let mut stream = resp.bytes_stream();
+        let started_at = Instant::now();
+        let mut last_emit = started_at;
         let mut downloaded: u64 = 0;
         let mut last_pct: u8 = 1;
         let mut stream_err: Option<String> = None;
 
         while let Some(chunk_res) = stream.next().await {
+            if is_cancelled() {
+                drop(out);
+                let _ = fs::remove_file(dest_path);
+                emit_progress(app, app_id, "cancelled", 0, "已取消下载");
+                return Err("已取消下载".to_string());
+            }
             match chunk_res {
                 Ok(chunk) => {
                     if let Err(e) = out.write_all(&chunk) {
@@ -131,22 +162,40 @@ async fn download_artifact(
                         break;
                     }
                     downloaded += chunk.len() as u64;
-                    if let Some(tot) = total.filter(|&t| t > 0) {
-                        let pct = ((downloaded.saturating_mul(75)) / tot).min(75) as u8;
-                        if pct >= last_pct.saturating_add(3) || pct == 75 {
-                            last_pct = pct;
-                            emit_progress(
-                                app,
-                                app_id,
-                                "downloading",
-                                pct,
-                                format!(
-                                    "已下载 {:.1} MB / {:.1} MB",
-                                    downloaded as f64 / 1_048_576.0,
-                                    tot as f64 / 1_048_576.0
-                                ),
-                            );
-                        }
+                    let elapsed = started_at.elapsed().as_secs_f64().max(0.1);
+                    let speed_mb = (downloaded as f64 / 1_048_576.0) / elapsed;
+                    let pct = total
+                        .filter(|&t| t > 0)
+                        .map(|t| ((downloaded.saturating_mul(75)) / t).min(75) as u8)
+                        .unwrap_or_else(|| {
+                            // Incremental visual movement when server omits Content-Length
+                            (1 + ((downloaded / (8 * 1_048_576)).min(70) as u8)).min(72)
+                        });
+                    let due_time = last_emit.elapsed() >= Duration::from_millis(250);
+                    let due_pct = pct >= last_pct.saturating_add(2);
+                    let finished = total.is_some_and(|t| t > 0 && downloaded >= t);
+                    if due_time || due_pct || finished {
+                        last_pct = pct;
+                        last_emit = Instant::now();
+                        let msg = if let Some(tot) = total.filter(|&t| t > 0) {
+                            let rem_bytes = tot.saturating_sub(downloaded) as f64;
+                            let bytes_per_sec = (downloaded as f64 / elapsed).max(1.0);
+                            let eta_secs = (rem_bytes / bytes_per_sec).round() as u64;
+                            format!(
+                                "已下载 {:.1} / {:.1} MB · {:.1} MB/s · {}",
+                                downloaded as f64 / 1_048_576.0,
+                                tot as f64 / 1_048_576.0,
+                                speed_mb,
+                                format_eta(eta_secs)
+                            )
+                        } else {
+                            format!(
+                                "已下载 {:.1} MB · {:.1} MB/s",
+                                downloaded as f64 / 1_048_576.0,
+                                speed_mb
+                            )
+                        };
+                        emit_progress(app, app_id, "downloading", pct, msg);
                     }
                 }
                 Err(e) => {
@@ -439,6 +488,7 @@ pub async fn install_or_upgrade_app(
     paths: &AppPaths,
     app_id: AppId,
     artifact: &PlatformArtifact,
+    cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<InstallOutcome, String> {
     let work_dir = paths.switch_dir().join("downloads").join(app_id.as_str());
     if work_dir.exists() {
@@ -447,34 +497,60 @@ pub async fn install_or_upgrade_app(
     fs::create_dir_all(&work_dir).map_err(|e| format!("创建工作目录失败: {e}"))?;
     let pkg_path = work_dir.join(infer_filename(app_id, artifact));
 
-    let download_res = download_artifact(app, app_id, artifact, &pkg_path).await;
+    let download_res = download_artifact(app, app_id, artifact, &pkg_path, cancel_flag.as_ref()).await;
     if let Err(err) = download_res {
         let _ = fs::remove_dir_all(&work_dir);
+        if err != "已取消下载" {
+            emit_progress(app, app_id, "error", 0, &err);
+        }
         return Err(err);
     }
 
     emit_progress(app, app_id, "verifying", 80, "正在校验安装包完整性");
     if let Err(err) = verify_digests(&pkg_path, artifact) {
         let _ = fs::remove_dir_all(&work_dir);
+        emit_progress(app, app_id, "error", 0, &err);
         return Err(err);
     }
 
-    let adapter = get_adapter(app_id);
-    let prev_mode = adapter.read_mode(paths);
-    let was_running = adapter.is_running(paths);
+    let (prev_mode, was_running) = {
+        let adapter = get_adapter(app_id);
+        let prev_mode = adapter.read_mode(paths);
+        let was_running = adapter.is_running(paths);
+        if was_running {
+            emit_progress(app, app_id, "closing", 85, "正在退出运行中的旧版本");
+            if let Err(err) = adapter.quit_app(paths) {
+                let _ = fs::remove_dir_all(&work_dir);
+                emit_progress(app, app_id, "error", 0, &err);
+                return Err(err);
+            }
+        }
+        (prev_mode, was_running)
+    };
     if was_running {
-        emit_progress(app, app_id, "closing", 85, "正在退出运行中的旧版本");
-        adapter.quit_app(paths)?;
+        for _ in 0..24 {
+            if !get_adapter(app_id).is_running(paths) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     emit_progress(app, app_id, "installing", 90, "正在执行静默安装/覆盖升级");
     let install_res = install_platform_package(paths, app_id, &pkg_path, artifact, &work_dir);
     let _ = fs::remove_dir_all(&work_dir);
-    install_res?;
+    if let Err(err) = install_res {
+        emit_progress(app, app_id, "error", 0, &err);
+        return Err(err);
+    }
 
+    let adapter = get_adapter(app_id);
     if prev_mode != AppMode::Official {
         emit_progress(app, app_id, "configuring", 96, "正在无损重放 Tako 配置");
-        adapter.apply_mode(paths, prev_mode)?;
+        if let Err(err) = adapter.apply_mode(paths, prev_mode) {
+            emit_progress(app, app_id, "error", 0, &err);
+            return Err(err);
+        }
     }
 
     if was_running {

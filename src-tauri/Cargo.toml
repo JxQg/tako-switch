@@ -1,6 +1,6 @@
 [package]
 name = "tako-switch"
-version = "2.0.0"
+version = "2.0.1"
 description = "Ultra-simple Tako desktop app configurator & built-in Tako Super MCP host"
 authors = ["shiroha <shir0ha@qq.com>"]
 edition = "2021"
@@ -15,9 +15,13 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 base64 = "0.22"
+bytes = "1"
 dirs = "6"
 futures-util = "0.3"
 hex = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }

@@ -1,10 +1,13 @@
 use crate::adapters::{
-    has_tako_mcp_server, merge_tako_mcp_server, AppId, AppMode, DesktopAppAdapter,
-    DiagnosticResult, InstallInfo,
+    has_tako_mcp_server, merge_tako_mcp_server, read_json_object_or_empty, AppId, AppMode,
+    DesktopAppAdapter, DiagnosticResult, InstallInfo,
 };
-use crate::config::{
-    backup_file_once, effective_agy_api_key, read_switch_state, write_atomic, AppPaths,
+use crate::agy_proxy::{
+    ensure_gateway_service, is_proxy_healthy, stop_gateway_service_if_unused, LOCAL_GATEWAY_PORT,
+    LOCAL_GATEWAY_URL,
 };
+use crate::config::{backup_file_once, effective_agy_api_key, write_atomic, AppPaths};
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -21,12 +24,86 @@ const AGY_ENV_PLIST_NAME: &str = "tech.shiroha.tako-switch.agy-env.plist";
 const AGY_ENV_PLIST_LABEL: &str = "tech.shiroha.tako-switch.agy-env";
 #[cfg(target_os = "macos")]
 const AGY_MACOS_BUNDLE_ID: &str = "com.google.antigravity";
+const AGY_TAKO_MCP_GRANT: &str = "mcp(tako/*)";
 
 pub struct AntigravityAdapter;
 
 impl AntigravityAdapter {
     fn mcp_path(paths: &AppPaths) -> PathBuf {
         paths.agy_gemini_config_dir.join("mcp_config.json")
+    }
+
+    fn config_path(paths: &AppPaths) -> PathBuf {
+        paths.agy_gemini_config_dir.join("config.json")
+    }
+
+    fn has_tako_mcp_permission(paths: &AppPaths) -> bool {
+        let Ok(root) = read_json_object_or_empty(&Self::config_path(paths)) else {
+            return false;
+        };
+        root.get("userSettings")
+            .and_then(Value::as_object)
+            .and_then(|us| us.get("globalPermissionGrants"))
+            .and_then(Value::as_object)
+            .and_then(|g| g.get("allow"))
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .any(|v| v.as_str() == Some(AGY_TAKO_MCP_GRANT))
+            })
+            .unwrap_or(false)
+    }
+
+    fn set_tako_mcp_permission(paths: &AppPaths, enable: bool) -> Result<(), String> {
+        let path = Self::config_path(paths);
+        if !enable && !path.exists() {
+            return Ok(());
+        }
+        let mut root = read_json_object_or_empty(&path)?;
+        if enable {
+            let user_settings = root
+                .entry("userSettings".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !user_settings.is_object() {
+                *user_settings = Value::Object(Map::new());
+            }
+            let us_obj = user_settings
+                .as_object_mut()
+                .ok_or_else(|| "userSettings 必须为 JSON object".to_string())?;
+            let grants = us_obj
+                .entry("globalPermissionGrants".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !grants.is_object() {
+                *grants = Value::Object(Map::new());
+            }
+            let grants_obj = grants
+                .as_object_mut()
+                .ok_or_else(|| "globalPermissionGrants 必须为 JSON object".to_string())?;
+            let allow = grants_obj
+                .entry("allow".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if !allow.is_array() {
+                *allow = Value::Array(Vec::new());
+            }
+            if let Some(arr) = allow.as_array_mut() {
+                if !arr.iter().any(|v| v.as_str() == Some(AGY_TAKO_MCP_GRANT)) {
+                    arr.push(Value::String(AGY_TAKO_MCP_GRANT.to_string()));
+                }
+            }
+        } else if let Some(arr) = root
+            .get_mut("userSettings")
+            .and_then(Value::as_object_mut)
+            .and_then(|us| us.get_mut("globalPermissionGrants"))
+            .and_then(Value::as_object_mut)
+            .and_then(|g| g.get_mut("allow"))
+            .and_then(Value::as_array_mut)
+        {
+            arr.retain(|v| v.as_str() != Some(AGY_TAKO_MCP_GRANT));
+        }
+
+        let bytes = serde_json::to_vec_pretty(&Value::Object(root))
+            .map_err(|e| format!("序列化 {} 失败: {e}", path.display()))?;
+        write_atomic(&path, &bytes, false)
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -209,8 +286,6 @@ impl DesktopAppAdapter for AntigravityAdapter {
         let env = Self::read_gateway_env(paths);
         if env.contains_key("AGY_LLM_GATEWAY_URL") && env.contains_key("AGY_LLM_GATEWAY_API_KEY") {
             AppMode::Tako
-        } else if has_tako_mcp_server(&Self::mcp_path(paths)) {
-            AppMode::Hybrid
         } else {
             AppMode::Official
         }
@@ -222,24 +297,25 @@ impl DesktopAppAdapter for AntigravityAdapter {
 
     fn apply_mode(&self, paths: &AppPaths, mode: AppMode) -> Result<(), String> {
         let mcp_path = Self::mcp_path(paths);
+        let config_path = Self::config_path(paths);
         backup_file_once(paths, "antigravity", "mcp_config.json", &mcp_path)?;
+        backup_file_once(paths, "antigravity", "config.json", &config_path)?;
 
         match mode {
             AppMode::Official => {
                 Self::clear_gateway_env(paths)?;
-                merge_tako_mcp_server(&mcp_path, paths, false)
-            }
-            AppMode::Hybrid => {
-                Self::clear_gateway_env(paths)?;
-                merge_tako_mcp_server(&mcp_path, paths, true)
+                merge_tako_mcp_server(&mcp_path, paths, false)?;
+                Self::set_tako_mcp_permission(paths, false)?;
+                stop_gateway_service_if_unused(paths)
             }
             AppMode::Tako => {
                 let api_key = effective_agy_api_key(paths).ok_or_else(|| {
                     "请先登录 Tako 账号或配置专用反重力 Key，再切换到全 Tako 模式".to_string()
                 })?;
-                let base_url = read_switch_state(paths).normalized_base_url();
-                Self::set_gateway_env(paths, &base_url, &api_key)?;
-                merge_tako_mcp_server(&mcp_path, paths, true)
+                ensure_gateway_service(paths)?;
+                Self::set_gateway_env(paths, LOCAL_GATEWAY_URL, &api_key)?;
+                merge_tako_mcp_server(&mcp_path, paths, true)?;
+                Self::set_tako_mcp_permission(paths, true)
             }
         }
     }
@@ -259,6 +335,16 @@ impl DesktopAppAdapter for AntigravityAdapter {
             }
             if env.get("AGY_LLM_GATEWAY_URL").map(|s| s.is_empty()).unwrap_or(true) {
                 issues.push("AGY_LLM_GATEWAY_URL 为空".to_string());
+            } else if env.get("AGY_LLM_GATEWAY_URL").map(String::as_str) == Some(LOCAL_GATEWAY_URL)
+                && !paths.is_test
+            {
+                if is_proxy_healthy(LOCAL_GATEWAY_PORT) {
+                    notes.push(format!("本地统一网关: 运行中 (127.0.0.1:{LOCAL_GATEWAY_PORT})"));
+                } else {
+                    issues.push(format!(
+                        "本地统一网关 (127.0.0.1:{LOCAL_GATEWAY_PORT}) 未运行，请重新点击 Tako 或重启 Tako Switch"
+                    ));
+                }
             }
             if env
                 .get("AGY_LLM_GATEWAY_API_KEY")
@@ -266,6 +352,14 @@ impl DesktopAppAdapter for AntigravityAdapter {
                 .unwrap_or(true)
             {
                 issues.push("AGY_LLM_GATEWAY_API_KEY 为空".to_string());
+            }
+            if Self::has_tako_mcp_permission(paths) {
+                notes.push("MCP 自动放行: mcp(tako/*) 已写入 config.json".to_string());
+            } else {
+                notes.push(
+                    "提示: 未检测到 mcp(tako/*) 自动放行规则，重新点击 Tako 可自动补全"
+                        .to_string(),
+                );
             }
             notes.push("提示: 新建 Antigravity 网关环境变量需完整退出并重启应用后生效".to_string());
         }
@@ -559,7 +653,7 @@ fn launch_windows_antigravity(paths: &AppPaths) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{read_switch_state, save_switch_state, save_tako_cli_credentials};
+    use crate::config::{read_switch_state, save_switch_auth, save_switch_state};
     use tempfile::TempDir;
 
     #[test]
@@ -572,24 +666,30 @@ mod tests {
             r#"{"mcpServers":{"other":{"command":"npx"}}}"#,
         )
         .unwrap();
+        fs::write(
+            paths.agy_gemini_config_dir.join("config.json"),
+            r#"{"plugins":{"swarm":{"enabled":true}},"userSettings":{"permissionPreset":"AGENT_PERMISSION_PRESET_TURBO","globalPermissionGrants":{"allow":["command(git status)"]}}}"#,
+        )
+        .unwrap();
 
-        save_tako_cli_credentials(&paths, Some("cr_main_key"), Some("1")).unwrap();
+        save_switch_auth(&paths, Some("cr_main_key"), Some("1"), Some("oauth")).unwrap();
         let mut state = read_switch_state(&paths);
         state.agy_api_key = Some("cr_agy_only".to_string());
         save_switch_state(&paths, &state).unwrap();
 
         let adapter = AntigravityAdapter;
-        adapter.apply_mode(&paths, AppMode::Hybrid).unwrap();
-        assert_eq!(adapter.read_mode(&paths), AppMode::Hybrid);
-        assert!(adapter.read_mcp_enabled(&paths, AppMode::Hybrid));
 
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        // Applying Tako a second time must not duplicate mcp(tako/*)
         adapter.apply_mode(&paths, AppMode::Tako).unwrap();
         assert_eq!(adapter.read_mode(&paths), AppMode::Tako);
         let env = AntigravityAdapter::read_gateway_env(&paths);
         assert_eq!(
             env.get("AGY_LLM_GATEWAY_URL").map(String::as_str),
-            Some("https://tako.shiroha.tech")
+            Some(LOCAL_GATEWAY_URL)
         );
+        #[cfg(not(target_os = "windows"))]
+        assert!(crate::agy_proxy::gateway_plist_path(&paths).exists());
         assert_eq!(
             env.get("AGY_LLM_GATEWAY_API_KEY").map(String::as_str),
             Some("cr_agy_only")
@@ -598,11 +698,59 @@ mod tests {
             env.get("AGY_LLM_GATEWAY_WIRE_PROTOCOL").map(String::as_str),
             Some("genai")
         );
+        assert!(AntigravityAdapter::has_tako_mcp_permission(&paths));
+        let cfg_tako = read_json_object_or_empty(&AntigravityAdapter::config_path(&paths)).unwrap();
+        assert!(cfg_tako.get("plugins").is_some());
+        let us_tako = cfg_tako.get("userSettings").unwrap().as_object().unwrap();
+        assert_eq!(
+            us_tako.get("permissionPreset").and_then(Value::as_str),
+            Some("AGENT_PERMISSION_PRESET_TURBO")
+        );
+        let allow_tako = us_tako
+            .get("globalPermissionGrants")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .get("allow")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            allow_tako
+                .iter()
+                .filter(|v| v.as_str() == Some(AGY_TAKO_MCP_GRANT))
+                .count(),
+            1
+        );
+        assert!(allow_tako
+            .iter()
+            .any(|v| v.as_str() == Some("command(git status)")));
         assert!(adapter.diagnose(&paths).ok);
 
         adapter.apply_mode(&paths, AppMode::Official).unwrap();
         assert_eq!(adapter.read_mode(&paths), AppMode::Official);
         assert!(AntigravityAdapter::read_gateway_env(&paths).is_empty());
+        #[cfg(not(target_os = "windows"))]
+        assert!(!crate::agy_proxy::gateway_plist_path(&paths).exists());
         assert!(!adapter.read_mcp_enabled(&paths, AppMode::Official));
+        assert!(!AntigravityAdapter::has_tako_mcp_permission(&paths));
+        let cfg_off = read_json_object_or_empty(&AntigravityAdapter::config_path(&paths)).unwrap();
+        assert!(cfg_off.get("plugins").is_some());
+        let allow_off = cfg_off
+            .get("userSettings")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .get("globalPermissionGrants")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .get("allow")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(allow_off
+            .iter()
+            .any(|v| v.as_str() == Some("command(git status)")));
     }
 }

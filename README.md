@@ -5,16 +5,15 @@
 ## 核心能力
 
 - **3 端桌面客户端统一托管**：
-  - **Codex Desktop** (`com.openai.codex` / `OpenAI.Codex`)：`~/.codex/config.toml` 无损写入（跳过 ChatGPT OAuth，保留用户现有 `auth.json` 与其他 TOML 配置）。
-  - **Claude Desktop** (`com.anthropic.claudefordesktop`)：启用原生 `Claude-3p` 隔离配置槽与 `1p`/`3p` 双目录 MCP 隔离，切回官方零重登、零破坏会话历史。
+  - **Codex Desktop** (`com.openai.codex` / `OpenAI.Codex`)：`~/.codex/config.toml` 无损写入，默认切 Tako 时自动暂存官方 `~/.codex/auth.json` 并写入 `OPENAI_API_KEY`（免登录 ChatGPT 直进；设置可选保留官方登录）+ 切回官方无损还原。
+  - **Claude Desktop** (`com.anthropic.claudefordesktop`)：启用原生 `Claude-3p` 隔离配置槽（`inferenceCredentialKind: "static"` + `_meta.json` `entries`）与 `1p`/`3p` 双目录 MCP 隔离，切回官方零重登、零破坏会话历史。
   - **Google Antigravity Desktop** (`com.google.antigravity`)：零 root 用户态网关注入（macOS LaunchAgent `launchctl setenv` / Windows `HKCU\Environment` + `WM_SETTINGCHANGE`，固定 `WIRE_PROTOCOL=genai`）与 `~/.gemini/config/mcp_config.json` 管理；支持专用反重力 Key 覆盖。
-- **三态一键切换** + **首次修改前自动无损备份** (`~/.tako/switch/backups/`)：
+- **二态一键切换** + **首次修改前自动无损备份** (`~/.tako/switch/backups/`) + **独立登录态** (`~/.tako/switch/auth.json`，与 `~/.tako/config.json` 隔离)：
   - `官方`：彻底还原原厂直连状态。
-  - `聚合`：保留官方订阅主模型，注入 Tako 超级 MCP 工具。
-  - `Tako`：主模型与 MCP 全量走 Tako 企业网关，直接免官方登录使用。
+  - `Tako`：主模型与 Tako 超级 MCP 全量走 Tako 企业网关，直接免官方登录使用。
 - **内置 Rust stdio MCP 服务器 (`tako-switch mcp-server`)**：
-  - 5 合 1 工具：`tako_generate_image`、`tako_generate_video`、`tako_generate_audio`、`tako_web_search`、`tako_consult`。
-  - 每次 `tools/list` / `tools/call` 动态读取 `~/.tako/config.json` 与 `~/.tako/switch/state.json`，开关即时生效，无需重装 MCP。
+  - 5 合 1 工具：`tako_generate_image`、`tako_generate_video`、`tako_audio`、`tako_web_search`、`tako_consult`。
+  - 每次 `tools/list` / `tools/call` 动态读取 `~/.tako/switch/auth.json` 与 `~/.tako/switch/state.json`，开关即时生效，无需重装 MCP。
 - **双层自动化更新 & 成本收敛策略**：
   1. `tako-switch` 自身自更新：基于 `tauri-plugin-updater`（Ed25519 minisign）优先检查国内上海 OSS 加速节点 `https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/tako-switch/latest.json`，自动回退 GitHub Releases。**OSS 桶与 GitHub v2 Release 严格仅保留最新单一版本**，自动清理历史旧包，避免存储费用累积。
   2. 三端托管桌面应用追新：GitHub Actions 每 6 小时自动同步 Antigravity / Claude / Codex 官方无墙源至 `manifest/manifest.json`（国内仅镜像该几十 KB 的清单 JSON；3–4 GB 第三方安装包直接从原厂官方无墙 CDN 拉取，不消耗自有 OSS 流量）。

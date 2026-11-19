@@ -1,0 +1,1906 @@
+use crate::adapters::{get_adapter, AppId, AppMode};
+use crate::config::{
+    effective_agy_api_key, read_main_api_key, read_switch_state, write_atomic, AppPaths,
+};
+use bytes::Bytes;
+use futures_util::StreamExt;
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
+use hyper::header::{HeaderName, HeaderValue};
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use reqwest::{Client, Method};
+use serde_json::{json, Map, Value};
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
+use std::convert::Infallible;
+use std::fs;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
+use tokio::sync::RwLock;
+
+pub const AGY_PROXY_PORT: u16 = 18419;
+pub const AGY_PROXY_URL: &str = "http://127.0.0.1:18419";
+pub const AGY_PROXY_HEALTH_PATH: &str = "/__tako_proxy_health";
+
+pub const LOCAL_GATEWAY_PORT: u16 = AGY_PROXY_PORT;
+pub const LOCAL_GATEWAY_URL: &str = AGY_PROXY_URL;
+pub const CODEX_PROXY_BASE_URL: &str = "http://127.0.0.1:18419/codex/v1";
+pub const CODEX_PROXY_CATALOG_URL: &str = "http://127.0.0.1:18419/codex/models";
+pub const CLAUDE_PROXY_BASE_URL: &str = "http://127.0.0.1:18419/claude";
+
+#[cfg(not(target_os = "windows"))]
+pub const GATEWAY_PLIST_NAME: &str = "tech.shiroha.tako-switch.gateway.plist";
+#[cfg(not(target_os = "windows"))]
+const LEGACY_AGY_PROXY_PLIST_NAME: &str = "tech.shiroha.tako-switch.agy-proxy.plist";
+#[cfg(target_os = "macos")]
+const GATEWAY_PLIST_LABEL: &str = "tech.shiroha.tako-switch.gateway";
+#[cfg(target_os = "macos")]
+const LEGACY_AGY_PROXY_PLIST_LABEL: &str = "tech.shiroha.tako-switch.agy-proxy";
+
+const PRICING_CACHE_TTL: Duration = Duration::from_secs(300);
+const ALLOWED_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const DEFAULT_CODEX_BASE_INSTRUCTIONS: &str = "You are Codex, an expert AI software engineering assistant. Follow user instructions carefully, inspect files before editing, and verify changes using available tools.";
+
+static IN_PROCESS_PROXY_STARTED: AtomicBool = AtomicBool::new(false);
+
+type ProxyBody = BoxBody<Bytes, std::io::Error>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientKind {
+    Antigravity,
+    Codex,
+    Claude,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PricingCache {
+    pub reasoning_levels: HashMap<String, Vec<String>>,
+    pub descriptions: HashMap<String, String>,
+    pub has_flash_image: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticRoute {
+    pub base_model: String,
+    pub effort: String,
+}
+
+struct ProxyState {
+    paths: AppPaths,
+    client: Client,
+    pricing_cache: RwLock<Option<(String, Instant, PricingCache)>>,
+    synthetic_routes: RwLock<HashMap<String, SyntheticRoute>>,
+    codex_model_messages: RwLock<Option<Value>>,
+}
+
+pub fn parse_pricing_metadata(body: &Value) -> PricingCache {
+    let mut cache = PricingCache::default();
+    let Some(items) = body.get("data").and_then(Value::as_array) else {
+        return cache;
+    };
+    for item in items {
+        let Some(model_name) = item
+            .get("model_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if model_name == "gemini-3.1-flash-image" {
+            cache.has_flash_image = true;
+        }
+        if let Some(desc) = item
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cache
+                .descriptions
+                .insert(model_name.to_string(), desc.to_string());
+        }
+        if let Some(raw_levels) = item.get("reasoning_levels").and_then(Value::as_array) {
+            let mut present = HashSet::new();
+            for lvl in raw_levels {
+                if let Some(s) = lvl.as_str() {
+                    let norm = s.trim().to_ascii_lowercase();
+                    if ALLOWED_EFFORTS.contains(&norm.as_str()) {
+                        present.insert(norm);
+                    }
+                }
+            }
+            let ordered: Vec<String> = ALLOWED_EFFORTS
+                .iter()
+                .filter(|eff| present.contains(**eff))
+                .map(|eff| (*eff).to_string())
+                .collect();
+            if !ordered.is_empty() {
+                cache.reasoning_levels.insert(model_name.to_string(), ordered);
+            }
+        }
+    }
+    cache
+}
+
+pub fn effective_effort_levels(base_id: &str, pricing: &PricingCache) -> Option<Vec<String>> {
+    if let Some(levels) = pricing.reasoning_levels.get(base_id) {
+        if levels.len() >= 2 {
+            return Some(levels.clone());
+        }
+    }
+    if base_id == "gemini-3.1-pro-preview" || base_id == "gemini-3.1-pro" {
+        return Some(vec!["low".to_string(), "high".to_string()]);
+    }
+    None
+}
+
+fn strip_effort_display_suffix(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    for eff in ALLOWED_EFFORTS {
+        for pat in [format!(" ({eff})"), format!(" ({eff} thinking)")] {
+            if lower.ends_with(&pat) && trimmed.len() > pat.len() {
+                return trimmed[..trimmed.len() - pat.len()].trim().to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+pub fn display_base_name(base_id: &str, orig_display: Option<&str>) -> String {
+    match base_id {
+        "gemini-3.8-flash" => "Gemini 3.8 Flash".to_string(),
+        "gemini-3.7-flash" => "Gemini 3.7 Flash".to_string(),
+        "gemini-3.6-flash" => "Gemini 3.6 Flash".to_string(),
+        "gemini-3.5-flash" => "Gemini 3.5 Flash".to_string(),
+        "gemini-3.1-pro-preview" | "gemini-3.1-pro" => "Gemini 3.1 Pro".to_string(),
+        "gemini-3-pro-preview" | "gemini-3-pro" => "Gemini 3 Pro".to_string(),
+        _ => {
+            let candidate = orig_display
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(base_id);
+            strip_effort_display_suffix(candidate)
+        }
+    }
+}
+
+pub fn effort_label(effort: &str) -> &'static str {
+    match effort {
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "xhigh" => "XHigh",
+        "max" => "Max",
+        _ => "Medium",
+    }
+}
+
+pub fn expand_models_catalog(
+    mut body: Value,
+    pricing: &PricingCache,
+) -> (Value, HashMap<String, SyntheticRoute>) {
+    let mut routes = HashMap::new();
+    let Some(models) = body.get("models").and_then(Value::as_array) else {
+        return (body, routes);
+    };
+
+    let mut expanded = Vec::with_capacity(models.len() + 8);
+    let mut has_flash_image_entry = false;
+
+    for item in models {
+        let Some(obj) = item.as_object() else {
+            expanded.push(item.clone());
+            continue;
+        };
+        let raw_name = obj.get("name").and_then(Value::as_str).unwrap_or("");
+        let base_id = raw_name.strip_prefix("models/").unwrap_or(raw_name);
+        if base_id == "gemini-3.1-flash-image" {
+            has_flash_image_entry = true;
+        }
+
+        if let Some(levels) = effective_effort_levels(base_id, pricing) {
+            let base_display = display_base_name(
+                base_id,
+                obj.get("displayName").and_then(Value::as_str),
+            );
+            for effort in levels {
+                let mut variant = obj.clone();
+                let synth_id = format!("{base_id}-{effort}");
+                variant.insert("name".to_string(), Value::String(format!("models/{synth_id}")));
+                variant.insert(
+                    "displayName".to_string(),
+                    Value::String(format!("{base_display} ({})", effort_label(&effort))),
+                );
+                variant.insert("thinking".to_string(), Value::Bool(true));
+                expanded.push(Value::Object(variant));
+                routes.insert(
+                    synth_id,
+                    SyntheticRoute {
+                        base_model: base_id.to_string(),
+                        effort,
+                    },
+                );
+            }
+        } else {
+            expanded.push(Value::Object(obj.clone()));
+        }
+    }
+
+    if pricing.has_flash_image && !has_flash_image_entry {
+        expanded.push(json!({
+            "name": "models/gemini-3.1-flash-image",
+            "displayName": "Gemini 3.1 Flash Image",
+            "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
+        }));
+    }
+
+    if let Some(root) = body.as_object_mut() {
+        root.insert("models".to_string(), Value::Array(expanded));
+    }
+
+    (body, routes)
+}
+
+pub fn parse_gemini_action_path(path: &str) -> Option<(String, String)> {
+    let rest = path.strip_prefix("/v1beta/models/")?;
+    let colon_idx = rest.rfind(':')?;
+    let model = rest[..colon_idx].trim();
+    let action = rest[colon_idx + 1..].trim();
+    if model.is_empty() || action.is_empty() {
+        return None;
+    }
+    Some((model.to_string(), action.to_string()))
+}
+
+pub fn resolve_synthetic_route(
+    model: &str,
+    routes: &HashMap<String, SyntheticRoute>,
+    pricing: &PricingCache,
+) -> Option<SyntheticRoute> {
+    if let Some(hit) = routes.get(model) {
+        return Some(hit.clone());
+    }
+    for effort in ["xhigh", "medium", "high", "low", "max"] {
+        let suffix = format!("-{effort}");
+        if let Some(base) = model.strip_suffix(&suffix) {
+            if let Some(levels) = effective_effort_levels(base, pricing) {
+                if levels.iter().any(|l| l == effort) {
+                    return Some(SyntheticRoute {
+                        base_model: base.to_string(),
+                        effort: effort.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn inject_thinking_effort(body_bytes: &[u8], effort: &str) -> Vec<u8> {
+    let Ok(mut root) = serde_json::from_slice::<Value>(body_bytes) else {
+        return body_bytes.to_vec();
+    };
+    let Some(root_obj) = root.as_object_mut() else {
+        return body_bytes.to_vec();
+    };
+
+    let gen_cfg = root_obj
+        .entry("generationConfig".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !gen_cfg.is_object() {
+        *gen_cfg = Value::Object(Map::new());
+    }
+    let Some(gen_obj) = gen_cfg.as_object_mut() else {
+        return body_bytes.to_vec();
+    };
+
+    let thinking_cfg = gen_obj
+        .entry("thinkingConfig".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !thinking_cfg.is_object() {
+        *thinking_cfg = Value::Object(Map::new());
+    }
+    if let Some(tc_obj) = thinking_cfg.as_object_mut() {
+        tc_obj.remove("thinkingBudget");
+        tc_obj.remove("thinking_budget");
+        tc_obj.remove("thinking_level");
+        tc_obj.insert(
+            "thinkingLevel".to_string(),
+            Value::String(effort.to_ascii_uppercase()),
+        );
+        if !tc_obj.contains_key("includeThoughts") && !tc_obj.contains_key("include_thoughts") {
+            tc_obj.insert("includeThoughts".to_string(), Value::Bool(true));
+        }
+    }
+
+    serde_json::to_vec(&root).unwrap_or_else(|_| body_bytes.to_vec())
+}
+
+fn title_case_token(tok: &str) -> String {
+    let mut chars = tok.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(tok.len());
+    out.extend(first.to_uppercase());
+    out.push_str(&chars.as_str().to_ascii_lowercase());
+    out
+}
+
+fn codex_model_priority(id: &str) -> i64 {
+    match id {
+        "gpt-6.2-sol" => 1,
+        "gpt-6.2-astra" => 2,
+        "gpt-6.1-sol" => 3,
+        "gpt-6-astra" => 4,
+        "gpt-6.1-terra" => 5,
+        "gpt-6-sol" => 6,
+        "swe-2" => 7,
+        "swe-2-flash" => 8,
+        "gpt-6-luna" => 9,
+        "gpt-5.6-sol" => 10,
+        "gpt-5.6-terra" => 11,
+        "gpt-5.6-luna" => 12,
+        "gpt-5.6" => 13,
+        "gpt-5.5" => 14,
+        "codex-auto-review" => 99,
+        _ if id.starts_with("gpt-") => 18,
+        _ if id == "tako-auto" => 19,
+        _ => 25,
+    }
+}
+
+fn codex_display_name(id: &str) -> String {
+    if let Some(rest) = id.strip_prefix("gpt-") {
+        let parts: Vec<String> = rest
+            .split('-')
+            .map(|seg| match seg.to_ascii_lowercase().as_str() {
+                "oss" => "OSS".to_string(),
+                "4o" => "4o".to_string(),
+                "mini" => "Mini".to_string(),
+                _ if seg.chars().all(|c| c.is_ascii_digit() || c == '.') => seg.to_string(),
+                _ => title_case_token(seg),
+            })
+            .collect();
+        return format!("GPT-{}", parts.join("-"));
+    }
+    if id == "swe-2" {
+        return "SWE-2".to_string();
+    }
+    if let Some(rest) = id.strip_prefix("swe-2-") {
+        let parts: Vec<String> = rest.split('-').map(title_case_token).collect();
+        return format!("SWE-2 {}", parts.join(" "));
+    }
+    id.split('-')
+        .map(title_case_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn effort_description(effort: &str) -> &'static str {
+    match effort {
+        "low" => "Fast responses with lighter reasoning",
+        "medium" => "Balances speed and reasoning depth",
+        "high" => "Greater reasoning depth for complex problems",
+        "xhigh" => "Extra high reasoning depth",
+        "max" => "Maximum reasoning depth",
+        _ => "Balanced reasoning depth",
+    }
+}
+
+fn codex_efforts_for_model(id: &str, pricing: &PricingCache) -> (&'static str, Vec<&'static str>) {
+    if let Some(levels) = pricing.reasoning_levels.get(id) {
+        let mapped: Vec<&'static str> = levels
+            .iter()
+            .filter_map(|lvl| match lvl.as_str() {
+                "low" => Some("low"),
+                "medium" => Some("medium"),
+                "high" => Some("high"),
+                "xhigh" => Some("xhigh"),
+                "max" => Some("max"),
+                _ => None,
+            })
+            .collect();
+        if !mapped.is_empty() {
+            let default_lvl = if mapped.contains(&"high") {
+                "high"
+            } else if mapped.contains(&"medium") {
+                "medium"
+            } else {
+                mapped[0]
+            };
+            return (default_lvl, mapped);
+        }
+    }
+
+    if id.starts_with("gpt-6")
+        || id.starts_with("gpt-5")
+        || id.starts_with("o1")
+        || id.starts_with("o3")
+        || id.starts_with("o4")
+        || id == "codex-auto-review"
+    {
+        let default_lvl = if id.ends_with("-sol") { "low" } else { "medium" };
+        return (
+            default_lvl,
+            vec!["low", "medium", "high", "xhigh", "max"],
+        );
+    }
+
+    ("medium", vec!["low", "medium", "high"])
+}
+
+/// Converts upstream OpenAI `/v1/models` + `/api/pricing` metadata into Codex's `ModelsResponse` schema.
+pub fn build_codex_models_catalog(
+    upstream_models: &Value,
+    pricing: &PricingCache,
+    cached_model_messages: Option<&Value>,
+) -> Value {
+    let mut ids: Vec<String> = upstream_models
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for item in arr {
+                let Some(id) = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                let supports_responses = item
+                    .get("supported_endpoint_types")
+                    .and_then(Value::as_array)
+                    .map(|eps| {
+                        eps.iter()
+                            .any(|ep| ep.as_str() == Some("openai-response"))
+                    })
+                    .unwrap_or(false);
+                if !supports_responses {
+                    continue;
+                }
+                let lower = id.to_ascii_lowercase();
+                if lower.contains("image")
+                    || lower.contains("video")
+                    || lower.contains("audio")
+                    || lower.contains("tts")
+                    || lower.contains("whisper")
+                    || lower.contains("embedding")
+                {
+                    continue;
+                }
+                if seen.insert(id.to_string()) {
+                    out.push(id.to_string());
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+
+    ids.sort_by(|a, b| codex_model_priority(a).cmp(&codex_model_priority(b)).then_with(|| a.cmp(b)));
+
+    let valid_mm = cached_model_messages.filter(|mm| {
+        mm.as_object()
+            .map(|o| !o.is_empty())
+            .unwrap_or(false)
+    });
+
+    let models: Vec<Value> = ids
+        .into_iter()
+        .map(|id| {
+            let priority = codex_model_priority(&id);
+            let visibility = if id == "codex-auto-review" {
+                "hide"
+            } else {
+                "list"
+            };
+            let (default_lvl, levels) = codex_efforts_for_model(&id, pricing);
+            let supported_reasoning_levels: Vec<Value> = levels
+                .into_iter()
+                .map(|eff| {
+                    json!({
+                        "effort": eff,
+                        "description": effort_description(eff),
+                    })
+                })
+                .collect();
+            let description = pricing
+                .descriptions
+                .get(&id)
+                .map(String::as_str)
+                .unwrap_or("Tako AI model");
+
+            let mut obj = Map::new();
+            obj.insert("slug".to_string(), Value::String(id.clone()));
+            obj.insert(
+                "display_name".to_string(),
+                Value::String(codex_display_name(&id)),
+            );
+            obj.insert(
+                "description".to_string(),
+                Value::String(description.to_string()),
+            );
+            obj.insert(
+                "default_reasoning_level".to_string(),
+                Value::String(default_lvl.to_string()),
+            );
+            obj.insert(
+                "supported_reasoning_levels".to_string(),
+                Value::Array(supported_reasoning_levels),
+            );
+            obj.insert(
+                "shell_type".to_string(),
+                Value::String("unified_exec".to_string()),
+            );
+            obj.insert(
+                "visibility".to_string(),
+                Value::String(visibility.to_string()),
+            );
+            obj.insert("supported_in_api".to_string(), Value::Bool(true));
+            obj.insert("priority".to_string(), json!(priority));
+            obj.insert("prefer_websockets".to_string(), Value::Bool(false));
+            obj.insert(
+                "base_instructions".to_string(),
+                Value::String(DEFAULT_CODEX_BASE_INSTRUCTIONS.to_string()),
+            );
+            obj.insert(
+                "input_modalities".to_string(),
+                json!(["text", "image"]),
+            );
+            obj.insert(
+                "truncation_policy".to_string(),
+                json!({"mode": "tokens", "limit": 10000}),
+            );
+            obj.insert(
+                "apply_patch_tool_type".to_string(),
+                Value::String("freeform".to_string()),
+            );
+            obj.insert(
+                "web_search_tool_type".to_string(),
+                Value::String("text_and_image".to_string()),
+            );
+            obj.insert("context_window".to_string(), json!(400_000));
+            obj.insert("effective_context_window_percent".to_string(), json!(95));
+            obj.insert("support_verbosity".to_string(), Value::Bool(true));
+            obj.insert("default_verbosity".to_string(), Value::String("low".to_string()));
+            obj.insert(
+                "default_reasoning_summary".to_string(),
+                Value::String("none".to_string()),
+            );
+            obj.insert("supports_parallel_tool_calls".to_string(), Value::Bool(true));
+            obj.insert("experimental_supported_tools".to_string(), json!([]));
+            if let Some(mm) = valid_mm {
+                obj.insert("model_messages".to_string(), mm.clone());
+            }
+            Value::Object(obj)
+        })
+        .collect();
+
+    json!({ "models": models })
+}
+
+fn strip_dated_snapshot_suffix(id: &str) -> Option<&str> {
+    let idx = id.rfind('-')?;
+    let suffix = &id[idx + 1..];
+    if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
+        Some(&id[..idx])
+    } else {
+        None
+    }
+}
+
+fn parse_claude_tier_and_version(id: &str) -> (Option<&'static str>, u32, u32) {
+    let lower = id.to_ascii_lowercase();
+    let no_1m = lower.strip_suffix("[1m]").unwrap_or(&lower);
+    let trimmed = strip_dated_snapshot_suffix(no_1m).unwrap_or(no_1m);
+
+    let tier = ["opus", "sonnet", "fable", "haiku", "mythos"]
+        .into_iter()
+        .find(|t| trimmed.split('-').any(|seg| seg == *t) || trimmed.contains(t));
+
+    let nums: Vec<u32> = trimmed
+        .split('-')
+        .filter_map(|seg| {
+            if !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()) {
+                seg.parse::<u32>().ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let major = nums.first().copied().unwrap_or(0);
+    let minor = nums.get(1).copied().unwrap_or(0);
+    (tier, major, minor)
+}
+
+fn claude_tier_rank(tier: Option<&str>) -> u8 {
+    match tier {
+        Some("opus") => 0,
+        Some("sonnet") => 1,
+        Some("fable") => 2,
+        Some("haiku") => 3,
+        Some("mythos") => 4,
+        _ => 5,
+    }
+}
+
+fn claude_display_name(id: &str, tier: Option<&str>, major: u32, minor: u32) -> String {
+    if let Some(t) = tier {
+        let tier_title = title_case_token(t);
+        if major > 0 && minor > 0 {
+            return format!("Claude {tier_title} {major}.{minor}");
+        }
+        if major > 0 {
+            return format!("Claude {tier_title} {major}");
+        }
+        return format!("Claude {tier_title}");
+    }
+    id.split('-')
+        .map(title_case_token)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Converts upstream `/v1/models` + `/api/pricing` into Claude Desktop's Anthropic `/v1/models` format.
+pub fn build_claude_models_catalog(upstream_models: &Value, pricing: &PricingCache) -> Value {
+    let raw_items = upstream_models
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut all_ids = HashSet::new();
+    let mut claude_ids = Vec::new();
+    for item in &raw_items {
+        let Some(id) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let owned_by = item
+            .get("owned_by")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if (id.starts_with("claude-") || owned_by.eq_ignore_ascii_case("claude"))
+            && all_ids.insert(id.to_string())
+        {
+            claude_ids.push(id.to_string());
+        }
+    }
+
+    let mut parsed: Vec<(String, Option<&'static str>, u32, u32)> = claude_ids
+        .into_iter()
+        .filter(|id| {
+            if let Some(base) = strip_dated_snapshot_suffix(id) {
+                !all_ids.contains(base)
+            } else {
+                true
+            }
+        })
+        .map(|id| {
+            let (tier, major, minor) = parse_claude_tier_and_version(&id);
+            (id, tier, major, minor)
+        })
+        .collect();
+
+    parsed.sort_by(|a, b| {
+        claude_tier_rank(a.1)
+            .cmp(&claude_tier_rank(b.1))
+            .then_with(|| Reverse(a.2).cmp(&Reverse(b.2)))
+            .then_with(|| Reverse(a.3).cmp(&Reverse(b.3)))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut seen_tiers: HashSet<&'static str> = HashSet::new();
+    let data: Vec<Value> = parsed
+        .into_iter()
+        .map(|(id, tier, major, minor)| {
+            let is_family_default = tier
+                .map(|t| seen_tiers.insert(t))
+                .unwrap_or(false);
+            let supports_1m = tier != Some("haiku")
+                && (major > 4 || (major == 4 && minor >= 6));
+            let max_input_tokens: u64 = if supports_1m { 1_000_000 } else { 200_000 };
+            let display_name = claude_display_name(&id, tier, major, minor);
+
+            let mut obj = Map::new();
+            obj.insert("id".to_string(), Value::String(id.clone()));
+            obj.insert("type".to_string(), Value::String("model".to_string()));
+            obj.insert("display_name".to_string(), Value::String(display_name));
+            obj.insert(
+                "created_at".to_string(),
+                Value::String("2026-01-01T00:00:00Z".to_string()),
+            );
+            if let Some(t) = tier {
+                obj.insert(
+                    "anthropic_family_tier".to_string(),
+                    Value::String(t.to_string()),
+                );
+            }
+            if is_family_default {
+                obj.insert("is_family_default".to_string(), Value::Bool(true));
+            }
+            obj.insert("supports_1m".to_string(), Value::Bool(supports_1m));
+            obj.insert("max_input_tokens".to_string(), json!(max_input_tokens));
+            if let Some(desc) = pricing.descriptions.get(&id) {
+                let clipped: String = desc.chars().take(100).collect();
+                if !clipped.is_empty() {
+                    obj.insert("description".to_string(), Value::String(clipped));
+                }
+            }
+            Value::Object(obj)
+        })
+        .collect();
+
+    let first_id = data
+        .first()
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
+        .map(|s| Value::String(s.to_string()))
+        .unwrap_or(Value::Null);
+    let last_id = data
+        .last()
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
+        .map(|s| Value::String(s.to_string()))
+        .unwrap_or(Value::Null);
+
+    json!({
+        "data": data,
+        "has_more": false,
+        "first_id": first_id,
+        "last_id": last_id,
+    })
+}
+
+/// Strips `[1m]` context suffix from `"model"` in Claude Messages/count_tokens requests.
+pub fn normalize_claude_request_body(body_bytes: &[u8]) -> Vec<u8> {
+    let Ok(mut root) = serde_json::from_slice::<Value>(body_bytes) else {
+        return body_bytes.to_vec();
+    };
+    let Some(obj) = root.as_object_mut() else {
+        return body_bytes.to_vec();
+    };
+    let Some(model) = obj.get("model").and_then(Value::as_str) else {
+        return body_bytes.to_vec();
+    };
+    let lower = model.to_ascii_lowercase();
+    if let Some(prefix) = lower.strip_suffix("[1m]") {
+        let stripped = model[..prefix.len()].to_string();
+        obj.insert("model".to_string(), Value::String(stripped));
+        return serde_json::to_vec(&root).unwrap_or_else(|_| body_bytes.to_vec());
+    }
+    body_bytes.to_vec()
+}
+
+fn should_strip_req_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "accept-encoding"
+            | "keep-alive"
+            | "proxy-connection"
+            | "te"
+            | "trailers"
+            | "upgrade"
+    )
+}
+
+fn should_strip_resp_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "te"
+            | "trailers"
+            | "upgrade"
+    )
+}
+
+fn full_body(bytes: impl Into<Bytes>) -> ProxyBody {
+    Full::new(bytes.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
+
+fn json_error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
+    let payload = json!({
+        "error": {
+            "code": status.as_u16(),
+            "message": message,
+            "status": "PROXY_ERROR"
+        }
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(full_body(bytes))
+        .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
+}
+
+async fn get_pricing_cache(state: &ProxyState, base_url: &str) -> PricingCache {
+    {
+        let guard = state.pricing_cache.read().await;
+        if let Some((ref cached_base, fetched_at, ref cached)) = *guard {
+            if cached_base == base_url && fetched_at.elapsed() < PRICING_CACHE_TTL {
+                return cached.clone();
+            }
+        }
+    }
+
+    let url = format!("{base_url}/api/pricing");
+    let fetched = tokio::time::timeout(
+        Duration::from_secs(5),
+        state.client.get(&url).send(),
+    )
+    .await;
+
+    if let Ok(Ok(resp)) = fetched {
+        if resp.status().is_success() {
+            if let Ok(body) = resp.json::<Value>().await {
+                let parsed = parse_pricing_metadata(&body);
+                let mut guard = state.pricing_cache.write().await;
+                *guard = Some((base_url.to_string(), Instant::now(), parsed.clone()));
+                return parsed;
+            }
+        }
+    }
+
+    let guard = state.pricing_cache.read().await;
+    guard
+        .as_ref()
+        .filter(|(cached_base, _, _)| cached_base == base_url)
+        .map(|(_, _, c)| c.clone())
+        .unwrap_or_default()
+}
+
+async fn get_codex_model_messages(state: &ProxyState) -> Option<Value> {
+    {
+        let guard = state.codex_model_messages.read().await;
+        if let Some(ref cached) = *guard {
+            return Some(cached.clone());
+        }
+    }
+    let cache_path = state.paths.codex_dir.join("models_cache.json");
+    let extracted = fs::read(&cache_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|val| {
+            val.get("models")
+                .and_then(Value::as_array)
+                .and_then(|models| {
+                    models.iter().find_map(|m| {
+                        let mm = m.get("model_messages")?;
+                        let obj = mm.as_object()?;
+                        if !obj.is_empty() && obj.contains_key("instructions_template") {
+                            Some(mm.clone())
+                        } else {
+                            None
+                        }
+                    })
+                })
+        });
+    if let Some(ref mm) = extracted {
+        let mut guard = state.codex_model_messages.write().await;
+        *guard = Some(mm.clone());
+    }
+    extracted
+}
+
+fn build_upstream_headers(
+    paths: &AppPaths,
+    incoming: &hyper::HeaderMap,
+    kind: ClientKind,
+) -> reqwest::header::HeaderMap {
+    let mut out = reqwest::header::HeaderMap::new();
+    let agy_key = if kind == ClientKind::Antigravity {
+        effective_agy_api_key(paths)
+    } else {
+        None
+    };
+    let main_key = if matches!(kind, ClientKind::Codex | ClientKind::Claude) {
+        read_main_api_key(paths)
+    } else {
+        None
+    };
+
+    for (name, val) in incoming {
+        let name_str = name.as_str();
+        if should_strip_req_header(name_str) {
+            continue;
+        }
+        match kind {
+            ClientKind::Antigravity
+                if agy_key.is_some()
+                    && (name_str.eq_ignore_ascii_case("x-goog-api-key")
+                        || name_str.eq_ignore_ascii_case("authorization")) =>
+            {
+                continue;
+            }
+            ClientKind::Codex | ClientKind::Claude
+                if main_key.is_some()
+                    && (name_str.eq_ignore_ascii_case("authorization")
+                        || name_str.eq_ignore_ascii_case("x-api-key")) =>
+            {
+                continue;
+            }
+            _ => {}
+        }
+        if let (Ok(r_name), Ok(r_val)) = (
+            reqwest::header::HeaderName::from_bytes(name_str.as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(val.as_bytes()),
+        ) {
+            out.append(r_name, r_val);
+        }
+    }
+
+    match kind {
+        ClientKind::Antigravity => {
+            if let Some(key) = agy_key {
+                if let Ok(r_val) = reqwest::header::HeaderValue::from_str(&key) {
+                    out.insert(
+                        reqwest::header::HeaderName::from_static("x-goog-api-key"),
+                        r_val,
+                    );
+                }
+            }
+        }
+        ClientKind::Codex | ClientKind::Claude => {
+            if let Some(key) = main_key {
+                if let Ok(r_val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
+                    out.insert(
+                        reqwest::header::HeaderName::from_static("authorization"),
+                        r_val,
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+fn copy_response_headers(
+    upstream: &reqwest::header::HeaderMap,
+    builder: hyper::http::response::Builder,
+) -> hyper::http::response::Builder {
+    let mut b = builder;
+    for (name, val) in upstream {
+        let name_str = name.as_str();
+        if should_strip_resp_header(name_str) {
+            continue;
+        }
+        if let (Ok(h_name), Ok(h_val)) = (
+            HeaderName::from_bytes(name_str.as_bytes()),
+            HeaderValue::from_bytes(val.as_bytes()),
+        ) {
+            b = b.header(h_name, h_val);
+        }
+    }
+    b
+}
+
+async fn handle_models_list(
+    state: Arc<ProxyState>,
+    path_and_query: &str,
+    incoming_headers: &hyper::HeaderMap,
+) -> Response<ProxyBody> {
+    let base_url = read_switch_state(&state.paths).normalized_base_url();
+    let target_url = format!("{base_url}{path_and_query}");
+    let headers = build_upstream_headers(&state.paths, incoming_headers, ClientKind::Antigravity);
+
+    let (upstream_res, pricing) = tokio::join!(
+        state.client.get(&target_url).headers(headers).send(),
+        get_pricing_cache(&state, &base_url)
+    );
+
+    let resp = match upstream_res {
+        Ok(r) => r,
+        Err(err) => {
+            return json_error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("上游模型列表请求失败: {err}"),
+            );
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let resp_headers = resp.headers().clone();
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(err) => {
+            return json_error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("读取上游模型列表失败: {err}"),
+            );
+        }
+    };
+
+    if status == StatusCode::OK {
+        if let Ok(json_body) = serde_json::from_slice::<Value>(&bytes) {
+            if json_body.get("models").and_then(Value::as_array).is_some() {
+                let (expanded_body, routes) = expand_models_catalog(json_body, &pricing);
+                {
+                    let mut guard = state.synthetic_routes.write().await;
+                    *guard = routes;
+                }
+                if let Ok(out_bytes) = serde_json::to_vec(&expanded_body) {
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json; charset=utf-8")
+                        .body(full_body(out_bytes))
+                        .unwrap_or_else(|_| {
+                            json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "build response failed")
+                        });
+                }
+            }
+        }
+    }
+
+    let builder = copy_response_headers(&resp_headers, Response::builder().status(status));
+    builder
+        .body(full_body(bytes))
+        .unwrap_or_else(|_| json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "build response failed"))
+}
+
+async fn handle_codex_models(
+    state: Arc<ProxyState>,
+    incoming_headers: &hyper::HeaderMap,
+) -> Response<ProxyBody> {
+    let base_url = read_switch_state(&state.paths).normalized_base_url();
+    let target_url = format!("{base_url}/v1/models");
+    let headers = build_upstream_headers(&state.paths, incoming_headers, ClientKind::Codex);
+
+    let (upstream_res, pricing, cached_mm) = tokio::join!(
+        state.client.get(&target_url).headers(headers).send(),
+        get_pricing_cache(&state, &base_url),
+        get_codex_model_messages(&state)
+    );
+
+    let resp = match upstream_res {
+        Ok(r) => r,
+        Err(err) => {
+            return json_error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("获取 Codex 上游模型列表失败: {err}"),
+            );
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let resp_headers = resp.headers().clone();
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(err) => {
+            return json_error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("读取 Codex 上游模型列表失败: {err}"),
+            );
+        }
+    };
+
+    if status == StatusCode::OK {
+        if let Ok(json_body) = serde_json::from_slice::<Value>(&bytes) {
+            if json_body.get("data").and_then(Value::as_array).is_some() {
+                let catalog = build_codex_models_catalog(&json_body, &pricing, cached_mm.as_ref());
+                if let Ok(out_bytes) = serde_json::to_vec(&catalog) {
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json; charset=utf-8")
+                        .body(full_body(out_bytes))
+                        .unwrap_or_else(|_| {
+                            json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "build response failed")
+                        });
+                }
+            }
+        }
+    }
+
+    let builder = copy_response_headers(&resp_headers, Response::builder().status(status));
+    builder
+        .body(full_body(bytes))
+        .unwrap_or_else(|_| json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "build response failed"))
+}
+
+async fn handle_claude_models(
+    state: Arc<ProxyState>,
+    incoming_headers: &hyper::HeaderMap,
+) -> Response<ProxyBody> {
+    let base_url = read_switch_state(&state.paths).normalized_base_url();
+    let target_url = format!("{base_url}/v1/models");
+    let headers = build_upstream_headers(&state.paths, incoming_headers, ClientKind::Claude);
+
+    let (upstream_res, pricing) = tokio::join!(
+        state.client.get(&target_url).headers(headers).send(),
+        get_pricing_cache(&state, &base_url)
+    );
+
+    let resp = match upstream_res {
+        Ok(r) => r,
+        Err(err) => {
+            return json_error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("获取 Claude 上游模型列表失败: {err}"),
+            );
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let resp_headers = resp.headers().clone();
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(err) => {
+            return json_error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("读取 Claude 上游模型列表失败: {err}"),
+            );
+        }
+    };
+
+    if status == StatusCode::OK {
+        if let Ok(json_body) = serde_json::from_slice::<Value>(&bytes) {
+            if json_body.get("data").and_then(Value::as_array).is_some() {
+                let catalog = build_claude_models_catalog(&json_body, &pricing);
+                if let Ok(out_bytes) = serde_json::to_vec(&catalog) {
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json; charset=utf-8")
+                        .body(full_body(out_bytes))
+                        .unwrap_or_else(|_| {
+                            json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "build response failed")
+                        });
+                }
+            }
+        }
+    }
+
+    let builder = copy_response_headers(&resp_headers, Response::builder().status(status));
+    builder
+        .body(full_body(bytes))
+        .unwrap_or_else(|_| json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "build response failed"))
+}
+
+fn strip_route_prefix(path_and_query: &str, prefix: &str) -> String {
+    let rest = path_and_query.strip_prefix(prefix).unwrap_or(path_and_query);
+    if rest.is_empty() {
+        "/".to_string()
+    } else if rest.starts_with('?') {
+        format!("/{rest}")
+    } else {
+        rest.to_string()
+    }
+}
+
+async fn handle_request(
+    state: Arc<ProxyState>,
+    req: Request<Incoming>,
+) -> Result<Response<ProxyBody>, Infallible> {
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().map(str::to_string);
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| path.clone());
+
+    if path == AGY_PROXY_HEALTH_PATH {
+        let payload = json!({
+            "ok": true,
+            "service": "tako-switch-gateway",
+            "version": env!("CARGO_PKG_VERSION"),
+            "routes": ["antigravity", "codex", "claude"]
+        });
+        let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(full_body(bytes))
+            .unwrap_or_else(|_| {
+                json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "health error")
+            }));
+    }
+
+    if (*req.method() == hyper::Method::GET || *req.method() == hyper::Method::HEAD)
+        && (path == "/" || path.is_empty())
+    {
+        let payload = json!({
+            "ok": true,
+            "service": "tako-switch-gateway"
+        });
+        let body = if *req.method() == hyper::Method::HEAD {
+            full_body(Bytes::new())
+        } else {
+            full_body(serde_json::to_vec(&payload).unwrap_or_default())
+        };
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap_or_else(|_| {
+                json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "probe error")
+            }));
+    }
+
+    if *req.method() == hyper::Method::GET && (path == "/v1beta/models" || path == "/v1beta/models/")
+    {
+        return Ok(handle_models_list(state, &path_and_query, req.headers()).await);
+    }
+
+    if *req.method() == hyper::Method::GET && (path == "/codex/models" || path == "/codex/models/")
+    {
+        return Ok(handle_codex_models(state, req.headers()).await);
+    }
+
+    let is_claude_models = *req.method() == hyper::Method::GET
+        && ((path == "/claude/v1/models" || path == "/claude/v1/models/")
+            || ((path == "/v1/models" || path == "/v1/models/")
+                && req.headers().contains_key("anthropic-version")));
+    if is_claude_models {
+        return Ok(handle_claude_models(state, req.headers()).await);
+    }
+
+    let method = match Method::from_bytes(req.method().as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
+            return Ok(json_error_response(
+                StatusCode::BAD_REQUEST,
+                "不支持的 HTTP Method",
+            ));
+        }
+    };
+    let incoming_headers = req.headers().clone();
+    let body_bytes = match req.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(err) => {
+            return Ok(json_error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("读取请求体失败: {err}"),
+            ));
+        }
+    };
+
+    let base_url = read_switch_state(&state.paths).normalized_base_url();
+    let (client_kind, target_path_and_query, outbound_body) =
+        if path == "/codex" || path.starts_with("/codex/") {
+            let stripped = strip_route_prefix(&path_and_query, "/codex");
+            (ClientKind::Codex, stripped, body_bytes)
+        } else if path == "/claude" || path.starts_with("/claude/") {
+            let stripped_path = path.strip_prefix("/claude").unwrap_or(&path);
+            let body = if method == Method::POST
+                && (stripped_path == "/v1/messages"
+                    || stripped_path == "/v1/messages/count_tokens")
+            {
+                Bytes::from(normalize_claude_request_body(&body_bytes))
+            } else {
+                body_bytes
+            };
+            (
+                ClientKind::Claude,
+                strip_route_prefix(&path_and_query, "/claude"),
+                body,
+            )
+        } else if path.starts_with("/v1/messages")
+            || incoming_headers.contains_key("anthropic-version")
+        {
+            let body = if method == Method::POST
+                && (path == "/v1/messages" || path == "/v1/messages/count_tokens")
+            {
+                Bytes::from(normalize_claude_request_body(&body_bytes))
+            } else {
+                body_bytes
+            };
+            (ClientKind::Claude, path_and_query, body)
+        } else {
+            let mut next_path = path_and_query;
+            let mut next_body = body_bytes;
+            if let Some((model, action)) = parse_gemini_action_path(&path) {
+                let cached_route = {
+                    let routes = state.synthetic_routes.read().await;
+                    routes.get(&model).cloned()
+                };
+                let route = if let Some(hit) = cached_route {
+                    Some(hit)
+                } else {
+                    let pricing = get_pricing_cache(&state, &base_url).await;
+                    let routes = state.synthetic_routes.read().await;
+                    resolve_synthetic_route(&model, &routes, &pricing)
+                };
+
+                if let Some(route) = route {
+                    next_path = match query.as_deref() {
+                        Some(q) if !q.is_empty() => {
+                            format!("/v1beta/models/{}:{action}?{q}", route.base_model)
+                        }
+                        _ => format!("/v1beta/models/{}:{action}", route.base_model),
+                    };
+                    if action == "generateContent" || action == "streamGenerateContent" {
+                        next_body =
+                            Bytes::from(inject_thinking_effort(&next_body, &route.effort));
+                    }
+                }
+            }
+            (ClientKind::Antigravity, next_path, next_body)
+        };
+
+    let target_url = format!("{base_url}{target_path_and_query}");
+    let upstream_headers = build_upstream_headers(&state.paths, &incoming_headers, client_kind);
+
+    let resp = match state
+        .client
+        .request(method, &target_url)
+        .headers(upstream_headers)
+        .body(outbound_body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            return Ok(json_error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("转发上游请求失败: {err}"),
+            ));
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let builder = copy_response_headers(resp.headers(), Response::builder().status(status));
+    let stream = resp
+        .bytes_stream()
+        .map(|chunk| chunk.map(Frame::data).map_err(std::io::Error::other));
+    let body: ProxyBody = http_body_util::BodyExt::boxed(StreamBody::new(stream));
+    Ok(builder.body(body).unwrap_or_else(|_| {
+        json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "构建响应失败")
+    }))
+}
+
+/// Runs the local unified Tako HTTP/SSE gateway on `127.0.0.1:<port>`.
+pub async fn run_proxy_server(port: u16) -> Result<(), String> {
+    let paths = AppPaths::detect()?;
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("创建代理 HTTP 客户端失败: {e}"))?;
+
+    let state = Arc::new(ProxyState {
+        paths,
+        client,
+        pricing_cache: RwLock::new(None),
+        synthetic_routes: RwLock::new(HashMap::new()),
+        codex_model_messages: RwLock::new(None),
+    });
+
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("绑定 {addr} 失败: {e}"))?;
+
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|e| format!("接受代理连接失败: {e}"))?;
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
+            let svc = service_fn(move |req| handle_request(state_clone.clone(), req));
+            let _ = http1::Builder::new().serve_connection(io, svc).await;
+        });
+    }
+}
+
+fn probe_health_text(port: u16) -> Option<String> {
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(350)).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(350)));
+    let req = format!(
+        "GET {AGY_PROXY_HEALTH_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut buf = [0u8; 512];
+    let n = stream.read(&mut buf).ok()?;
+    (n > 0).then(|| String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
+/// Probes `127.0.0.1:<port>/__tako_proxy_health` to verify our local gateway daemon is responsive.
+pub fn is_proxy_healthy(port: u16) -> bool {
+    let Some(text) = probe_health_text(port) else {
+        return false;
+    };
+    text.contains("200 OK")
+        && (text.contains("tako-switch-gateway") || text.contains("tako-switch-agy-proxy"))
+}
+
+/// Verifies the running local gateway matches the current crate version (for seamless self-update reloads).
+pub fn is_proxy_healthy_current_version(port: u16) -> bool {
+    let Some(text) = probe_health_text(port) else {
+        return false;
+    };
+    let expected_ver = format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"));
+    text.contains("200 OK") && text.contains("tako-switch-gateway") && text.contains(&expected_ver)
+}
+
+pub fn ensure_in_process_proxy_running() {
+    if is_proxy_healthy(LOCAL_GATEWAY_PORT) {
+        return;
+    }
+    if IN_PROCESS_PROXY_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tauri::async_runtime::spawn(async {
+        if let Err(err) = run_proxy_server(LOCAL_GATEWAY_PORT).await {
+            eprintln!("tako-switch in-process gateway stopped: {err}");
+            IN_PROCESS_PROXY_STARTED.store(false, Ordering::SeqCst);
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn xml_escape(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(not(target_os = "windows"))]
+fn render_gateway_launch_agent_plist(exe_path: &str) -> String {
+    let escaped_exe = xml_escape(exe_path);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>tech.shiroha.tako-switch.gateway</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{escaped_exe}</string>
+    <string>gateway-proxy</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardErrorPath</key>
+  <string>/tmp/tako-switch-gateway.err.log</string>
+</dict>
+</plist>
+"#
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn gateway_plist_path(paths: &AppPaths) -> std::path::PathBuf {
+    paths.launch_agents_dir.join(GATEWAY_PLIST_NAME)
+}
+
+#[cfg(target_os = "macos")]
+fn bootout_macos_label(uid: &str, label: &str) {
+    let _ = std::process::Command::new("/bin/launchctl")
+        .args(["bootout", &format!("gui/{uid}/{label}")])
+        .output();
+}
+
+#[cfg(target_os = "macos")]
+fn apply_macos_gateway_launch_agent(plist_path: &std::path::Path) {
+    if let Ok(uid_out) = std::process::Command::new("/usr/bin/id").arg("-u").output() {
+        let uid = String::from_utf8_lossy(&uid_out.stdout).trim().to_string();
+        if !uid.is_empty() {
+            bootout_macos_label(&uid, LEGACY_AGY_PROXY_PLIST_LABEL);
+            bootout_macos_label(&uid, GATEWAY_PLIST_LABEL);
+            let _ = std::process::Command::new("/bin/launchctl")
+                .args([
+                    "bootstrap",
+                    &format!("gui/{uid}"),
+                    &plist_path.to_string_lossy(),
+                ])
+                .output();
+        }
+    }
+}
+
+/// Ensures the shared local gateway daemon (macOS LaunchAgent / Windows in-process server) is running.
+pub fn ensure_gateway_service(paths: &AppPaths) -> Result<(), String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let exe = paths.mcp_server_exe();
+        let plist = render_gateway_launch_agent_plist(&exe.to_string_lossy());
+        let plist_path = gateway_plist_path(paths);
+        let legacy_path = paths.launch_agents_dir.join(LEGACY_AGY_PROXY_PLIST_NAME);
+
+        if !paths.is_test
+            && is_proxy_healthy_current_version(LOCAL_GATEWAY_PORT)
+            && !legacy_path.exists()
+            && fs::read_to_string(&plist_path).ok().as_deref() == Some(plist.as_str())
+        {
+            return Ok(());
+        }
+
+        if legacy_path.exists() {
+            let _ = fs::remove_file(&legacy_path);
+        }
+        write_atomic(&plist_path, plist.as_bytes(), false)?;
+
+        #[cfg(target_os = "macos")]
+        if !paths.is_test {
+            apply_macos_gateway_launch_agent(&plist_path);
+            for _ in 0..10 {
+                if is_proxy_healthy(LOCAL_GATEWAY_PORT) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            ensure_in_process_proxy_running();
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if !paths.is_test {
+            ensure_in_process_proxy_running();
+        }
+        Ok(())
+    }
+}
+
+/// Stops the local gateway daemon only when all three desktop apps have returned to Official mode.
+pub fn stop_gateway_service_if_unused(paths: &AppPaths) -> Result<(), String> {
+    let any_tako = AppId::all()
+        .iter()
+        .any(|&id| get_adapter(id).read_mode(paths) == AppMode::Tako);
+    if any_tako {
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let plist_path = gateway_plist_path(paths);
+        if plist_path.exists() {
+            fs::remove_file(&plist_path)
+                .map_err(|e| format!("删除 {} 失败: {e}", plist_path.display()))?;
+        }
+        let legacy_path = paths.launch_agents_dir.join(LEGACY_AGY_PROXY_PLIST_NAME);
+        if legacy_path.exists() {
+            let _ = fs::remove_file(&legacy_path);
+        }
+        #[cfg(target_os = "macos")]
+        if !paths.is_test {
+            if let Ok(uid_out) = std::process::Command::new("/usr/bin/id").arg("-u").output() {
+                let uid = String::from_utf8_lossy(&uid_out.stdout).trim().to_string();
+                if !uid.is_empty() {
+                    bootout_macos_label(&uid, GATEWAY_PLIST_LABEL);
+                    bootout_macos_label(&uid, LEGACY_AGY_PROXY_PLIST_LABEL);
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_pricing_metadata_extracts_reasoning_levels_and_image_flag() {
+        let pricing_json = json!({
+            "data": [
+                {
+                    "model_name": "gemini-3.8-flash",
+                    "reasoning_levels": ["HIGH", "low", "medium", "low", "unknown"]
+                },
+                {
+                    "model_name": "swe-2",
+                    "reasoning_levels": ["max", "medium", "high"],
+                    "description": "SWE coding model"
+                },
+                {
+                    "model_name": "gemini-3.1-flash-image"
+                },
+                {
+                    "model_name": "gpt-6.2-sol",
+                    "reasoning_levels": null
+                }
+            ]
+        });
+
+        let parsed = parse_pricing_metadata(&pricing_json);
+        assert!(parsed.has_flash_image);
+        assert_eq!(
+            parsed.descriptions.get("swe-2").map(String::as_str),
+            Some("SWE coding model")
+        );
+        assert_eq!(
+            parsed.reasoning_levels.get("gemini-3.8-flash"),
+            Some(&vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string()
+            ])
+        );
+        assert_eq!(
+            parsed.reasoning_levels.get("swe-2"),
+            Some(&vec![
+                "medium".to_string(),
+                "high".to_string(),
+                "max".to_string()
+            ])
+        );
+        assert!(!parsed.reasoning_levels.contains_key("gpt-6.2-sol"));
+    }
+
+    #[test]
+    fn expand_models_catalog_creates_effort_variants_and_routes() {
+        let pricing = parse_pricing_metadata(&json!({
+            "data": [
+                {"model_name": "gemini-3.8-flash", "reasoning_levels": ["low", "medium", "high"]},
+                {"model_name": "swe-2", "reasoning_levels": ["medium", "high", "max"]},
+                {"model_name": "gemini-3.1-flash-image"}
+            ]
+        }));
+
+        let upstream = json!({
+            "models": [
+                {
+                    "name": "models/gemini-3.8-flash",
+                    "displayName": "gemini-3.8-flash",
+                    "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
+                },
+                {
+                    "name": "models/gemini-3.1-pro-preview",
+                    "displayName": "gemini-3.1-pro-preview",
+                    "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
+                },
+                {
+                    "name": "models/swe-2",
+                    "displayName": "swe-2",
+                    "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
+                },
+                {
+                    "name": "models/claude-opus-4-6",
+                    "displayName": "claude-opus-4-6",
+                    "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
+                }
+            ]
+        });
+
+        let (expanded, routes) = expand_models_catalog(upstream, &pricing);
+        let list = expanded["models"].as_array().unwrap();
+        let names: Vec<&str> = list
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        let displays: Vec<&str> = list
+            .iter()
+            .map(|m| m["displayName"].as_str().unwrap())
+            .collect();
+
+        assert!(names.contains(&"models/gemini-3.8-flash-low"));
+        assert!(names.contains(&"models/gemini-3.8-flash-medium"));
+        assert!(names.contains(&"models/gemini-3.8-flash-high"));
+        assert!(names.contains(&"models/gemini-3.1-pro-preview-low"));
+        assert!(names.contains(&"models/gemini-3.1-pro-preview-high"));
+        assert!(names.contains(&"models/swe-2-medium"));
+        assert!(names.contains(&"models/swe-2-high"));
+        assert!(names.contains(&"models/swe-2-max"));
+        assert!(names.contains(&"models/claude-opus-4-6"));
+        assert!(names.contains(&"models/gemini-3.1-flash-image"));
+
+        assert!(displays.contains(&"Gemini 3.8 Flash (Low)"));
+        assert!(displays.contains(&"Gemini 3.8 Flash (Medium)"));
+        assert!(displays.contains(&"Gemini 3.8 Flash (High)"));
+        assert!(displays.contains(&"Gemini 3.1 Pro (Low)"));
+        assert!(displays.contains(&"Gemini 3.1 Pro (High)"));
+        assert!(displays.contains(&"swe-2 (Max)"));
+
+        assert_eq!(
+            routes.get("gemini-3.8-flash-high"),
+            Some(&SyntheticRoute {
+                base_model: "gemini-3.8-flash".to_string(),
+                effort: "high".to_string()
+            })
+        );
+        assert_eq!(
+            routes.get("gemini-3.1-pro-preview-low"),
+            Some(&SyntheticRoute {
+                base_model: "gemini-3.1-pro-preview".to_string(),
+                effort: "low".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn inject_thinking_effort_sets_level_and_removes_conflicting_budget() {
+        let raw = br#"{
+            "contents": [{"role":"user","parts":[{"text":"hi"}]}],
+            "generationConfig": {
+                "maxOutputTokens": 128,
+                "thinkingConfig": {
+                    "thinkingBudget": 8192,
+                    "thinking_budget": 4096,
+                    "thinking_level": "LOW"
+                }
+            }
+        }"#;
+
+        let out_bytes = inject_thinking_effort(raw, "high");
+        let parsed: Value = serde_json::from_slice(&out_bytes).unwrap();
+        let tc = parsed["generationConfig"]["thinkingConfig"]
+            .as_object()
+            .unwrap();
+        assert_eq!(tc.get("thinkingLevel").and_then(Value::as_str), Some("HIGH"));
+        assert_eq!(tc.get("includeThoughts").and_then(Value::as_bool), Some(true));
+        assert!(!tc.contains_key("thinkingBudget"));
+        assert!(!tc.contains_key("thinking_budget"));
+        assert!(!tc.contains_key("thinking_level"));
+    }
+
+    #[test]
+    fn resolve_synthetic_route_handles_restart_fallback() {
+        let pricing = parse_pricing_metadata(&json!({
+            "data": [
+                {"model_name": "gemini-3.8-flash", "reasoning_levels": ["low", "medium", "high"]}
+            ]
+        }));
+        let empty_routes = HashMap::new();
+
+        assert_eq!(
+            resolve_synthetic_route("gemini-3.8-flash-medium", &empty_routes, &pricing),
+            Some(SyntheticRoute {
+                base_model: "gemini-3.8-flash".to_string(),
+                effort: "medium".to_string()
+            })
+        );
+        assert_eq!(
+            resolve_synthetic_route("gemini-3.1-pro-preview-high", &empty_routes, &pricing),
+            Some(SyntheticRoute {
+                base_model: "gemini-3.1-pro-preview".to_string(),
+                effort: "high".to_string()
+            })
+        );
+        assert_eq!(
+            resolve_synthetic_route("gemini-3.8-flash-max", &empty_routes, &pricing),
+            None
+        );
+        assert_eq!(
+            resolve_synthetic_route("claude-opus-4-6", &empty_routes, &pricing),
+            None
+        );
+    }
+
+    #[test]
+    fn build_codex_models_catalog_maps_openai_response_models_and_efforts() {
+        let pricing = parse_pricing_metadata(&json!({
+            "data": [
+                {"model_name": "swe-2", "reasoning_levels": ["medium", "high", "max"]}
+            ]
+        }));
+        let upstream = json!({
+            "data": [
+                {"id": "claude-opus-4-8", "supported_endpoint_types": ["anthropic", "openai"]},
+                {"id": "gpt-image-2", "supported_endpoint_types": ["openai-response"]},
+                {"id": "codex-auto-review", "supported_endpoint_types": ["openai-response"]},
+                {"id": "swe-2", "supported_endpoint_types": ["openai", "openai-response"]},
+                {"id": "gpt-6.2-sol", "supported_endpoint_types": ["openai", "openai-response"]}
+            ]
+        });
+
+        let catalog = build_codex_models_catalog(&upstream, &pricing, None);
+        let models = catalog["models"].as_array().unwrap();
+        let slugs: Vec<&str> = models.iter().map(|m| m["slug"].as_str().unwrap()).collect();
+
+        assert_eq!(slugs, vec!["gpt-6.2-sol", "swe-2", "codex-auto-review"]);
+        assert!(!slugs.contains(&"claude-opus-4-8"));
+        assert!(!slugs.contains(&"gpt-image-2"));
+
+        let sol = &models[0];
+        assert_eq!(sol["display_name"].as_str(), Some("GPT-6.2-Sol"));
+        assert_eq!(sol["visibility"].as_str(), Some("list"));
+        assert_eq!(sol["experimental_supported_tools"], json!([]));
+        assert!(!sol["base_instructions"].as_str().unwrap().is_empty());
+
+        let swe = &models[1];
+        let swe_efforts: Vec<&str> = swe["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["effort"].as_str().unwrap())
+            .collect();
+        assert_eq!(swe_efforts, vec!["medium", "high", "max"]);
+
+        let review = &models[2];
+        assert_eq!(review["visibility"].as_str(), Some("hide"));
+    }
+
+    #[test]
+    fn build_claude_models_catalog_enriches_tiers_defaults_and_1m() {
+        let pricing = parse_pricing_metadata(&json!({
+            "data": [
+                {"model_name": "claude-opus-5-5", "description": "Flagship Opus"}
+            ]
+        }));
+        let upstream = json!({
+            "data": [
+                {"id": "gpt-6.2-sol", "owned_by": "openai"},
+                {"id": "claude-haiku-4-5-20251001", "owned_by": "claude"},
+                {"id": "claude-haiku-4-5", "owned_by": "claude"},
+                {"id": "claude-haiku-5-5", "owned_by": "claude"},
+                {"id": "claude-sonnet-5-5", "owned_by": "claude"},
+                {"id": "claude-opus-4-8", "owned_by": "claude"},
+                {"id": "claude-opus-5-5", "owned_by": "claude"},
+                {"id": "claude-fable-5-2", "owned_by": "claude"}
+            ]
+        });
+
+        let catalog = build_claude_models_catalog(&upstream, &pricing);
+        let data = catalog["data"].as_array().unwrap();
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+
+        assert_eq!(
+            ids,
+            vec![
+                "claude-opus-5-5",
+                "claude-opus-4-8",
+                "claude-sonnet-5-5",
+                "claude-fable-5-2",
+                "claude-haiku-5-5",
+                "claude-haiku-4-5"
+            ]
+        );
+        assert!(!ids.contains(&"claude-haiku-4-5-20251001"));
+        assert!(!ids.contains(&"gpt-6.2-sol"));
+
+        assert_eq!(data[0]["display_name"].as_str(), Some("Claude Opus 5.5"));
+        assert_eq!(data[0]["is_family_default"].as_bool(), Some(true));
+        assert_eq!(data[0]["supports_1m"].as_bool(), Some(true));
+        assert_eq!(data[0]["max_input_tokens"].as_u64(), Some(1_000_000));
+        assert!(data[1].get("is_family_default").is_none());
+        assert_eq!(data[2]["is_family_default"].as_bool(), Some(true));
+        assert_eq!(data[3]["is_family_default"].as_bool(), Some(true));
+        assert_eq!(data[4]["is_family_default"].as_bool(), Some(true));
+        assert_eq!(data[4]["supports_1m"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn normalize_claude_request_body_strips_1m_suffix() {
+        let with_1m = br#"{"model":"claude-opus-4-8[1m]","max_tokens":64}"#;
+        let out_1m: Value =
+            serde_json::from_slice(&normalize_claude_request_body(with_1m)).unwrap();
+        assert_eq!(out_1m["model"].as_str(), Some("claude-opus-4-8"));
+
+        let plain = br#"{"model":"claude-sonnet-5-5","max_tokens":64}"#;
+        assert_eq!(normalize_claude_request_body(plain), plain);
+    }
+}

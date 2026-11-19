@@ -2,10 +2,18 @@ use crate::adapters::{
     has_tako_mcp_server, merge_tako_mcp_server, read_json_object_or_empty, AppId, AppMode,
     DesktopAppAdapter, DiagnosticResult, InstallInfo,
 };
+use crate::agy_proxy::{
+    ensure_gateway_service, is_proxy_healthy, stop_gateway_service_if_unused,
+    CLAUDE_PROXY_BASE_URL, LOCAL_GATEWAY_PORT, LOCAL_GATEWAY_URL,
+};
 use crate::config::{backup_file_once, read_backup, read_main_api_key, read_switch_state, write_atomic, AppPaths};
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use base64::Engine;
 use serde_json::{Map, Value};
 use std::fs;
 use std::path::PathBuf;
+
+const TAKO_LOGO_PNG: &[u8] = include_bytes!("../../icons/128x128.png");
 
 #[cfg(target_os = "macos")]
 use crate::adapters::{
@@ -39,10 +47,99 @@ impl ClaudeAdapter {
             .join(format!("{TAKO_CLAUDE_3P_UUID}.json"))
     }
 
+    fn claude_3p_app_config_path(paths: &AppPaths) -> PathBuf {
+        paths.claude_3p_dir.join("config.json")
+    }
+
+    fn claude_code_settings_path(paths: &AppPaths) -> PathBuf {
+        paths.home.join(".claude").join("settings.json")
+    }
+
+    fn set_claude_code_mcp_permissions(paths: &AppPaths, enable: bool) -> Result<(), String> {
+        let path = Self::claude_code_settings_path(paths);
+        if !enable && !path.exists() {
+            return Ok(());
+        }
+        backup_file_once(paths, "claude", "claude_code_settings.json", &path)?;
+        let mut root = read_json_object_or_empty(&path)?;
+
+        let mut rules = Vec::with_capacity(crate::adapters::TAKO_MCP_TOOL_NAMES.len() + 1);
+        rules.push("mcp__tako__*".to_string());
+        for &tool_name in crate::adapters::TAKO_MCP_TOOL_NAMES {
+            rules.push(format!("mcp__tako__{tool_name}"));
+        }
+
+        if enable {
+            let permissions = root
+                .entry("permissions".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !permissions.is_object() {
+                *permissions = Value::Object(Map::new());
+            }
+            if let Some(perm_obj) = permissions.as_object_mut() {
+                let allow = perm_obj
+                    .entry("allow".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if !allow.is_array() {
+                    *allow = Value::Array(Vec::new());
+                }
+                if let Some(arr) = allow.as_array_mut() {
+                    for rule in &rules {
+                        if !arr.iter().any(|v| v.as_str() == Some(rule.as_str())) {
+                            arr.push(Value::String(rule.clone()));
+                        }
+                    }
+                }
+            }
+        } else if let Some(arr) = root
+            .get_mut("permissions")
+            .and_then(Value::as_object_mut)
+            .and_then(|p| p.get_mut("allow"))
+            .and_then(Value::as_array_mut)
+        {
+            arr.retain(|v| {
+                v.as_str()
+                    .map(|s| !rules.iter().any(|r| r == s))
+                    .unwrap_or(true)
+            });
+        }
+
+        let bytes = serde_json::to_vec_pretty(&Value::Object(root))
+            .map_err(|e| format!("序列化 {} 失败: {e}", path.display()))?;
+        write_atomic(&path, &bytes, false)
+    }
+
+    fn tako_deployment_logo_data_uri() -> String {
+        format!("data:image/png;base64,{}", BASE64_STD.encode(TAKO_LOGO_PNG))
+    }
+
+    fn apply_claude_chinese_locale(paths: &AppPaths) {
+        let cfg_path = Self::claude_3p_app_config_path(paths);
+        if let Ok(mut cfg) = read_json_object_or_empty(&cfg_path) {
+            cfg.insert("locale".to_string(), Value::String("zh-Hans".to_string()));
+            if let Ok(bytes) = serde_json::to_vec_pretty(&Value::Object(cfg)) {
+                let _ = write_atomic(&cfg_path, &bytes, false);
+            }
+        }
+        #[cfg(target_os = "macos")]
+        if !paths.is_test {
+            let _ = std::process::Command::new("/usr/bin/defaults")
+                .args([
+                    "write",
+                    CLAUDE_MACOS_BUNDLE_ID,
+                    "AppleLanguages",
+                    "-array",
+                    "zh-Hans",
+                ])
+                .output();
+        }
+    }
+
     fn deactivate_3p(paths: &AppPaths) -> Result<(), String> {
         let meta_path = Self::meta_3p_path(paths);
         if meta_path.exists() {
             let mut meta = read_json_object_or_empty(&meta_path)?;
+            let mut changed = false;
             if meta.get("appliedId").and_then(Value::as_str) == Some(TAKO_CLAUDE_3P_UUID) {
                 let restored_applied = read_backup(paths, "claude", "3p_meta.json")
                     .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
@@ -57,6 +154,18 @@ impl ClaudeAdapter {
                 } else {
                     meta.remove("appliedId");
                 }
+                changed = true;
+            }
+            if let Some(entries) = meta.get_mut("entries").and_then(Value::as_array_mut) {
+                let prev_len = entries.len();
+                entries.retain(|e| {
+                    e.get("id").and_then(Value::as_str) != Some(TAKO_CLAUDE_3P_UUID)
+                });
+                if entries.len() != prev_len {
+                    changed = true;
+                }
+            }
+            if changed {
                 let bytes = serde_json::to_vec_pretty(&Value::Object(meta))
                     .map_err(|e| format!("序列化 Claude 3p _meta.json 失败: {e}"))?;
                 write_atomic(&meta_path, &bytes, false)?;
@@ -158,17 +267,13 @@ impl DesktopAppAdapter for ClaudeAdapter {
                 return AppMode::Tako;
             }
         }
-        if has_tako_mcp_server(&Self::mcp_1p_path(paths)) {
-            AppMode::Hybrid
-        } else {
-            AppMode::Official
-        }
+        AppMode::Official
     }
 
     fn read_mcp_enabled(&self, paths: &AppPaths, mode: AppMode) -> bool {
         match mode {
             AppMode::Tako => has_tako_mcp_server(&Self::mcp_3p_path(paths)),
-            AppMode::Hybrid | AppMode::Official => has_tako_mcp_server(&Self::mcp_1p_path(paths)),
+            AppMode::Official => has_tako_mcp_server(&Self::mcp_1p_path(paths)),
         }
     }
 
@@ -186,30 +291,86 @@ impl DesktopAppAdapter for ClaudeAdapter {
                 Self::deactivate_3p(paths)?;
                 merge_tako_mcp_server(&mcp_1p, paths, false)?;
                 merge_tako_mcp_server(&mcp_3p, paths, false)?;
-                Ok(())
-            }
-            AppMode::Hybrid => {
-                Self::deactivate_3p(paths)?;
-                merge_tako_mcp_server(&mcp_3p, paths, false)?;
-                merge_tako_mcp_server(&mcp_1p, paths, true)?;
-                Ok(())
+                Self::set_claude_code_mcp_permissions(paths, false)?;
+                stop_gateway_service_if_unused(paths)
             }
             AppMode::Tako => {
                 let api_key = read_main_api_key(paths)
                     .ok_or_else(|| "请先登录 Tako 账号或填入 Key，再切换到全 Tako 模式".to_string())?;
-                let base_url = read_switch_state(paths).normalized_base_url();
+                let state = read_switch_state(paths);
+                ensure_gateway_service(paths)?;
+                let base_url = CLAUDE_PROXY_BASE_URL.to_string();
+                let display_name = state.normalized_gateway_name();
+                let subtitle = state.normalized_gateway_subtitle();
+                let balance_remain =
+                    crate::auth::read_balance_cache(paths).and_then(|c| c.status.wallet_remain_usd);
+                let effective_subtitle: Option<String> = match (balance_remain, subtitle.as_deref())
+                {
+                    (Some(rem), Some(sub))
+                        if sub != crate::config::DEFAULT_GATEWAY_DISPLAY_SUBTITLE =>
+                    {
+                        Some(
+                            format!("{sub} · 余额 {}", crate::auth::format_usd(rem))
+                                .chars()
+                                .take(60)
+                                .collect(),
+                        )
+                    }
+                    (Some(rem), _) => Some(
+                        format!("余额 {} · {}", crate::auth::format_usd(rem), display_name)
+                            .chars()
+                            .take(60)
+                            .collect(),
+                    ),
+                    (None, Some(sub)) => Some(sub.to_string()),
+                    (None, None) => None,
+                };
+                let instructions = if state.prefer_chinese_ui {
+                    "默认使用简体中文回复用户（除非用户明确要求其他语言）。当需要生成/编辑图片、生成视频、合成语音、联网搜索、咨询第二个大模型，或查询当前 Tako 钱包余额/套餐额度时，优先调用已挂载的 Tako MCP 工具（tako_generate_image / tako_generate_video / tako_generate_audio / tako_web_search / tako_consult / tako_account_status）。"
+                } else {
+                    "When generating/editing images, generating videos, synthesizing audio, searching the web, consulting a second frontier model, or checking current Tako balance/quota, prefer the mounted Tako MCP tools (tako_generate_image / tako_generate_video / tako_generate_audio / tako_web_search / tako_consult / tako_account_status)."
+                };
 
-                let profile = serde_json::json!({
-                    "id": TAKO_CLAUDE_3P_UUID,
-                    "name": "Tako",
-                    "description": "Tako Enterprise Gateway",
-                    "inferenceProvider": "gateway",
-                    "inferenceGatewayBaseUrl": base_url,
-                    "inferenceGatewayAuthScheme": "bearer",
-                    "inferenceGatewayApiKey": api_key,
-                    "defaultModel": "claude-sonnet-4-6"
-                });
-                let prof_bytes = serde_json::to_vec_pretty(&profile)
+                let mut profile = Map::new();
+                profile.insert("inferenceProvider".to_string(), Value::String("gateway".to_string()));
+                profile.insert("inferenceGatewayBaseUrl".to_string(), Value::String(base_url));
+                profile.insert("inferenceGatewayAuthScheme".to_string(), Value::String("bearer".to_string()));
+                profile.insert("inferenceCredentialKind".to_string(), Value::String("static".to_string()));
+                profile.insert("inferenceGatewayApiKey".to_string(), Value::String(api_key));
+                profile.insert("deploymentDisplayName".to_string(), Value::String(display_name.clone()));
+                if let Some(sub) = effective_subtitle {
+                    profile.insert("deploymentDisplaySubtitle".to_string(), Value::String(sub));
+                }
+                profile.insert(
+                    "deploymentLogo".to_string(),
+                    Value::String(Self::tako_deployment_logo_data_uri()),
+                );
+                profile.insert("inferenceModelPricingEnabled".to_string(), Value::Bool(true));
+                profile.insert("mcpToolTimeoutSec".to_string(), serde_json::json!(300));
+                profile.insert("isLocalDevMcpEnabled".to_string(), Value::Bool(true));
+                profile.insert(
+                    "mcpPersistentAlwaysAllowEnabled".to_string(),
+                    Value::Bool(true),
+                );
+                let mut tool_policy = Map::new();
+                tool_policy.insert("*".to_string(), Value::String("allow".to_string()));
+                for &tool_name in crate::adapters::TAKO_MCP_TOOL_NAMES {
+                    tool_policy.insert(tool_name.to_string(), Value::String("allow".to_string()));
+                }
+                profile.insert(
+                    "managedMcpServers".to_string(),
+                    serde_json::json!([{
+                        "name": "tako",
+                        "transport": "policy-only",
+                        "toolPolicy": Value::Object(tool_policy)
+                    }]),
+                );
+                profile.insert(
+                    "organizationInstructions".to_string(),
+                    Value::String(instructions.to_string()),
+                );
+
+                let prof_bytes = serde_json::to_vec_pretty(&Value::Object(profile))
                     .map_err(|e| format!("序列化 Claude 3p profile 失败: {e}"))?;
                 write_atomic(&Self::profile_3p_path(paths), &prof_bytes, true)?;
 
@@ -222,12 +383,32 @@ impl DesktopAppAdapter for ClaudeAdapter {
                     "appliedId".to_string(),
                     Value::String(TAKO_CLAUDE_3P_UUID.to_string()),
                 );
+                let mut entries = meta
+                    .get("entries")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                entries.retain(|e| {
+                    e.get("id").and_then(Value::as_str) != Some(TAKO_CLAUDE_3P_UUID)
+                });
+                entries.push(serde_json::json!({
+                    "id": TAKO_CLAUDE_3P_UUID,
+                    "name": display_name,
+                    "provider": "gateway",
+                    "note": "Managed by Tako Switch"
+                }));
+                meta.insert("entries".to_string(), Value::Array(entries));
                 let meta_bytes = serde_json::to_vec_pretty(&Value::Object(meta))
                     .map_err(|e| format!("序列化 Claude 3p _meta.json 失败: {e}"))?;
                 write_atomic(&meta_3p, &meta_bytes, false)?;
 
+                if state.prefer_chinese_ui {
+                    Self::apply_claude_chinese_locale(paths);
+                }
+
                 merge_tako_mcp_server(&mcp_1p, paths, false)?;
                 merge_tako_mcp_server(&mcp_3p, paths, true)?;
+                Self::set_claude_code_mcp_permissions(paths, true)?;
                 Ok(())
             }
         }
@@ -252,6 +433,14 @@ impl DesktopAppAdapter for ClaudeAdapter {
                         issues.push("inferenceGatewayBaseUrl 为空".to_string());
                     } else if url.trim_end_matches('/').ends_with("/v1") {
                         issues.push(format!("Claude Desktop 网关 URL 不能带 /v1 后缀，当前为: {url}"));
+                    } else if url.starts_with(LOCAL_GATEWAY_URL) && !paths.is_test {
+                        if is_proxy_healthy(LOCAL_GATEWAY_PORT) {
+                            notes.push(format!("本地统一网关: 运行中 (127.0.0.1:{LOCAL_GATEWAY_PORT})"));
+                        } else {
+                            issues.push(format!(
+                                "本地统一网关 (127.0.0.1:{LOCAL_GATEWAY_PORT}) 未运行，请重新点击 Tako 或重启 Tako Switch"
+                            ));
+                        }
                     }
                     let scheme = prof
                         .get("inferenceGatewayAuthScheme")
@@ -259,6 +448,13 @@ impl DesktopAppAdapter for ClaudeAdapter {
                         .unwrap_or("");
                     if scheme != "bearer" {
                         issues.push(format!("inferenceGatewayAuthScheme 应为 bearer，当前为: {scheme}"));
+                    }
+                    let cred_kind = prof
+                        .get("inferenceCredentialKind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if cred_kind != "static" {
+                        issues.push(format!("inferenceCredentialKind 应为 static，当前为: {cred_kind}"));
                     }
                     let key = prof
                         .get("inferenceGatewayApiKey")
@@ -364,7 +560,7 @@ fn launch_windows_claude(paths: &AppPaths) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::save_tako_cli_credentials;
+    use crate::config::save_switch_auth;
     use tempfile::TempDir;
 
     #[test]
@@ -377,41 +573,140 @@ mod tests {
             r#"{"mcpServers":{"existing":{"command":"foo"}}}"#,
         )
         .unwrap();
+        fs::create_dir_all(paths.home.join(".claude")).unwrap();
+        fs::write(
+            ClaudeAdapter::claude_code_settings_path(&paths),
+            r#"{"permissions":{"allow":["Bash(git status)"]},"model":"claude-sonnet-5-5"}"#,
+        )
+        .unwrap();
 
-        save_tako_cli_credentials(&paths, Some("cr_claude_secret"), Some("2")).unwrap();
+        save_switch_auth(&paths, Some("cr_claude_secret"), Some("2"), Some("oauth")).unwrap();
         let adapter = ClaudeAdapter;
-
-        adapter.apply_mode(&paths, AppMode::Hybrid).unwrap();
-        assert_eq!(adapter.read_mode(&paths), AppMode::Hybrid);
-        assert!(adapter.read_mcp_enabled(&paths, AppMode::Hybrid));
-        let p1 = read_json_object_or_empty(&paths.claude_1p_dir.join("claude_desktop_config.json")).unwrap();
-        let servers = p1.get("mcpServers").unwrap().as_object().unwrap();
-        assert!(servers.contains_key("existing"));
-        assert!(servers.contains_key("tako"));
 
         adapter.apply_mode(&paths, AppMode::Tako).unwrap();
         assert_eq!(adapter.read_mode(&paths), AppMode::Tako);
         assert!(adapter.read_mcp_enabled(&paths, AppMode::Tako));
         assert!(adapter.diagnose(&paths).ok);
+        let p1 = read_json_object_or_empty(&paths.claude_1p_dir.join("claude_desktop_config.json")).unwrap();
+        let servers = p1.get("mcpServers").unwrap().as_object().unwrap();
+        assert!(servers.contains_key("existing"));
+        assert!(!servers.contains_key("tako"));
         let prof = read_json_object_or_empty(&ClaudeAdapter::profile_3p_path(&paths)).unwrap();
         assert_eq!(
             prof.get("inferenceGatewayBaseUrl").and_then(Value::as_str),
-            Some("https://tako.shiroha.tech")
+            Some(CLAUDE_PROXY_BASE_URL)
         );
         assert_eq!(
             prof.get("inferenceGatewayAuthScheme").and_then(Value::as_str),
             Some("bearer")
         );
+        assert_eq!(
+            prof.get("inferenceCredentialKind").and_then(Value::as_str),
+            Some("static")
+        );
+        assert_eq!(
+            prof.get("deploymentDisplayName").and_then(Value::as_str),
+            Some("Tako")
+        );
+        assert_eq!(
+            prof.get("deploymentDisplaySubtitle").and_then(Value::as_str),
+            Some("Tako AI Gateway")
+        );
+        assert_eq!(prof.get("mcpToolTimeoutSec").and_then(Value::as_u64), Some(300));
+        assert_eq!(
+            prof.get("isLocalDevMcpEnabled").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            prof.get("mcpPersistentAlwaysAllowEnabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let managed = prof
+            .get("managedMcpServers")
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(managed.len(), 1);
+        assert_eq!(managed[0].get("name").and_then(Value::as_str), Some("tako"));
+        assert_eq!(
+            managed[0].get("transport").and_then(Value::as_str),
+            Some("policy-only")
+        );
+        assert_eq!(
+            managed[0]
+                .get("toolPolicy")
+                .and_then(Value::as_object)
+                .and_then(|tp| tp.get("*"))
+                .and_then(Value::as_str),
+            Some("allow")
+        );
+        assert_eq!(
+            managed[0]
+                .get("toolPolicy")
+                .and_then(Value::as_object)
+                .and_then(|tp| tp.get("tako_generate_image"))
+                .and_then(Value::as_str),
+            Some("allow")
+        );
+        let cc_tako = read_json_object_or_empty(&ClaudeAdapter::claude_code_settings_path(&paths)).unwrap();
+        assert_eq!(cc_tako.get("model").and_then(Value::as_str), Some("claude-sonnet-5-5"));
+        let cc_allow = cc_tako
+            .get("permissions")
+            .and_then(Value::as_object)
+            .and_then(|p| p.get("allow"))
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(cc_allow.iter().any(|v| v.as_str() == Some("Bash(git status)")));
+        assert!(cc_allow.iter().any(|v| v.as_str() == Some("mcp__tako__*")));
+        assert!(cc_allow.iter().any(|v| v.as_str() == Some("mcp__tako__tako_generate_image")));
+        assert_eq!(
+            prof.get("inferenceModelPricingEnabled").and_then(Value::as_bool),
+            Some(true)
+        );
+        let logo = prof.get("deploymentLogo").and_then(Value::as_str).unwrap();
+        assert!(logo.starts_with("data:image/png;base64,"));
+        assert!(logo.len() <= 32768);
+        assert!(!prof
+            .get("organizationInstructions")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty());
+        assert!(prof.get("defaultModel").is_none());
+        let claude_cfg = read_json_object_or_empty(&ClaudeAdapter::claude_3p_app_config_path(&paths)).unwrap();
+        assert_eq!(
+            claude_cfg.get("locale").and_then(Value::as_str),
+            Some("zh-Hans")
+        );
+        let meta = read_json_object_or_empty(&ClaudeAdapter::meta_3p_path(&paths)).unwrap();
+        let entries = meta.get("entries").and_then(Value::as_array).unwrap();
+        assert!(entries
+            .iter()
+            .any(|e| e.get("id").and_then(Value::as_str) == Some(TAKO_CLAUDE_3P_UUID)));
         // 1p should no longer carry tako when 3p is active
         assert!(!has_tako_mcp_server(&paths.claude_1p_dir.join("claude_desktop_config.json")));
 
         adapter.apply_mode(&paths, AppMode::Official).unwrap();
         assert_eq!(adapter.read_mode(&paths), AppMode::Official);
         assert!(!ClaudeAdapter::profile_3p_path(&paths).exists());
+        let meta_after = read_json_object_or_empty(&ClaudeAdapter::meta_3p_path(&paths)).unwrap();
+        let entries_after = meta_after.get("entries").and_then(Value::as_array).unwrap();
+        assert!(!entries_after
+            .iter()
+            .any(|e| e.get("id").and_then(Value::as_str) == Some(TAKO_CLAUDE_3P_UUID)));
         let p1_after =
             read_json_object_or_empty(&paths.claude_1p_dir.join("claude_desktop_config.json")).unwrap();
         let servers_after = p1_after.get("mcpServers").unwrap().as_object().unwrap();
         assert!(servers_after.contains_key("existing"));
         assert!(!servers_after.contains_key("tako"));
+        let cc_after = read_json_object_or_empty(&ClaudeAdapter::claude_code_settings_path(&paths)).unwrap();
+        let cc_allow_after = cc_after
+            .get("permissions")
+            .and_then(Value::as_object)
+            .and_then(|p| p.get("allow"))
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(cc_allow_after.iter().any(|v| v.as_str() == Some("Bash(git status)")));
+        assert!(!cc_allow_after.iter().any(|v| v.as_str() == Some("mcp__tako__*")));
+        assert!(!cc_allow_after.iter().any(|v| v.as_str() == Some("mcp__tako__tako_generate_image")));
     }
 }

@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AppId {
     Codex,
@@ -42,7 +42,6 @@ impl AppId {
 #[serde(rename_all = "lowercase")]
 pub enum AppMode {
     Official,
-    Hybrid,
     Tako,
 }
 
@@ -110,6 +109,15 @@ pub fn snapshot_app(paths: &AppPaths, id: AppId) -> AppSnapshot {
         diagnostic: adapter.diagnose(paths),
     }
 }
+
+pub const TAKO_MCP_TOOL_NAMES: &[&str] = &[
+    "tako_generate_image",
+    "tako_generate_video",
+    "tako_generate_audio",
+    "tako_web_search",
+    "tako_consult",
+    "tako_account_status",
+];
 
 pub fn build_stdio_mcp_json_entry(paths: &AppPaths) -> Value {
     let exe = paths.mcp_server_exe().to_string_lossy().to_string();
@@ -214,6 +222,12 @@ pub fn read_macos_bundle_id(app_path: &Path) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 pub fn is_macos_bundle_id_running(bundle_id: &str) -> bool {
+    if let Ok(out) = std::process::Command::new("/usr/bin/lsappinfo")
+        .args(["find", &format!("bundleid={bundle_id}")])
+        .output()
+    {
+        return out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ASN:");
+    }
     let script = format!("application id \"{bundle_id}\" is running");
     std::process::Command::new("/usr/bin/osascript")
         .arg("-e")

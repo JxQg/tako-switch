@@ -1,5 +1,6 @@
 use crate::config::{
-    read_main_api_id, read_main_api_key, read_switch_state, save_tako_cli_credentials, AppPaths,
+    read_main_api_id, read_main_api_key, read_switch_auth, read_switch_state, save_switch_auth,
+    write_atomic, AppPaths,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -8,9 +9,19 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+pub const TAKO_QUOTA_PER_USD: f64 = 500_000.0;
+
+pub fn quota_units_to_usd(units: i64) -> f64 {
+    (units as f64) / TAKO_QUOTA_PER_USD
+}
+
+pub fn format_usd(usd: f64) -> String {
+    format!("${usd:.2}")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,8 +45,119 @@ pub struct AccountStatus {
     pub plan_name: Option<String>,
     pub wallet_remain: Option<i64>,
     pub wallet_used: Option<i64>,
+    #[serde(default)]
+    pub wallet_remain_usd: Option<f64>,
+    #[serde(default)]
+    pub wallet_used_usd: Option<f64>,
     pub quota: Option<QuotaSummary>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceCache {
+    pub cached_at_unix: u64,
+    pub status: AccountStatus,
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub fn read_balance_cache(paths: &AppPaths) -> Option<BalanceCache> {
+    let raw = std::fs::read_to_string(paths.balance_cache_path()).ok()?;
+    serde_json::from_str::<BalanceCache>(&raw).ok()
+}
+
+pub fn write_balance_cache(paths: &AppPaths, status: &AccountStatus) {
+    let cache = BalanceCache {
+        cached_at_unix: unix_now_secs(),
+        status: status.clone(),
+    };
+    if let Ok(bytes) = serde_json::to_vec_pretty(&cache) {
+        let _ = write_atomic(&paths.balance_cache_path(), &bytes, true);
+    }
+}
+
+pub fn clear_balance_cache(paths: &AppPaths) {
+    let p = paths.balance_cache_path();
+    if p.exists() {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+fn calc_pct(used: f64, limit: f64) -> u64 {
+    if limit <= 0.0 || used <= 0.0 {
+        return 0;
+    }
+    ((used / limit) * 100.0).round().clamp(0.0, 100.0) as u64
+}
+
+pub fn format_status_line_text(status: &AccountStatus, session_cost_usd: Option<f64>) -> String {
+    if !status.logged_in {
+        return "Tako · 未登录".to_string();
+    }
+    let mut parts = Vec::new();
+    let label = status
+        .plan_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Tako");
+    parts.push(label.to_string());
+
+    if let Some(rem) = status.wallet_remain_usd {
+        parts.push(format!("余额 {}", format_usd(rem)));
+    }
+    if let Some(cost) = session_cost_usd.filter(|c| *c > 0.0001) {
+        parts.push(format!("本次 {}", format_usd(cost)));
+    }
+    if let Some(q) = &status.quota {
+        if q.window_cost_limit > 0.0 || q.weekly_cost_limit > 0.0 {
+            let p5h = calc_pct(q.window_used, q.window_cost_limit);
+            let p7d = calc_pct(q.weekly_used, q.weekly_cost_limit);
+            parts.push(format!("5h {p5h}% / 7d {p7d}%"));
+        }
+    }
+    parts.join(" · ")
+}
+
+pub async fn render_status_line(paths: &AppPaths, stdin_json: Option<&str>) -> String {
+    let session_cost_usd = stdin_json
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.pointer("/cost/total_cost_usd").and_then(|c| c.as_f64()));
+
+    if read_main_api_key(paths).is_none() {
+        return "Tako · 未登录".to_string();
+    }
+
+    let cached = read_balance_cache(paths);
+    if let Some(ref c) = cached {
+        if unix_now_secs().saturating_sub(c.cached_at_unix) <= 30 {
+            return format_status_line_text(&c.status, session_cost_usd);
+        }
+    }
+
+    match tokio::time::timeout(Duration::from_secs(4), fetch_account_status(paths)).await {
+        Ok(live) if live.logged_in && live.error.is_none() => {
+            format_status_line_text(&live, session_cost_usd)
+        }
+        Ok(live) => match cached {
+            Some(c) if c.status.wallet_remain_usd.is_some() => {
+                format_status_line_text(&c.status, session_cost_usd)
+            }
+            _ => format_status_line_text(&live, session_cost_usd),
+        },
+        Err(_) => match cached {
+            Some(c) => format_status_line_text(&c.status, session_cost_usd),
+            None => "Tako · 查询超时".to_string(),
+        },
+    }
 }
 
 pub fn mask_api_key(key: &str) -> String {
@@ -265,7 +387,7 @@ async fn exchange_desktop_token(
         .and_then(|v| v.as_str())
         .ok_or_else(|| "响应缺少 data.key".to_string())?;
     let api_id = get_key_id(&client, base_url, key).await.ok();
-    save_tako_cli_credentials(paths, Some(key), api_id.as_deref())
+    save_switch_auth(paths, Some(key), api_id.as_deref(), Some("oauth"))
 }
 
 pub async fn login_with_key(paths: &AppPaths, raw_key: &str) -> Result<AccountStatus, String> {
@@ -296,23 +418,27 @@ pub async fn login_with_key(paths: &AppPaths, raw_key: &str) -> Result<AccountSt
     }
 
     let api_id = get_key_id(&client, &base_url, key).await.ok();
-    save_tako_cli_credentials(paths, Some(key), api_id.as_deref())?;
+    save_switch_auth(paths, Some(key), api_id.as_deref(), Some("manual_key"))?;
     Ok(fetch_account_status(paths).await)
 }
 
 pub async fn logout(paths: &AppPaths) -> Result<AccountStatus, String> {
     let state = read_switch_state(paths);
     let base_url = state.normalized_base_url();
-    if let Some(key) = read_main_api_key(paths) {
-        if let Ok(client) = build_http_client() {
-            let _ = client
-                .post(format!("{base_url}/api/desktop/revoke"))
-                .header("Authorization", format!("Bearer {key}"))
-                .send()
-                .await;
+    let auth = read_switch_auth(paths);
+    if auth.auth_source.as_deref() == Some("oauth") {
+        if let Some(key) = auth.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Ok(client) = build_http_client() {
+                let _ = client
+                    .post(format!("{base_url}/api/desktop/revoke"))
+                    .header("Authorization", format!("Bearer {key}"))
+                    .send()
+                    .await;
+            }
         }
     }
-    save_tako_cli_credentials(paths, None, None)?;
+    save_switch_auth(paths, None, None, None)?;
+    clear_balance_cache(paths);
     Ok(fetch_account_status(paths).await)
 }
 
@@ -344,6 +470,8 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
             plan_name: None,
             wallet_remain: None,
             wallet_used: None,
+            wallet_remain_usd: None,
+            wallet_used_usd: None,
             quota: None,
             error: None,
         };
@@ -359,12 +487,15 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
             plan_name: None,
             wallet_remain: None,
             wallet_used: None,
+            wallet_remain_usd: None,
+            wallet_used_usd: None,
             quota: None,
             error: Some("无法初始化 HTTP 客户端".to_string()),
         };
     };
 
     let mut api_id = read_main_api_id(paths);
+    let auth_source = read_switch_auth(paths).auth_source;
     let mut user_name = None;
     let mut plan_name = None;
     let mut wallet_remain = None;
@@ -397,7 +528,12 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
                             .and_then(|v| v.as_str())
                             .map(str::to_string);
                         if let Some(ref found_id) = api_id {
-                            let _ = save_tako_cli_credentials(paths, Some(&key), Some(found_id));
+                            let _ = save_switch_auth(
+                                paths,
+                                Some(&key),
+                                Some(found_id),
+                                auth_source.as_deref(),
+                            );
                         }
                     }
                 }
@@ -437,7 +573,7 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
 
     if api_id.is_none() {
         if let Ok(id) = get_key_id(&client, &base_url, &key).await {
-            let _ = save_tako_cli_credentials(paths, Some(&key), Some(&id));
+            let _ = save_switch_auth(paths, Some(&key), Some(&id), auth_source.as_deref());
             api_id = Some(id);
         }
     }
@@ -488,7 +624,7 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
         }
     }
 
-    AccountStatus {
+    let status = AccountStatus {
         logged_in: true,
         base_url,
         masked_key: masked,
@@ -496,9 +632,15 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
         plan_name,
         wallet_remain,
         wallet_used,
+        wallet_remain_usd: wallet_remain.map(quota_units_to_usd),
+        wallet_used_usd: wallet_used.map(quota_units_to_usd),
         quota,
         error: err_msg,
+    };
+    if status.logged_in && status.error.is_none() {
+        write_balance_cache(paths, &status);
     }
+    status
 }
 
 #[cfg(test)]
@@ -519,5 +661,47 @@ mod tests {
     fn mask_key_hides_secret_middle() {
         assert_eq!(mask_api_key("cr_1234567890abcdef"), "cr_1234…cdef");
         assert_eq!(mask_api_key("short"), "cr_***");
+    }
+
+    #[test]
+    fn converts_quota_units_and_formats_status_line() {
+        assert!((quota_units_to_usd(500_000) - 1.0).abs() < f64::EPSILON);
+        assert_eq!(format_usd(12.345), "$12.35");
+
+        let balance_only = AccountStatus {
+            logged_in: true,
+            base_url: "https://tako.shiroha.tech".to_string(),
+            masked_key: Some("cr_abcd…efgh".to_string()),
+            user_name: Some("Shiroha".to_string()),
+            plan_name: None,
+            wallet_remain: Some(6_250_000),
+            wallet_used: Some(1_000_000),
+            wallet_remain_usd: Some(12.5),
+            wallet_used_usd: Some(2.0),
+            quota: None,
+            error: None,
+        };
+        assert_eq!(
+            format_status_line_text(&balance_only, Some(0.32)),
+            "Tako · 余额 $12.50 · 本次 $0.32"
+        );
+
+        let with_plan = AccountStatus {
+            plan_name: Some("Pro x4".to_string()),
+            quota: Some(QuotaSummary {
+                window_cost_limit: 10.0,
+                window_used: 2.0,
+                window_minutes: 300.0,
+                daily_cost_limit: 0.0,
+                daily_used: 0.0,
+                weekly_cost_limit: 50.0,
+                weekly_used: 25.0,
+            }),
+            ..balance_only
+        };
+        assert_eq!(
+            format_status_line_text(&with_plan, None),
+            "Pro x4 · 余额 $12.50 · 5h 20% / 7d 50%"
+        );
     }
 }

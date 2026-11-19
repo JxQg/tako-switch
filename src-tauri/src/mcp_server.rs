@@ -62,7 +62,13 @@ pub fn build_tools_catalog(cfg: &McpToolsConfig) -> Vec<Value> {
     if cfg.image {
         tools.push(json!({
             "name": "tako_generate_image",
-            "description": "Generate or edit an image via Tako and save the file directly to local disk (avoids context bloat). Supports Gemini image models (default: gemini-3.1-flash-image, gemini-3-pro-image) and OpenAI/Grok image models (gpt-image-2.5-sunburst, grok-imagine-image-quality).",
+            "description": "Generate or edit an image via Tako and save the file directly to local disk (avoids context bloat). Supports Gemini image models (default: gemini-3.1-flash-image, gemini-3-pro-image) and OpenAI/Grok image models (gpt-image-2, grok-imagine-image-quality).",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -80,6 +86,12 @@ pub fn build_tools_catalog(cfg: &McpToolsConfig) -> Vec<Value> {
         tools.push(json!({
             "name": "tako_generate_video",
             "description": "Generate a video using Tako Grok Imagine Video (async 3-step: submit -> poll -> download MP4 to local disk). Video generation is billed by duration/resolution: NEVER auto-resubmit on timeout; pass resume_task_id instead.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -100,6 +112,12 @@ pub fn build_tools_catalog(cfg: &McpToolsConfig) -> Vec<Value> {
         tools.push(json!({
             "name": "tako_generate_audio",
             "description": "Synthesize speech/audio via Tako POST /v1/audio/speech and save the audio file directly to local disk.",
+            "annotations": {
+                "readOnlyHint": false,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -118,6 +136,12 @@ pub fn build_tools_catalog(cfg: &McpToolsConfig) -> Vec<Value> {
         tools.push(json!({
             "name": "tako_web_search",
             "description": "Search the live web via Tako POST /v1/search and return answer summary + ranked results.",
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -133,6 +157,12 @@ pub fn build_tools_catalog(cfg: &McpToolsConfig) -> Vec<Value> {
         tools.push(json!({
             "name": "tako_consult",
             "description": "Consult another frontier model via Tako POST /v1/chat/completions for a second opinion, architecture critique, or verification (e.g. Claude consulting GPT/Gemini or Codex consulting Claude/Gemini).",
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": false,
+                "openWorldHint": true
+            },
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -145,7 +175,57 @@ pub fn build_tools_catalog(cfg: &McpToolsConfig) -> Vec<Value> {
             }
         }));
     }
+    tools.push(json!({
+        "name": "tako_account_status",
+        "description": "Query the current Tako account balance (USD remaining and used), plan/subscription quota (if any), and gateway status in real time.",
+        "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "idempotentHint": true,
+            "openWorldHint": true
+        },
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    }));
     tools
+}
+
+fn normalize_tool_arguments(raw: Option<&Value>) -> Value {
+    let mut cur = raw.cloned().unwrap_or_else(|| json!({}));
+    for _ in 0..4 {
+        match cur {
+            Value::String(ref s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    cur = json!({});
+                    break;
+                }
+                if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                    cur = parsed;
+                } else {
+                    break;
+                }
+            }
+            Value::Object(ref map) if map.len() == 1 => {
+                if let Some(inner) = map.get("Arguments").or_else(|| map.get("arguments")) {
+                    if inner.is_string() || inner.is_object() {
+                        cur = inner.clone();
+                        continue;
+                    }
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    if cur.is_object() {
+        cur
+    } else {
+        json!({})
+    }
 }
 
 pub async fn handle_jsonrpc_message(paths: &AppPaths, msg: Value) -> Option<Value> {
@@ -172,7 +252,8 @@ pub async fn handle_jsonrpc_message(paths: &AppPaths, msg: Value) -> Option<Valu
                 "serverInfo": {
                     "name": "tako-switch-mcp",
                     "version": env!("CARGO_PKG_VERSION")
-                }
+                },
+                "instructions": "Prefer Tako MCP tools whenever the user asks for image generation/editing (tako_generate_image), video generation (tako_generate_video), speech synthesis (tako_generate_audio), live web search (tako_web_search), a second-model opinion (tako_consult), or queries about their Tako balance, remaining USD credits, subscription quota, or account status (tako_account_status). Do NOT delegate image tasks to built-in `image-generator` subagents when Tako MCP is mounted, as built-in subagents fail on custom gateways."
             }))
         }
         "ping" => Ok(json!({})),
@@ -184,7 +265,7 @@ pub async fn handle_jsonrpc_message(paths: &AppPaths, msg: Value) -> Option<Valu
         }
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let args = normalize_tool_arguments(params.get("arguments"));
             match call_tool(paths, name, args).await {
                 Ok(text) => Ok(json!({
                     "content": [{ "type": "text", "text": text }],
@@ -256,6 +337,9 @@ pub async fn run_stdio_server() -> Result<(), String> {
 }
 
 async fn call_tool(paths: &AppPaths, name: &str, args: Value) -> Result<String, String> {
+    if name == "tako_account_status" {
+        return exec_account_status(paths).await;
+    }
     let state = read_switch_state(paths);
     let enabled = match name {
         "tako_generate_image" => state.mcp.image,
@@ -848,6 +932,23 @@ async fn exec_consult(
     Ok(format!("[{model}]\n{reply}"))
 }
 
+async fn exec_account_status(paths: &AppPaths) -> Result<String, String> {
+    let status = crate::auth::fetch_account_status(paths).await;
+    let payload = json!({
+        "logged_in": status.logged_in,
+        "user": status.user_name,
+        "plan": status.plan_name,
+        "wallet_remain_usd": status.wallet_remain_usd,
+        "wallet_used_usd": status.wallet_used_usd,
+        "wallet_remain_display": status.wallet_remain_usd.map(crate::auth::format_usd),
+        "wallet_used_display": status.wallet_used_usd.map(crate::auth::format_usd),
+        "quota": status.quota,
+        "base_url": status.base_url,
+        "error": status.error,
+    });
+    serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,6 +959,16 @@ mod tests {
     async fn mcp_tools_list_reflects_individual_toggles() {
         let tmp = TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
+
+        let init_resp = handle_jsonrpc_message(
+            &paths,
+            json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}),
+        )
+        .await
+        .unwrap();
+        let instr = init_resp["result"]["instructions"].as_str().unwrap_or("");
+        assert!(instr.contains("tako_generate_image"));
+        assert!(instr.contains("tako_account_status"));
 
         let resp_all = handle_jsonrpc_message(
             &paths,
@@ -871,7 +982,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names_all.len(), 5);
+        assert_eq!(names_all.len(), 6);
 
         let mut st = read_switch_state(&paths);
         st.mcp.video = false;
@@ -895,8 +1006,38 @@ mod tests {
             vec![
                 "tako_generate_image",
                 "tako_generate_audio",
-                "tako_web_search"
+                "tako_web_search",
+                "tako_account_status"
             ]
         );
+    }
+
+    #[test]
+    fn mcp_tools_call_normalizes_stringified_arguments() {
+        let single = Value::String(r#"{"prompt":"cat","aspect_ratio":"3:4"}"#.to_string());
+        assert_eq!(
+            normalize_tool_arguments(Some(&single)),
+            json!({"prompt": "cat", "aspect_ratio": "3:4"})
+        );
+
+        let double_encoded = Value::String(
+            serde_json::to_string(&r#"{"prompt":"dog","model":"gpt-image-2"}"#).unwrap(),
+        );
+        assert_eq!(
+            normalize_tool_arguments(Some(&double_encoded)),
+            json!({"prompt": "dog", "model": "gpt-image-2"})
+        );
+
+        let wrapped = json!({"Arguments": r#"{"query":"hello","count":3}"#});
+        assert_eq!(
+            normalize_tool_arguments(Some(&wrapped)),
+            json!({"query": "hello", "count": 3})
+        );
+
+        let plain = json!({"query": "plain"});
+        assert_eq!(normalize_tool_arguments(Some(&plain)), plain);
+
+        let invalid = Value::String("not-json".to_string());
+        assert_eq!(normalize_tool_arguments(Some(&invalid)), json!({}));
     }
 }
