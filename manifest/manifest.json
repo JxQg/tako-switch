@@ -1,24 +1,24 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-19T12:19:21Z",
+  "generatedAt": "2026-11-20T04:50:45Z",
   "apps": {
     "codex": {
       "displayName": "Codex Desktop",
-      "version": "26.1111.71704",
+      "version": "26.1117.31558",
       "platforms": {
         "macos-arm64": {
-          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-arm64-26.1111.71704.zip",
-          "version": "26.1111.71704",
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-arm64-26.1117.31558.zip",
+          "version": "26.1117.31558",
           "installType": "zip",
           "appBundleName": "ChatGPT.app",
-          "size": 835851598
+          "size": 723988688
         },
         "macos-x64": {
-          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-x64-26.1111.71704.zip",
-          "version": "26.1111.71704",
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-x64-26.1117.31558.zip",
+          "version": "26.1117.31558",
           "installType": "zip",
           "appBundleName": "ChatGPT.app",
-          "size": 863552428
+          "size": 754284267
         },
         "windows-x64": {
           "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix",
@@ -31,23 +31,23 @@
     },
     "claude": {
       "displayName": "Claude Desktop",
-      "version": "6.6395.1",
+      "version": "6.28899.2",
       "platforms": {
         "macos-universal": {
-          "url": "https://downloads.claude.ai/releases/darwin/universal/6.6395.1/Claude-8fc566f7b97e371bae421fc79c260de86c6a4106.zip",
-          "version": "6.6395.1",
+          "url": "https://downloads.claude.ai/releases/darwin/universal/6.28899.2/Claude-155ca43c0ad5a4bd5734795688543b65b464cf47.zip",
+          "version": "6.28899.2",
           "installType": "zip",
           "appBundleName": "Claude.app",
-          "size": 399137278
+          "size": 404686665
         },
         "windows-x64": {
-          "url": "https://downloads.claude.ai/releases/win32/x64/6.6395.1/Claude-8fc566f7b97e371bae421fc79c260de86c6a4106.exe",
-          "version": "6.6395.1",
+          "url": "https://downloads.claude.ai/releases/win32/x64/6.28899.2/Claude-155ca43c0ad5a4bd5734795688543b65b464cf47.exe",
+          "version": "6.28899.2",
           "installType": "exe",
           "silentArgs": [
             "--silent"
           ],
-          "size": 274749088
+          "size": 279375008
         }
       }
     },
