@@ -33,7 +33,7 @@ const TRAY_ID: &str = "main-tray";
 const SELF_UPDATE_OSS_ENDPOINT: &str =
     "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/tako-switch/latest.json";
 const SELF_UPDATE_GITHUB_ENDPOINT: &str =
-    "https://github.com/Barrierml/tako-switch/releases/latest/download/latest.json";
+    "https://github.com/tako-dev/tako-switch/releases/latest/download/latest.json";
 const SELF_UPDATE_BG_INTERVAL_SECS: u64 = 1800;
 
 pub struct InstallGuard {
@@ -656,13 +656,16 @@ fn get_running_states() -> Result<std::collections::BTreeMap<String, bool>, Stri
 }
 
 #[tauri::command]
-fn set_app_mode(
+async fn set_app_mode(
     app: AppHandle,
     app_id: AppId,
     mode: AppMode,
     auto_restart: bool,
 ) -> Result<AppSnapshot, String> {
     let paths = AppPaths::detect()?;
+    if app_id == AppId::Claude && mode == AppMode::Tako {
+        let _ = crate::agy_proxy::refresh_claude_catalog_cache(&paths).await;
+    }
     let adapter = get_adapter(app_id);
     adapter.apply_mode(&paths, mode)?;
     if auto_restart && adapter.is_running(&paths) {
@@ -687,6 +690,17 @@ fn restart_app(app_id: AppId) -> Result<AppSnapshot, String> {
 }
 
 #[tauri::command]
+fn close_app(app_id: AppId) -> Result<AppSnapshot, String> {
+    let paths = AppPaths::detect()?;
+    let adapter = get_adapter(app_id);
+    if adapter.is_running(&paths) {
+        adapter.quit_app(&paths)?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    Ok(snapshot_app(&paths, app_id))
+}
+
+#[tauri::command]
 fn launch_app(app_id: AppId) -> Result<AppSnapshot, String> {
     let paths = AppPaths::detect()?;
     let adapter = get_adapter(app_id);
@@ -698,6 +712,37 @@ fn launch_app(app_id: AppId) -> Result<AppSnapshot, String> {
 fn diagnose_app(app_id: AppId) -> Result<DiagnosticResult, String> {
     let paths = AppPaths::detect()?;
     Ok(get_adapter(app_id).diagnose(&paths))
+}
+
+#[tauri::command]
+async fn list_client_models(app_id: AppId) -> Result<agy_proxy::ClientModelsResponse, String> {
+    let paths = AppPaths::detect()?;
+    agy_proxy::fetch_client_models_for_ui(&paths, app_id).await
+}
+
+#[tauri::command]
+async fn save_client_model_filter(
+    app: AppHandle,
+    app_id: AppId,
+    filter: config::ClientModelFilter,
+) -> Result<SwitchState, String> {
+    let paths = AppPaths::detect()?;
+    let normalized = filter.normalized();
+    if normalized.mode == config::ModelFilterMode::Custom && normalized.enabled_ids.is_empty() {
+        return Err("至少保留 1 个展示模型".to_string());
+    }
+    let mut state = read_switch_state(&paths);
+    *state.model_filters.for_app_mut(app_id) = normalized;
+    save_switch_state(&paths, &state)?;
+    if app_id == AppId::Claude {
+        let _ = crate::agy_proxy::refresh_claude_catalog_cache(&paths).await;
+        let adapter = get_adapter(app_id);
+        if adapter.read_mode(&paths) == AppMode::Tako {
+            adapter.apply_mode(&paths, AppMode::Tako)?;
+        }
+    }
+    let _ = app.emit("state-changed", ());
+    Ok(state)
 }
 
 #[tauri::command]
@@ -989,8 +1034,11 @@ pub fn run() {
             save_settings,
             set_app_mode,
             restart_app,
+            close_app,
             launch_app,
             diagnose_app,
+            list_client_models,
+            save_client_model_filter,
             check_app_updates,
             install_or_upgrade_app,
             cancel_app_install,

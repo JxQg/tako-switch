@@ -16,9 +16,11 @@ import {
   LogOut,
   MessageSquare,
   Moon,
+  Power,
   RefreshCw,
   RotateCw,
   Settings as SettingsIcon,
+  SlidersHorizontal,
   Sparkles,
   Sun,
   X,
@@ -34,6 +36,7 @@ import {
   type AppMode,
   type AppSnapshot,
   type AppUpdateStatus,
+  type ClientModelFilter,
   type DashboardPayload,
   type InstallProgressEvent,
   type McpToolsConfig,
@@ -41,6 +44,7 @@ import {
   type SelfUpdateProgressEvent,
 } from "./lib/api";
 import { AppBrandIcon, TakoBrandMark } from "./components/BrandIcons";
+import { ModelPickerModal } from "./components/ModelPickerModal";
 
 type ThemePref = "system" | "light" | "dark";
 type SelfUpdateStatus =
@@ -98,6 +102,40 @@ const APP_DISPLAY_NAMES: Record<AppId, string> = {
   claude: "Claude Desktop",
   antigravity: "Google Antigravity",
 };
+
+const CONSULT_MODEL_PRESETS = [
+  "gpt-6.2-sol",
+  "gpt-6.2-astra",
+  "deepseek-v4.1-flash",
+  "swe-2",
+  "claude-opus-5-5",
+] as const;
+
+function modelFilterPillLabel(filter?: ClientModelFilter): string {
+  if (!filter) return "模型";
+  if (filter.mode === "recommended") {
+    const n = filter.enabledIds.length;
+    return n > 0 ? `模型 ${n}` : "模型 推荐";
+  }
+  if (filter.mode === "custom") {
+    const n = filter.enabledIds.length;
+    return n > 0 ? `模型 自选(${n})` : "模型 自选";
+  }
+  return "模型 全部";
+}
+
+function modelFilterPillTitle(filter?: ClientModelFilter): string {
+  if (!filter) return "管理该客户端在 Tako 模式下展示的模型列表";
+  if (filter.mode === "recommended") {
+    const n = filter.enabledIds.length;
+    return `推荐精简（${n > 0 ? `${n} 个主力模型` : "默认精简"}）· 点击管理模型列表`;
+  }
+  if (filter.mode === "custom") {
+    const n = filter.enabledIds.length;
+    return `自定义筛选（已选 ${n} 个模型）· 点击管理模型列表`;
+  }
+  return "全部显示 · 点击管理或精简模型列表";
+}
 
 function calcPercent(used?: number | null, limit?: number | null): number {
   if (!limit || limit <= 0 || !used || used <= 0) return 0;
@@ -192,6 +230,7 @@ export default function App() {
   >({});
   const [needsRestart, setNeedsRestart] = useState<Partial<Record<AppId, boolean>>>({});
   const [expandedApp, setExpandedApp] = useState<AppId | null>(null);
+  const [modelModalApp, setModelModalApp] = useState<AppId | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -626,6 +665,28 @@ export default function App() {
         setNeedsRestart((prev) => ({ ...prev, [app.id]: true }));
         showTransientNote(`${APP_DISPLAY_NAMES[app.id]} 已切换模式，重启应用后生效`);
       }
+    } catch (err) {
+      setErrorMsg(String(err));
+    } finally {
+      setBusyApp(null);
+    }
+  };
+
+  const handleCloseApp = async (appId: AppId) => {
+    setBusyApp(appId);
+    setErrorMsg(null);
+    try {
+      const updated = await api.closeApp(appId);
+      setNeedsRestart((prev) => ({ ...prev, [appId]: false }));
+      setDashboard((prev) =>
+        prev
+          ? {
+              ...prev,
+              apps: prev.apps.map((item) => (item.id === appId ? updated : item)),
+            }
+          : prev,
+      );
+      showTransientNote(`${APP_DISPLAY_NAMES[appId]} 已关闭`);
     } catch (err) {
       setErrorMsg(String(err));
     } finally {
@@ -1171,9 +1232,17 @@ export default function App() {
                 return (
                   <div
                     key={app.id}
-                    className="rounded-[14px] border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-card)] transition-colors hover:border-[var(--border-strong)] overflow-hidden"
+                    className={`rounded-[14px] border bg-[var(--bg-card)] shadow-[var(--shadow-card)] transition-colors overflow-hidden ${
+                      app.running
+                        ? "border-[var(--success-border)]"
+                        : "border-[var(--border)] hover:border-[var(--border-strong)]"
+                    }`}
                   >
-                    <div className="px-3.5 py-3 flex items-center gap-3.5">
+                    <div
+                      className={`px-3.5 py-3 flex items-center gap-3.5 ${
+                        app.running ? "tako-running-row" : ""
+                      }`}
+                    >
                       {/* App Brand & Info */}
                       <div className="flex-1 min-w-0 flex items-center gap-3">
                         <AppBrandIcon appId={app.id} />
@@ -1197,10 +1266,10 @@ export default function App() {
 
                             {app.running && (
                               <span
-                                className="inline-flex items-center gap-1 text-[12px] font-medium text-[var(--success)] shrink-0"
+                                className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-[var(--success-soft)] border border-[var(--success-border)] text-[11px] leading-[16px] font-medium text-[var(--success)] shrink-0"
                                 title="应用正在运行"
                               >
-                                <span className="h-1.5 w-1.5 rounded-full bg-[var(--success)]" />
+                                <span className="tako-live-dot" aria-hidden="true" />
                                 运行中
                               </span>
                             )}
@@ -1237,6 +1306,22 @@ export default function App() {
                                 }`}
                               />
                             </button>
+                            {app.mode === "tako" && (
+                              <>
+                                <span className="text-[var(--text-muted)]">·</span>
+                                <button
+                                  type="button"
+                                  onClick={() => setModelModalApp(app.id)}
+                                  title={modelFilterPillTitle(dashboard?.state.modelFilters?.[app.id])}
+                                  className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-[var(--accent-soft)] hover:bg-[var(--accent-border)] text-[var(--accent)] border border-[var(--accent-border)] text-[11px] font-medium transition cursor-pointer shrink-0 tabular-nums"
+                                >
+                                  <SlidersHorizontal className="h-3 w-3" />
+                                  <span>
+                                    {modelFilterPillLabel(dashboard?.state.modelFilters?.[app.id])}
+                                  </span>
+                                </button>
+                              </>
+                            )}
                           </div>
                         </div>
                       </div>
@@ -1333,12 +1418,24 @@ export default function App() {
                               onClick={() =>
                                 restartRequired
                                   ? handleRestartApp(app.id)
-                                  : handleLaunchApp(app.id)
+                                  : app.running
+                                    ? handleCloseApp(app.id)
+                                    : handleLaunchApp(app.id)
                               }
-                              title={restartRequired ? "重启生效" : "打开应用"}
+                              title={
+                                restartRequired
+                                  ? "重启生效"
+                                  : app.running
+                                    ? "关闭应用"
+                                    : "打开应用"
+                              }
                               className="h-8 px-2.5 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] text-[12px] font-medium flex items-center justify-center transition cursor-pointer disabled:opacity-60"
                             >
-                              {restartRequired ? "重启" : "打开"}
+                              {restartRequired
+                                ? "重启"
+                                : app.running
+                                  ? "关闭"
+                                  : "打开"}
                             </button>
                           </>
                         ) : restartRequired ? (
@@ -1359,11 +1456,20 @@ export default function App() {
                           <button
                             type="button"
                             disabled={isBusy}
-                            onClick={() => handleLaunchApp(app.id)}
+                            onClick={() =>
+                              app.running
+                                ? handleCloseApp(app.id)
+                                : handleLaunchApp(app.id)
+                            }
+                            title={app.running ? "关闭应用" : "打开应用"}
                             className="w-full h-8 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] text-[12px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60"
                           >
-                            <ExternalLink className="h-3.5 w-3.5 text-[var(--text-secondary)]" />
-                            <span>打开</span>
+                            {app.running ? (
+                              <Power className="h-3.5 w-3.5 text-[var(--text-secondary)]" />
+                            ) : (
+                              <ExternalLink className="h-3.5 w-3.5 text-[var(--text-secondary)]" />
+                            )}
+                            <span>{app.running ? "关闭" : "打开"}</span>
                           </button>
                         )}
                       </div>
@@ -1942,6 +2048,31 @@ export default function App() {
                       </label>
                     </div>
 
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-[11px] text-[var(--text-muted)] shrink-0">
+                        外脑预设:
+                      </span>
+                      {CONSULT_MODEL_PRESETS.map((preset) => {
+                        const active = settingsForm.consultModel.trim() === preset;
+                        return (
+                          <button
+                            key={preset}
+                            type="button"
+                            onClick={() =>
+                              setSettingsForm((s) => ({ ...s, consultModel: preset }))
+                            }
+                            className={`px-2 py-0.5 rounded-md text-[11px] font-mono border transition cursor-pointer ${
+                              active
+                                ? "bg-[var(--accent-soft)] border-[var(--accent-border)] text-[var(--accent)] font-medium"
+                                : "bg-[var(--bg-card)] border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-subtle)]"
+                            }`}
+                          >
+                            {preset}
+                          </button>
+                        );
+                      })}
+                    </div>
+
                     <div className="flex items-center justify-between gap-3 pt-1">
                       <span className="text-[var(--text-secondary)] leading-snug">
                         Codex 切 Tako 时保留官方 ChatGPT 登录（可保留远程操控/官方插件）
@@ -2033,6 +2164,46 @@ export default function App() {
           </form>
         </div>
       )}
+
+      <ModelPickerModal
+        appId={modelModalApp}
+        appName={modelModalApp ? APP_DISPLAY_NAMES[modelModalApp] : ""}
+        appRunning={
+          modelModalApp
+            ? Boolean(dashboard?.apps.find((a) => a.id === modelModalApp)?.running)
+            : false
+        }
+        onClose={() => setModelModalApp(null)}
+        onSaved={(savedAppId, nextState, restarted) => {
+          const wasRunning = Boolean(
+            dashboard?.apps.find((a) => a.id === savedAppId)?.running,
+          );
+          setDashboard((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  state: nextState,
+                  apps: restarted
+                    ? prev.apps.map((a) =>
+                        a.id === savedAppId ? { ...a, running: true } : a,
+                      )
+                    : prev.apps,
+                }
+              : prev,
+          );
+          setModelModalApp(null);
+          if (restarted) {
+            setNeedsRestart((prev) => ({ ...prev, [savedAppId]: false }));
+            void loadDashboard(false);
+            showTransientNote(`${APP_DISPLAY_NAMES[savedAppId]} 模型列表已保存并重启生效`);
+          } else if (wasRunning) {
+            setNeedsRestart((prev) => ({ ...prev, [savedAppId]: true }));
+            showTransientNote(`${APP_DISPLAY_NAMES[savedAppId]} 模型设置已保存，重启应用后生效`);
+          } else {
+            showTransientNote(`${APP_DISPLAY_NAMES[savedAppId]} 模型设置已保存`);
+          }
+        }}
+      />
     </div>
   );
 }

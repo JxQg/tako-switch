@@ -1,7 +1,10 @@
 use crate::adapters::{get_adapter, AppId, AppMode};
 #[cfg(not(target_os = "windows"))]
 use crate::config::write_atomic;
-use crate::config::{effective_agy_api_key, read_main_api_key, read_switch_state, AppPaths};
+use crate::config::{
+    effective_agy_api_key, read_main_api_key, read_switch_state, AppPaths, ClientModelFilter,
+    ModelFilterMode,
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
@@ -12,6 +15,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use reqwest::{Client, Method};
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -60,17 +64,156 @@ pub enum ClientKind {
     Claude,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelChannelPrice {
+    pub name: String,
+    pub ratio: f64,
+    pub standard_load_usd_per_m: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelPricingInfo {
+    pub is_free: bool,
+    pub is_dynamic_pricing: bool,
+    pub standard_load_usd_per_m: Option<f64>,
+    pub standard_load_max_usd_per_m: Option<f64>,
+    pub realized_usd_per_m: Option<f64>,
+    pub cache_hit_rate: Option<f64>,
+    pub input_usd_per_m: Option<f64>,
+    pub output_usd_per_m: Option<f64>,
+    pub request_usd: Option<f64>,
+    pub channels: Vec<ModelChannelPrice>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelPerfInfo {
+    pub avg_tps: Option<f64>,
+    pub avg_latency_ms: Option<f64>,
+    pub success_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PricingCache {
     pub reasoning_levels: HashMap<String, Vec<String>>,
     pub descriptions: HashMap<String, String>,
     pub has_flash_image: bool,
+    pub prices: HashMap<String, ModelPricingInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntheticRoute {
     pub base_model: String,
     pub effort: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientModelOption {
+    pub id: String,
+    pub display_name: String,
+    pub family: String,
+    pub description: String,
+    pub context_window: Option<u64>,
+    pub recommended: bool,
+    pub visible: bool,
+    pub effort_levels: Vec<String>,
+    pub is_free: bool,
+    pub is_dynamic_pricing: bool,
+    pub standard_load_usd_per_m: Option<f64>,
+    pub standard_load_max_usd_per_m: Option<f64>,
+    pub realized_usd_per_m: Option<f64>,
+    pub cache_hit_rate: Option<f64>,
+    pub input_usd_per_m: Option<f64>,
+    pub output_usd_per_m: Option<f64>,
+    pub request_usd: Option<f64>,
+    pub channels: Vec<ModelChannelPrice>,
+    pub avg_tps: Option<f64>,
+    pub avg_latency_ms: Option<f64>,
+    pub success_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientModelsResponse {
+    pub app_id: AppId,
+    pub filter: ClientModelFilter,
+    pub recommended_ids: Vec<String>,
+    pub visible_count: usize,
+    pub total_count: usize,
+    pub models: Vec<ClientModelOption>,
+}
+
+fn catalog_filter_key(_app_id: AppId, id: &str) -> String {
+    id.trim().to_ascii_lowercase()
+}
+
+fn normalized_filter_set(app_id: AppId, filter: &ClientModelFilter) -> Option<HashSet<String>> {
+    match filter.mode {
+        ModelFilterMode::All => None,
+        ModelFilterMode::Recommended => Some(
+            ClientModelFilter::recommended_ids_for(app_id)
+                .iter()
+                .map(|s| catalog_filter_key(app_id, s))
+                .collect(),
+        ),
+        ModelFilterMode::Custom => Some(
+            filter
+                .enabled_ids
+                .iter()
+                .map(|s| catalog_filter_key(app_id, s))
+                .filter(|s| !s.is_empty())
+                .collect(),
+        ),
+    }
+}
+
+fn is_recommended_model(app_id: AppId, id: &str) -> bool {
+    let key = catalog_filter_key(app_id, id);
+    ClientModelFilter::recommended_ids_for(app_id)
+        .iter()
+        .any(|rec| rec.eq_ignore_ascii_case(&key))
+}
+
+fn model_family_label(app_id: AppId, id: &str) -> &'static str {
+    if app_id == AppId::Claude {
+        return match parse_claude_tier_and_version(id).0 {
+            Some("opus") => "Opus",
+            Some("sonnet") => "Sonnet",
+            Some("fable") => "Fable",
+            Some("haiku") => "Haiku",
+            Some("mythos") => "Mythos",
+            _ => "Claude",
+        };
+    }
+    let lower = id.trim().to_ascii_lowercase();
+    if lower.starts_with("gpt-")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+    {
+        "GPT"
+    } else if lower.starts_with("claude-") {
+        "Claude"
+    } else if lower.starts_with("gemini-") || lower.starts_with("gemma-") {
+        "Gemini"
+    } else if lower.starts_with("deepseek-") {
+        "DeepSeek"
+    } else if lower.starts_with("swe-") {
+        "SWE"
+    } else if lower.starts_with("glm-") {
+        "GLM"
+    } else if lower.starts_with("kimi-") {
+        "Kimi"
+    } else if lower.starts_with("grok-") {
+        "Grok"
+    } else if lower.starts_with("minimax-") {
+        "MiniMax"
+    } else if lower.starts_with("mimo-") {
+        "MiMo"
+    } else {
+        "其他"
+    }
 }
 
 struct ProxyState {
@@ -83,6 +226,16 @@ struct ProxyState {
 
 pub fn parse_pricing_metadata(body: &Value) -> PricingCache {
     let mut cache = PricingCache::default();
+    let top_group_ratio: HashMap<String, f64> = body
+        .get("group_ratio")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter_map(|(k, v)| v.as_f64().filter(|n| n.is_finite()).map(|n| (k.clone(), n)))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let Some(items) = body.get("data").and_then(Value::as_array) else {
         return cache;
     };
@@ -127,8 +280,237 @@ pub fn parse_pricing_metadata(body: &Value) -> PricingCache {
                 cache.reasoning_levels.insert(model_name.to_string(), ordered);
             }
         }
+
+        let item_group_ratio = item.get("group_ratio").and_then(Value::as_object);
+        let ch_min_map = item
+            .get("group_channel_ratio_min")
+            .and_then(Value::as_object);
+        let ch_max_map = item
+            .get("group_channel_ratio_max")
+            .and_then(Value::as_object);
+        let enable_groups: Vec<&str> = item
+            .get("enable_groups")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+
+        let mut min_ratio = f64::INFINITY;
+        let mut max_ratio = f64::NEG_INFINITY;
+        for g in &enable_groups {
+            let gr = item_group_ratio
+                .and_then(|m| m.get(*g))
+                .and_then(Value::as_f64)
+                .filter(|n| n.is_finite())
+                .or_else(|| top_group_ratio.get(*g).copied())
+                .unwrap_or(1.0);
+            let cm = ch_min_map
+                .and_then(|m| m.get(*g))
+                .and_then(Value::as_f64)
+                .filter(|n| n.is_finite())
+                .unwrap_or(1.0);
+            let cx = ch_max_map
+                .and_then(|m| m.get(*g))
+                .and_then(Value::as_f64)
+                .filter(|n| n.is_finite())
+                .unwrap_or(cm);
+            min_ratio = min_ratio.min(gr * cm);
+            max_ratio = max_ratio.max(gr * cx);
+        }
+        let display_group_ratio = if min_ratio.is_finite() {
+            min_ratio
+        } else {
+            1.0
+        };
+        let display_group_ratio_max = if max_ratio.is_finite() {
+            max_ratio
+        } else {
+            display_group_ratio
+        };
+
+        let quota_type = item.get("quota_type").and_then(Value::as_i64).unwrap_or(0);
+        let billing_mode = item
+            .get("billing_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let billing_expr = item
+            .get("billing_expr")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let is_dynamic_pricing = billing_mode == "tiered_expr" || !billing_expr.is_empty();
+        let model_ratio = item
+            .get("model_ratio")
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite())
+            .unwrap_or(0.0);
+        let completion_ratio = item
+            .get("completion_ratio")
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite())
+            .unwrap_or(0.0);
+        let model_price = item
+            .get("model_price")
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite())
+            .unwrap_or(0.0);
+        let std_load_raw = item
+            .get("standard_load_price_per_million")
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && *n > 0.0);
+        let realized_usd_per_m = item
+            .get("realized_price_per_million")
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && *n > 0.0);
+        let cache_hit_rate = item
+            .get("cache_hit_rate")
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && *n > 0.0 && *n <= 1.0);
+
+        let has_usage_schema = item
+            .get("billing_usage_schema")
+            .and_then(Value::as_object)
+            .is_some_and(|m| !m.is_empty());
+        let is_non_free_special = matches!(
+            model_name.to_ascii_lowercase().as_str(),
+            "tako-auto" | "web_search" | "speech_tts" | "speech_asr"
+        );
+        let is_free = !is_dynamic_pricing
+            && !has_usage_schema
+            && !is_non_free_special
+            && realized_usd_per_m.is_none()
+            && ((quota_type == 1 && model_price <= 0.0)
+                || (quota_type == 0 && model_ratio <= 0.0 && model_price <= 0.0));
+
+        let standard_load_usd_per_m = if quota_type == 0 {
+            std_load_raw
+                .map(|base| base * display_group_ratio)
+                .filter(|v| v.is_finite() && *v > 0.0)
+        } else {
+            None
+        };
+        let standard_load_max_usd_per_m = if quota_type == 0
+            && display_group_ratio_max.is_finite()
+            && display_group_ratio_max > display_group_ratio + 1e-9
+        {
+            std_load_raw
+                .map(|base| base * display_group_ratio_max)
+                .filter(|v| v.is_finite() && *v > 0.0)
+        } else {
+            None
+        };
+        let input_usd_per_m = if quota_type == 0 && model_ratio > 0.0 {
+            Some(model_ratio * 2.0 * display_group_ratio).filter(|v| v.is_finite() && *v > 0.0)
+        } else {
+            None
+        };
+        let output_usd_per_m = if quota_type == 0 && model_ratio > 0.0 && completion_ratio > 0.0 {
+            Some(model_ratio * 2.0 * completion_ratio * display_group_ratio)
+                .filter(|v| v.is_finite() && *v > 0.0)
+        } else {
+            None
+        };
+        let request_usd = if quota_type == 1 && model_price > 0.0 {
+            Some(model_price * display_group_ratio).filter(|v| v.is_finite() && *v > 0.0)
+        } else {
+            None
+        };
+        let channels = item
+            .get("channels")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|ch| {
+                        let name = ch
+                            .get("channel_name")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())?
+                            .to_string();
+                        let ratio = ch
+                            .get("channel_ratio")
+                            .and_then(Value::as_f64)
+                            .filter(|r| r.is_finite() && *r > 0.0)?;
+                        let std_load = if quota_type == 0 {
+                            ch.get("standard_load_price_per_million")
+                                .and_then(Value::as_f64)
+                                .filter(|v| v.is_finite() && *v > 0.0)
+                        } else {
+                            None
+                        };
+                        Some(ModelChannelPrice {
+                            name,
+                            ratio,
+                            standard_load_usd_per_m: std_load,
+                        })
+                    })
+                    .take(6)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        cache.prices.insert(
+            model_name.to_ascii_lowercase(),
+            ModelPricingInfo {
+                is_free,
+                is_dynamic_pricing,
+                standard_load_usd_per_m,
+                standard_load_max_usd_per_m,
+                realized_usd_per_m,
+                cache_hit_rate,
+                input_usd_per_m,
+                output_usd_per_m,
+                request_usd,
+                channels,
+            },
+        );
     }
     cache
+}
+
+pub fn parse_perf_metrics_summary(body: &Value) -> HashMap<String, ModelPerfInfo> {
+    let mut map = HashMap::new();
+    let models = body
+        .get("data")
+        .and_then(|d| d.get("models"))
+        .and_then(Value::as_array)
+        .or_else(|| body.get("models").and_then(Value::as_array));
+    let Some(models) = models else {
+        return map;
+    };
+    for item in models {
+        let Some(name) = item
+            .get("model_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let avg_tps = item
+            .get("avg_tps")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0);
+        let avg_latency_ms = item
+            .get("avg_latency_ms")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v > 0.0);
+        let success_rate = item
+            .get("success_rate")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite() && *v >= 0.0);
+        if avg_tps.is_some() || avg_latency_ms.is_some() || success_rate.is_some() {
+            map.insert(
+                name.to_ascii_lowercase(),
+                ModelPerfInfo {
+                    avg_tps,
+                    avg_latency_ms,
+                    success_rate,
+                },
+            );
+        }
+    }
+    map
 }
 
 pub fn effective_effort_levels(base_id: &str, pricing: &PricingCache) -> Option<Vec<String>> {
@@ -313,13 +695,17 @@ fn antigravity_model_sort_key(id: &str) -> (u16, u8, String) {
     (family_prio, eff_rank, base.to_string())
 }
 
-pub fn expand_models_catalog(
-    mut body: Value,
-    pricing: &PricingCache,
-) -> (Value, HashMap<String, SyntheticRoute>) {
-    let mut routes = HashMap::new();
+struct AgyBaseCandidate {
+    base_id: String,
+    variant_prefix: String,
+    display_name: String,
+    effort_levels: Vec<String>,
+    raw_obj: Map<String, Value>,
+}
+
+fn collect_antigravity_base_candidates(body: &Value, pricing: &PricingCache) -> Vec<AgyBaseCandidate> {
     let Some(models) = body.get("models").and_then(Value::as_array) else {
-        return (body, routes);
+        return Vec::new();
     };
 
     let mut all_base_ids = HashSet::new();
@@ -336,14 +722,8 @@ pub fn expand_models_catalog(
         }
     }
 
-    struct ExpandedEntry {
-        id: String,
-        value: Value,
-        builtin: bool,
-    }
-
-    let mut entries: Vec<ExpandedEntry> = Vec::with_capacity(models.len() + 8);
-    let mut seen_ids = HashSet::new();
+    let mut candidates = Vec::with_capacity(models.len() + 2);
+    let mut seen_base = HashSet::new();
     let mut has_flash_image_entry = false;
 
     for item in models {
@@ -366,72 +746,161 @@ pub fn expand_models_catalog(
         if lower_base == "gemini-3.1-flash-image" {
             has_flash_image_entry = true;
         }
-
-        if let Some(levels) = effective_effort_levels(base_id, pricing) {
-            let base_display = display_base_name(
-                base_id,
-                obj.get("displayName").and_then(Value::as_str),
-            );
-            // Emit Antigravity's built-in slug `gemini-3.1-pro-{low,high}` for
-            // `gemini-3.1-pro-preview` so it takes 0 custom placeholder slots.
-            let variant_prefix = if base_id == "gemini-3.1-pro-preview" {
-                "gemini-3.1-pro"
-            } else {
-                base_id
-            };
-            for effort in levels {
-                let mut variant = obj.clone();
-                let synth_id = format!("{variant_prefix}-{effort}");
-                variant.insert("name".to_string(), Value::String(format!("models/{synth_id}")));
-                variant.insert(
-                    "displayName".to_string(),
-                    Value::String(format!("{base_display} ({})", effort_label(&effort))),
-                );
-                variant.insert("thinking".to_string(), Value::Bool(true));
-                if seen_ids.insert(synth_id.clone()) {
-                    entries.push(ExpandedEntry {
-                        builtin: is_antigravity_builtin_model(&synth_id),
-                        id: synth_id.clone(),
-                        value: Value::Object(variant),
-                    });
-                }
-                let route = SyntheticRoute {
-                    base_model: base_id.to_string(),
-                    effort: effort.clone(),
-                };
-                routes.insert(synth_id, route.clone());
-                if variant_prefix != base_id {
-                    routes.insert(format!("{base_id}-{effort}"), route);
-                }
-            }
-        } else if seen_ids.insert(base_id.to_string()) {
-            let mut next_obj = obj.clone();
-            let pretty = display_base_name(
-                base_id,
-                next_obj.get("displayName").and_then(Value::as_str),
-            );
-            next_obj.insert("displayName".to_string(), Value::String(pretty));
-            entries.push(ExpandedEntry {
-                builtin: is_antigravity_builtin_model(base_id),
-                id: base_id.to_string(),
-                value: Value::Object(next_obj),
-            });
+        if !seen_base.insert(lower_base) {
+            continue;
         }
+
+        let effort_levels = effective_effort_levels(base_id, pricing).unwrap_or_default();
+        let display_name = display_base_name(
+            base_id,
+            obj.get("displayName").and_then(Value::as_str),
+        );
+        // Emit Antigravity's built-in slug `gemini-3.1-pro-{low,high}` for
+        // `gemini-3.1-pro-preview` so it takes 0 custom placeholder slots.
+        let variant_prefix = if base_id == "gemini-3.1-pro-preview" {
+            "gemini-3.1-pro".to_string()
+        } else {
+            base_id.to_string()
+        };
+
+        candidates.push(AgyBaseCandidate {
+            base_id: base_id.to_string(),
+            variant_prefix,
+            display_name,
+            effort_levels,
+            raw_obj: obj.clone(),
+        });
     }
 
     if pricing.has_flash_image
         && !has_flash_image_entry
-        && seen_ids.insert("gemini-3.1-flash-image".to_string())
+        && seen_base.insert("gemini-3.1-flash-image".to_string())
     {
-        entries.push(ExpandedEntry {
-            id: "gemini-3.1-flash-image".to_string(),
-            builtin: true,
-            value: json!({
-                "name": "models/gemini-3.1-flash-image",
-                "displayName": "Gemini 3.1 Flash Image",
-                "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
-            }),
+        let raw_val = json!({
+            "name": "models/gemini-3.1-flash-image",
+            "displayName": "Gemini 3.1 Flash Image",
+            "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]
         });
+        if let Some(raw_obj) = raw_val.as_object() {
+            candidates.push(AgyBaseCandidate {
+                base_id: "gemini-3.1-flash-image".to_string(),
+                variant_prefix: "gemini-3.1-flash-image".to_string(),
+                display_name: "Gemini 3.1 Flash Image".to_string(),
+                effort_levels: Vec::new(),
+                raw_obj: raw_obj.clone(),
+            });
+        }
+    }
+
+    candidates.sort_by_key(|c| antigravity_model_sort_key(&c.base_id));
+    candidates
+}
+
+fn antigravity_candidate_matches(
+    cand: &AgyBaseCandidate,
+    allowed: &HashSet<String>,
+) -> bool {
+    let lower_base = cand.base_id.to_ascii_lowercase();
+    let lower_prefix = cand.variant_prefix.to_ascii_lowercase();
+    allowed.contains(&lower_base)
+        || allowed.contains(&lower_prefix)
+        || (lower_base == "gemini-3.1-pro" && allowed.contains("gemini-3.1-pro-preview"))
+}
+
+fn resolve_antigravity_selected_base_ids(
+    candidates: &[AgyBaseCandidate],
+    filter: &ClientModelFilter,
+) -> HashSet<String> {
+    let Some(allowed) = normalized_filter_set(AppId::Antigravity, filter) else {
+        return candidates
+            .iter()
+            .map(|c| c.base_id.to_ascii_lowercase())
+            .collect();
+    };
+    let mut selected: HashSet<String> = candidates
+        .iter()
+        .filter(|c| antigravity_candidate_matches(c, &allowed))
+        .map(|c| c.base_id.to_ascii_lowercase())
+        .collect();
+    if selected.is_empty() && !candidates.is_empty() {
+        for cand in candidates.iter().take(3) {
+            selected.insert(cand.base_id.to_ascii_lowercase());
+        }
+    }
+    selected
+}
+
+pub fn expand_models_catalog(
+    body: Value,
+    pricing: &PricingCache,
+) -> (Value, HashMap<String, SyntheticRoute>) {
+    expand_models_catalog_with_filter(body, pricing, None)
+}
+
+pub fn expand_models_catalog_with_filter(
+    mut body: Value,
+    pricing: &PricingCache,
+    filter: Option<&ClientModelFilter>,
+) -> (Value, HashMap<String, SyntheticRoute>) {
+    let mut routes = HashMap::new();
+    if body.get("models").and_then(Value::as_array).is_none() {
+        return (body, routes);
+    }
+
+    let candidates = collect_antigravity_base_candidates(&body, pricing);
+    let selected_set = filter.map(|f| resolve_antigravity_selected_base_ids(&candidates, f));
+
+    struct ExpandedEntry {
+        id: String,
+        value: Value,
+        builtin: bool,
+    }
+
+    let mut entries: Vec<ExpandedEntry> = Vec::with_capacity(candidates.len() * 2 + 4);
+    let mut seen_ids = HashSet::new();
+
+    for cand in candidates {
+        let keep_candidate = selected_set
+            .as_ref()
+            .map(|set| set.contains(&cand.base_id.to_ascii_lowercase()))
+            .unwrap_or(true);
+
+        if !cand.effort_levels.is_empty() {
+            for effort in cand.effort_levels {
+                let synth_id = format!("{}-{effort}", cand.variant_prefix);
+                let route = SyntheticRoute {
+                    base_model: cand.base_id.clone(),
+                    effort: effort.clone(),
+                };
+                routes.insert(synth_id.clone(), route.clone());
+                if cand.variant_prefix != cand.base_id {
+                    routes.insert(format!("{}-{effort}", cand.base_id), route);
+                }
+
+                if keep_candidate && seen_ids.insert(synth_id.clone()) {
+                    let mut variant = cand.raw_obj.clone();
+                    variant.insert("name".to_string(), Value::String(format!("models/{synth_id}")));
+                    variant.insert(
+                        "displayName".to_string(),
+                        Value::String(format!("{} ({})", cand.display_name, effort_label(&effort))),
+                    );
+                    variant.insert("thinking".to_string(), Value::Bool(true));
+                    entries.push(ExpandedEntry {
+                        builtin: is_antigravity_builtin_model(&synth_id),
+                        id: synth_id,
+                        value: Value::Object(variant),
+                    });
+                }
+            }
+        } else if keep_candidate && seen_ids.insert(cand.base_id.clone()) {
+            let mut next_obj = cand.raw_obj;
+            next_obj.insert("displayName".to_string(), Value::String(cand.display_name));
+            entries.push(ExpandedEntry {
+                builtin: is_antigravity_builtin_model(&cand.base_id),
+                id: cand.base_id,
+                value: Value::Object(next_obj),
+            });
+        }
     }
 
     let mut builtins = Vec::new();
@@ -600,6 +1069,22 @@ fn extract_endpoint_types(item: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Gemini-family models are only exposed through Antigravity; Claude and Codex catalogs skip them.
+fn is_gemini_family(id: &str, owned_by: &str) -> bool {
+    let lower = id.trim().to_ascii_lowercase();
+    let owner = owned_by.trim().to_ascii_lowercase();
+    lower.starts_with("gemini-")
+        || lower.starts_with("gemma-")
+        || lower.starts_with("imagen-")
+        || owner.contains("gemini")
+        || owner.contains("google")
+}
+
+/// Models kept out of the Claude and Codex catalogs; Antigravity keeps them.
+fn is_client_excluded_model(id: &str, owned_by: &str) -> bool {
+    is_gemini_family(id, owned_by) || id.trim().eq_ignore_ascii_case("deepseek-v4-pro")
 }
 
 fn is_non_chat_or_noise_model(id: &str, eps: &[String]) -> bool {
@@ -1127,6 +1612,13 @@ pub fn build_codex_models_catalog(
             continue;
         };
         let eps = extract_endpoint_types(item);
+        let owned_by = item
+            .get("owned_by")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if is_client_excluded_model(id, owned_by) {
+            continue;
+        }
         let supports_chat_or_responses = eps.iter().any(|ep| {
             matches!(
                 ep.as_str(),
@@ -1245,6 +1737,53 @@ pub fn build_codex_models_catalog(
     json!({ "models": models })
 }
 
+pub fn filter_codex_models_catalog(full_catalog: &Value, filter: &ClientModelFilter) -> Value {
+    let raw_models = full_catalog
+        .get("models")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut selectable = Vec::new();
+    let mut hidden = Vec::new();
+    for item in raw_models {
+        let vis = item
+            .get("visibility")
+            .and_then(Value::as_str)
+            .unwrap_or("list");
+        if vis == "hide" {
+            hidden.push(item);
+        } else {
+            selectable.push(item);
+        }
+    }
+
+    let allowed = normalized_filter_set(AppId::Codex, filter);
+    let mut kept_selectable: Vec<Value> = match allowed {
+        None => selectable,
+        Some(ref set) => {
+            let matched: Vec<Value> = selectable
+                .iter()
+                .filter(|item| {
+                    item.get("slug")
+                        .and_then(Value::as_str)
+                        .map(|slug| set.contains(&slug.trim().to_ascii_lowercase()))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+            if matched.is_empty() && !selectable.is_empty() {
+                selectable.into_iter().take(3).collect()
+            } else {
+                matched
+            }
+        }
+    };
+
+    kept_selectable.extend(hidden);
+    json!({ "models": kept_selectable })
+}
+
 fn parse_claude_tier_and_version(id: &str) -> (Option<&'static str>, u32, u32) {
     let lower = id.to_ascii_lowercase();
     let no_1m = lower.strip_suffix("[1m]").unwrap_or(&lower);
@@ -1298,6 +1837,32 @@ fn claude_display_name(id: &str, tier: Option<&str>, major: u32, minor: u32) -> 
         .join(" ")
 }
 
+/// Claude Desktop only offers the effort selector for models whose catalog entry carries
+/// `max_effort_level`. Pricing metadata wins when the upstream publishes reasoning levels;
+/// otherwise fall back to high.
+fn claude_max_effort_level(real_id: &str, pricing: &PricingCache) -> &'static str {
+    if let Some(levels) = effective_effort_levels(real_id, pricing) {
+        if let Some(level) = ALLOWED_EFFORTS
+            .iter()
+            .rev()
+            .find(|l| levels.iter().any(|x| x == *l))
+        {
+            return level;
+        }
+    }
+    let lower = real_id.to_ascii_lowercase();
+    if lower.starts_with("gpt-6")
+        || lower.starts_with("gpt-5")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+    {
+        "max"
+    } else {
+        "high"
+    }
+}
+
 /// Converts upstream `/v1/models` + `/api/pricing` into Claude Desktop's Anthropic `/v1/models` format.
 pub fn build_claude_models_catalog(upstream_models: &Value, pricing: &PricingCache) -> Value {
     let raw_items = upstream_models
@@ -1307,7 +1872,7 @@ pub fn build_claude_models_catalog(upstream_models: &Value, pricing: &PricingCac
         .unwrap_or_default();
 
     let mut all_ids = HashSet::new();
-    let mut candidate_entries: Vec<(String, bool)> = Vec::new();
+    let mut candidate_ids: Vec<String> = Vec::new();
     for item in &raw_items {
         let Some(id) = item
             .get("id")
@@ -1324,90 +1889,55 @@ pub fn build_claude_models_catalog(upstream_models: &Value, pricing: &PricingCac
             .get("owned_by")
             .and_then(Value::as_str)
             .unwrap_or("");
+        if is_client_excluded_model(id, owned_by) {
+            continue;
+        }
         let eps = extract_endpoint_types(item);
         if is_non_chat_or_noise_model(id, &eps) {
             continue;
         }
-        let is_claude = id.starts_with("claude-") || owned_by.eq_ignore_ascii_case("claude");
-        let supports_anthropic = eps.iter().any(|ep| ep == "anthropic");
-        if (is_claude || supports_anthropic) && all_ids.insert(id.to_string()) {
-            candidate_entries.push((id.to_string(), is_claude));
+        let is_claude =
+            id.to_ascii_lowercase().starts_with("claude-") || owned_by.eq_ignore_ascii_case("claude");
+        if is_claude && all_ids.insert(id.to_string()) {
+            candidate_ids.push(id.to_string());
         }
     }
 
     struct ClaudeCatalogItem {
         id: String,
-        is_claude: bool,
         tier: Option<&'static str>,
         major: u32,
         minor: u32,
-        third_party_rank: i64,
-        third_party_key: String,
     }
 
-    let mut parsed: Vec<ClaudeCatalogItem> = candidate_entries
+    let mut parsed: Vec<ClaudeCatalogItem> = candidate_ids
         .into_iter()
-        .filter(|(id, _)| !is_duplicate_alias(id, &all_ids))
-        .map(|(id, is_claude)| {
-            if is_claude {
-                let (tier, major, minor) = parse_claude_tier_and_version(&id);
-                ClaudeCatalogItem {
-                    id,
-                    is_claude: true,
-                    tier,
-                    major,
-                    minor,
-                    third_party_rank: 0,
-                    third_party_key: String::new(),
-                }
-            } else {
-                let (rank, key) = third_party_family_order(&id);
-                ClaudeCatalogItem {
-                    id,
-                    is_claude: false,
-                    tier: None,
-                    major: 0,
-                    minor: 0,
-                    third_party_rank: rank,
-                    third_party_key: key,
-                }
+        .filter(|id| !is_duplicate_alias(id, &all_ids))
+        .map(|id| {
+            let (tier, major, minor) = parse_claude_tier_and_version(&id);
+            ClaudeCatalogItem {
+                id,
+                tier,
+                major,
+                minor,
             }
         })
         .collect();
 
     parsed.sort_by(|a, b| {
-        if a.is_claude != b.is_claude {
-            return b.is_claude.cmp(&a.is_claude);
-        }
-        if a.is_claude {
-            claude_tier_rank(a.tier)
-                .cmp(&claude_tier_rank(b.tier))
-                .then_with(|| Reverse(a.major).cmp(&Reverse(b.major)))
-                .then_with(|| Reverse(a.minor).cmp(&Reverse(b.minor)))
-                .then_with(|| a.id.cmp(&b.id))
-        } else {
-            a.third_party_rank
-                .cmp(&b.third_party_rank)
-                .then_with(|| a.third_party_key.cmp(&b.third_party_key))
-        }
+        claude_tier_rank(a.tier)
+            .cmp(&claude_tier_rank(b.tier))
+            .then_with(|| Reverse(a.major).cmp(&Reverse(b.major)))
+            .then_with(|| Reverse(a.minor).cmp(&Reverse(b.minor)))
+            .then_with(|| a.id.cmp(&b.id))
     });
 
     let mut seen_tiers: HashSet<&'static str> = HashSet::new();
     let data: Vec<Value> = parsed
         .into_iter()
         .map(|item| {
-            let is_family_default = if item.is_claude {
-                item.tier
-                    .map(|t| seen_tiers.insert(t))
-                    .unwrap_or(false)
-            } else {
-                false
-            };
-            let tier_for_gateway = if item.is_claude {
-                item.tier.unwrap_or("sonnet")
-            } else {
-                "sonnet"
-            };
+            let is_family_default = item.tier.map(|t| seen_tiers.insert(t)).unwrap_or(false);
+            let tier_for_gateway = item.tier.unwrap_or("sonnet");
             let max_input_tokens = model_context_window(&item.id);
             let display_name = pretty_model_display_name(&item.id);
             let description = concise_model_description(
@@ -1416,7 +1946,7 @@ pub fn build_claude_models_catalog(upstream_models: &Value, pricing: &PricingCac
             );
 
             let mut obj = Map::new();
-            obj.insert("id".to_string(), Value::String(item.id));
+            obj.insert("id".to_string(), Value::String(item.id.clone()));
             obj.insert("type".to_string(), Value::String("model".to_string()));
             obj.insert("display_name".to_string(), Value::String(display_name));
             obj.insert(
@@ -1434,6 +1964,10 @@ pub fn build_claude_models_catalog(upstream_models: &Value, pricing: &PricingCac
             obj.insert("supports_1m".to_string(), Value::Bool(false));
             obj.insert("max_input_tokens".to_string(), json!(max_input_tokens));
             obj.insert("description".to_string(), Value::String(description));
+            obj.insert(
+                "max_effort_level".to_string(),
+                Value::String(claude_max_effort_level(&item.id, pricing).to_string()),
+            );
             Value::Object(obj)
         })
         .collect();
@@ -1459,6 +1993,173 @@ pub fn build_claude_models_catalog(upstream_models: &Value, pricing: &PricingCac
     })
 }
 
+/// Claude Desktop takes a gateway model's effort levels and limits from `inferenceModels`
+/// in the 3p profile; the fields it discovers over `/v1/models` are ignored for that.
+pub fn build_claude_inference_models(catalog: &Value, filter: &ClientModelFilter) -> Value {
+    let filtered = filter_claude_models_catalog(catalog, filter);
+    let models: Vec<Value> = filtered
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| {
+            let name = m.get("id").and_then(Value::as_str)?.to_string();
+            let mut entry = Map::new();
+            entry.insert("name".to_string(), Value::String(name));
+            if let Some(label) = m.get("display_name").and_then(Value::as_str) {
+                entry.insert("labelOverride".to_string(), Value::String(label.to_string()));
+            }
+            if let Some(tier) = m.get("anthropic_family_tier").and_then(Value::as_str) {
+                entry.insert(
+                    "anthropicFamilyTier".to_string(),
+                    Value::String(tier.to_string()),
+                );
+            }
+            if m.get("is_family_default").and_then(Value::as_bool) == Some(true) {
+                entry.insert("isFamilyDefault".to_string(), Value::Bool(true));
+            }
+            if let Some(effort) = m.get("max_effort_level").and_then(Value::as_str) {
+                entry.insert("maxEffort".to_string(), Value::String(effort.to_string()));
+            }
+            Some(Value::Object(entry))
+        })
+        .collect();
+    Value::Array(models)
+}
+
+fn claude_catalog_cache_path(paths: &AppPaths) -> std::path::PathBuf {
+    paths.switch_dir().join("claude-catalog.json")
+}
+
+/// Refreshes the cached Claude catalog so the adapter can write `inferenceModels`
+/// without doing network I/O itself.
+pub async fn refresh_claude_catalog_cache(paths: &AppPaths) -> Result<(), String> {
+    let state = read_switch_state(paths);
+    let base_url = state.normalized_base_url();
+    let api_key = read_main_api_key(paths)
+        .ok_or_else(|| "未登录 Tako 账号或缺少 API Key".to_string())?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("创建模型请求客户端失败: {e}"))?;
+
+    let (models_res, pricing_res) = tokio::join!(
+        client
+            .get(format!("{base_url}/v1/models"))
+            .bearer_auth(api_key)
+            .send(),
+        client
+            .get(format!("{base_url}/api/pricing"))
+            .timeout(Duration::from_secs(5))
+            .send()
+    );
+
+    let resp = models_res.map_err(|e| format!("拉取上游模型列表失败: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("上游模型列表返回 HTTP {}", resp.status().as_u16()));
+    }
+    let json_body: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("解析上游模型列表失败: {e}"))?;
+    let pricing = match pricing_res {
+        Ok(r) if r.status().is_success() => r
+            .json::<Value>()
+            .await
+            .map(|v| parse_pricing_metadata(&v))
+            .unwrap_or_default(),
+        _ => PricingCache::default(),
+    };
+
+    let full = build_claude_models_catalog(&json_body, &pricing);
+    let filtered = filter_claude_models_catalog(&full, &state.model_filters.claude);
+    let bytes = serde_json::to_vec(&filtered).map_err(|e| e.to_string())?;
+    fs::write(claude_catalog_cache_path(paths), bytes)
+        .map_err(|e| format!("写入 Claude 模型缓存失败: {e}"))
+}
+
+pub fn load_claude_inference_models(
+    paths: &AppPaths,
+    filter: &ClientModelFilter,
+) -> Option<Value> {
+    let bytes = fs::read(claude_catalog_cache_path(paths)).ok()?;
+    let catalog: Value = serde_json::from_slice(&bytes).ok()?;
+    catalog.get("data").and_then(Value::as_array)?;
+    Some(build_claude_inference_models(&catalog, filter))
+}
+
+pub fn filter_claude_models_catalog(full_catalog: &Value, filter: &ClientModelFilter) -> Value {
+    let raw_data = full_catalog
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let allowed = normalized_filter_set(AppId::Claude, filter);
+    let mut kept: Vec<Value> = match allowed {
+        None => raw_data.clone(),
+        Some(ref set) => raw_data
+            .iter()
+            .filter(|item| {
+                item.get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| set.contains(&catalog_filter_key(AppId::Claude, id)))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect(),
+    };
+
+    if kept.is_empty() && !raw_data.is_empty() {
+        let mut fallback_tiers: HashSet<&'static str> = HashSet::new();
+        for item in &raw_data {
+            let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+            if let (Some(t), _, _) = parse_claude_tier_and_version(id) {
+                if fallback_tiers.insert(t) {
+                    kept.push(item.clone());
+                }
+            }
+        }
+        if kept.is_empty() {
+            kept.push(raw_data[0].clone());
+        }
+    }
+
+    let mut seen_tiers: HashSet<&'static str> = HashSet::new();
+    for item in &mut kept {
+        if let Some(obj) = item.as_object_mut() {
+            obj.remove("is_family_default");
+            let id = obj.get("id").and_then(Value::as_str).unwrap_or("");
+            if let (Some(t), _, _) = parse_claude_tier_and_version(id) {
+                if seen_tiers.insert(t) {
+                    obj.insert("is_family_default".to_string(), Value::Bool(true));
+                }
+            }
+        }
+    }
+
+    let first_id = kept
+        .first()
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
+        .map(|s| Value::String(s.to_string()))
+        .unwrap_or(Value::Null);
+    let last_id = kept
+        .last()
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
+        .map(|s| Value::String(s.to_string()))
+        .unwrap_or(Value::Null);
+
+    json!({
+        "data": kept,
+        "has_more": false,
+        "first_id": first_id,
+        "last_id": last_id,
+    })
+}
+
 /// Strips `[1m]` context suffix from `"model"` in Claude Messages/count_tokens requests.
 pub fn normalize_claude_request_body(body_bytes: &[u8]) -> Vec<u8> {
     let Ok(mut root) = serde_json::from_slice::<Value>(body_bytes) else {
@@ -1467,16 +2168,20 @@ pub fn normalize_claude_request_body(body_bytes: &[u8]) -> Vec<u8> {
     let Some(obj) = root.as_object_mut() else {
         return body_bytes.to_vec();
     };
-    let Some(model) = obj.get("model").and_then(Value::as_str) else {
+    let Some(model) = obj.get("model").and_then(Value::as_str).map(str::to_string) else {
         return body_bytes.to_vec();
     };
+
     let lower = model.to_ascii_lowercase();
-    if let Some(prefix) = lower.strip_suffix("[1m]") {
-        let stripped = model[..prefix.len()].to_string();
-        obj.insert("model".to_string(), Value::String(stripped));
-        return serde_json::to_vec(&root).unwrap_or_else(|_| body_bytes.to_vec());
+    let base = lower
+        .strip_suffix("[1m]")
+        .map(|prefix| model[..prefix.len()].to_string())
+        .unwrap_or_else(|| model.clone());
+    if base == model {
+        return body_bytes.to_vec();
     }
-    body_bytes.to_vec()
+    obj.insert("model".to_string(), Value::String(base));
+    serde_json::to_vec(&root).unwrap_or_else(|_| body_bytes.to_vec())
 }
 
 fn should_strip_req_header(name: &str) -> bool {
@@ -1692,12 +2397,372 @@ fn copy_response_headers(
     b
 }
 
+fn resolve_model_metrics(
+    metric_id: &str,
+    pricing: &PricingCache,
+    perf: &HashMap<String, ModelPerfInfo>,
+) -> (ModelPricingInfo, ModelPerfInfo) {
+    let key = metric_id.trim().to_ascii_lowercase();
+    let price_info = pricing.prices.get(&key).cloned().unwrap_or_default();
+    let perf_info = perf.get(&key).cloned().unwrap_or_default();
+    (price_info, perf_info)
+}
+
+pub fn build_claude_model_options(
+    upstream_models: &Value,
+    pricing: &PricingCache,
+    perf: &HashMap<String, ModelPerfInfo>,
+    filter: &ClientModelFilter,
+) -> ClientModelsResponse {
+    let full = build_claude_models_catalog(upstream_models, pricing);
+    let filtered = filter_claude_models_catalog(&full, filter);
+    let visible_ids: HashSet<String> = filtered
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(Value::as_str).map(|s| s.to_ascii_lowercase()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let models: Vec<ClientModelOption> = full
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let id = m.get("id").and_then(Value::as_str)?.to_string();
+                    let display_name = m
+                        .get("display_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&id)
+                        .to_string();
+                    let description = m
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Tako 托管模型")
+                        .to_string();
+                    let context_window = m.get("max_input_tokens").and_then(Value::as_u64);
+                    let visible = visible_ids.contains(&id.to_ascii_lowercase());
+                    let family = model_family_label(AppId::Claude, &id).to_string();
+                    let (price_info, perf_info) =
+                        resolve_model_metrics(&id, pricing, perf);
+                    Some(ClientModelOption {
+                        family,
+                        recommended: is_recommended_model(AppId::Claude, &id),
+                        id,
+                        display_name,
+                        description,
+                        context_window,
+                        visible,
+                        effort_levels: Vec::new(),
+                        is_free: price_info.is_free,
+                        is_dynamic_pricing: price_info.is_dynamic_pricing,
+                        standard_load_usd_per_m: price_info.standard_load_usd_per_m,
+                        standard_load_max_usd_per_m: price_info.standard_load_max_usd_per_m,
+                        realized_usd_per_m: price_info.realized_usd_per_m,
+                        cache_hit_rate: price_info.cache_hit_rate,
+                        input_usd_per_m: price_info.input_usd_per_m,
+                        output_usd_per_m: price_info.output_usd_per_m,
+                        request_usd: price_info.request_usd,
+                        channels: price_info.channels,
+                        avg_tps: perf_info.avg_tps,
+                        avg_latency_ms: perf_info.avg_latency_ms,
+                        success_rate: perf_info.success_rate,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let visible_count = models.iter().filter(|m| m.visible).count();
+    let total_count = models.len();
+    ClientModelsResponse {
+        app_id: AppId::Claude,
+        filter: filter.clone(),
+        recommended_ids: ClientModelFilter::recommended_ids_for(AppId::Claude)
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        visible_count,
+        total_count,
+        models,
+    }
+}
+
+pub fn build_codex_model_options(
+    upstream_models: &Value,
+    pricing: &PricingCache,
+    perf: &HashMap<String, ModelPerfInfo>,
+    filter: &ClientModelFilter,
+) -> ClientModelsResponse {
+    let full = build_codex_models_catalog(upstream_models, pricing, None);
+    let filtered = filter_codex_models_catalog(&full, filter);
+    let visible_ids: HashSet<String> = filtered
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|m| m.get("visibility").and_then(Value::as_str) != Some("hide"))
+                .filter_map(|m| {
+                    m.get("slug")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_ascii_lowercase())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let models: Vec<ClientModelOption> = full
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter(|m| m.get("visibility").and_then(Value::as_str) != Some("hide"))
+                .filter_map(|m| {
+                    let id = m.get("slug").and_then(Value::as_str)?.to_string();
+                    let display_name = m
+                        .get("display_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&id)
+                        .to_string();
+                    let description = m
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Tako 托管模型")
+                        .to_string();
+                    let context_window = m.get("context_window").and_then(Value::as_u64);
+                    let effort_levels = m
+                        .get("supported_reasoning_levels")
+                        .and_then(Value::as_array)
+                        .map(|lvls| {
+                            lvls.iter()
+                                .filter_map(|lvl| {
+                                    lvl.get("effort").and_then(Value::as_str).map(str::to_string)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let visible = visible_ids.contains(&id.to_ascii_lowercase());
+                    let (price_info, perf_info) = resolve_model_metrics(&id, pricing, perf);
+                    Some(ClientModelOption {
+                        family: model_family_label(AppId::Codex, &id).to_string(),
+                        recommended: is_recommended_model(AppId::Codex, &id),
+                        id,
+                        display_name,
+                        description,
+                        context_window,
+                        visible,
+                        effort_levels,
+                        is_free: price_info.is_free,
+                        is_dynamic_pricing: price_info.is_dynamic_pricing,
+                        standard_load_usd_per_m: price_info.standard_load_usd_per_m,
+                        standard_load_max_usd_per_m: price_info.standard_load_max_usd_per_m,
+                        realized_usd_per_m: price_info.realized_usd_per_m,
+                        cache_hit_rate: price_info.cache_hit_rate,
+                        input_usd_per_m: price_info.input_usd_per_m,
+                        output_usd_per_m: price_info.output_usd_per_m,
+                        request_usd: price_info.request_usd,
+                        channels: price_info.channels,
+                        avg_tps: perf_info.avg_tps,
+                        avg_latency_ms: perf_info.avg_latency_ms,
+                        success_rate: perf_info.success_rate,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let visible_count = models.iter().filter(|m| m.visible).count();
+    let total_count = models.len();
+    ClientModelsResponse {
+        app_id: AppId::Codex,
+        filter: filter.clone(),
+        recommended_ids: ClientModelFilter::recommended_ids_for(AppId::Codex)
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        visible_count,
+        total_count,
+        models,
+    }
+}
+
+pub fn build_antigravity_model_options(
+    upstream_models: &Value,
+    pricing: &PricingCache,
+    perf: &HashMap<String, ModelPerfInfo>,
+    filter: &ClientModelFilter,
+) -> ClientModelsResponse {
+    let candidates = collect_antigravity_base_candidates(upstream_models, pricing);
+    let selected = resolve_antigravity_selected_base_ids(&candidates, filter);
+
+    let models: Vec<ClientModelOption> = candidates
+        .into_iter()
+        .map(|cand| {
+            let visible = selected.contains(&cand.base_id.to_ascii_lowercase());
+            let description = concise_model_description(
+                &cand.base_id,
+                pricing.descriptions.get(&cand.base_id).map(String::as_str),
+            );
+            let context_window = Some(model_context_window(&cand.base_id));
+            let recommended = is_recommended_model(AppId::Antigravity, &cand.base_id)
+                || is_recommended_model(AppId::Antigravity, &cand.variant_prefix);
+            let (price_info, perf_info) = resolve_model_metrics(&cand.base_id, pricing, perf);
+            ClientModelOption {
+                family: model_family_label(AppId::Antigravity, &cand.base_id).to_string(),
+                id: cand.base_id,
+                display_name: cand.display_name,
+                description,
+                context_window,
+                recommended,
+                visible,
+                effort_levels: cand.effort_levels,
+                is_free: price_info.is_free,
+                is_dynamic_pricing: price_info.is_dynamic_pricing,
+                standard_load_usd_per_m: price_info.standard_load_usd_per_m,
+                standard_load_max_usd_per_m: price_info.standard_load_max_usd_per_m,
+                realized_usd_per_m: price_info.realized_usd_per_m,
+                cache_hit_rate: price_info.cache_hit_rate,
+                input_usd_per_m: price_info.input_usd_per_m,
+                output_usd_per_m: price_info.output_usd_per_m,
+                request_usd: price_info.request_usd,
+                channels: price_info.channels,
+                avg_tps: perf_info.avg_tps,
+                avg_latency_ms: perf_info.avg_latency_ms,
+                success_rate: perf_info.success_rate,
+            }
+        })
+        .collect();
+
+    let visible_count = models.iter().filter(|m| m.visible).count();
+    let total_count = models.len();
+    ClientModelsResponse {
+        app_id: AppId::Antigravity,
+        filter: filter.clone(),
+        recommended_ids: ClientModelFilter::recommended_ids_for(AppId::Antigravity)
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        visible_count,
+        total_count,
+        models,
+    }
+}
+
+pub async fn fetch_client_models_for_ui(
+    paths: &AppPaths,
+    app_id: AppId,
+) -> Result<ClientModelsResponse, String> {
+    let switch_state = read_switch_state(paths);
+    let base_url = switch_state.normalized_base_url();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("创建模型请求客户端失败: {e}"))?;
+
+    let models_req = match app_id {
+        AppId::Claude | AppId::Codex => {
+            let api_key = read_main_api_key(paths).ok_or_else(|| {
+                "未登录 Tako 账号或缺少 API Key，无法拉取模型列表".to_string()
+            })?;
+            client
+                .get(format!("{base_url}/v1/models"))
+                .bearer_auth(api_key)
+        }
+        AppId::Antigravity => {
+            let agy_key = effective_agy_api_key(paths).ok_or_else(|| {
+                "未登录 Tako 账号或缺少 Antigravity 专用 Key，无法拉取模型列表".to_string()
+            })?;
+            client
+                .get(format!("{base_url}/v1beta/models"))
+                .header("x-goog-api-key", agy_key)
+        }
+    };
+
+    let pricing_url = format!("{base_url}/api/pricing");
+    let perf_url = format!("{base_url}/api/perf-metrics/summary");
+    let (models_res, pricing_res, perf_res) = tokio::join!(
+        models_req.send(),
+        client
+            .get(&pricing_url)
+            .timeout(Duration::from_secs(5))
+            .send(),
+        client
+            .get(&perf_url)
+            .timeout(Duration::from_secs(5))
+            .send()
+    );
+
+    let pricing = match pricing_res {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<Value>()
+            .await
+            .map(|v| parse_pricing_metadata(&v))
+            .unwrap_or_default(),
+        _ => PricingCache::default(),
+    };
+
+    let perf = match perf_res {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<Value>()
+            .await
+            .map(|v| parse_perf_metrics_summary(&v))
+            .unwrap_or_default(),
+        _ => HashMap::new(),
+    };
+
+    let resp = models_res.map_err(|e| format!("拉取上游模型列表失败: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        let snippet: String = body_text.chars().take(160).collect();
+        return Err(format!("上游返回 HTTP {}: {snippet}", status.as_u16()));
+    }
+
+    let json_body: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("解析上游模型列表失败: {e}"))?;
+
+    if app_id == AppId::Claude {
+        let full = build_claude_models_catalog(&json_body, &pricing);
+        let filtered = filter_claude_models_catalog(&full, &switch_state.model_filters.claude);
+        if let Ok(bytes) = serde_json::to_vec(&filtered) {
+            let _ = fs::write(claude_catalog_cache_path(paths), bytes);
+        }
+    }
+
+    Ok(match app_id {
+        AppId::Claude => build_claude_model_options(
+            &json_body,
+            &pricing,
+            &perf,
+            &switch_state.model_filters.claude,
+        ),
+        AppId::Codex => build_codex_model_options(
+            &json_body,
+            &pricing,
+            &perf,
+            &switch_state.model_filters.codex,
+        ),
+        AppId::Antigravity => build_antigravity_model_options(
+            &json_body,
+            &pricing,
+            &perf,
+            &switch_state.model_filters.antigravity,
+        ),
+    })
+}
+
 async fn handle_models_list(
     state: Arc<ProxyState>,
     path_and_query: &str,
     incoming_headers: &hyper::HeaderMap,
 ) -> Response<ProxyBody> {
-    let base_url = read_switch_state(&state.paths).normalized_base_url();
+    let switch_state = read_switch_state(&state.paths);
+    let base_url = switch_state.normalized_base_url();
     let target_url = format!("{base_url}{path_and_query}");
     let headers = build_upstream_headers(&state.paths, incoming_headers, ClientKind::Antigravity);
 
@@ -1732,7 +2797,11 @@ async fn handle_models_list(
     if status == StatusCode::OK {
         if let Ok(json_body) = serde_json::from_slice::<Value>(&bytes) {
             if json_body.get("models").and_then(Value::as_array).is_some() {
-                let (expanded_body, routes) = expand_models_catalog(json_body, &pricing);
+                let (expanded_body, routes) = expand_models_catalog_with_filter(
+                    json_body,
+                    &pricing,
+                    Some(&switch_state.model_filters.antigravity),
+                );
                 {
                     let mut guard = state.synthetic_routes.write().await;
                     *guard = routes;
@@ -1760,7 +2829,8 @@ async fn handle_codex_models(
     state: Arc<ProxyState>,
     incoming_headers: &hyper::HeaderMap,
 ) -> Response<ProxyBody> {
-    let base_url = read_switch_state(&state.paths).normalized_base_url();
+    let switch_state = read_switch_state(&state.paths);
+    let base_url = switch_state.normalized_base_url();
     let target_url = format!("{base_url}/v1/models");
     let headers = build_upstream_headers(&state.paths, incoming_headers, ClientKind::Codex);
 
@@ -1796,7 +2866,10 @@ async fn handle_codex_models(
     if status == StatusCode::OK {
         if let Ok(json_body) = serde_json::from_slice::<Value>(&bytes) {
             if json_body.get("data").and_then(Value::as_array).is_some() {
-                let catalog = build_codex_models_catalog(&json_body, &pricing, cached_mm.as_ref());
+                let full_catalog =
+                    build_codex_models_catalog(&json_body, &pricing, cached_mm.as_ref());
+                let catalog =
+                    filter_codex_models_catalog(&full_catalog, &switch_state.model_filters.codex);
                 if let Ok(out_bytes) = serde_json::to_vec(&catalog) {
                     return Response::builder()
                         .status(StatusCode::OK)
@@ -1820,7 +2893,8 @@ async fn handle_claude_models(
     state: Arc<ProxyState>,
     incoming_headers: &hyper::HeaderMap,
 ) -> Response<ProxyBody> {
-    let base_url = read_switch_state(&state.paths).normalized_base_url();
+    let switch_state = read_switch_state(&state.paths);
+    let base_url = switch_state.normalized_base_url();
     let target_url = format!("{base_url}/v1/models");
     let headers = build_upstream_headers(&state.paths, incoming_headers, ClientKind::Claude);
 
@@ -1855,7 +2929,11 @@ async fn handle_claude_models(
     if status == StatusCode::OK {
         if let Ok(json_body) = serde_json::from_slice::<Value>(&bytes) {
             if json_body.get("data").and_then(Value::as_array).is_some() {
-                let catalog = build_claude_models_catalog(&json_body, &pricing);
+                let full_catalog = build_claude_models_catalog(&json_body, &pricing);
+                let catalog = filter_claude_models_catalog(
+                    &full_catalog,
+                    &switch_state.model_filters.claude,
+                );
                 if let Ok(out_bytes) = serde_json::to_vec(&catalog) {
                     return Response::builder()
                         .status(StatusCode::OK)
@@ -2623,9 +3701,7 @@ mod tests {
                 "gpt-6.2-sol",
                 "swe-2",
                 "claude-opus-4-8",
-                "deepseek-v4-pro",
                 "deepseek-v4.1-flash",
-                "gemini-3.8-flash",
                 "kimi-k3",
                 "codex-auto-review"
             ]
@@ -2654,14 +3730,14 @@ mod tests {
         assert_eq!(swe_efforts, vec!["medium", "high", "max"]);
 
         let ds = &models[3];
-        assert_eq!(ds["display_name"].as_str(), Some("DeepSeek V4 Pro"));
+        assert_eq!(ds["display_name"].as_str(), Some("DeepSeek V4.1 Flash"));
 
         let review = models.last().unwrap();
         assert_eq!(review["visibility"].as_str(), Some("hide"));
     }
 
     #[test]
-    fn build_claude_models_catalog_deduplicates_and_includes_third_party() {
+    fn build_claude_models_catalog_filters_to_real_claude_models() {
         let pricing = parse_pricing_metadata(&json!({
             "data": [
                 {
@@ -2704,23 +3780,25 @@ mod tests {
                 "claude-sonnet-5-5",
                 "claude-fable-5-2",
                 "claude-haiku-5-5",
-                "claude-haiku-4-5",
-                "deepseek-v4-pro",
-                "deepseek-v4.1-flash",
-                "gpt-6.2-sol",
-                "gemini-3.8-flash",
-                "kimi-k3"
+                "claude-haiku-4-5"
             ]
         );
         assert!(!ids.contains(&"claude-haiku-4-5-20251001"));
-        assert!(!ids.contains(&"deepseek-v4.1-flash-1017"));
-        assert!(!ids.contains(&"k3"));
+        assert!(!ids.contains(&"deepseek-v4-pro"));
+        assert!(!ids.contains(&"deepseek-v4.1-flash"));
+        assert!(!ids.contains(&"gpt-6.2-sol"));
+        assert!(!ids.contains(&"gemini-3.8-flash"));
+        assert!(!ids.contains(&"kimi-k3"));
         assert!(!ids.contains(&"gpt-image-2"));
         assert!(!ids.contains(&"jev-latest"));
         assert!(!ids.contains(&"hy4flash-free"));
 
         // Every entry sets supports_1m = false to eliminate duplicate "[1m]" rows in Claude Desktop.
         assert!(data.iter().all(|m| m["supports_1m"].as_bool() == Some(false)));
+        // Every entry advertises an effort ceiling so Claude Desktop renders the effort selector.
+        assert!(data
+            .iter()
+            .all(|m| matches!(m["max_effort_level"].as_str(), Some("low" | "medium" | "high" | "xhigh" | "max"))));
 
         assert_eq!(data[0]["display_name"].as_str(), Some("Claude Opus 5.5"));
         assert_eq!(data[0]["is_family_default"].as_bool(), Some(true));
@@ -2729,13 +3807,266 @@ mod tests {
         assert!(data[1].get("is_family_default").is_none());
         assert_eq!(data[2]["is_family_default"].as_bool(), Some(true));
         assert_eq!(data[5]["max_input_tokens"].as_u64(), Some(200_000));
+    }
 
-        // Third-party models pass gateway filter via anthropic_family_tier="sonnet" without overriding defaults.
-        assert_eq!(data[6]["display_name"].as_str(), Some("DeepSeek V4 Pro"));
-        assert_eq!(data[6]["anthropic_family_tier"].as_str(), Some("sonnet"));
-        assert!(data[6].get("is_family_default").is_none());
-        assert_eq!(data[8]["display_name"].as_str(), Some("GPT-6.2 Sol"));
-        assert_eq!(data[9]["display_name"].as_str(), Some("Gemini 3.8 Flash"));
+    #[test]
+    fn filter_claude_models_catalog_handles_recommended_custom_all_and_fallback() {
+        let pricing = PricingCache::default();
+        let upstream = json!({
+            "data": [
+                {"id": "claude-opus-5-5", "owned_by": "claude", "supported_endpoint_types": ["anthropic"]},
+                {"id": "claude-opus-5", "owned_by": "claude", "supported_endpoint_types": ["anthropic"]},
+                {"id": "claude-sonnet-5-5", "owned_by": "claude", "supported_endpoint_types": ["anthropic"]},
+                {"id": "claude-fable-5-2", "owned_by": "claude", "supported_endpoint_types": ["anthropic"]},
+                {"id": "claude-haiku-5-5", "owned_by": "claude", "supported_endpoint_types": ["anthropic"]},
+                {"id": "claude-haiku-4-5", "owned_by": "claude", "supported_endpoint_types": ["anthropic"]}
+            ]
+        });
+
+        let full = build_claude_models_catalog(&upstream, &pricing);
+
+        let rec = filter_claude_models_catalog(&full, &ClientModelFilter::default_claude());
+        let rec_data = rec["data"].as_array().unwrap();
+        let rec_ids: Vec<&str> = rec_data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            rec_ids,
+            vec!["claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-2"]
+        );
+        assert!(rec_data
+            .iter()
+            .all(|m| m["is_family_default"].as_bool() == Some(true)));
+        assert_eq!(rec["first_id"].as_str(), Some("claude-opus-5-5"));
+        assert_eq!(rec["last_id"].as_str(), Some("claude-fable-5-2"));
+
+        let custom = filter_claude_models_catalog(
+            &full,
+            &ClientModelFilter {
+                mode: ModelFilterMode::Custom,
+                enabled_ids: vec!["claude-opus-5".to_string(), "claude-haiku-4-5".to_string()],
+            },
+        );
+        let custom_data = custom["data"].as_array().unwrap();
+        let custom_ids: Vec<&str> = custom_data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(custom_ids, vec!["claude-opus-5", "claude-haiku-4-5"]);
+        assert_eq!(custom_data[0]["is_family_default"].as_bool(), Some(true));
+        assert_eq!(custom_data[1]["is_family_default"].as_bool(), Some(true));
+
+        let fallback = filter_claude_models_catalog(
+            &full,
+            &ClientModelFilter {
+                mode: ModelFilterMode::Custom,
+                enabled_ids: vec!["claude-nonexistent".to_string()],
+            },
+        );
+        let fallback_ids: Vec<&str> = fallback["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            fallback_ids,
+            vec![
+                "claude-opus-5-5",
+                "claude-sonnet-5-5",
+                "claude-fable-5-2",
+                "claude-haiku-5-5"
+            ]
+        );
+
+        let all = filter_claude_models_catalog(
+            &full,
+            &ClientModelFilter {
+                mode: ModelFilterMode::All,
+                enabled_ids: vec![],
+            },
+        );
+        let all_data = all["data"].as_array().unwrap();
+        assert_eq!(all_data.len(), 6);
+        assert!(all_data[1].get("is_family_default").is_none());
+
+        let empty_perf = HashMap::new();
+        let ui_opts = build_claude_model_options(
+            &upstream,
+            &pricing,
+            &empty_perf,
+            &ClientModelFilter::default_claude(),
+        );
+        assert_eq!(ui_opts.visible_count, 3);
+        assert_eq!(ui_opts.total_count, 6);
+        assert_eq!(ui_opts.models[0].family, "Opus");
+        assert!(ui_opts.models[0].visible);
+        assert!(!ui_opts.models[1].visible);
+    }
+
+    #[test]
+    fn claude_inference_models_carry_tier_and_effort() {
+        let pricing = PricingCache::default();
+        let upstream = json!({
+            "data": [
+                {"id": "claude-opus-5-5", "owned_by": "claude", "supported_endpoint_types": ["anthropic"]},
+                {"id": "gpt-6.2-sol", "owned_by": "openai", "supported_endpoint_types": ["anthropic"]}
+            ]
+        });
+        let full = build_claude_models_catalog(&upstream, &pricing);
+        let models = build_claude_inference_models(&full, &ClientModelFilter::default_claude());
+        let arr = models.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+
+        let opus = &arr[0];
+        assert_eq!(opus["name"].as_str(), Some("claude-opus-5-5"));
+        assert_eq!(opus["labelOverride"].as_str(), Some("Claude Opus 5.5"));
+        assert_eq!(opus["anthropicFamilyTier"].as_str(), Some("opus"));
+        assert_eq!(opus["isFamilyDefault"].as_bool(), Some(true));
+        assert_eq!(opus["maxEffort"].as_str(), Some("high"));
+    }
+
+    #[test]
+    fn filter_codex_models_catalog_preserves_hidden_review_and_filters_visible() {
+        let pricing = PricingCache::default();
+        let upstream = json!({
+            "data": [
+                {"id": "gpt-6.2-sol", "supported_endpoint_types": ["openai", "openai-response"]},
+                {"id": "swe-2", "supported_endpoint_types": ["openai", "openai-response"]},
+                {"id": "claude-opus-4-8", "supported_endpoint_types": ["anthropic", "openai"]},
+                {"id": "deepseek-v4-pro", "supported_endpoint_types": ["openai", "openai-response"]},
+                {"id": "deepseek-v4.1-flash", "supported_endpoint_types": ["openai", "openai-response"]},
+                {"id": "gemini-3.8-flash", "supported_endpoint_types": ["gemini", "openai"]},
+                {"id": "kimi-k3", "supported_endpoint_types": ["openai", "openai-response"]},
+                {"id": "codex-auto-review", "supported_endpoint_types": ["openai-response"]}
+            ]
+        });
+
+        let full = build_codex_models_catalog(&upstream, &pricing, None);
+        let rec_filter = ClientModelFilter {
+            mode: ModelFilterMode::Recommended,
+            enabled_ids: vec![],
+        };
+        let rec = filter_codex_models_catalog(&full, &rec_filter);
+        let rec_slugs: Vec<&str> = rec["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["slug"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            rec_slugs,
+            vec![
+                "gpt-6.2-sol",
+                "swe-2",
+                "deepseek-v4.1-flash",
+                "codex-auto-review"
+            ]
+        );
+        assert_eq!(
+            rec["models"].as_array().unwrap().last().unwrap()["visibility"].as_str(),
+            Some("hide")
+        );
+
+        let custom = filter_codex_models_catalog(
+            &full,
+            &ClientModelFilter {
+                mode: ModelFilterMode::Custom,
+                enabled_ids: vec!["kimi-k3".to_string()],
+            },
+        );
+        let custom_slugs: Vec<&str> = custom["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["slug"].as_str().unwrap())
+            .collect();
+        assert_eq!(custom_slugs, vec!["kimi-k3", "codex-auto-review"]);
+
+        let fallback = filter_codex_models_catalog(
+            &full,
+            &ClientModelFilter {
+                mode: ModelFilterMode::Custom,
+                enabled_ids: vec!["missing-model".to_string()],
+            },
+        );
+        let fallback_slugs: Vec<&str> = fallback["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["slug"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            fallback_slugs,
+            vec!["gpt-6.2-sol", "swe-2", "claude-opus-4-8", "codex-auto-review"]
+        );
+
+        let empty_perf = HashMap::new();
+        let ui_opts = build_codex_model_options(&upstream, &pricing, &empty_perf, &rec_filter);
+        assert_eq!(ui_opts.visible_count, 3);
+        assert_eq!(ui_opts.total_count, 5);
+        assert!(!ui_opts.models.iter().any(|m| m.id == "codex-auto-review"));
+    }
+
+    #[test]
+    fn expand_models_catalog_with_filter_filters_before_placeholder_cap() {
+        let pricing = parse_pricing_metadata(&json!({
+            "data": [
+                {"model_name": "gemini-4-neon", "reasoning_levels": ["low", "medium", "high", "xhigh"]},
+                {"model_name": "swe-2", "reasoning_levels": ["medium", "high", "max"]}
+            ]
+        }));
+
+        let mut upstream_models = vec![
+            json!({"name": "models/gemini-4-neon", "displayName": "gemini-4-neon"}),
+            json!({"name": "models/deepseek-v4.1-flash", "displayName": "deepseek-v4.1-flash"}),
+            json!({"name": "models/swe-2", "displayName": "swe-2"}),
+        ];
+        for i in 0..38 {
+            upstream_models.push(json!({
+                "name": format!("models/z-extra-model-{i:02}"),
+                "displayName": format!("z-extra-model-{i:02}")
+            }));
+        }
+        let upstream = json!({ "models": upstream_models });
+
+        let custom_filter = ClientModelFilter {
+            mode: ModelFilterMode::Custom,
+            enabled_ids: vec!["deepseek-v4.1-flash".to_string(), "swe-2".to_string()],
+        };
+        let (filtered, routes) =
+            expand_models_catalog_with_filter(upstream.clone(), &pricing, Some(&custom_filter));
+        let names: Vec<&str> = filtered["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "models/deepseek-v4.1-flash",
+                "models/swe-2-medium",
+                "models/swe-2-high",
+                "models/swe-2-max",
+            ]
+        );
+        assert!(routes.contains_key("gemini-4-neon-xhigh"));
+
+        let empty_perf = HashMap::new();
+        let ui_opts =
+            build_antigravity_model_options(&upstream, &pricing, &empty_perf, &custom_filter);
+        assert_eq!(ui_opts.visible_count, 2);
+        assert_eq!(ui_opts.total_count, 41);
+        assert_eq!(
+            ui_opts
+                .models
+                .iter()
+                .find(|m| m.id == "gemini-4-neon")
+                .map(|m| m.effort_levels.clone()),
+            Some(vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string()
+            ])
+        );
     }
 
     #[test]
@@ -2768,5 +4099,161 @@ mod tests {
 
         let plain = br#"{"model":"claude-sonnet-5-5","max_tokens":64}"#;
         assert_eq!(normalize_claude_request_body(plain), plain);
+    }
+
+    #[test]
+    fn parse_pricing_and_perf_metrics_populates_price_and_speed_on_options() {
+        let pricing = parse_pricing_metadata(&json!({
+            "group_ratio": { "default": 1.0, "agy": 1.0 },
+            "data": [
+                {
+                    "model_name": "claude-opus-5-5",
+                    "quota_type": 0,
+                    "model_ratio": 2.0,
+                    "completion_ratio": 5.0,
+                    "model_price": 0.0,
+                    "standard_load_price_per_million": 0.664,
+                    "realized_price_per_million": 178.166,
+                    "cache_hit_rate": 0.9278,
+                    "enable_groups": ["default", "agy"],
+                    "group_channel_ratio_min": { "default": 3.6, "agy": 0.05 },
+                    "group_channel_ratio_max": { "default": 3.6, "agy": 0.05 },
+                    "channels": [
+                        {
+                            "channel_name": "Antigravity反代池-Claude5.5-0.05x",
+                            "channel_ratio": 0.05,
+                            "standard_load_price_per_million": 0.0332
+                        },
+                        {
+                            "channel_name": "CC Max-官方订阅-0.15x",
+                            "channel_ratio": 3.6,
+                            "standard_load_price_per_million": 2.3904
+                        }
+                    ]
+                },
+                {
+                    "model_name": "gemma-4-31b-it",
+                    "quota_type": 0,
+                    "model_ratio": 0.0,
+                    "completion_ratio": 1.0,
+                    "model_price": 0.0,
+                    "enable_groups": ["default"],
+                    "group_channel_ratio_min": { "default": 5.25 }
+                },
+                {
+                    "model_name": "tako-auto",
+                    "quota_type": 1,
+                    "model_ratio": 0.0,
+                    "completion_ratio": 0.0,
+                    "model_price": 0.0,
+                    "enable_groups": ["default"]
+                },
+                {
+                    "model_name": "grok-4.6",
+                    "quota_type": 0,
+                    "billing_mode": "tiered_expr",
+                    "billing_expr": "len <= 200000 ? tier(\"standard\", p * 2 + c * 6 + cr * 0.5) : tier(\"long\", p * 4 + c * 12)",
+                    "model_ratio": 0.0,
+                    "completion_ratio": 3.0,
+                    "model_price": 0.0,
+                    "realized_price_per_million": 0.919,
+                    "cache_hit_rate": 0.372,
+                    "enable_groups": ["default"],
+                    "group_channel_ratio_min": { "default": 0.53 }
+                },
+                {
+                    "model_name": "deepseek-v4.1-flash",
+                    "quota_type": 0,
+                    "model_ratio": 0.15,
+                    "completion_ratio": 4.0,
+                    "model_price": 0.0,
+                    "standard_load_price_per_million": 0.03852,
+                    "enable_groups": ["default"],
+                    "group_channel_ratio_min": { "default": 2.63 }
+                }
+            ]
+        }));
+
+        let perf = parse_perf_metrics_summary(&json!({
+            "success": true,
+            "data": {
+                "models": [
+                    {
+                        "model_name": "claude-opus-5-5",
+                        "avg_tps": 119.6,
+                        "avg_latency_ms": 10416,
+                        "success_rate": 100.0
+                    },
+                    {
+                        "model_name": "deepseek-v4.1-flash",
+                        "avg_tps": 297.57,
+                        "avg_latency_ms": 4274,
+                        "success_rate": 99.77
+                    },
+                    {
+                        "model_name": "tako-auto",
+                        "avg_tps": 0.0,
+                        "avg_latency_ms": 1200,
+                        "success_rate": 100.0
+                    }
+                ]
+            }
+        }));
+
+        let upstream = json!({
+            "data": [
+                {"id": "claude-opus-5-5", "supported_endpoint_types": ["anthropic", "openai"]},
+                {"id": "deepseek-v4.1-flash", "supported_endpoint_types": ["openai", "openai-response"]},
+                {"id": "gemma-4-31b-it", "supported_endpoint_types": ["gemini", "openai"]},
+                {"id": "grok-4.6", "supported_endpoint_types": ["openai"]},
+                {"id": "tako-auto", "supported_endpoint_types": ["openai"]}
+            ]
+        });
+
+        let resp = build_codex_model_options(
+            &upstream,
+            &pricing,
+            &perf,
+            &ClientModelFilter::default_codex(),
+        );
+        let opus = resp.models.iter().find(|m| m.id == "claude-opus-5-5").unwrap();
+        assert!(!opus.is_free);
+        assert!(!opus.is_dynamic_pricing);
+        assert!((opus.standard_load_usd_per_m.unwrap() - 0.0332).abs() < 1e-6);
+        assert!((opus.standard_load_max_usd_per_m.unwrap() - 2.3904).abs() < 1e-6);
+        assert!((opus.realized_usd_per_m.unwrap() - 178.166).abs() < 1e-6);
+        assert!((opus.cache_hit_rate.unwrap() - 0.9278).abs() < 1e-6);
+        assert_eq!(opus.channels.len(), 2);
+        assert!((opus.input_usd_per_m.unwrap() - 0.2).abs() < 1e-6);
+        assert!((opus.output_usd_per_m.unwrap() - 1.0).abs() < 1e-6);
+        assert_eq!(opus.avg_tps, Some(119.6));
+        assert_eq!(opus.avg_latency_ms, Some(10416.0));
+        assert_eq!(opus.success_rate, Some(100.0));
+
+        // Gemini-family models never reach the Codex catalog.
+        assert!(!resp.models.iter().any(|m| m.id == "gemma-4-31b-it"));
+        assert!(pricing.prices.get("gemma-4-31b-it").unwrap().is_free);
+
+        let auto = resp.models.iter().find(|m| m.id == "tako-auto").unwrap();
+        assert!(!auto.is_free);
+        assert_eq!(auto.avg_tps, None);
+        assert_eq!(auto.avg_latency_ms, Some(1200.0));
+
+        let grok = resp.models.iter().find(|m| m.id == "grok-4.6").unwrap();
+        assert!(!grok.is_free);
+        assert!(grok.is_dynamic_pricing);
+        assert_eq!(grok.standard_load_usd_per_m, None);
+        assert!((grok.realized_usd_per_m.unwrap() - 0.919).abs() < 1e-6);
+        assert!((grok.cache_hit_rate.unwrap() - 0.372).abs() < 1e-6);
+
+        let ds = resp
+            .models
+            .iter()
+            .find(|m| m.id == "deepseek-v4.1-flash")
+            .unwrap();
+        assert!(!ds.is_free);
+        assert!((ds.standard_load_usd_per_m.unwrap() - (0.03852 * 2.63)).abs() < 1e-6);
+        assert_eq!(ds.standard_load_max_usd_per_m, None);
+        assert_eq!(ds.avg_tps, Some(297.57));
     }
 }

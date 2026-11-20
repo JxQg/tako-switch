@@ -37,6 +37,58 @@ export interface McpToolsConfig {
   consultModel: string;
 }
 
+export type ModelFilterMode = "recommended" | "custom" | "all";
+
+export interface ClientModelFilter {
+  mode: ModelFilterMode;
+  enabledIds: string[];
+}
+
+export interface ModelFiltersConfig {
+  claude: ClientModelFilter;
+  codex: ClientModelFilter;
+  antigravity: ClientModelFilter;
+}
+
+export interface ModelChannelPrice {
+  name: string;
+  ratio: number;
+  standardLoadUsdPerM: number | null;
+}
+
+export interface ClientModelOption {
+  id: string;
+  displayName: string;
+  family: string;
+  description: string;
+  contextWindow: number | null;
+  recommended: boolean;
+  visible: boolean;
+  effortLevels: string[];
+  isFree: boolean;
+  isDynamicPricing: boolean;
+  standardLoadUsdPerM: number | null;
+  standardLoadMaxUsdPerM: number | null;
+  realizedUsdPerM: number | null;
+  cacheHitRate: number | null;
+  inputUsdPerM: number | null;
+  outputUsdPerM: number | null;
+  requestUsd: number | null;
+  channels: ModelChannelPrice[];
+  avgTps: number | null;
+  avgLatencyMs: number | null;
+  successRate: number | null;
+}
+
+export interface ClientModelsResponse {
+  appId: AppId;
+  filter: ClientModelFilter;
+  recommendedIds: string[];
+  visibleCount: number;
+  totalCount: number;
+  models: ClientModelOption[];
+}
+
 export interface SwitchState {
   baseUrl: string;
   agyApiKey?: string | null;
@@ -49,6 +101,7 @@ export interface SwitchState {
   preferChineseUi?: boolean;
   showTrayBalance?: boolean;
   mcp: McpToolsConfig;
+  modelFilters?: ModelFiltersConfig;
 }
 
 export interface InstallInfo {
@@ -129,9 +182,9 @@ export interface DashboardPayload {
 export const DEFAULT_MANIFEST_URL =
   "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/tako-switch/manifest.json";
 export const DEFAULT_FALLBACK_MANIFEST_URL =
-  "https://raw.githubusercontent.com/Barrierml/tako-switch/main/manifest/manifest.json";
-export const TAKO_FEEDBACK_URL = "https://github.com/Barrierml/tako-switch/issues";
-export const TAKO_RELEASES_URL = "https://github.com/Barrierml/tako-switch/releases/latest";
+  "https://raw.githubusercontent.com/tako-dev/tako-switch/main/manifest/manifest.json";
+export const TAKO_FEEDBACK_URL = "https://github.com/tako-dev/tako-switch/issues";
+export const TAKO_RELEASES_URL = "https://github.com/tako-dev/tako-switch/releases/latest";
 
 export interface InstallProgressEvent {
   appId: AppId;
@@ -187,8 +240,13 @@ export const api = {
   setAppMode: (appId: AppId, mode: AppMode, autoRestart: boolean) =>
     invoke<AppSnapshot>("set_app_mode", { appId, mode, autoRestart }),
   restartApp: (appId: AppId) => invoke<AppSnapshot>("restart_app", { appId }),
+  closeApp: (appId: AppId) => invoke<AppSnapshot>("close_app", { appId }),
   launchApp: (appId: AppId) => invoke<AppSnapshot>("launch_app", { appId }),
   diagnoseApp: (appId: AppId) => invoke<DiagnosticResult>("diagnose_app", { appId }),
+  listClientModels: (appId: AppId) =>
+    invoke<ClientModelsResponse>("list_client_models", { appId }),
+  saveClientModelFilter: (appId: AppId, filter: ClientModelFilter) =>
+    invoke<SwitchState>("save_client_model_filter", { appId, filter }),
   checkAppUpdates: () => invoke<ManifestCheckResult>("check_app_updates"),
   installOrUpgradeApp: (appId: AppId) =>
     invoke<InstallOutcome>("install_or_upgrade_app", { appId }),

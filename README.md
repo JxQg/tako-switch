@@ -38,7 +38,13 @@ npx tauri dev
 npx tauri build --bundles app
 ```
 
-## GitHub Actions Secrets 说明（已配置于 `Barrierml/tako-switch`）
+## 问题反馈与参与迭代
 
-- **Tauri 更新器签名**：`TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+- **官网下载与文档**：<https://tako.shiroha.tech/tako-switch>
+- **Bug 反馈 / 功能建议**：<https://github.com/tako-dev/tako-switch/issues>
+- **开源仓库**：<https://github.com/tako-dev/tako-switch>
+
+## GitHub Actions Secrets 说明（已配置于 `tako-dev/tako-switch`）
+
+- **Tauri 更新器签名**：`TAURI_SIGNING_PRIVATE_KEY`（若私钥设置密码则需同时配置 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，无密码私钥可省略）
 - **Apple Developer ID 签名与公证（`2UU65K4YLY`）**：`APPLE_CERTIFICATE`、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_ID`、`APPLE_PASSWORD`、`APPLE_TEAM_ID`、`KEYCHAIN_PASSWORD`

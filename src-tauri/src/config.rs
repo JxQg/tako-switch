@@ -1,5 +1,7 @@
+use crate::adapters::AppId;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,7 +14,33 @@ pub const DEFAULT_GATEWAY_DISPLAY_SUBTITLE: &str = "Tako AI Gateway";
 pub const DEFAULT_MANIFEST_URL: &str =
     "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/tako-switch/manifest.json";
 pub const DEFAULT_FALLBACK_MANIFEST_URL: &str =
-    "https://raw.githubusercontent.com/Barrierml/tako-switch/main/manifest/manifest.json";
+    "https://raw.githubusercontent.com/tako-dev/tako-switch/main/manifest/manifest.json";
+
+pub const DEFAULT_CLAUDE_RECOMMENDED_MODELS: &[&str] = &[
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-fable-5-2",
+];
+pub const DEFAULT_CODEX_RECOMMENDED_MODELS: &[&str] = &[
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
+    "swe-2",
+    "deepseek-v4.1-flash",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+];
+pub const DEFAULT_ANTIGRAVITY_RECOMMENDED_MODELS: &[&str] = &[
+    "gemini-4-neon",
+    "gemini-4-hydrogen",
+    "gemini-3.8-flash",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
+    "deepseek-v4.1-flash",
+    "swe-2",
+    "gemini-3.1-flash-image",
+];
 
 #[derive(Debug, Clone)]
 pub struct AppPaths {
@@ -196,6 +224,128 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelFilterMode {
+    Recommended,
+    Custom,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientModelFilter {
+    pub mode: ModelFilterMode,
+    #[serde(default)]
+    pub enabled_ids: Vec<String>,
+}
+
+impl ClientModelFilter {
+    pub fn default_for_app(app_id: AppId) -> Self {
+        match app_id {
+            AppId::Claude => Self::default_claude(),
+            AppId::Codex => Self::default_codex(),
+            AppId::Antigravity => Self::default_antigravity(),
+        }
+    }
+
+    pub fn default_claude() -> Self {
+        Self {
+            mode: ModelFilterMode::Recommended,
+            enabled_ids: DEFAULT_CLAUDE_RECOMMENDED_MODELS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }
+    }
+
+    pub fn default_codex() -> Self {
+        Self {
+            mode: ModelFilterMode::All,
+            enabled_ids: DEFAULT_CODEX_RECOMMENDED_MODELS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }
+    }
+
+    pub fn default_antigravity() -> Self {
+        Self {
+            mode: ModelFilterMode::All,
+            enabled_ids: DEFAULT_ANTIGRAVITY_RECOMMENDED_MODELS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }
+    }
+
+    pub fn recommended_ids_for(app_id: AppId) -> &'static [&'static str] {
+        match app_id {
+            AppId::Claude => DEFAULT_CLAUDE_RECOMMENDED_MODELS,
+            AppId::Codex => DEFAULT_CODEX_RECOMMENDED_MODELS,
+            AppId::Antigravity => DEFAULT_ANTIGRAVITY_RECOMMENDED_MODELS,
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        let mut seen = HashSet::new();
+        let mut enabled_ids = Vec::with_capacity(self.enabled_ids.len());
+        for raw in self.enabled_ids {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            if seen.insert(lower) {
+                enabled_ids.push(trimmed.to_string());
+            }
+        }
+        Self {
+            mode: self.mode,
+            enabled_ids,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelFiltersConfig {
+    #[serde(default = "ClientModelFilter::default_claude")]
+    pub claude: ClientModelFilter,
+    #[serde(default = "ClientModelFilter::default_codex")]
+    pub codex: ClientModelFilter,
+    #[serde(default = "ClientModelFilter::default_antigravity")]
+    pub antigravity: ClientModelFilter,
+}
+
+impl Default for ModelFiltersConfig {
+    fn default() -> Self {
+        Self {
+            claude: ClientModelFilter::default_claude(),
+            codex: ClientModelFilter::default_codex(),
+            antigravity: ClientModelFilter::default_antigravity(),
+        }
+    }
+}
+
+impl ModelFiltersConfig {
+    pub fn for_app(&self, app_id: AppId) -> &ClientModelFilter {
+        match app_id {
+            AppId::Claude => &self.claude,
+            AppId::Codex => &self.codex,
+            AppId::Antigravity => &self.antigravity,
+        }
+    }
+
+    pub fn for_app_mut(&mut self, app_id: AppId) -> &mut ClientModelFilter {
+        match app_id {
+            AppId::Claude => &mut self.claude,
+            AppId::Codex => &mut self.codex,
+            AppId::Antigravity => &mut self.antigravity,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchState {
@@ -217,6 +367,8 @@ pub struct SwitchState {
     pub show_tray_balance: bool,
     #[serde(default)]
     pub mcp: McpToolsConfig,
+    #[serde(default)]
+    pub model_filters: ModelFiltersConfig,
 }
 
 impl SwitchState {
@@ -233,6 +385,7 @@ impl SwitchState {
             prefer_chinese_ui: true,
             show_tray_balance: true,
             mcp: McpToolsConfig::with_default_dir(paths),
+            model_filters: ModelFiltersConfig::default(),
         }
     }
 
@@ -516,6 +669,56 @@ mod tests {
         assert_eq!(
             effective_agy_api_key(&paths).as_deref(),
             Some("cr_dedicated_agy")
+        );
+    }
+
+    #[test]
+    fn legacy_switch_state_defaults_model_filters_and_normalizes() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let legacy_json = serde_json::json!({
+            "baseUrl": "https://tako.shiroha.tech",
+            "manifestUrl": DEFAULT_MANIFEST_URL,
+            "fallbackManifestUrl": DEFAULT_FALLBACK_MANIFEST_URL,
+            "autoCheckUpdates": true,
+            "mcp": McpToolsConfig::default(),
+        });
+        write_atomic(
+            &paths.state_path(),
+            serde_json::to_string(&legacy_json).unwrap().as_bytes(),
+            false,
+        )
+        .unwrap();
+
+        let loaded = read_switch_state(&paths);
+        assert_eq!(
+            loaded.model_filters.claude.mode,
+            ModelFilterMode::Recommended
+        );
+        assert_eq!(
+            loaded.model_filters.claude.enabled_ids,
+            DEFAULT_CLAUDE_RECOMMENDED_MODELS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(loaded.model_filters.codex.mode, ModelFilterMode::All);
+        assert_eq!(loaded.model_filters.antigravity.mode, ModelFilterMode::All);
+
+        let normalized = ClientModelFilter {
+            mode: ModelFilterMode::Custom,
+            enabled_ids: vec![
+                " claude-opus-5-5 ".to_string(),
+                "".to_string(),
+                "   ".to_string(),
+                "Claude-Opus-5-5".to_string(),
+                "claude-sonnet-5-5".to_string(),
+            ],
+        }
+        .normalized();
+        assert_eq!(
+            normalized.enabled_ids,
+            vec!["claude-opus-5-5", "claude-sonnet-5-5"]
         );
     }
 }

@@ -18,6 +18,9 @@
   --accent-border: rgba(79, 70, 229, 0.24);
   --success: #059669;
   --success-soft: rgba(5, 150, 105, 0.11);
+  --success-border: rgba(5, 150, 105, 0.24);
+  --success-glow: rgba(16, 185, 129, 0.085);
+  --success-ring: rgba(16, 185, 129, 0.42);
   --warning: #d97706;
   --warning-soft: rgba(217, 119, 6, 0.11);
   --danger: #dc2626;
@@ -51,6 +54,9 @@
     --accent-border: rgba(99, 102, 241, 0.34);
     --success: #34d399;
     --success-soft: rgba(52, 211, 153, 0.15);
+    --success-border: rgba(52, 211, 153, 0.24);
+    --success-glow: rgba(52, 211, 153, 0.11);
+    --success-ring: rgba(52, 211, 153, 0.45);
     --warning: #fbbf24;
     --warning-soft: rgba(251, 191, 36, 0.15);
     --danger: #f87171;
@@ -84,6 +90,9 @@
   --accent-border: rgba(99, 102, 241, 0.34);
   --success: #34d399;
   --success-soft: rgba(52, 211, 153, 0.15);
+  --success-border: rgba(52, 211, 153, 0.24);
+  --success-glow: rgba(52, 211, 153, 0.11);
+  --success-ring: rgba(52, 211, 153, 0.45);
   --warning: #fbbf24;
   --warning-soft: rgba(251, 191, 36, 0.15);
   --danger: #f87171;
@@ -166,4 +175,118 @@ pre,
 
 .subtle-scroll::-webkit-scrollbar-thumb:hover {
   background: var(--text-muted);
+}
+
+/* Refined running-state indicators: subtle left edge bar + ambient whisper + breathing LED dot */
+@keyframes tako-ambient-breathe {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes tako-bar-breathe {
+  0%,
+  100% {
+    opacity: 0.48;
+    box-shadow: 0 0 0 0 transparent;
+  }
+  50% {
+    opacity: 0.95;
+    box-shadow: 0 0 8px 0 var(--success-ring);
+  }
+}
+
+@keyframes tako-dot-core {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+    opacity: 0.85;
+  }
+  50% {
+    box-shadow: 0 0 5px 1px var(--success-ring);
+    opacity: 1;
+  }
+}
+
+@keyframes tako-dot-ripple {
+  0% {
+    transform: scale(1);
+    opacity: 0.6;
+  }
+  65% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
+.tako-running-row {
+  position: relative;
+}
+
+.tako-running-row > * {
+  position: relative;
+  z-index: 1;
+}
+
+.tako-running-row::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(220px 92px at 32px 50%, var(--success-glow), transparent 74%);
+  animation: tako-ambient-breathe 4s ease-in-out infinite;
+}
+
+.tako-running-row::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 14px;
+  bottom: 14px;
+  width: 2.5px;
+  border-radius: 0 999px 999px 0;
+  background-color: var(--success);
+  pointer-events: none;
+  animation: tako-bar-breathe 4s ease-in-out infinite;
+}
+
+.tako-live-dot {
+  position: relative;
+  display: inline-flex;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background-color: var(--success);
+  flex-shrink: 0;
+  animation: tako-dot-core 2.8s ease-in-out infinite;
+}
+
+.tako-live-dot::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background-color: var(--success);
+  pointer-events: none;
+  animation: tako-dot-ripple 2.8s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tako-running-row::before,
+  .tako-running-row::after,
+  .tako-live-dot,
+  .tako-live-dot::after {
+    animation: none;
+  }
+  .tako-live-dot::after {
+    opacity: 0;
+  }
 }

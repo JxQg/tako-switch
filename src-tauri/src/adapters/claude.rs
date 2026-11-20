@@ -55,6 +55,20 @@ impl ClaudeAdapter {
         paths.home.join(".claude").join("settings.json")
     }
 
+    fn has_managed_tako_mcp(paths: &AppPaths) -> bool {
+        read_json_object_or_empty(&Self::profile_3p_path(paths))
+            .ok()
+            .and_then(|m| m.get("managedMcpServers").and_then(Value::as_array).cloned())
+            .map(|entries| {
+                entries.iter().any(|e| {
+                    e.get("name").and_then(Value::as_str) == Some("tako")
+                        && e.get("transport").and_then(Value::as_str) == Some("stdio")
+                        && e.get("command").and_then(Value::as_str).is_some_and(|c| !c.is_empty())
+                })
+            })
+            .unwrap_or(false)
+    }
+
     fn set_claude_code_mcp_permissions(paths: &AppPaths, enable: bool) -> Result<(), String> {
         let path = Self::claude_code_settings_path(paths);
         if !enable && !path.exists() {
@@ -272,7 +286,7 @@ impl DesktopAppAdapter for ClaudeAdapter {
 
     fn read_mcp_enabled(&self, paths: &AppPaths, mode: AppMode) -> bool {
         match mode {
-            AppMode::Tako => has_tako_mcp_server(&Self::mcp_3p_path(paths)),
+            AppMode::Tako => Self::has_managed_tako_mcp(paths),
             AppMode::Official => has_tako_mcp_server(&Self::mcp_1p_path(paths)),
         }
     }
@@ -352,16 +366,35 @@ impl DesktopAppAdapter for ClaudeAdapter {
                     "mcpPersistentAlwaysAllowEnabled".to_string(),
                     Value::Bool(true),
                 );
+                // The 3p deployment gates tool egress with a fail-closed allowlist, which
+                // blocks WebFetch/WebSearch on any host not listed here.
+                profile.insert(
+                    "coworkEgressAllowedHosts".to_string(),
+                    serde_json::json!(["*"]),
+                );
+                profile.insert(
+                    "builtinToolPolicy".to_string(),
+                    serde_json::json!({
+                        "WebFetch": "allow",
+                        "WebSearch": "allow",
+                    }),
+                );
                 let mut tool_policy = Map::new();
                 tool_policy.insert("*".to_string(), Value::String("allow".to_string()));
                 for &tool_name in crate::adapters::TAKO_MCP_TOOL_NAMES {
                     tool_policy.insert(tool_name.to_string(), Value::String("allow".to_string()));
                 }
+                // Deliver the MCP server as a managed stdio entry: Claude Desktop only
+                // enforces `toolPolicy` for servers the deployment itself provides, so this
+                // is what makes the Tako tools usable without a per-tool approval prompt.
+                let mcp_entry = crate::adapters::build_stdio_mcp_json_entry(paths);
                 profile.insert(
                     "managedMcpServers".to_string(),
                     serde_json::json!([{
                         "name": "tako",
-                        "transport": "policy-only",
+                        "transport": "stdio",
+                        "command": mcp_entry.get("command").cloned().unwrap_or(Value::Null),
+                        "args": mcp_entry.get("args").cloned().unwrap_or_else(|| serde_json::json!([])),
                         "toolPolicy": Value::Object(tool_policy)
                     }]),
                 );
@@ -369,6 +402,12 @@ impl DesktopAppAdapter for ClaudeAdapter {
                     "organizationInstructions".to_string(),
                     Value::String(instructions.to_string()),
                 );
+                // Desktop only offers effort levels for gateway models declared here.
+                if let Some(inference_models) =
+                    crate::agy_proxy::load_claude_inference_models(paths, &state.model_filters.claude)
+                {
+                    profile.insert("inferenceModels".to_string(), inference_models);
+                }
 
                 let prof_bytes = serde_json::to_vec_pretty(&Value::Object(profile))
                     .map_err(|e| format!("序列化 Claude 3p profile 失败: {e}"))?;
@@ -407,7 +446,9 @@ impl DesktopAppAdapter for ClaudeAdapter {
                 }
 
                 merge_tako_mcp_server(&mcp_1p, paths, false)?;
-                merge_tako_mcp_server(&mcp_3p, paths, true)?;
+                // The 3p slot gets tako from the managed profile entry, not the user config,
+                // so leave the user config alone to avoid starting a second instance.
+                merge_tako_mcp_server(&mcp_3p, paths, false)?;
                 Self::set_claude_code_mcp_permissions(paths, true)?;
                 Ok(())
             }
@@ -465,8 +506,8 @@ impl DesktopAppAdapter for ClaudeAdapter {
                     }
                 }
             }
-            if !has_tako_mcp_server(&Self::mcp_3p_path(paths)) {
-                notes.push("提示: Claude-3p 尚未注入 tako MCP".to_string());
+            if !Self::has_managed_tako_mcp(paths) {
+                notes.push("提示: Claude-3p profile 尚未下发 tako MCP".to_string());
             }
         }
 
@@ -630,8 +671,18 @@ mod tests {
         assert_eq!(managed[0].get("name").and_then(Value::as_str), Some("tako"));
         assert_eq!(
             managed[0].get("transport").and_then(Value::as_str),
-            Some("policy-only")
+            Some("stdio")
         );
+        assert!(managed[0]
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|c| !c.is_empty()));
+        assert_eq!(
+            managed[0].get("args").and_then(Value::as_array).map(Vec::len),
+            Some(1)
+        );
+        // The 3p user config must not also define tako, or Desktop starts two instances.
+        assert!(!has_tako_mcp_server(&ClaudeAdapter::mcp_3p_path(&paths)));
         assert_eq!(
             managed[0]
                 .get("toolPolicy")
