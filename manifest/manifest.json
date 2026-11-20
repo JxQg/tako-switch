@@ -1,27 +1,27 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-20T11:56:37Z",
+  "generatedAt": "2026-11-20T23:28:49Z",
   "apps": {
     "dsh-tako": {
       "displayName": "DSH Tako",
-      "version": "0.1.55",
+      "version": "0.1.56",
       "platforms": {
         "macos-arm64": {
-          "url": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.55/DSH-Tako-0.1.55-mac-arm64.dmg",
-          "version": "0.1.55",
+          "url": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.56/DSH-Tako-0.1.56-mac-arm64.dmg",
+          "version": "0.1.56",
           "installType": "dmg",
-          "fallbackUrl": "https://github.com/tako-dev/dsh-tako-desktop/releases/download/v0.1.55/DSH-Tako-0.1.55-mac-arm64.dmg",
-          "sha256": "bc603022ad1364536714a8d27a1042ca88519e6fe2aa7c0df84f16c09a5a4f17",
-          "size": 270740588,
+          "fallbackUrl": "https://github.com/tako-dev/dsh-tako-desktop/releases/download/v0.1.56/DSH-Tako-0.1.56-mac-arm64.dmg",
+          "sha256": "3bf34434aba316543777a61665dd62d0f7f6580ccfb1144da0cf51492b4dfa3e",
+          "size": 270742385,
           "appBundleName": "DSH Tako.app"
         },
         "windows-x64": {
-          "url": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.55/DSH-Tako-0.1.55-win-x64.exe",
-          "version": "0.1.55",
+          "url": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.56/DSH-Tako-0.1.56-win-x64.exe",
+          "version": "0.1.56",
           "installType": "exe",
-          "fallbackUrl": "https://github.com/tako-dev/dsh-tako-desktop/releases/download/v0.1.55/DSH-Tako-0.1.55-win-x64.exe",
-          "sha256": "bc5a39a7245d2559c93e284ee5d63d86a5e0f795c28e3ca5d9d08cfd2c44f79a",
-          "size": 313575106,
+          "fallbackUrl": "https://github.com/tako-dev/dsh-tako-desktop/releases/download/v0.1.56/DSH-Tako-0.1.56-win-x64.exe",
+          "sha256": "8c35f091d16482c540a8834d428bd6c1c638d42f783c149fea8ae39aaa246d32",
+          "size": 313575019,
           "silentArgs": [
             "/S"
           ]
@@ -30,21 +30,21 @@
     },
     "codex": {
       "displayName": "Codex Desktop",
-      "version": "26.1117.31558",
+      "version": "26.1117.41037",
       "platforms": {
         "macos-arm64": {
-          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-arm64-26.1117.31558.zip",
-          "version": "26.1117.31558",
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-arm64-26.1117.41037.zip",
+          "version": "26.1117.41037",
           "installType": "zip",
           "appBundleName": "ChatGPT.app",
-          "size": 723988688
+          "size": 724006681
         },
         "macos-x64": {
-          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-x64-26.1117.31558.zip",
-          "version": "26.1117.31558",
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-x64-26.1117.41037.zip",
+          "version": "26.1117.41037",
           "installType": "zip",
           "appBundleName": "ChatGPT.app",
-          "size": 754284267
+          "size": 754302240
         },
         "windows-x64": {
           "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix",
@@ -57,52 +57,43 @@
     },
     "claude": {
       "displayName": "Claude Desktop",
-      "version": "6.28899.2",
+      "version": "6.28899.6",
       "platforms": {
         "macos-universal": {
-          "url": "https://downloads.claude.ai/releases/darwin/universal/6.28899.2/Claude-155ca43c0ad5a4bd5734795688543b65b464cf47.zip",
-          "version": "6.28899.2",
+          "url": "https://downloads.claude.ai/releases/darwin/universal/6.28899.6/Claude-2f5fc59b2d1c672dd9dced86720c50f48cca0cf9.zip",
+          "version": "6.28899.6",
           "installType": "zip",
           "appBundleName": "Claude.app",
-          "size": 404686665
-        },
-        "windows-x64": {
-          "url": "https://downloads.claude.ai/releases/win32/x64/6.28899.2/Claude-155ca43c0ad5a4bd5734795688543b65b464cf47.exe",
-          "version": "6.28899.2",
-          "installType": "exe",
-          "silentArgs": [
-            "--silent"
-          ],
-          "size": 279375008
+          "size": 404693227
         }
       }
     },
     "antigravity": {
       "displayName": "Google Antigravity",
-      "version": "2.33.0",
+      "version": "2.34.0",
       "platforms": {
         "macos-arm64": {
-          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.33.0-4731201358004224/darwin-arm/Antigravity.zip",
-          "version": "2.33.0",
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.34.0-5887025308631040/darwin-arm/Antigravity.zip",
+          "version": "2.34.0",
           "installType": "zip",
-          "sha512": "6a418a0680163b166675dad0caf4870f19a70ad69a2e7cfb8da0530e0fbc83cbc6fe5cad06576f2241d13f15c0f965ac9ba5ead853fe7d2cd60ff04a166b01bd",
-          "size": 208556255,
+          "sha512": "e266374246e95b1babbb980fbc9ada6ddaf7b4c1ff9a7403b5a965700e66e9b650ea0dc00a5a94e4dea0af2b747a697b9ab2ed9bb5646fe88841d0d1077c0217",
+          "size": 211599326,
           "appBundleName": "Antigravity.app"
         },
         "macos-x64": {
-          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.33.0-4731201358004224/darwin-x64/Antigravity.zip",
-          "version": "2.33.0",
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.34.0-5887025308631040/darwin-x64/Antigravity.zip",
+          "version": "2.34.0",
           "installType": "zip",
-          "sha512": "44a2b19436a834d5d788eed327092af11f1139f3a85cd2e5ea9c2b4b44e405040544a97f24a21956a280f37e11eac7f4d65ebc3f84e1814adef8e193bf7f893a",
-          "size": 220260763,
+          "sha512": "a2fae6eecf1818d511c3a9f8d43acbd8aea42191efc1a955156682495450cb4ae32c5e6e493c908a09b9c387443dbe18eee9c47038be15b978f63f4762b78293",
+          "size": 223410052,
           "appBundleName": "Antigravity.app"
         },
         "windows-x64": {
-          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.33.0-4731201358004224/windows-x64/Antigravity-x64.exe",
-          "version": "2.33.0",
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.34.0-5887025308631040/windows-x64/Antigravity-x64.exe",
+          "version": "2.34.0",
           "installType": "exe",
-          "sha512": "3636c0fe4b477bbc756324dbbf14eab541cf974560093a95c57db409370dd871557497bb9511938eb0408074fd0a0972cb4f2f3024fce54a4d73bdbe2d9c2a1b",
-          "size": 182549552,
+          "sha512": "2a430f97a29643cb1751dbe46d29379c775f5b24983e413d64d6be49b2849cb304e19c30a45f500137f75a5421ad09d82dd7d1d4ed290c1c35be3d7fe13f0a6c",
+          "size": 169817280,
           "silentArgs": [
             "/VERYSILENT",
             "/NORESTART",
