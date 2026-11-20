@@ -220,7 +220,7 @@ impl DesktopAppAdapter for CodexAdapter {
         }
         #[cfg(target_os = "windows")]
         {
-            is_windows_process_running("Codex")
+            super::windows_process::is_running(AppId::Codex)
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         false
@@ -473,14 +473,6 @@ fn detect_windows_codex() -> Option<(Option<String>, Option<String>)> {
     let ver = parts.next().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let loc = parts.next().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     Some((ver, loc))
-}
-
-#[cfg(target_os = "windows")]
-fn is_windows_process_running(name: &str) -> bool {
-    let script = format!(
-        "if (Get-Process -Name '{name}' -ErrorAction SilentlyContinue) {{ 'true' }}"
-    );
-    ps_hidden(&script).as_deref() == Some("true")
 }
 
 #[cfg(target_os = "windows")]

@@ -248,7 +248,7 @@ impl DesktopAppAdapter for AntigravityAdapter {
         }
         #[cfg(target_os = "windows")]
         {
-            is_windows_process_running("Antigravity")
+            super::windows_process::is_running(AppId::Antigravity)
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         false
@@ -610,14 +610,6 @@ fn detect_windows_antigravity(paths: &AppPaths) -> Option<(Option<String>, Strin
         }
     }
     None
-}
-
-#[cfg(target_os = "windows")]
-fn is_windows_process_running(name: &str) -> bool {
-    let script = format!(
-        "if (Get-Process -Name '{name}' -ErrorAction SilentlyContinue) {{ 'true' }}"
-    );
-    ps_hidden(&script).as_deref() == Some("true")
 }
 
 #[cfg(target_os = "windows")]
