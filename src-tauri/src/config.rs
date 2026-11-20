@@ -46,6 +46,7 @@ pub const DEFAULT_ANTIGRAVITY_RECOMMENDED_MODELS: &[&str] = &[
 pub struct AppPaths {
     pub home: PathBuf,
     pub tako_dir: PathBuf,
+    pub dsh_tako_dir: PathBuf,
     pub codex_dir: PathBuf,
     pub claude_1p_dir: PathBuf,
     pub claude_3p_dir: PathBuf,
@@ -67,6 +68,11 @@ impl AppPaths {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".tako"));
 
+        let dsh_tako_dir = std::env::var_os("DSH_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".dsh-tako"));
+
         let codex_dir = std::env::var_os("CODEX_HOME")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
@@ -79,6 +85,7 @@ impl AppPaths {
         Ok(Self {
             home,
             tako_dir,
+            dsh_tako_dir,
             codex_dir,
             claude_1p_dir,
             claude_3p_dir,
@@ -92,6 +99,7 @@ impl AppPaths {
         Self {
             home: root.to_path_buf(),
             tako_dir: root.join(".tako"),
+            dsh_tako_dir: root.join(".dsh-tako"),
             codex_dir: root.join(".codex"),
             claude_1p_dir: root.join("claude_1p"),
             claude_3p_dir: root.join("claude_3p"),
@@ -243,9 +251,17 @@ pub struct ClientModelFilter {
 impl ClientModelFilter {
     pub fn default_for_app(app_id: AppId) -> Self {
         match app_id {
+            AppId::DshTako => Self::default_dsh_tako(),
             AppId::Claude => Self::default_claude(),
             AppId::Codex => Self::default_codex(),
             AppId::Antigravity => Self::default_antigravity(),
+        }
+    }
+
+    pub fn default_dsh_tako() -> Self {
+        Self {
+            mode: ModelFilterMode::All,
+            enabled_ids: Vec::new(),
         }
     }
 
@@ -281,6 +297,7 @@ impl ClientModelFilter {
 
     pub fn recommended_ids_for(app_id: AppId) -> &'static [&'static str] {
         match app_id {
+            AppId::DshTako => &[],
             AppId::Claude => DEFAULT_CLAUDE_RECOMMENDED_MODELS,
             AppId::Codex => DEFAULT_CODEX_RECOMMENDED_MODELS,
             AppId::Antigravity => DEFAULT_ANTIGRAVITY_RECOMMENDED_MODELS,
@@ -310,6 +327,8 @@ impl ClientModelFilter {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelFiltersConfig {
+    #[serde(default = "ClientModelFilter::default_dsh_tako")]
+    pub dsh_tako: ClientModelFilter,
     #[serde(default = "ClientModelFilter::default_claude")]
     pub claude: ClientModelFilter,
     #[serde(default = "ClientModelFilter::default_codex")]
@@ -321,6 +340,7 @@ pub struct ModelFiltersConfig {
 impl Default for ModelFiltersConfig {
     fn default() -> Self {
         Self {
+            dsh_tako: ClientModelFilter::default_dsh_tako(),
             claude: ClientModelFilter::default_claude(),
             codex: ClientModelFilter::default_codex(),
             antigravity: ClientModelFilter::default_antigravity(),
@@ -331,6 +351,7 @@ impl Default for ModelFiltersConfig {
 impl ModelFiltersConfig {
     pub fn for_app(&self, app_id: AppId) -> &ClientModelFilter {
         match app_id {
+            AppId::DshTako => &self.dsh_tako,
             AppId::Claude => &self.claude,
             AppId::Codex => &self.codex,
             AppId::Antigravity => &self.antigravity,
@@ -339,6 +360,7 @@ impl ModelFiltersConfig {
 
     pub fn for_app_mut(&mut self, app_id: AppId) -> &mut ClientModelFilter {
         match app_id {
+            AppId::DshTako => &mut self.dsh_tako,
             AppId::Claude => &mut self.claude,
             AppId::Codex => &mut self.codex,
             AppId::Antigravity => &mut self.antigravity,

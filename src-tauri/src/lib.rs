@@ -299,10 +299,15 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
     for &app_id in AppId::all() {
         let mode = get_adapter(app_id).read_mode(paths);
         let mark = |m: AppMode| if mode == m { "● " } else { "○ " };
+        let (off_label, tako_label) = if app_id == AppId::DshTako {
+            ("独立登录", "同步密钥 (免二次登录)")
+        } else {
+            ("官方直连", "Tako 全接管 (免官方登录)")
+        };
         let off = MenuItem::with_id(
             app,
             format!("mode:{}:official", app_id.as_str()),
-            format!("{}官方直连", mark(AppMode::Official)),
+            format!("{}{off_label}", mark(AppMode::Official)),
             true,
             None::<&str>,
         )
@@ -310,7 +315,7 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
         let tako = MenuItem::with_id(
             app,
             format!("mode:{}:tako", app_id.as_str()),
-            format!("{}Tako 全接管 (免官方登录)", mark(AppMode::Tako)),
+            format!("{}{tako_label}", mark(AppMode::Tako)),
             true,
             None::<&str>,
         )
@@ -318,7 +323,11 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
 
         let sub = Submenu::with_items(
             app,
-            format!("{} ({})", app_id.display_name(), mode_label(mode)),
+            format!(
+                "{} ({})",
+                app_id.display_name(),
+                mode_label_for(app_id, mode)
+            ),
             true,
             &[&off, &tako],
         )
@@ -357,9 +366,9 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
     items.push(&show);
     items.push(&refresh_bal);
     items.push(&sep1);
-    items.push(&submenus[0]);
-    items.push(&submenus[1]);
-    items.push(&submenus[2]);
+    for sub in &submenus {
+        items.push(sub);
+    }
     items.push(&sep2);
     items.push(&check_upd);
     items.push(&quit);
@@ -367,7 +376,13 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
     Menu::with_items(app, &items).map_err(|e| format!("组装托盘菜单失败: {e}"))
 }
 
-fn mode_label(mode: AppMode) -> &'static str {
+fn mode_label_for(app_id: AppId, mode: AppMode) -> &'static str {
+    if app_id == AppId::DshTako {
+        return match mode {
+            AppMode::Official => "独立",
+            AppMode::Tako => "同步",
+        };
+    }
     match mode {
         AppMode::Official => "官方",
         AppMode::Tako => "Tako",
@@ -471,6 +486,7 @@ fn parse_tray_mode_id(id: &str) -> Option<(AppId, AppMode)> {
         return None;
     }
     let app_id = match parts.next()? {
+        "dsh-tako" => AppId::DshTako,
         "codex" => AppId::Codex,
         "claude" => AppId::Claude,
         "antigravity" => AppId::Antigravity,
@@ -548,10 +564,24 @@ async fn get_dashboard(app: AppHandle, refresh_account: bool) -> Result<Dashboar
     })
 }
 
+fn sync_after_account_login(paths: &AppPaths) {
+    for &app_id in AppId::all() {
+        let adapter = get_adapter(app_id);
+        let should_sync = adapter.read_mode(paths) == AppMode::Tako
+            || (app_id == AppId::DshTako
+                && adapter.detect_install(paths).installed
+                && !adapters::dsh_tako::has_any_dsh_tako_key(paths));
+        if should_sync {
+            let _ = adapter.apply_mode(paths, AppMode::Tako);
+        }
+    }
+}
+
 #[tauri::command]
 async fn login_oauth(app: AppHandle) -> Result<AccountStatus, String> {
     let paths = AppPaths::detect()?;
     let status = start_oauth_login(&paths).await?;
+    sync_after_account_login(&paths);
     update_account_and_tray(&app, &paths, status.clone(), false);
     Ok(status)
 }
@@ -560,6 +590,7 @@ async fn login_oauth(app: AppHandle) -> Result<AccountStatus, String> {
 async fn login_with_key(app: AppHandle, key: String) -> Result<AccountStatus, String> {
     let paths = AppPaths::detect()?;
     let status = auth_login_with_key(&paths, &key).await?;
+    sync_after_account_login(&paths);
     update_account_and_tray(&app, &paths, status.clone(), false);
     Ok(status)
 }
@@ -645,6 +676,9 @@ async fn save_settings(app: AppHandle, input: SettingsPatch) -> Result<SwitchSta
     let codex_auth_mode_changed = prev_codex_preserve != state.codex_preserve_official_auth;
     if endpoint_or_profile_changed || codex_auth_mode_changed {
         for &app_id in AppId::all() {
+            if !app_id.requires_local_gateway() {
+                continue;
+            }
             if !endpoint_or_profile_changed && app_id != AppId::Codex {
                 continue;
             }
@@ -997,7 +1031,9 @@ pub fn run() {
 
             let any_tako = AppId::all()
                 .iter()
-                .any(|&id| get_adapter(id).read_mode(&paths) == AppMode::Tako);
+                .copied()
+                .filter(|id| id.requires_local_gateway())
+                .any(|id| get_adapter(id).read_mode(&paths) == AppMode::Tako);
             if any_tako {
                 let _ = agy_proxy::ensure_gateway_service(&paths);
             }

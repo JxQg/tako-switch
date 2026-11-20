@@ -25,7 +25,7 @@
 
 | 路径 | 职责与核心符号 |
 |---|---|
-| `src/App.tsx` | 主界面：账号登录/登出、三大客户端卡片（一键安装 / `官方 ↔ Tako` 切换 / 启动 / 关闭 / 诊断 / 模型筛选）、设置抽屉与更新检查 |
+| `src/App.tsx` | 主界面：账号登录/登出、四大客户端卡片（一键安装 / 模式切换 / 启动 / 关闭 / 诊断 / 模型筛选）、设置抽屉与更新检查 |
 | `src/components/ModelPickerModal.tsx` | 分客户端模型选择弹窗：按推荐/自定义/全量过滤，展示 7 日实付均价、输入输出单价与吞吐/延迟 |
 | `src/components/BrandIcons.tsx` / `ModelIcons.tsx` | 客户端品牌图标与模型厂商图标（Codex / Claude / Antigravity / DeepSeek 等） |
 | `src/lib/api.ts` | Tauri `invoke` Typed IPC 封装与数据类型定义（`AppSnapshot`、`SwitchState`、`ClientModelsResponse` 等） |
@@ -39,10 +39,11 @@
 | `src-tauri/src/manifest.rs` | `Manifest` 解析、平台匹配 (`resolve_platform_artifact`)、Semver + Calver 版本比较 (`compare_versions`) 与更新计算 (`compute_updates`) |
 | `src-tauri/src/installer.rs` | 带 `InstallProgressEvent` 与 SHA-256/SHA-512 校验的客户端下载安装器 |
 | `src-tauri/src/adapters/mod.rs` | `DesktopAppAdapter` trait、`AppId` / `AppMode`、`snapshot_app`、`merge_tako_mcp_server`、`build_stdio_mcp_json_entry` |
+| `src-tauri/src/adapters/dsh_tako.rs` | `DshTakoAdapter`：OSS/GitHub 安装升级、`~/.dsh-tako/.credentials.yaml` (`0600`) 无损同步 `refs.TAKO_API_KEY` |
 | `src-tauri/src/adapters/claude.rs` | `ClaudeAdapter`：原生 `Claude-3p` 隔离槽与受管 `stdio` MCP 写入 |
 | `src-tauri/src/adapters/codex.rs` | `CodexAdapter`：`~/.codex/config.toml` 无损 TOML 合并与官方 `auth.json` 暂存还原 |
 | `src-tauri/src/adapters/antigravity.rs` | `AntigravityAdapter`：用户态环境变量网关注入与 `~/.gemini/config/mcp_config.json` 管理 |
-| `scripts/sync-manifest.py` / `test_sync_manifest.py` | 抓取三端官方无墙源并更新 `manifest/manifest.json` 的同步脚本与单测 |
+| `scripts/sync-manifest.py` / `test_sync_manifest.py` | 抓取 DSH Tako 与三端官方无墙源并更新 `manifest/manifest.json` 的同步脚本与单测 |
 | `manifest/manifest.json` | 托管桌面端官方安装源清单（由 `.github/workflows/sync-manifest.yml` 每 6 小时自动刷新） |
 | `.github/workflows/ci.yml` | PR 与 `main` push 验证流水线：前端构建 + 清单脚本单测 + Linux/macOS/Windows 三平台 `cargo test` & `clippy` |
 | `.github/workflows/release.yml` | `v*` tag 发布流水线：macOS 双架构签名公证 + Windows NSIS + `latest.json` / `SHA256SUMS.txt` + 旧 `v2.*` Release 自动清理 |
@@ -88,7 +89,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
 # 3. 清单同步脚本测试与结构校验
 python3 -m unittest -v scripts/test_sync_manifest.py
-python3 -c 'import json; d=json.load(open("manifest/manifest.json")); assert set(d["apps"])=={"codex","claude","antigravity"}'
+python3 -c 'import json; d=json.load(open("manifest/manifest.json")); assert set(d["apps"])=={"dsh-tako","codex","claude","antigravity"}'
 ```
 
 ---

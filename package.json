@@ -1,7 +1,7 @@
 {
   "name": "tako-switch",
   "private": true,
-  "version": "2.0.4",
+  "version": "2.0.5",
   "description": "Ultra-simple Tako desktop app configurator & built-in Tako Super MCP host",
   "type": "module",
   "scripts": {

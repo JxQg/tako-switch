@@ -77,6 +77,7 @@ fn find_process(mut matches: impl FnMut(&[u16]) -> bool) -> io::Result<bool> {
 
 fn exe_name(id: AppId) -> &'static str {
     match id {
+        AppId::DshTako => "DSH Tako.exe",
         AppId::Codex => "Codex.exe",
         AppId::Claude => "Claude.exe",
         AppId::Antigravity => "Antigravity.exe",
@@ -128,6 +129,7 @@ mod tests {
     #[test]
     fn matches_exact_names_case_insensitively() {
         for (id, name) in [
+            (AppId::DshTako, "dsh tako.exe"),
             (AppId::Codex, "CODEX.EXE"),
             (AppId::Claude, "claude.exe"),
             (AppId::Antigravity, "AntiGravity.Exe"),
@@ -155,6 +157,6 @@ mod tests {
     #[test]
     fn batch_returns_all_client_keys() {
         let keys: Vec<_> = running_states().unwrap().into_keys().collect();
-        assert_eq!(keys, ["antigravity", "claude", "codex"]);
+        assert_eq!(keys, ["antigravity", "claude", "codex", "dsh-tako"]);
     }
 }

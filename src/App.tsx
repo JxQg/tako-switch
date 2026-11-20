@@ -98,6 +98,7 @@ const THEME_OPTIONS: { id: ThemePref; label: string }[] = [
 ];
 
 const APP_DISPLAY_NAMES: Record<AppId, string> = {
+  "dsh-tako": "DSH Tako",
   codex: "Codex Desktop",
   claude: "Claude Desktop",
   antigravity: "Google Antigravity",
@@ -176,6 +177,11 @@ function installStageLabel(stage: string): string {
 }
 
 function modeSummary(app: AppSnapshot): string {
+  if (app.id === "dsh-tako") {
+    return app.mode === "tako"
+      ? "Tako 原生桌面端 · 已同步密钥（开箱即用）"
+      : "Tako 原生桌面端 · 独立登录";
+  }
   if (app.mode === "official") return "官方直连（需官方登录）";
   return app.mcpEnabled ? "Tako 全接管（免官方登录）· Tako MCP" : "Tako 全接管（免官方登录）";
 }
@@ -651,7 +657,10 @@ export default function App() {
     setErrorMsg(null);
     try {
       const updated = await api.setAppMode(app.id, mode, false);
-      const gwOk = updated.mode === "tako" ? await api.ensureLocalGateway().catch(() => true) : undefined;
+      const gwOk =
+        app.id !== "dsh-tako" && updated.mode === "tako"
+          ? await api.ensureLocalGateway().catch(() => true)
+          : undefined;
       setDashboard((prev) =>
         prev
           ? {
@@ -927,7 +936,7 @@ export default function App() {
   }, [dashboard]);
 
   const anyTakoMode = useMemo(
-    () => Boolean(dashboard?.apps.some((a) => a.mode === "tako")),
+    () => Boolean(dashboard?.apps.some((a) => a.id !== "dsh-tako" && a.mode === "tako")),
     [dashboard?.apps],
   );
 
@@ -1306,7 +1315,7 @@ export default function App() {
                                 }`}
                               />
                             </button>
-                            {app.mode === "tako" && (
+                            {app.id !== "dsh-tako" && app.mode === "tako" && (
                               <>
                                 <span className="text-[var(--text-muted)]">·</span>
                                 <button
@@ -1326,10 +1335,16 @@ export default function App() {
                         </div>
                       </div>
 
-                      {/* Fixed-Width Mode Switcher (Aligned Across All 3 Rows) */}
+                      {/* Fixed-Width Mode Switcher (Aligned Across All Rows) */}
                       <div className="w-[132px] shrink-0 grid grid-cols-2 p-0.5 rounded-[10px] bg-[var(--bg-pill)] border border-[var(--border)]">
                         {MODE_OPTIONS.map((option) => {
                           const active = app.mode === option.id;
+                          const label =
+                            app.id === "dsh-tako"
+                              ? option.id === "tako"
+                                ? "同步"
+                                : "独立"
+                              : option.label;
                           return (
                             <button
                               key={option.id}
@@ -1352,7 +1367,7 @@ export default function App() {
                                   : undefined
                               }
                             >
-                              {option.label}
+                              {label}
                             </button>
                           );
                         })}

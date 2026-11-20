@@ -233,6 +233,7 @@ fn default_app_bundle_name(app_id: AppId, artifact: &PlatformArtifact) -> String
         return name.to_string();
     }
     match app_id {
+        AppId::DshTako => "DSH Tako.app".to_string(),
         AppId::Codex => "ChatGPT.app".to_string(),
         AppId::Claude => "Claude.app".to_string(),
         AppId::Antigravity => "Antigravity.app".to_string(),
@@ -439,6 +440,7 @@ fn install_platform_package(
         }
         "exe" => {
             let default_args: Vec<String> = match app_id {
+                AppId::DshTako => vec!["/S".to_string()],
                 AppId::Claude => vec!["--silent".to_string()],
                 AppId::Antigravity => vec![
                     "/VERYSILENT".to_string(),
@@ -545,9 +547,24 @@ pub async fn install_or_upgrade_app(
     }
 
     let adapter = get_adapter(app_id);
-    if prev_mode != AppMode::Official {
-        emit_progress(app, app_id, "configuring", 96, "正在无损重放 Tako 配置");
-        if let Err(err) = adapter.apply_mode(paths, prev_mode) {
+    let target_mode = if prev_mode != AppMode::Official {
+        prev_mode
+    } else if app_id == AppId::DshTako
+        && crate::config::read_main_api_key(paths).is_some()
+        && !crate::adapters::dsh_tako::has_any_dsh_tako_key(paths)
+    {
+        AppMode::Tako
+    } else {
+        AppMode::Official
+    };
+    if target_mode != AppMode::Official {
+        let msg = if app_id == AppId::DshTako {
+            "正在同步 Tako 账号密钥（开箱即用）"
+        } else {
+            "正在无损重放 Tako 配置"
+        };
+        emit_progress(app, app_id, "configuring", 96, msg);
+        if let Err(err) = adapter.apply_mode(paths, target_mode) {
             emit_progress(app, app_id, "error", 0, &err);
             return Err(err);
         }
@@ -562,7 +579,7 @@ pub async fn install_or_upgrade_app(
 
     Ok(InstallOutcome {
         app_id,
-        mode_reapplied: prev_mode,
+        mode_reapplied: target_mode,
         snapshot,
     })
 }

@@ -27,12 +27,13 @@
 
 ---
 
-## 三大托管客户端与无损隔离机制（Managed Clients）
+## 四大托管客户端与无损隔离机制（Managed Clients）
 
 Tako Switch 在每次写入前都会自动备份原配置至 `~/.tako/switch/backups/`，并针对每个客户端采用最稳妥的无损隔离策略：
 
-| 客户端 | 托管内容 | 隔离与安全保障 | 切回「官方」行为 |
+| 客户端 | 托管内容 | 隔离与安全保障 | 切回「官方 / 独立」行为 |
 |---|---|---|---|
+| **DSH Tako** (`tech.shiroha.dsh-tako`) | 一键从上海 OSS / GitHub 安装升级，并同步当前 Tako API Key 至 `~/.dsh-tako/.credentials.yaml`（严格保持 `0600` 权限，装完即用） | 原生内置完整 Tako 模型与联网工具，无需占用本地网关端口；保留原有 `records` 与其他密钥条目 | 恢复备份或清理同步写入的 `TAKO_API_KEY`，改回在 DSH Tako 内独立登录 |
 | **Claude Desktop** (`com.anthropic.claudefordesktop`) | 启用官方原生 `Claude-3p` 隔离配置槽、本地 `/claude` 网关与受管 `stdio` MCP 工具策略 | 与 `1p` 官方个人登录槽完全物理隔离，零重登、不触碰官方对话历史 | 关闭 3p 网关接管并原样恢复备份 |
 | **Codex Desktop** (`com.openai.codex` / `OpenAI.Codex`) | 无损编辑 `~/.codex/config.toml`、本地 `/codex` 网关、动态模型目录与预授权 MCP | 保留用户其他 TOML 配置段；自动暂存官方 `auth.json` 实现免登录直进（设置中可选保留官方登录） | 从 `~/.tako/switch/backups/` 原样还原配置与官方登录态 |
 | **Google Antigravity** (`com.google.antigravity`) | 用户态环境变量注入（macOS LaunchAgent / Windows `HKCU\Environment`，固定 `WIRE_PROTOCOL=genai`）、推理档位展开与 `~/.gemini/config/mcp_config.json` | 零 root 权限修改系统；支持在设置中单独指定 Antigravity 专用 Key 覆盖主 Key | 清理用户态网关环境变量并还原备份配置 |

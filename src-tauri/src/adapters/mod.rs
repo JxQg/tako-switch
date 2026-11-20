@@ -1,6 +1,7 @@
 pub mod antigravity;
 pub mod claude;
 pub mod codex;
+pub mod dsh_tako;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_process;
 
@@ -11,20 +12,30 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum AppId {
+    #[serde(rename = "dsh-tako")]
+    DshTako,
+    #[serde(rename = "codex")]
     Codex,
+    #[serde(rename = "claude")]
     Claude,
+    #[serde(rename = "antigravity")]
     Antigravity,
 }
 
 impl AppId {
     pub fn all() -> &'static [AppId] {
-        &[AppId::Codex, AppId::Claude, AppId::Antigravity]
+        &[
+            AppId::DshTako,
+            AppId::Codex,
+            AppId::Claude,
+            AppId::Antigravity,
+        ]
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            AppId::DshTako => "dsh-tako",
             AppId::Codex => "codex",
             AppId::Claude => "claude",
             AppId::Antigravity => "antigravity",
@@ -33,10 +44,15 @@ impl AppId {
 
     pub fn display_name(&self) -> &'static str {
         match self {
+            AppId::DshTako => "DSH Tako",
             AppId::Codex => "Codex Desktop",
             AppId::Claude => "Claude Desktop",
             AppId::Antigravity => "Google Antigravity",
         }
+    }
+
+    pub fn requires_local_gateway(self) -> bool {
+        !matches!(self, AppId::DshTako)
     }
 }
 
@@ -91,6 +107,7 @@ pub trait DesktopAppAdapter {
 
 pub fn get_adapter(id: AppId) -> Box<dyn DesktopAppAdapter> {
     match id {
+        AppId::DshTako => Box::new(dsh_tako::DshTakoAdapter),
         AppId::Codex => Box::new(codex::CodexAdapter),
         AppId::Claude => Box::new(claude::ClaudeAdapter),
         AppId::Antigravity => Box::new(antigravity::AntigravityAdapter),

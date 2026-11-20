@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type AppId = "codex" | "claude" | "antigravity";
+export type AppId = "dsh-tako" | "codex" | "claude" | "antigravity";
 export type AppMode = "official" | "tako";
 
 export interface QuotaSummary {
@@ -45,6 +45,7 @@ export interface ClientModelFilter {
 }
 
 export interface ModelFiltersConfig {
+  dshTako?: ClientModelFilter;
   claude: ClientModelFilter;
   codex: ClientModelFilter;
   antigravity: ClientModelFilter;

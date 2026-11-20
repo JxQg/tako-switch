@@ -20,6 +20,9 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
+DSH_TAKO_OSS_LATEST_URL = "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/latest.json"
+DSH_TAKO_GH_LATEST_API = "https://api.github.com/repos/tako-dev/dsh-tako-desktop/releases/latest"
+
 ANTIGRAVITY_FEEDS = {
     "macos-arm64": (
         "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml",
@@ -179,6 +182,106 @@ def parse_sparkle_appcast(raw: str) -> dict:
     return out
 
 
+def _dsh_tako_artifact(
+    url: str,
+    version: str,
+    install_type: str,
+    fallback_url: str | None = None,
+    sha256: str | None = None,
+    size: int | None = None,
+) -> dict:
+    art: dict = {
+        "url": url,
+        "version": version,
+        "installType": install_type,
+    }
+    if fallback_url and fallback_url != url:
+        art["fallbackUrl"] = fallback_url
+    if sha256:
+        art["sha256"] = sha256.lower()
+    if isinstance(size, int) and size > 0:
+        art["size"] = size
+    if install_type == "dmg":
+        art["appBundleName"] = "DSH Tako.app"
+    elif install_type == "exe":
+        art["silentArgs"] = ["/S"]
+    return art
+
+
+def parse_dsh_tako_latest_json(raw: str) -> dict:
+    data = json.loads(raw)
+    version = str(data.get("version") or data.get("tag") or "").strip().lstrip("vV")
+    assets = data.get("assets") or []
+    if not version or not isinstance(assets, list):
+        raise ValueError("Invalid DSH Tako latest.json: missing version or assets")
+
+    platforms: dict[str, dict] = {}
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name") or "")
+        role = str(asset.get("role") or "")
+        oss_url = str(asset.get("ossUrl") or "").strip()
+        gh_url = str(asset.get("githubUrl") or "").strip() or None
+        primary_url = oss_url or (gh_url or "")
+        if not primary_url:
+            continue
+        sha256 = asset.get("sha256")
+        if isinstance(sha256, str):
+            sha256 = sha256.strip() or None
+        else:
+            sha256 = None
+        size = asset.get("size") if isinstance(asset.get("size"), int) else None
+
+        if role == "mac-arm64" or name.endswith("-mac-arm64.dmg"):
+            platforms["macos-arm64"] = _dsh_tako_artifact(
+                primary_url, version, "dmg", fallback_url=gh_url if oss_url else None, sha256=sha256, size=size
+            )
+        elif role == "win-x64" or name.endswith("-win-x64.exe"):
+            platforms["windows-x64"] = _dsh_tako_artifact(
+                primary_url, version, "exe", fallback_url=gh_url if oss_url else None, sha256=sha256, size=size
+            )
+
+    if not platforms:
+        raise ValueError("Invalid DSH Tako latest.json: no supported platform assets found")
+    return {"version": version, "platforms": platforms}
+
+
+def parse_dsh_tako_github_release(raw: str) -> dict:
+    data = json.loads(raw)
+    version = str(data.get("tag_name") or "").strip().lstrip("vV")
+    assets = data.get("assets") or []
+    if not version or not isinstance(assets, list):
+        raise ValueError("Invalid DSH Tako GitHub release payload")
+
+    platforms: dict[str, dict] = {}
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name") or "")
+        url = str(asset.get("browser_download_url") or "").strip()
+        if not url:
+            continue
+        size = asset.get("size") if isinstance(asset.get("size"), int) else None
+        digest = asset.get("digest")
+        sha256 = None
+        if isinstance(digest, str) and digest.startswith("sha256:"):
+            sha256 = digest.split(":", 1)[1].strip() or None
+
+        if name.endswith("-mac-arm64.dmg"):
+            platforms["macos-arm64"] = _dsh_tako_artifact(
+                url, version, "dmg", sha256=sha256, size=size
+            )
+        elif name.endswith("-win-x64.exe"):
+            platforms["windows-x64"] = _dsh_tako_artifact(
+                url, version, "exe", sha256=sha256, size=size
+            )
+
+    if not platforms:
+        raise ValueError("Invalid DSH Tako GitHub release: no supported platform assets found")
+    return {"version": version, "platforms": platforms}
+
+
 def apply_mirror(artifact: dict, mirror_base: str | None, app_id: str, plat: str, ver: str) -> dict:
     if not mirror_base:
         return artifact
@@ -192,6 +295,12 @@ def apply_mirror(artifact: dict, mirror_base: str | None, app_id: str, plat: str
 
 
 def build_manifest(mirror_base: str | None = None) -> dict:
+    # 0. DSH Tako Desktop (OSS primary + GitHub fallback from dsh-oss-sync contract)
+    try:
+        dsh_tako = parse_dsh_tako_latest_json(http_get_text(DSH_TAKO_OSS_LATEST_URL))
+    except Exception:
+        dsh_tako = parse_dsh_tako_github_release(http_get_text(DSH_TAKO_GH_LATEST_API))
+
     # 1. Google Antigravity
     agy_platforms: dict[str, dict] = {}
     agy_top_ver = "0.0.0"
@@ -292,6 +401,11 @@ def build_manifest(mirror_base: str | None = None) -> dict:
         "schemaVersion": 1,
         "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "apps": {
+            "dsh-tako": {
+                "displayName": "DSH Tako",
+                "version": dsh_tako["version"],
+                "platforms": dsh_tako["platforms"],
+            },
             "codex": {
                 "displayName": "Codex Desktop",
                 "version": codex_arm["version"],

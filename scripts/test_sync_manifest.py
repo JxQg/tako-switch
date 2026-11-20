@@ -75,6 +75,44 @@ sha512: akGKBoAWOxZmddrQyvSHDxmnCtaaLnz7jaBTDg+8g8vG/lytBldvIkHRPxXA+WWsm6Xq2FP+
         )
         self.assertEqual(mirrored["fallbackUrl"], "https://origin.example/App.zip")
 
+    def test_parse_dsh_tako_latest_json(self) -> None:
+        raw = """{
+          "version": "0.1.55",
+          "assets": [
+            {
+              "name": "DSH-Tako-0.1.55-mac-arm64.dmg",
+              "role": "mac-arm64",
+              "ossUrl": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.55/DSH-Tako-0.1.55-mac-arm64.dmg",
+              "githubUrl": "https://github.com/tako-dev/dsh-tako-desktop/releases/download/v0.1.55/DSH-Tako-0.1.55-mac-arm64.dmg",
+              "sha256": "BC603022",
+              "size": 270740588
+            },
+            {
+              "name": "DSH-Tako-0.1.55-win-x64.exe",
+              "role": "win-x64",
+              "ossUrl": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.55/DSH-Tako-0.1.55-win-x64.exe",
+              "githubUrl": "https://github.com/tako-dev/dsh-tako-desktop/releases/download/v0.1.55/DSH-Tako-0.1.55-win-x64.exe",
+              "sha256": "BC5A39A7",
+              "size": 313575106
+            }
+          ]
+        }"""
+        parsed = mod.parse_dsh_tako_latest_json(raw)
+        self.assertEqual(parsed["version"], "0.1.55")
+        mac = parsed["platforms"]["macos-arm64"]
+        self.assertEqual(mac["installType"], "dmg")
+        self.assertEqual(mac["appBundleName"], "DSH Tako.app")
+        self.assertTrue(mac["url"].startswith("https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/"))
+        self.assertTrue(mac["fallbackUrl"].startswith("https://github.com/tako-dev/dsh-tako-desktop/"))
+        self.assertEqual(mac["sha256"], "bc603022")
+        self.assertEqual(mac["size"], 270740588)
+
+        win = parsed["platforms"]["windows-x64"]
+        self.assertEqual(win["installType"], "exe")
+        self.assertEqual(win["silentArgs"], ["/S"])
+        self.assertEqual(win["sha256"], "bc5a39a7")
+        self.assertEqual(win["size"], 313575106)
+
 
 if __name__ == "__main__":
     unittest.main()

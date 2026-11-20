@@ -62,6 +62,14 @@ export function AppBrandIcon({
   appId: AppId;
   className?: string;
 }) {
+  if (appId === "dsh-tako") {
+    return (
+      <div className={`${className} ${TILE_CLASS}`}>
+        <TakoBrandMark className="h-full w-full" />
+      </div>
+    );
+  }
+
   if (appId === "codex") {
     return (
       <div className={`${className} ${TILE_CLASS}`}>

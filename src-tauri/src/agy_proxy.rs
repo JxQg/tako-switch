@@ -2655,6 +2655,18 @@ pub async fn fetch_client_models_for_ui(
     paths: &AppPaths,
     app_id: AppId,
 ) -> Result<ClientModelsResponse, String> {
+    if app_id == AppId::DshTako {
+        let switch_state = read_switch_state(paths);
+        return Ok(ClientModelsResponse {
+            app_id,
+            filter: switch_state.model_filters.dsh_tako,
+            recommended_ids: Vec::new(),
+            visible_count: 0,
+            total_count: 0,
+            models: Vec::new(),
+        });
+    }
+
     let switch_state = read_switch_state(paths);
     let base_url = switch_state.normalized_base_url();
     let client = Client::builder()
@@ -2663,6 +2675,7 @@ pub async fn fetch_client_models_for_ui(
         .map_err(|e| format!("创建模型请求客户端失败: {e}"))?;
 
     let models_req = match app_id {
+        AppId::DshTako => unreachable!(),
         AppId::Claude | AppId::Codex => {
             let api_key = read_main_api_key(paths).ok_or_else(|| {
                 "未登录 Tako 账号或缺少 API Key，无法拉取模型列表".to_string()
@@ -2735,6 +2748,7 @@ pub async fn fetch_client_models_for_ui(
     }
 
     Ok(match app_id {
+        AppId::DshTako => unreachable!(),
         AppId::Claude => build_claude_model_options(
             &json_body,
             &pricing,
@@ -3339,11 +3353,13 @@ pub fn ensure_gateway_service(paths: &AppPaths) -> Result<(), String> {
     }
 }
 
-/// Stops the local gateway daemon only when all three desktop apps have returned to Official mode.
+/// Stops the local gateway daemon only when all gateway-backed desktop apps have returned to Official mode.
 pub fn stop_gateway_service_if_unused(paths: &AppPaths) -> Result<(), String> {
     let any_tako = AppId::all()
         .iter()
-        .any(|&id| get_adapter(id).read_mode(paths) == AppMode::Tako);
+        .copied()
+        .filter(|id| id.requires_local_gateway())
+        .any(|id| get_adapter(id).read_mode(paths) == AppMode::Tako);
     if any_tako {
         return Ok(());
     }

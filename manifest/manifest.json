@@ -1,7 +1,33 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-20T04:50:45Z",
+  "generatedAt": "2026-11-20T11:56:37Z",
   "apps": {
+    "dsh-tako": {
+      "displayName": "DSH Tako",
+      "version": "0.1.55",
+      "platforms": {
+        "macos-arm64": {
+          "url": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.55/DSH-Tako-0.1.55-mac-arm64.dmg",
+          "version": "0.1.55",
+          "installType": "dmg",
+          "fallbackUrl": "https://github.com/tako-dev/dsh-tako-desktop/releases/download/v0.1.55/DSH-Tako-0.1.55-mac-arm64.dmg",
+          "sha256": "bc603022ad1364536714a8d27a1042ca88519e6fe2aa7c0df84f16c09a5a4f17",
+          "size": 270740588,
+          "appBundleName": "DSH Tako.app"
+        },
+        "windows-x64": {
+          "url": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.55/DSH-Tako-0.1.55-win-x64.exe",
+          "version": "0.1.55",
+          "installType": "exe",
+          "fallbackUrl": "https://github.com/tako-dev/dsh-tako-desktop/releases/download/v0.1.55/DSH-Tako-0.1.55-win-x64.exe",
+          "sha256": "bc5a39a7245d2559c93e284ee5d63d86a5e0f795c28e3ca5d9d08cfd2c44f79a",
+          "size": 313575106,
+          "silentArgs": [
+            "/S"
+          ]
+        }
+      }
+    },
     "codex": {
       "displayName": "Codex Desktop",
       "version": "26.1117.31558",
@@ -22,10 +48,10 @@
         },
         "windows-x64": {
           "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix",
-          "version": "26.1111.9664.0",
+          "version": "26.1117.3838.0",
           "installType": "msix",
           "packageFamilyName": "OpenAI.Codex_2p2nqsd0c76g0",
-          "size": 1057886060
+          "size": 811237227
         }
       }
     },

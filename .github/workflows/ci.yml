@@ -36,7 +36,7 @@ jobs:
           import json
           data = json.load(open("manifest/manifest.json", encoding="utf-8"))
           assert data["schemaVersion"] == 1
-          assert set(data["apps"].keys()) == {"codex", "claude", "antigravity"}
+          assert set(data["apps"].keys()) == {"dsh-tako", "codex", "claude", "antigravity"}
           print("manifest.json OK:", list(data["apps"].keys()))
           '
 

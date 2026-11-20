@@ -46,6 +46,7 @@ type CategoryFilter = "__all__" | "__selected__" | string;
 type ModelSortBy = "default" | "price" | "speed";
 
 const CLIENT_HINTS: Record<AppId, string> = {
+  "dsh-tako": "DSH Tako 原生内置全部 Tako 模型目录与联网工具。",
   claude:
     "Claude Desktop 仅展示 Claude 系列模型：勾选并保存后会自动写入本地 Claude 3p 配置，关闭并重新打开 Claude Desktop 即可生效。",
   codex: "Codex 原生支持多厂商模型，可切换精简推荐或自由勾选展示列表。",
