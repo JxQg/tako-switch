@@ -297,8 +297,8 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
 
     let mut submenus = Vec::new();
     for &app_id in AppId::all() {
-        let snap = snapshot_app(paths, app_id);
-        let mark = |m: AppMode| if snap.mode == m { "● " } else { "○ " };
+        let mode = get_adapter(app_id).read_mode(paths);
+        let mark = |m: AppMode| if mode == m { "● " } else { "○ " };
         let off = MenuItem::with_id(
             app,
             format!("mode:{}:official", app_id.as_str()),
@@ -318,7 +318,7 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
 
         let sub = Submenu::with_items(
             app,
-            format!("{} ({})", app_id.display_name(), mode_label(snap.mode)),
+            format!("{} ({})", app_id.display_name(), mode_label(mode)),
             true,
             &[&off, &tako],
         )
@@ -375,9 +375,15 @@ fn mode_label(mode: AppMode) -> &'static str {
 }
 
 fn refresh_tray(app: &AppHandle, paths: &AppPaths) {
+    update_tray(app, paths, true);
+}
+
+fn update_tray(app: &AppHandle, paths: &AppPaths, rebuild_menu: bool) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        if let Ok(menu) = build_tray_menu(app, paths) {
-            let _ = tray.set_menu(Some(menu));
+        if rebuild_menu {
+            if let Ok(menu) = build_tray_menu(app, paths) {
+                let _ = tray.set_menu(Some(menu));
+            }
         }
         let st = read_switch_state(paths);
         let has_key = config::read_main_api_key(paths).is_some();
@@ -515,19 +521,27 @@ async fn get_dashboard(app: AppHandle, refresh_account: bool) -> Result<Dashboar
             }
         }
     };
-    let state = read_switch_state(&paths);
-    let apps = AppId::all()
-        .iter()
-        .map(|&id| snapshot_app(&paths, id))
-        .collect();
-    let cached_manifest = load_cached_manifest(&paths);
+    let (state, apps, cached_manifest, local_gateway_healthy) =
+        tauri::async_runtime::spawn_blocking(move || {
+            (
+                read_switch_state(&paths),
+                AppId::all()
+                    .iter()
+                    .map(|&id| snapshot_app(&paths, id))
+                    .collect(),
+                load_cached_manifest(&paths),
+                agy_proxy::is_proxy_healthy(agy_proxy::LOCAL_GATEWAY_PORT),
+            )
+        })
+        .await
+        .map_err(|err| format!("读取客户端状态失败: {err}"))?;
 
     Ok(DashboardPayload {
         account,
         state,
         apps,
         cached_manifest,
-        local_gateway_healthy: agy_proxy::is_proxy_healthy(agy_proxy::LOCAL_GATEWAY_PORT),
+        local_gateway_healthy,
         local_gateway_url: agy_proxy::LOCAL_GATEWAY_URL.to_string(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
@@ -646,13 +660,23 @@ async fn save_settings(app: AppHandle, input: SettingsPatch) -> Result<SwitchSta
 }
 
 #[tauri::command]
-fn get_running_states() -> Result<std::collections::BTreeMap<String, bool>, String> {
-    let paths = AppPaths::detect()?;
-    let mut map = std::collections::BTreeMap::new();
-    for &app_id in AppId::all() {
-        map.insert(app_id.as_str().to_string(), get_adapter(app_id).is_running(&paths));
-    }
-    Ok(map)
+async fn get_running_states() -> Result<std::collections::BTreeMap<String, bool>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        #[cfg(target_os = "windows")]
+        {
+            adapters::windows_process::running_states()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let paths = AppPaths::detect()?;
+            Ok(AppId::all()
+                .iter()
+                .map(|&id| (id.as_str().to_string(), get_adapter(id).is_running(&paths)))
+                .collect())
+        }
+    })
+    .await
+    .map_err(|err| format!("读取运行状态失败: {err}"))?
 }
 
 #[tauri::command]
@@ -969,7 +993,7 @@ pub fn run() {
             let builder = builder.icon_as_template(true);
 
             builder.build(app)?;
-            refresh_tray(app.handle(), &paths);
+            update_tray(app.handle(), &paths, false);
 
             let any_tako = AppId::all()
                 .iter()

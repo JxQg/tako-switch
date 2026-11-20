@@ -1,6 +1,8 @@
 pub mod antigravity;
 pub mod claude;
 pub mod codex;
+#[cfg(target_os = "windows")]
+pub(crate) mod windows_process;
 
 use crate::config::{write_atomic, AppPaths};
 use serde::{Deserialize, Serialize};

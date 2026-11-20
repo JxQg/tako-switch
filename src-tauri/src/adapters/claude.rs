@@ -238,7 +238,7 @@ impl DesktopAppAdapter for ClaudeAdapter {
         }
         #[cfg(target_os = "windows")]
         {
-            is_windows_claude_running()
+            super::windows_process::is_running(AppId::Claude)
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         false
@@ -557,12 +557,6 @@ fn detect_windows_claude(paths: &AppPaths) -> Option<(Option<String>, String, St
     let ver = parts.next().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let loc = parts.next().map(str::trim).unwrap_or("").to_string();
     Some((ver, loc, "msix".to_string()))
-}
-
-#[cfg(target_os = "windows")]
-fn is_windows_claude_running() -> bool {
-    ps_hidden("if (Get-Process -Name 'Claude' -ErrorAction SilentlyContinue) { 'true' }").as_deref()
-        == Some("true")
 }
 
 #[cfg(target_os = "windows")]
