@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-20T23:28:49Z",
+  "generatedAt": "2026-11-21T04:45:00Z",
   "apps": {
     "dsh-tako": {
       "displayName": "DSH Tako",
@@ -65,6 +65,15 @@
           "installType": "zip",
           "appBundleName": "Claude.app",
           "size": 404693227
+        },
+        "windows-x64": {
+          "url": "https://downloads.claude.ai/releases/win32/x64/6.28899.6/Claude-2f5fc59b2d1c672dd9dced86720c50f48cca0cf9.exe",
+          "version": "6.28899.6",
+          "installType": "exe",
+          "silentArgs": [
+            "--silent"
+          ],
+          "size": 279363744
         }
       }
     },
