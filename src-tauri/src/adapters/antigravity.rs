@@ -48,6 +48,24 @@ impl AntigravityAdapter {
         paths.home.join(".gemini").join("AGENTS.md")
     }
 
+    pub fn is_chinese_configured(paths: &AppPaths) -> bool {
+        crate::adapters::has_managed_chinese_block(&Self::gemini_agents_md_path(paths))
+    }
+
+    pub fn sync_standalone_chinese_locale(paths: &AppPaths, enable: bool) -> Result<(), String> {
+        sync_managed_chinese_markdown(
+            paths,
+            "antigravity",
+            "AGENTS.md",
+            &Self::gemini_agents_md_path(paths),
+            enable,
+            AGY_CHINESE_AGENTS_BODY,
+        )?;
+        #[cfg(target_os = "macos")]
+        sync_macos_apple_languages(paths, AGY_MACOS_BUNDLE_ID, enable);
+        Ok(())
+    }
+
     fn has_tako_mcp_permission(paths: &AppPaths) -> bool {
         let Ok(root) = read_json_object_or_empty(&Self::config_path(paths)) else {
             return false;
@@ -218,7 +236,39 @@ impl DesktopAppAdapter for AntigravityAdapter {
     }
 
     fn detect_install(&self, paths: &AppPaths) -> InstallInfo {
-        let _ = paths;
+        if let Some(ref override_dir) = paths.agy_app_override_dir {
+            if override_dir.exists() {
+                let kind = if override_dir
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("app"))
+                {
+                    "app_bundle"
+                } else {
+                    "exe"
+                };
+                return InstallInfo {
+                    installed: true,
+                    version: None,
+                    install_path: Some(override_dir.to_string_lossy().to_string()),
+                    install_kind: Some(kind.to_string()),
+                };
+            }
+            return InstallInfo {
+                installed: false,
+                version: None,
+                install_path: None,
+                install_kind: None,
+            };
+        }
+        if paths.is_test {
+            return InstallInfo {
+                installed: false,
+                version: None,
+                install_path: None,
+                install_kind: None,
+            };
+        }
         #[cfg(target_os = "macos")]
         {
             if let Some(app_path) =
@@ -394,10 +444,22 @@ impl DesktopAppAdapter for AntigravityAdapter {
                         .to_string(),
                 );
             }
-            if read_switch_state(paths).prefer_chinese_ui {
+            if read_switch_state(paths).prefer_chinese_ui || Self::is_chinese_configured(paths) {
                 notes.push("中文增强: 已启用 (~/.gemini/AGENTS.md 简体中文规则)".to_string());
             }
             notes.push("提示: 新建 Antigravity 网关环境变量需完整退出并重启应用后生效".to_string());
+        } else if Self::is_chinese_configured(paths) {
+            notes.push("中文增强: 已启用 (~/.gemini/AGENTS.md 简体中文规则)".to_string());
+        }
+        let ui_patch = super::antigravity_i18n::inspect_antigravity_ui_patch(paths);
+        match ui_patch.status {
+            super::antigravity_i18n::UiPatchStatus::Patched => {
+                notes.push("界面汉化补丁: 已生效（菜单与 Hub 界面简体中文）".to_string());
+            }
+            super::antigravity_i18n::UiPatchStatus::OutdatedAfterUpgrade => {
+                notes.push("界面汉化补丁: 检测到客户端升级，可一键重打汉化补丁".to_string());
+            }
+            _ => {}
         }
 
         DiagnosticResult {

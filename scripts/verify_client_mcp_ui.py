@@ -53,6 +53,22 @@ REQUIRED_TESTIDS = [
     "mcp-demo-copy-prompt",
     "consult-preset-gpt-6.2-sol",
     "mcp-live-run-btn",
+    "main-chinese-ui-toggle",
+    "open-model-square-btn",
+    "agy-ui-patch-btn",
+    "agy-ui-restore-btn",
+    "plaza-price-mode-detail",
+    "plaza-price-mode-avg",
+    "plaza-currency-cny",
+    "plaza-currency-usd",
+    "plaza-unit-m",
+    "plaza-unit-k",
+    "plaza-quick-all",
+    "plaza-quick-promo",
+    "plaza-quick-cheap",
+    "plaza-quick-code",
+    "plaza-quick-long",
+    "plaza-quick-image",
 ]
 
 REQUIRED_WEBP_ASSETS = [
@@ -83,11 +99,25 @@ FORBIDDEN_LEGACY_FILES = [
     Path("src/components/McpShowcaseModal.tsx"),
 ]
 
-FORBIDDEN_ASAR_PATTERNS = [
-    (re.compile(r"app\.asar", re.IGNORECASE), "reference to third-party app.asar"),
+CONTROLLED_AGY_I18N_REL = Path("src-tauri/src/adapters/antigravity_i18n.rs")
+
+REQUIRED_AGY_I18N_SYMBOLS = [
+    "app.asar.orig",
+    "original_asar_sha256",
+    "Sha256",
+    "verify_clean_backup_asar",
+    "restore_antigravity_ui_for_paths",
+]
+
+FORBIDDEN_EXTERNAL_ASAR_PATTERNS = [
     (re.compile(r"@electron/asar", re.IGNORECASE), "electron/asar package usage"),
     (re.compile(r"\basar\s*\.\s*(extract|createPackage|extractAll)\b"), "asar unpack/repack call"),
     (re.compile(r"\bnpx\s+asar\b", re.IGNORECASE), "npx asar CLI invocation"),
+]
+
+FORBIDDEN_ASAR_PATTERNS = [
+    (re.compile(r"app\.asar", re.IGNORECASE), "unauthorized reference to third-party app.asar"),
+    *FORBIDDEN_EXTERNAL_ASAR_PATTERNS,
 ]
 
 
@@ -225,6 +255,13 @@ def has_testid(src_files: Dict[Path, str], testid: str) -> bool:
     if testid.startswith("consult-preset-"):
         suffix = testid[len("consult-preset-") :]
         tpl_re = re.compile(r"data-testid=\{\s*`consult-preset-\$\{[^}]+\}`\s*\}")
+        for content in src_files.values():
+            if tpl_re.search(content) and re.search(rf"""['"]{re.escape(suffix)}['"]""", content):
+                return True
+
+    if testid.startswith("plaza-quick-"):
+        suffix = testid[len("plaza-quick-") :]
+        tpl_re = re.compile(r"data-testid=\{\s*`plaza-quick-\$\{[^}]+\}`\s*\}")
         for content in src_files.values():
             if tpl_re.search(content) and re.search(rf"""['"]{re.escape(suffix)}['"]""", content):
                 return True
@@ -590,8 +627,9 @@ def run_checks(repo_root: Path) -> List[Tuple[str, bool, str]]:
                 )
             )
 
-    # 4. Forbidden app.asar tampering scan
+    # 4. Controlled Antigravity i18n backup & forbidden app.asar tampering scan
     self_path = Path(__file__).resolve()
+    controlled_i18n_path = (repo_root / CONTROLLED_AGY_I18N_REL).resolve()
     scan_dirs = [
         (repo_root / "src-tauri" / "src", (".rs",)),
         (repo_root / "src", (".ts", ".tsx", ".js", ".jsx")),
@@ -600,10 +638,16 @@ def run_checks(repo_root: Path) -> List[Tuple[str, bool, str]]:
     asar_hits: List[str] = []
     for base, exts in scan_dirs:
         for fpath, content in collect_source_texts(base, exts).items():
-            if fpath.resolve() == self_path:
+            resolved = fpath.resolve()
+            if resolved == self_path:
                 continue
+            patterns = (
+                FORBIDDEN_EXTERNAL_ASAR_PATTERNS
+                if resolved == controlled_i18n_path
+                else FORBIDDEN_ASAR_PATTERNS
+            )
             for idx, line in enumerate(content.splitlines(), start=1):
-                for pat, desc in FORBIDDEN_ASAR_PATTERNS:
+                for pat, desc in patterns:
                     if pat.search(line):
                         rel = fpath.relative_to(repo_root)
                         asar_hits.append(f"{rel}:{idx} ({desc}): {line.strip()}")
@@ -611,11 +655,32 @@ def run_checks(repo_root: Path) -> List[Tuple[str, bool, str]]:
         (
             "security:no-app-asar-tampering",
             len(asar_hits) == 0,
-            "0 forbidden app.asar tampering matches"
+            "0 unauthorized app.asar or external asar CLI matches"
             if not asar_hits
             else "found forbidden matches: " + "; ".join(asar_hits),
         )
     )
+
+    if not controlled_i18n_path.is_file():
+        checks.append(
+            (
+                "security:controlled-agy-i18n-backup",
+                False,
+                f"missing {CONTROLLED_AGY_I18N_REL}",
+            )
+        )
+    else:
+        i18n_text = controlled_i18n_path.read_text(encoding="utf-8")
+        missing_syms = [sym for sym in REQUIRED_AGY_I18N_SYMBOLS if sym not in i18n_text]
+        checks.append(
+            (
+                "security:controlled-agy-i18n-backup",
+                len(missing_syms) == 0,
+                "antigravity_i18n.rs enforces .orig backup, SHA256 check, and restore"
+                if not missing_syms
+                else f"antigravity_i18n.rs missing required safety symbols: {missing_syms}",
+            )
+        )
 
     return checks
 
@@ -726,8 +791,20 @@ export const Leaky = () => (
         root = Path(tmp)
         (root / "public" / "mcp-demo").mkdir(parents=True)
         (root / "src" / "components").mkdir(parents=True)
-        (root / "src-tauri" / "src").mkdir(parents=True)
+        (root / "src-tauri" / "src" / "adapters").mkdir(parents=True)
         (root / "scripts").mkdir(parents=True)
+
+        (root / CONTROLLED_AGY_I18N_REL).write_text(
+            """
+use sha2::Sha256;
+// Controlled app.asar backup & restore
+const ORIG: &str = "app.asar.orig";
+struct Meta { original_asar_sha256: String }
+fn verify_clean_backup_asar() {}
+pub fn restore_antigravity_ui_for_paths() {}
+""",
+            encoding="utf-8",
+        )
 
         for idx, name in enumerate(REQUIRED_WEBP_ASSETS):
             blob = b"RIFF" + struct.pack("<I", 12) + b"WEBP" + b"VP8 " + bytes([idx, 1, 2, 3])
@@ -755,10 +832,12 @@ const TOOLS = [
   {{ key: "search", label: "联网", mcpTool: "tako_web_search" }},
   {{ key: "consult", label: "外脑", mcpTool: "tako_consult" }},
 ];
+const QUICKS = ["all", "promo", "cheap", "code", "long", "image"];
 export const McpInlineTheater = () => (
   <div data-testid="mcp-inline-theater">
     <button data-testid="open-mcp-demo" />
     {{TOOLS.map((t) => <button data-testid={{`mcp-demo-tab-${{t.key}}`}} data-mcp-tool={{t.mcpTool}}>{{t.label}}</button>)}}
+    {{QUICKS.map((q) => <button data-testid={{`plaza-quick-${{q}}`}}>{{q}}</button>)}}
     <button data-testid="mcp-mode-showcase" />
     <button data-testid="mcp-mode-live" />
     <div data-testid="mcp-image-slider" />
@@ -769,6 +848,16 @@ export const McpInlineTheater = () => (
     <button data-testid="mcp-demo-copy-prompt" />
     <button data-testid="consult-preset-gpt-6.2-sol" />
     <button data-testid="mcp-live-run-btn" />
+    <button data-testid="main-chinese-ui-toggle" />
+    <button data-testid="open-model-square-btn" />
+    <button data-testid="agy-ui-patch-btn" />
+    <button data-testid="agy-ui-restore-btn" />
+    <button data-testid="plaza-price-mode-detail" />
+    <button data-testid="plaza-price-mode-avg" />
+    <button data-testid="plaza-currency-cny" />
+    <button data-testid="plaza-currency-usd" />
+    <button data-testid="plaza-unit-m" />
+    <button data-testid="plaza-unit-k" />
   </div>
 );
 """,
@@ -789,6 +878,18 @@ export const McpInlineTheater = () => (
         results = run_checks(root)
         failed = [(n, m) for n, ok, m in results if not ok]
         assert not failed, f"synthetic V2 repo should pass all checks, failed: {failed}"
+
+        # Unauthorized app.asar outside antigravity_i18n.rs must fail
+        (root / "src" / "rogue.ts").write_text('const p = "Resources/app.asar";\n', encoding="utf-8")
+        rogue_res = dict((n, ok) for n, ok, _ in run_checks(root))
+        assert not rogue_res["security:no-app-asar-tampering"]
+        (root / "src" / "rogue.ts").unlink()
+
+        # npx asar inside antigravity_i18n.rs must still fail
+        (root / CONTROLLED_AGY_I18N_REL).write_text('const BAD: &str = "npx asar pack";\n', encoding="utf-8")
+        bad_cli_res = dict((n, ok) for n, ok, _ in run_checks(root))
+        assert not bad_cli_res["security:no-app-asar-tampering"]
+        assert not bad_cli_res["security:controlled-agy-i18n-backup"]
 
     print("Self-tests passed.")
 

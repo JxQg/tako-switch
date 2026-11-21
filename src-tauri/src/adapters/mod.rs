@@ -1,9 +1,15 @@
 pub mod antigravity;
+pub mod antigravity_i18n;
 pub mod claude;
 pub mod codex;
 pub mod dsh_tako;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_process;
+
+pub use antigravity_i18n::{
+    inspect_antigravity_ui_patch, patch_antigravity_ui_for_paths,
+    restore_antigravity_ui_for_paths, UiPatchInfo, UiPatchStatus,
+};
 
 use crate::config::{write_atomic, AppPaths};
 use serde::{Deserialize, Serialize};
@@ -91,6 +97,8 @@ pub struct AppSnapshot {
     pub running: bool,
     pub install: InstallInfo,
     pub diagnostic: DiagnosticResult,
+    pub chinese_configured: bool,
+    pub ui_patch: UiPatchInfo,
 }
 
 pub trait DesktopAppAdapter {
@@ -117,6 +125,16 @@ pub fn get_adapter(id: AppId) -> Box<dyn DesktopAppAdapter> {
 pub fn snapshot_app(paths: &AppPaths, id: AppId) -> AppSnapshot {
     let adapter = get_adapter(id);
     let mode = adapter.read_mode(paths);
+    let chinese_configured = match id {
+        AppId::DshTako => true,
+        AppId::Codex => codex::CodexAdapter::is_chinese_configured(paths),
+        AppId::Claude => claude::ClaudeAdapter::is_chinese_configured(paths),
+        AppId::Antigravity => antigravity::AntigravityAdapter::is_chinese_configured(paths),
+    };
+    let ui_patch = match id {
+        AppId::Antigravity => inspect_antigravity_ui_patch(paths),
+        _ => UiPatchInfo::not_applicable(),
+    };
     AppSnapshot {
         id,
         name: adapter.id().display_name().to_string(),
@@ -126,6 +144,8 @@ pub fn snapshot_app(paths: &AppPaths, id: AppId) -> AppSnapshot {
         running: adapter.is_running(paths),
         install: adapter.detect_install(paths),
         diagnostic: adapter.diagnose(paths),
+        chinese_configured,
+        ui_patch,
     }
 }
 
@@ -203,6 +223,17 @@ pub fn has_tako_mcp_server(path: &Path) -> bool {
 
 pub const TAKO_CHINESE_BLOCK_START: &str = "<!-- tako-switch:chinese-ui:start -->";
 pub const TAKO_CHINESE_BLOCK_END: &str = "<!-- tako-switch:chinese-ui:end -->";
+
+pub fn has_managed_chinese_block(path: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Some(start_idx) = raw.find(TAKO_CHINESE_BLOCK_START) else {
+        return false;
+    };
+    let after = start_idx + TAKO_CHINESE_BLOCK_START.len();
+    raw[after..].contains(TAKO_CHINESE_BLOCK_END)
+}
 
 fn strip_managed_chinese_blocks(raw: &str) -> (String, bool) {
     let mut current = raw.to_string();

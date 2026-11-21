@@ -25,27 +25,30 @@
 
 | 路径 | 职责与核心符号 |
 |---|---|
-| `src/App.tsx` | 主界面：账号登录/登出、四大客户端卡片（一键安装 / 模式切换 / 启动 / 关闭 / 诊断 / 模型筛选）、设置抽屉与更新检查 |
+| `src/App.tsx` | 主界面：账号登录/登出、一键三端汉化开关、模型广场直达入口、四大客户端卡片（含 Antigravity 界面汉化/还原）、设置抽屉与更新检查 |
 | `src/components/McpInlineTheater.tsx` | 主界面下方 5 合 1 超级 MCP 内联实景剧场（「效果演示」零扣费媒体交互 + 「现场试跑」Live Playground） |
-| `src/components/ModelPickerModal.tsx` | 分客户端模型选择弹窗：按推荐/自定义/全量过滤，展示 7 日实付均价、输入输出单价与吞吐/延迟 |
+| `src/components/ModelPickerModal.tsx` | 模型广场总览与分客户端模型选择弹窗：人民币/内部额度切换、明细价/均价双视图、官方倍率折扣与 6 场景筛选 |
 | `src/components/BrandIcons.tsx` / `ModelIcons.tsx` | 客户端品牌图标与模型厂商图标（Codex / Claude / Antigravity / DeepSeek 等） |
-| `src/lib/api.ts` | Tauri `invoke` Typed IPC 封装与数据类型定义（`AppSnapshot`、`SwitchState`、`ClientModelsResponse`、`LiveDemoResult` 等） |
+| `src/lib/plaza-pricing.ts` | 与网关模型广场 PR #296 对齐的纯函数计价库（`CNY = internalUSD / 3`、`/1M`·`/1K`、官方倍率折算与快捷筛选） |
+| `src/lib/api.ts` | Tauri `invoke` Typed IPC 封装与数据类型定义（`AppSnapshot`、`UiPatchInfo`、`SwitchState`、`ClientModelsResponse`、`LiveDemoResult` 等） |
 | `src/index.css` | 全局设计 Token（浅色 + 深色 `[data-theme="dark"]`）与 `.tako-running-row` / `.tako-live-dot` 呼吸指示器样式 |
 | `src-tauri/src/main.rs` | 4 角色子命令路由（`mcp-server`、`status-line`、`gateway-proxy` / `agy-proxy`、GUI） |
-| `src-tauri/src/lib.rs` | Tauri 命令注册（含 `run_mcp_live_demo`）、`ManifestCheckResult`、OSS/GitHub 双端点更新策略 (`choose_self_update_endpoints`)、网关守护 |
-| `src-tauri/src/config.rs` | `AppPaths`、备份存取 (`has_backup`)、`SwitchState`、`ClientModelFilter`、持久化设备指纹 (`read_or_create_device_id` / `build_desktop_device_name`)、原子写 (`write_atomic`) |
+| `src-tauri/src/lib.rs` | Tauri 命令注册（含 `set_prefer_chinese_ui`、`patch_antigravity_ui`、`restore_antigravity_ui`、`list_plaza_models`、`run_mcp_live_demo`）、OSS/GitHub 双端点更新策略、网关守护 |
+| `src-tauri/src/config.rs` | `AppPaths`（含沙盒 `agy_app_override_dir`）、备份存取 (`has_backup`)、`SwitchState`、`ClientModelFilter`、持久化设备指纹、原子写 (`write_atomic`) |
 | `src-tauri/src/auth.rs` | 独立于 `tako-cli` 的 OAuth PKCE 登录（`DESKTOP_OAUTH_CLIENT_ID = "takoswitch"`、`build_oauth_authorize_url`、`exchange_desktop_token`）与 `~/.tako/switch/auth.json` 存取、`AccountStatus`、`BalanceCache` |
-| `src-tauri/src/agy_proxy.rs` | 本地网关服务、`ClientModelsResponse` 构建、`/claude` 与 `/codex` 模型目录生成与过滤、Antigravity 32 槽位展开 |
+| `src-tauri/src/agy_proxy.rs` | 本地网关服务、免登录模型广场 `fetch_plaza_models_for_ui` / `build_plaza_model_options`、`/claude` 与 `/codex` 模型目录生成与过滤、Antigravity 32 槽位展开 |
 | `src-tauri/src/mcp_server.rs` | 6 合 1 `stdio` MCP 工具实现（`tako_web_search`、`tako_generate_image`、`tako_generate_video`、`tako_generate_audio`、`tako_consult`、`tako_account_status`）及现场试跑核心 `execute_live_demo_for_paths` |
 | `src-tauri/src/manifest.rs` | `Manifest` 解析、平台匹配 (`resolve_platform_artifact`)、Semver + Calver 版本比较 (`compare_versions`) 与更新计算 (`compute_updates`) |
 | `src-tauri/src/installer.rs` | 带 `InstallProgressEvent` 与 SHA-256/SHA-512 校验的客户端下载安装器 |
 | `src-tauri/src/adapters/mod.rs` | `DesktopAppAdapter` trait、`AppId` / `AppMode`、`snapshot_app`、`merge_tako_mcp_server`、`build_stdio_mcp_json_entry` |
 | `src-tauri/src/adapters/dsh_tako.rs` | `DshTakoAdapter`：OSS/GitHub 安装升级、`~/.dsh-tako/.credentials.yaml` (`0600`) 无损同步 `refs.TAKO_API_KEY` |
-| `src-tauri/src/adapters/claude.rs` | `ClaudeAdapter`：原生 `Claude-3p` 隔离槽与受管 `stdio` MCP 写入 |
-| `src-tauri/src/adapters/codex.rs` | `CodexAdapter`：`~/.codex/config.toml` 无损 TOML 合并与官方 `auth.json` 暂存还原 |
-| `src-tauri/src/adapters/antigravity.rs` | `AntigravityAdapter`：用户态环境变量网关注入与 `~/.gemini/config/mcp_config.json` 管理 |
+| `src-tauri/src/adapters/claude.rs` | `ClaudeAdapter`：原生 `Claude-3p` 隔离槽、受管 `stdio` MCP 写入与独立简体中文配置同步 |
+| `src-tauri/src/adapters/codex.rs` | `CodexAdapter`：`~/.codex/config.toml` 无损 TOML 合并、官方 `auth.json` 暂存还原与独立简体中文配置同步 |
+| `src-tauri/src/adapters/antigravity.rs` | `AntigravityAdapter`：用户态环境变量网关注入、`~/.gemini/config/mcp_config.json` 与 `~/.gemini/AGENTS.md` 管理 |
+| `src-tauri/src/adapters/antigravity_i18n.rs` | 纯 Rust Electron ASAR v1 界面汉化补丁器、`.orig` 备份、SHA-256 完整性校验、升级检测与原厂签名级无损还原 |
+| `docs/roadmap.md` / `docs/dispatch/v2.0.8.md` | `v2.0.x` 产品演进路线图与双工作树研发/测试隔离契约 |
 | `scripts/sync-manifest.py` / `test_sync_manifest.py` | 抓取 DSH Tako 与三端官方无墙源并更新 `manifest/manifest.json` 的同步脚本与单测 |
-| `scripts/verify_client_mcp_ui.py` | V2 超级 MCP 内联剧场二进制媒体（WebP/MP4/MP3）、`data-testid`、CSP 与反篡改静态门禁校验脚本 |
+| `scripts/verify_client_mcp_ui.py` | V2 超级 MCP 内联剧场二进制媒体（WebP/MP4/MP3）、`data-testid`、CSP 与受控汉化备份安全门禁校验脚本 |
 | `manifest/manifest.json` | 托管桌面端官方安装源清单（由 `.github/workflows/sync-manifest.yml` 每 6 小时自动刷新） |
 | `.github/workflows/ci.yml` | PR 与 `main` push 验证流水线：前端构建 + 清单脚本单测 + Linux/macOS/Windows 三平台 `cargo test` & `clippy` |
 | `.github/workflows/release.yml` | `v*` tag 发布流水线：macOS 双架构签名公证 + Windows NSIS + `latest.json` / `SHA256SUMS.txt` + 旧 `v2.*` Release 自动清理 |
@@ -118,4 +121,4 @@ python3 scripts/verify_client_mcp_ui.py --self-test && python3 scripts/verify_cl
 ## 安全与合规红线（Hard Boundaries）
 
 - **公开仓库零敏感信息**：严禁向仓库写入或提交任何 API Key（`cr_`/`sk-`）、Apple ID / App-Specific Password / `.p12` / `.cer`、私密服务器 IP 或内部主机名；文档与测试夹具中一律使用明显占位符。
-- **禁止客户端绕过与篡改**：严禁加入伪造模型 ID 绕过客户端校验（如伪装模型前缀/行为字段）、欺骗上游身份检查、或反编译/修补第三方桌面客户端二进制（例如 `app.asar`）的代码。
+- **禁止鉴权欺骗与无备份篡改**：严禁伪造模型 ID 绕过客户端校验（如伪装模型前缀/行为字段）或欺骗上游身份鉴权；Google Antigravity 界面汉化必须唯一通过 `src-tauri/src/adapters/antigravity_i18n.rs` 执行受控 `.orig` 备份与 SHA-256 校验还原流程，严禁无备份覆盖原文件，严禁在其他源码文件私自触碰 `app.asar` 或调用 `@electron/asar` / `npx asar`。

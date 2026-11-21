@@ -218,6 +218,38 @@ impl ClaudeAdapter {
         Ok(())
     }
 
+    pub fn is_chinese_configured(paths: &AppPaths) -> bool {
+        let has_1p = read_json_object_or_empty(&Self::claude_1p_app_config_path(paths))
+            .ok()
+            .and_then(|m| {
+                m.get("locale")
+                    .and_then(Value::as_str)
+                    .map(|s| s == "zh-Hans")
+            })
+            .unwrap_or(false);
+        let has_3p = read_json_object_or_empty(&Self::claude_3p_app_config_path(paths))
+            .ok()
+            .and_then(|m| {
+                m.get("locale")
+                    .and_then(Value::as_str)
+                    .map(|s| s == "zh-Hans")
+            })
+            .unwrap_or(false);
+        let has_cc = read_json_object_or_empty(&Self::claude_code_settings_path(paths))
+            .ok()
+            .and_then(|m| {
+                m.get("language")
+                    .and_then(Value::as_str)
+                    .map(|s| s == "Simplified Chinese")
+            })
+            .unwrap_or(false);
+        has_1p || has_3p || has_cc
+    }
+
+    pub fn sync_standalone_chinese_locale(paths: &AppPaths, enable: bool) -> Result<(), String> {
+        Self::sync_claude_chinese_locale(paths, enable)
+    }
+
     fn deactivate_3p(paths: &AppPaths) -> Result<(), String> {
         let meta_path = Self::meta_3p_path(paths);
         if meta_path.exists() {
@@ -576,9 +608,11 @@ impl DesktopAppAdapter for ClaudeAdapter {
             if !Self::has_managed_tako_mcp(paths) {
                 notes.push("提示: Claude-3p profile 尚未下发 tako MCP".to_string());
             }
-            if read_switch_state(paths).prefer_chinese_ui {
+            if read_switch_state(paths).prefer_chinese_ui || Self::is_chinese_configured(paths) {
                 notes.push("中文增强: 已启用 (locale=zh-Hans / Claude Code language=Simplified Chinese)".to_string());
             }
+        } else if Self::is_chinese_configured(paths) {
+            notes.push("中文增强: 已启用 (locale=zh-Hans / Claude Code language=Simplified Chinese)".to_string());
         }
 
         DiagnosticResult {
