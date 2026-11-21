@@ -33,8 +33,8 @@
 | `src/index.css` | 全局设计 Token（浅色 + 深色 `[data-theme="dark"]`）与 `.tako-running-row` / `.tako-live-dot` 呼吸指示器样式 |
 | `src-tauri/src/main.rs` | 4 角色子命令路由（`mcp-server`、`status-line`、`gateway-proxy` / `agy-proxy`、GUI） |
 | `src-tauri/src/lib.rs` | Tauri 命令注册（含 `run_mcp_live_demo`）、`ManifestCheckResult`、OSS/GitHub 双端点更新策略 (`choose_self_update_endpoints`)、网关守护 |
-| `src-tauri/src/config.rs` | `AppPaths`、备份存取 (`has_backup`)、`SwitchState`、`ClientModelFilter`、`DEFAULT_*_RECOMMENDED_MODELS`、原子写 (`write_atomic`) |
-| `src-tauri/src/auth.rs` | 独立于 `tako-cli` 的 OAuth PKCE 登录与 `~/.tako/switch/auth.json` 存取、`AccountStatus`、`BalanceCache` |
+| `src-tauri/src/config.rs` | `AppPaths`、备份存取 (`has_backup`)、`SwitchState`、`ClientModelFilter`、持久化设备指纹 (`read_or_create_device_id` / `build_desktop_device_name`)、原子写 (`write_atomic`) |
+| `src-tauri/src/auth.rs` | 独立于 `tako-cli` 的 OAuth PKCE 登录（`DESKTOP_OAUTH_CLIENT_ID = "takoswitch"`、`build_oauth_authorize_url`、`exchange_desktop_token`）与 `~/.tako/switch/auth.json` 存取、`AccountStatus`、`BalanceCache` |
 | `src-tauri/src/agy_proxy.rs` | 本地网关服务、`ClientModelsResponse` 构建、`/claude` 与 `/codex` 模型目录生成与过滤、Antigravity 32 槽位展开 |
 | `src-tauri/src/mcp_server.rs` | 6 合 1 `stdio` MCP 工具实现（`tako_web_search`、`tako_generate_image`、`tako_generate_video`、`tako_generate_audio`、`tako_consult`、`tako_account_status`）及现场试跑核心 `execute_live_demo_for_paths` |
 | `src-tauri/src/manifest.rs` | `Manifest` 解析、平台匹配 (`resolve_platform_artifact`)、Semver + Calver 版本比较 (`compare_versions`) 与更新计算 (`compute_updates`) |
@@ -70,6 +70,7 @@
    - 展开 `/v1beta/models` 推理档位前，必须先按 `ClientModelFilter` 过滤再截断 **32 个自定义模型槽位上限**（`expand_models_catalog_with_filter`），否则用户勾选的主力模型会被截掉。
 5. **账号与配置隔离（`config.rs`、`auth.rs`、`mcp_server.rs`）**：
    - `~/.tako/switch/auth.json` 与 `tako-cli` 的 `~/.tako/config.json` 必须保持物理隔离，不得互写。
+   - `~/.tako/switch/device-id` 持久化 8 位本机设备指纹（登出/清理 `auth.json` 时不得删除），OAuth 登录固定携带 `client_id = "takoswitch"` 与 `{host}-{device_id}`（总长 ≤ 32）的 `device_name`，保证多机互不顶号、同机幂等。
    - `mcp_server.rs` 每次处理 `tools/list` / `tools/call` 时直接读取磁盘上的最新 `auth.json` 与 `state.json`，不得只靠启动期快照缓存状态。
 6. **双端点自更新与官方清单约定（`lib.rs`、`manifest.rs`、`scripts/sync-manifest.py`）**：
    - `tako-switch` 自身更新器在 `tauri.conf.json` 与 `lib.rs` 中同时支持阿里云上海 OSS 与 GitHub Releases 回退，通过 `choose_self_update_endpoints` 按 Semver 决定优先端点。

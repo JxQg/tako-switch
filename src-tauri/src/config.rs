@@ -125,6 +125,10 @@ impl AppPaths {
         self.switch_dir().join("balance-cache.json")
     }
 
+    pub fn device_id_path(&self) -> PathBuf {
+        self.switch_dir().join("device-id")
+    }
+
     pub fn backups_dir(&self, app_id: &str) -> PathBuf {
         self.switch_dir().join("backups").join(app_id)
     }
@@ -647,6 +651,114 @@ pub fn has_backup(paths: &AppPaths, app_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn is_valid_device_id(id: &str) -> bool {
+    (8..=16).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+pub fn read_or_create_device_id(paths: &AppPaths) -> String {
+    let path = paths.device_id_path();
+    if let Ok(raw) = fs::read_to_string(&path) {
+        let trimmed = raw.trim();
+        if is_valid_device_id(trimmed) {
+            return trimmed.to_string();
+        }
+    }
+    let id = format!("{:08x}", rand::thread_rng().gen::<u32>());
+    let _ = write_atomic(&path, id.as_bytes(), false);
+    id
+}
+
+pub fn sanitize_host_label(raw: &str) -> Option<String> {
+    let first_label = raw.trim().split('.').next().unwrap_or("");
+    let mut out = String::with_capacity(first_label.len());
+    let mut prev_dash = false;
+    for ch in first_label.chars() {
+        let mapped = if ch.is_whitespace() {
+            Some('-')
+        } else if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '+' | '-') {
+            Some(ch)
+        } else {
+            None
+        };
+        if let Some(c) = mapped {
+            if c == '-' {
+                if !prev_dash {
+                    out.push('-');
+                    prev_dash = true;
+                }
+            } else {
+                out.push(c);
+                prev_dash = false;
+            }
+        }
+    }
+    let cleaned = out.trim_matches(['-', '.', '_', '+']);
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
+pub fn detect_raw_hostname() -> Option<String> {
+    for key in ["HOSTNAME", "COMPUTERNAME"] {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    let mut cmd = std::process::Command::new("hostname");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let host = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+pub fn build_desktop_device_name_with_host(paths: &AppPaths, raw_host: Option<&str>) -> String {
+    let device_id = read_or_create_device_id(paths);
+    let max_host_len = 32usize.saturating_sub(1 + device_id.len());
+    let candidate = raw_host
+        .and_then(sanitize_host_label)
+        .unwrap_or_else(|| std::env::consts::OS.to_string());
+    let mut host = candidate
+        .chars()
+        .take(max_host_len)
+        .collect::<String>()
+        .trim_end_matches(['-', '.', '_', '+'])
+        .to_string();
+    if host.is_empty() {
+        host = std::env::consts::OS
+            .chars()
+            .take(max_host_len)
+            .collect::<String>()
+            .trim_end_matches(['-', '.', '_', '+'])
+            .to_string();
+    }
+    format!("{host}-{device_id}")
+}
+
+pub fn build_desktop_device_name(paths: &AppPaths) -> String {
+    let raw_host = detect_raw_hostname();
+    build_desktop_device_name_with_host(paths, raw_host.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,5 +854,101 @@ mod tests {
             normalized.enabled_ids,
             vec!["claude-opus-5-5", "claude-sonnet-5-5"]
         );
+    }
+
+    #[test]
+    fn device_id_is_persisted_reused_and_preserved_across_auth_clear() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+
+        let id1 = read_or_create_device_id(&paths);
+        assert_eq!(id1.len(), 8);
+        assert!(id1
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        assert!(paths.device_id_path().exists());
+
+        let id2 = read_or_create_device_id(&paths);
+        assert_eq!(id1, id2);
+
+        save_switch_auth(&paths, Some("cr_switch_key"), Some("7"), Some("oauth")).unwrap();
+        save_switch_auth(&paths, None, None, None).unwrap();
+        assert!(paths.device_id_path().exists());
+        assert_eq!(read_or_create_device_id(&paths), id1);
+
+        // Pre-existing valid 8..=16 lowercase alphanumeric ID is trimmed and reused
+        write_atomic(&paths.device_id_path(), b"  abc123def456  \n", false).unwrap();
+        assert_eq!(read_or_create_device_id(&paths), "abc123def456");
+
+        // Invalid existing ID (too short / uppercase / punctuation) is regenerated
+        for invalid in [b"short".as_slice(), b"ABC12345", b"bad-id12", b"12345678901234567"] {
+            write_atomic(&paths.device_id_path(), invalid, false).unwrap();
+            let regen = read_or_create_device_id(&paths);
+            assert_eq!(regen.len(), 8);
+            assert!(regen
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        }
+    }
+
+    #[test]
+    fn sanitize_host_label_and_device_name_enforce_contract() {
+        assert_eq!(
+            sanitize_host_label("  MacBook-Pro.local "),
+            Some("MacBook-Pro".to_string())
+        );
+        assert_eq!(
+            sanitize_host_label("Alice's  MacBook\tPro.corp.internal"),
+            Some("Alices-MacBook-Pro".to_string())
+        );
+        assert_eq!(
+            sanitize_host_label("--__++team_box+1--."),
+            Some("team_box+1".to_string())
+        );
+        assert_eq!(sanitize_host_label("  ---._+  "), None);
+        assert_eq!(sanitize_host_label("中文主机名.local"), None);
+        assert_eq!(sanitize_host_label(".local"), None);
+
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        write_atomic(&paths.device_id_path(), b"a1b2c3d4", false).unwrap();
+
+        let name = build_desktop_device_name_with_host(&paths, Some("MacBook-Pro.local"));
+        assert_eq!(name, "MacBook-Pro-a1b2c3d4");
+        assert!((1..=32).contains(&name.len()));
+
+        // Long hostname truncates cleanly without leaving trailing separators before -device_id
+        let boundary = build_desktop_device_name_with_host(
+            &paths,
+            Some("1234567890123456789012-rest.local"),
+        );
+        assert_eq!(boundary, "1234567890123456789012-a1b2c3d4");
+        assert_eq!(boundary.len(), 31);
+
+        let very_long = build_desktop_device_name_with_host(
+            &paths,
+            Some("super-long-workstations-hostname-for-engineering.corp"),
+        );
+        assert_eq!(very_long, "super-long-workstations-a1b2c3d4");
+        assert_eq!(very_long.len(), 32);
+        assert!(very_long.ends_with("-a1b2c3d4"));
+        assert!(very_long
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'@' | b'+' | b'-')));
+
+        // Fallback to OS when host is None or sanitizes to None
+        let fallback_none = build_desktop_device_name_with_host(&paths, None);
+        assert_eq!(fallback_none, format!("{}-a1b2c3d4", std::env::consts::OS));
+        let fallback_cn = build_desktop_device_name_with_host(&paths, Some("我的电脑"));
+        assert_eq!(fallback_cn, format!("{}-a1b2c3d4", std::env::consts::OS));
+
+        // Longer 16-char device-id still respects total 32-char cap
+        write_atomic(&paths.device_id_path(), b"0123456789abcdef", false).unwrap();
+        let long_id_name = build_desktop_device_name_with_host(
+            &paths,
+            Some("abcdefghijklmnopqrstuvwxyz.local"),
+        );
+        assert_eq!(long_id_name, "abcdefghijklmno-0123456789abcdef");
+        assert_eq!(long_id_name.len(), 32);
     }
 }

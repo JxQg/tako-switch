@@ -66,6 +66,7 @@ Tako Switch 的所有配置均保存在用户主目录的独立子目录下，�
 | 路径 | 用途 |
 |---|---|
 | `~/.tako/switch/auth.json` | 当前登录态与 Tako API Key（支持 OAuth PKCE 或手动导入） |
+| `~/.tako/switch/device-id` | 本机唯一设备指纹，保障多机同时登录互不顶号、同机重登幂等更新 |
 | `~/.tako/switch/state.json` | 网关地址、客户端切换模式、MCP 工具开关与各客户端模型筛选策略 |
 | `~/.tako/switch/backups/<app>/` | 首次写入前的原始配置文件与官方登录态快照，用于无损恢复 |
 | `~/.tako/switch/manifest-cache.json` | 托管桌面客户端安装包清单本地缓存 |

@@ -14,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 pub const TAKO_QUOTA_PER_USD: f64 = 500_000.0;
+pub const DESKTOP_OAUTH_CLIENT_ID: &str = "takoswitch";
 
 pub fn quota_units_to_usd(units: i64) -> f64 {
     (units as f64) / TAKO_QUOTA_PER_USD
@@ -262,6 +263,24 @@ pub fn open_external_url(url: &str) -> Result<(), String> {
     }
 }
 
+pub fn build_oauth_authorize_url(
+    base_url: &str,
+    redirect_uri: &str,
+    oauth_state: &str,
+    code_challenge: &str,
+    device_name: &str,
+) -> String {
+    let base = base_url.trim_end_matches('/');
+    format!(
+        "{base}/app/authorize?client_id={}&response_type=code&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&device_name={}",
+        url_encode_component(DESKTOP_OAUTH_CLIENT_ID),
+        url_encode_component(redirect_uri),
+        url_encode_component(oauth_state),
+        url_encode_component(code_challenge),
+        url_encode_component(device_name),
+    )
+}
+
 pub async fn start_oauth_login(paths: &AppPaths) -> Result<AccountStatus, String> {
     let state_cfg = read_switch_state(paths);
     let base_url = state_cfg.normalized_base_url();
@@ -278,15 +297,14 @@ pub async fn start_oauth_login(paths: &AppPaths) -> Result<AccountStatus, String
     let oauth_state = generate_random_url_safe(24);
     let code_verifier = generate_random_url_safe(48);
     let code_challenge = pkce_s256_challenge(&code_verifier);
-    let platform = std::env::consts::OS;
-    let device_name = format!("tako-switch@{platform}");
+    let device_name = crate::config::build_desktop_device_name(paths);
 
-    let auth_url = format!(
-        "{base_url}/app/authorize?client_id=tako-connect&response_type=code&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&device_name={}",
-        url_encode_component(&redirect_uri),
-        url_encode_component(&oauth_state),
-        url_encode_component(&code_challenge),
-        url_encode_component(&device_name),
+    let auth_url = build_oauth_authorize_url(
+        &base_url,
+        &redirect_uri,
+        &oauth_state,
+        &code_challenge,
+        &device_name,
     );
 
     open_external_url(&auth_url)?;
@@ -346,7 +364,7 @@ pub async fn start_oauth_login(paths: &AppPaths) -> Result<AccountStatus, String
     Ok(fetch_account_status(paths).await)
 }
 
-async fn exchange_desktop_token(
+pub async fn exchange_desktop_token(
     paths: &AppPaths,
     base_url: &str,
     code: &str,
@@ -361,7 +379,7 @@ async fn exchange_desktop_token(
             "code": code,
             "code_verifier": code_verifier,
             "redirect_uri": redirect_uri,
-            "client_id": "tako-connect"
+            "client_id": DESKTOP_OAUTH_CLIENT_ID
         }))
         .send()
         .await
@@ -702,6 +720,99 @@ mod tests {
         assert_eq!(
             format_status_line_text(&with_plan, None),
             "Pro x4 · 余额 $12.50 · 5h 20% / 7d 50%"
+        );
+    }
+
+    #[test]
+    fn oauth_authorize_url_uses_takoswitch_client_id_and_device_name() {
+        assert_eq!(DESKTOP_OAUTH_CLIENT_ID, "takoswitch");
+        let url = build_oauth_authorize_url(
+            "https://tako.shiroha.tech/",
+            "http://127.0.0.1:43210/tako/callback",
+            "state-xyz",
+            "challenge-abc",
+            "MacBook-Pro-a1b2c3d4",
+        );
+        assert!(url.starts_with("https://tako.shiroha.tech/app/authorize?"));
+        assert!(url.contains("client_id=takoswitch"));
+        assert!(!url.contains("tako-connect"));
+        assert!(url.contains("response_type=code"));
+        assert!(url.contains("code_challenge=challenge-abc"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("state=state-xyz"));
+        assert!(url.contains("device_name=MacBook-Pro-a1b2c3d4"));
+        assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A43210%2Ftako%2Fcallback"));
+    }
+
+    #[tokio::test]
+    async fn exchange_desktop_token_sends_takoswitch_client_id_and_logout_keeps_device_id() {
+        use tempfile::TempDir;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut token_body_seen = String::new();
+            for _ in 0..3 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let resp_body = if req.starts_with("POST /api/desktop/token ") {
+                    token_body_seen = req.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                    r#"{"success":true,"data":{"key":"cr_oauth_device_key"}}"#
+                } else if req.starts_with("POST /apiStats/api/get-key-id ") {
+                    r#"{"success":true,"data":{"id":"key_99"}}"#
+                } else if req.starts_with("POST /api/desktop/revoke ") {
+                    r#"{"success":true}"#
+                } else {
+                    r#"{"success":false}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            }
+            token_body_seen
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let device_id = crate::config::read_or_create_device_id(&paths);
+        let mut st = read_switch_state(&paths);
+        st.base_url = format!("http://{addr}");
+        crate::config::save_switch_state(&paths, &st).unwrap();
+
+        exchange_desktop_token(
+            &paths,
+            &format!("http://{addr}"),
+            "auth_code_1",
+            "verifier_1",
+            "http://127.0.0.1:9999/tako/callback",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(read_main_api_key(&paths).as_deref(), Some("cr_oauth_device_key"));
+        assert_eq!(read_main_api_id(&paths).as_deref(), Some("key_99"));
+        assert_eq!(read_switch_auth(&paths).auth_source.as_deref(), Some("oauth"));
+
+        let status_after_logout = logout(&paths).await.unwrap();
+        assert!(!status_after_logout.logged_in);
+        assert!(paths.device_id_path().exists());
+        assert_eq!(crate::config::read_or_create_device_id(&paths), device_id);
+
+        let token_body = server.await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&token_body).unwrap();
+        assert_eq!(parsed["client_id"], "takoswitch");
+        assert_eq!(parsed["grant_type"], "authorization_code");
+        assert_eq!(parsed["code"], "auth_code_1");
+        assert_eq!(parsed["code_verifier"], "verifier_1");
+        assert_eq!(
+            parsed["redirect_uri"],
+            "http://127.0.0.1:9999/tako/callback"
         );
     }
 }
