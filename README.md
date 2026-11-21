@@ -38,19 +38,22 @@ Tako Switch 在每次写入前都会自动备份原配置至 `~/.tako/switch/bac
 | **Codex Desktop** (`com.openai.codex` / `OpenAI.Codex`) | 无损编辑 `~/.codex/config.toml`、本地 `/codex` 网关、动态模型目录与预授权 MCP | 保留用户其他 TOML 配置段；自动暂存官方 `auth.json` 实现免登录直进（设置中可选保留官方登录） | 从 `~/.tako/switch/backups/` 原样还原配置与官方登录态 |
 | **Google Antigravity** (`com.google.antigravity`) | 用户态环境变量注入（macOS LaunchAgent / Windows `HKCU\Environment`，固定 `WIRE_PROTOCOL=genai`）、推理档位展开与 `~/.gemini/config/mcp_config.json` | 零 root 权限修改系统；支持在设置中单独指定 Antigravity 专用 Key 覆盖主 Key | 清理用户态网关环境变量并还原备份配置 |
 
+- **三端无损简体中文增强（`preferChineseUi`）**：在「设置」中默认开启，按客户端无损注入中文界面与中文回复偏好——支持 **Codex Desktop** 跨平台界面本地化（`localeOverride`）与受管 `AGENTS.md` 规则块、**Claude Desktop** 系统菜单（macOS `AppleLanguages`）与中文交互指令、**Google Antigravity** 界面语言与受管规则块；关闭该开关或切回「官方」模式时，自动按备份原样清理还原，不触碰任何第三方客户端二进制包。
+
 ---
 
 ## 内置本地统一网关与 6 合 1 Tako 超级 MCP
 
 - **本地统一网关（`http://127.0.0.1:18419`）**：随应用自动托管运行，为三端桌面客户端提供本地代理路由（`/claude`、`/codex` 及 Gemini 协议适配）、动态模型目录、推理档位展开与用量/额度查询支撑。
 - **内置 Rust `stdio` MCP 服务器（`tako-switch mcp-server`）**：每次 `tools/list` 与 `tools/call` 均动态读取 `~/.tako/switch/auth.json` 与 `~/.tako/switch/state.json`，在 Tako Switch 设置中开关工具后立即生效，无需重装 MCP。
+- **内联实景剧场（零扣费交互）与现场试跑（Live Playground）**：主界面下方内置 5 合 1 超级 MCP 剧场——「效果演示」模式使用本地内置 WebP / H.264 MP4 / 冰糖 MP3 实景素材，无需登录或扣费即可对比生图效果、首尾帧动态视频、多情绪真声试听、联网溯源引用与外脑会诊；登录或填入 API Key 后可切换至「现场试跑」模式，直接通过 `run_mcp_live_demo` 实时调用多模态工具并内联预览结果（视频轮询超时支持保留 `taskId` 一键断点续查，绝不重复扣费）。
 
 | 工具名 | 能力说明 | 默认后端 / 模型 |
 |---|---|---|
 | `tako_web_search` | 实时联网搜索，返回结构化摘要与可点击引用来源 | DeepSeek / Grok |
 | `tako_generate_image` | 文生图与参考图编辑，支持自动保存生成图片 | `gpt-image-2` |
 | `tako_generate_video` | 文生视频与图生视频，支持异步轮询与 MP4 下载 | `grok-imagine-video-1.5` (480p) |
-| `tako_generate_audio` | 多语种语音合成（TTS）与音频转写（ASR） | `speech_tts` / `speech_asr` |
+| `tako_generate_audio` | 多语种高表现力语音合成（TTS，默认「冰糖」音色，支持声音设计与克隆）与音频转写（ASR） | `mimo-v2.5-tts`（冰糖）/ `speech_tts` / `speech_asr` |
 | `tako_consult` | 向外部专家模型咨询疑难推理或获取第二意见 | `gpt-6.2-sol`（可配置） |
 | `tako_account_status` | 实时查询当前 Tako 账号余额、所属分组与速率限制 | Live quota API |
 

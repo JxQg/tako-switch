@@ -26,16 +26,17 @@
 | 路径 | 职责与核心符号 |
 |---|---|
 | `src/App.tsx` | 主界面：账号登录/登出、四大客户端卡片（一键安装 / 模式切换 / 启动 / 关闭 / 诊断 / 模型筛选）、设置抽屉与更新检查 |
+| `src/components/McpInlineTheater.tsx` | 主界面下方 5 合 1 超级 MCP 内联实景剧场（「效果演示」零扣费媒体交互 + 「现场试跑」Live Playground） |
 | `src/components/ModelPickerModal.tsx` | 分客户端模型选择弹窗：按推荐/自定义/全量过滤，展示 7 日实付均价、输入输出单价与吞吐/延迟 |
 | `src/components/BrandIcons.tsx` / `ModelIcons.tsx` | 客户端品牌图标与模型厂商图标（Codex / Claude / Antigravity / DeepSeek 等） |
-| `src/lib/api.ts` | Tauri `invoke` Typed IPC 封装与数据类型定义（`AppSnapshot`、`SwitchState`、`ClientModelsResponse` 等） |
+| `src/lib/api.ts` | Tauri `invoke` Typed IPC 封装与数据类型定义（`AppSnapshot`、`SwitchState`、`ClientModelsResponse`、`LiveDemoResult` 等） |
 | `src/index.css` | 全局设计 Token（浅色 + 深色 `[data-theme="dark"]`）与 `.tako-running-row` / `.tako-live-dot` 呼吸指示器样式 |
 | `src-tauri/src/main.rs` | 4 角色子命令路由（`mcp-server`、`status-line`、`gateway-proxy` / `agy-proxy`、GUI） |
-| `src-tauri/src/lib.rs` | Tauri 命令注册、`ManifestCheckResult`、OSS/GitHub 双端点更新策略 (`choose_self_update_endpoints`)、网关守护 |
+| `src-tauri/src/lib.rs` | Tauri 命令注册（含 `run_mcp_live_demo`）、`ManifestCheckResult`、OSS/GitHub 双端点更新策略 (`choose_self_update_endpoints`)、网关守护 |
 | `src-tauri/src/config.rs` | `AppPaths`、备份存取 (`has_backup`)、`SwitchState`、`ClientModelFilter`、`DEFAULT_*_RECOMMENDED_MODELS`、原子写 (`write_atomic`) |
 | `src-tauri/src/auth.rs` | 独立于 `tako-cli` 的 OAuth PKCE 登录与 `~/.tako/switch/auth.json` 存取、`AccountStatus`、`BalanceCache` |
 | `src-tauri/src/agy_proxy.rs` | 本地网关服务、`ClientModelsResponse` 构建、`/claude` 与 `/codex` 模型目录生成与过滤、Antigravity 32 槽位展开 |
-| `src-tauri/src/mcp_server.rs` | 6 合 1 `stdio` MCP 工具实现：`tako_web_search`、`tako_generate_image`、`tako_generate_video`、`tako_generate_audio`、`tako_consult`、`tako_account_status` |
+| `src-tauri/src/mcp_server.rs` | 6 合 1 `stdio` MCP 工具实现（`tako_web_search`、`tako_generate_image`、`tako_generate_video`、`tako_generate_audio`、`tako_consult`、`tako_account_status`）及现场试跑核心 `execute_live_demo_for_paths` |
 | `src-tauri/src/manifest.rs` | `Manifest` 解析、平台匹配 (`resolve_platform_artifact`)、Semver + Calver 版本比较 (`compare_versions`) 与更新计算 (`compute_updates`) |
 | `src-tauri/src/installer.rs` | 带 `InstallProgressEvent` 与 SHA-256/SHA-512 校验的客户端下载安装器 |
 | `src-tauri/src/adapters/mod.rs` | `DesktopAppAdapter` trait、`AppId` / `AppMode`、`snapshot_app`、`merge_tako_mcp_server`、`build_stdio_mcp_json_entry` |
@@ -44,6 +45,7 @@
 | `src-tauri/src/adapters/codex.rs` | `CodexAdapter`：`~/.codex/config.toml` 无损 TOML 合并与官方 `auth.json` 暂存还原 |
 | `src-tauri/src/adapters/antigravity.rs` | `AntigravityAdapter`：用户态环境变量网关注入与 `~/.gemini/config/mcp_config.json` 管理 |
 | `scripts/sync-manifest.py` / `test_sync_manifest.py` | 抓取 DSH Tako 与三端官方无墙源并更新 `manifest/manifest.json` 的同步脚本与单测 |
+| `scripts/verify_client_mcp_ui.py` | V2 超级 MCP 内联剧场二进制媒体（WebP/MP4/MP3）、`data-testid`、CSP 与反篡改静态门禁校验脚本 |
 | `manifest/manifest.json` | 托管桌面端官方安装源清单（由 `.github/workflows/sync-manifest.yml` 每 6 小时自动刷新） |
 | `.github/workflows/ci.yml` | PR 与 `main` push 验证流水线：前端构建 + 清单脚本单测 + Linux/macOS/Windows 三平台 `cargo test` & `clippy` |
 | `.github/workflows/release.yml` | `v*` tag 发布流水线：macOS 双架构签名公证 + Windows NSIS + `latest.json` / `SHA256SUMS.txt` + 旧 `v2.*` Release 自动清理 |
@@ -90,6 +92,9 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 # 3. 清单同步脚本测试与结构校验
 python3 -m unittest -v scripts/test_sync_manifest.py
 python3 -c 'import json; d=json.load(open("manifest/manifest.json")); assert set(d["apps"])=={"dsh-tako","codex","claude","antigravity"}'
+
+# 4. 超级 MCP 内联剧场与安全门禁校验
+python3 scripts/verify_client_mcp_ui.py --self-test && python3 scripts/verify_client_mcp_ui.py
 ```
 
 ---
