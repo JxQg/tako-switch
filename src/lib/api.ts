@@ -227,6 +227,36 @@ export interface SettingsPatch {
   mcp?: McpToolsConfig;
 }
 
+export interface LiveDemoRequest {
+  tool: "image" | "video" | "audio" | "search" | "consult";
+  prompt: string;
+  model?: string;
+  voice?: string;
+  instructions?: string;
+  aspectRatio?: string;
+  provider?: string;
+  resumeTaskId?: string;
+}
+
+export interface LiveDemoCitation {
+  title: string;
+  url: string;
+  snippet: string;
+  domain: string;
+}
+
+export interface LiveDemoResult {
+  tool: "image" | "video" | "audio" | "search" | "consult";
+  status: "completed" | "pending";
+  model: string;
+  elapsedMs: number;
+  savedPath: string | null;
+  previewDataUrl: string | null;
+  textOutput: string | null;
+  taskId: string | null;
+  citations: LiveDemoCitation[];
+}
+
 export const api = {
   getDashboard: (refreshAccount: boolean) =>
     invoke<DashboardPayload>("get_dashboard", { refreshAccount }),
@@ -256,4 +286,6 @@ export const api = {
   ensureLocalGateway: () => invoke<boolean>("ensure_local_gateway"),
   checkSelfUpdateSmart: () => invoke<SelfUpdateCheckResult>("check_self_update_smart"),
   installSelfUpdate: () => invoke<void>("install_self_update"),
+  runMcpLiveDemo: (input: LiveDemoRequest) =>
+    invoke<LiveDemoResult>("run_mcp_live_demo", { input }),
 };
