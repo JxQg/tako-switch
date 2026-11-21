@@ -1,5 +1,6 @@
 use crate::adapters::{
-    read_json_object_or_empty, AppId, AppMode, DesktopAppAdapter, DiagnosticResult, InstallInfo,
+    read_json_object_or_empty, sync_managed_chinese_markdown, AppId, AppMode, DesktopAppAdapter,
+    DiagnosticResult, InstallInfo,
 };
 use crate::agy_proxy::{
     ensure_gateway_service, is_proxy_healthy, stop_gateway_service_if_unused,
@@ -14,13 +15,17 @@ use toml_edit::{Array, DocumentMut, Item, Table, Value as TomlValue};
 #[cfg(target_os = "macos")]
 use crate::adapters::{
     find_macos_app, is_macos_bundle_id_running, launch_macos_app, quit_macos_bundle_id,
-    read_macos_app_bundle_version,
+    read_macos_app_bundle_version, sync_macos_apple_languages,
 };
 
 pub struct CodexAdapter;
 
 #[cfg(target_os = "macos")]
 const CODEX_MACOS_BUNDLE_ID: &str = "com.openai.codex";
+
+const CODEX_CHINESE_AGENTS_BODY: &str = "\
+- 默认使用简体中文与用户沟通，包括最终回复、代码解释、变更摘要与错误分析（除非用户明确要求使用其他语言）。\n\
+- 保持代码标识符、文件路径、命令行、配置键名与日志原文的原始格式，不强行翻译专有名词。";
 
 impl CodexAdapter {
     fn config_path(paths: &AppPaths) -> PathBuf {
@@ -29,6 +34,10 @@ impl CodexAdapter {
 
     fn auth_path(paths: &AppPaths) -> PathBuf {
         paths.codex_dir.join("auth.json")
+    }
+
+    pub fn agents_md_path(paths: &AppPaths) -> PathBuf {
+        paths.codex_dir.join("AGENTS.md")
     }
 
     fn is_oauth_auth_json(bytes: &[u8]) -> bool {
@@ -131,6 +140,57 @@ impl CodexAdapter {
             }
             if providers.is_empty() {
                 doc.remove("model_providers");
+            }
+        }
+    }
+
+    fn set_desktop_locale_zh_cn(doc: &mut DocumentMut) {
+        if doc
+            .get("desktop")
+            .and_then(|i| i.as_table_like())
+            .is_none()
+        {
+            doc["desktop"] = Item::Table(Table::new());
+        }
+        if let Some(desktop) = doc.get_mut("desktop").and_then(|i| i.as_table_like_mut()) {
+            desktop.insert("localeOverride", toml_edit::value("zh-CN"));
+        }
+    }
+
+    fn restore_backup_desktop_locale(doc: &mut DocumentMut, paths: &AppPaths) {
+        let backup_doc = read_backup(paths, "codex", "config.toml")
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|s| s.parse::<DocumentMut>().ok());
+
+        let orig_locale = backup_doc
+            .as_ref()
+            .and_then(|b| b.get("desktop"))
+            .and_then(|i| i.as_table_like())
+            .and_then(|t| t.get("localeOverride"))
+            .cloned();
+
+        let had_nonempty_backup_desktop = backup_doc
+            .as_ref()
+            .and_then(|b| b.get("desktop"))
+            .and_then(|i| i.as_table_like())
+            .map(|t| !t.is_empty())
+            .unwrap_or(false);
+
+        if let Some(locale_item) = orig_locale {
+            if doc
+                .get("desktop")
+                .and_then(|i| i.as_table_like())
+                .is_none()
+            {
+                doc["desktop"] = Item::Table(Table::new());
+            }
+            if let Some(desktop) = doc.get_mut("desktop").and_then(|i| i.as_table_like_mut()) {
+                desktop.insert("localeOverride", locale_item);
+            }
+        } else if let Some(desktop) = doc.get_mut("desktop").and_then(|i| i.as_table_like_mut()) {
+            desktop.remove("localeOverride");
+            if desktop.is_empty() && !had_nonempty_backup_desktop {
+                doc.remove("desktop");
             }
         }
     }
@@ -287,6 +347,7 @@ impl DesktopAppAdapter for CodexAdapter {
             AppMode::Official => {
                 Self::restore_official_auth(paths)?;
                 Self::restore_backup_provider(&mut doc, paths);
+                Self::restore_backup_desktop_locale(&mut doc, paths);
                 Self::set_mcp_server(&mut doc, paths, false);
                 let absent_marker = paths.backups_dir("codex").join("config.toml.absent");
                 if doc.as_table().is_empty() && absent_marker.exists() && config_path.exists() {
@@ -295,6 +356,16 @@ impl DesktopAppAdapter for CodexAdapter {
                 } else {
                     write_atomic(&config_path, doc.to_string().as_bytes(), false)?;
                 }
+                sync_managed_chinese_markdown(
+                    paths,
+                    "codex",
+                    "AGENTS.md",
+                    &Self::agents_md_path(paths),
+                    false,
+                    "",
+                )?;
+                #[cfg(target_os = "macos")]
+                sync_macos_apple_languages(paths, CODEX_MACOS_BUNDLE_ID, false);
                 stop_gateway_service_if_unused(paths)
             }
             AppMode::Tako => {
@@ -313,17 +384,30 @@ impl DesktopAppAdapter for CodexAdapter {
                 tako["model_catalog_url"] = toml_edit::value(CODEX_PROXY_CATALOG_URL);
                 tako["wire_api"] = toml_edit::value("responses");
 
-                #[cfg(target_os = "macos")]
-                if state.prefer_chinese_ui && !paths.is_test {
-                    let _ = std::process::Command::new("/usr/bin/defaults")
-                        .args([
-                            "write",
-                            CODEX_MACOS_BUNDLE_ID,
-                            "AppleLanguages",
-                            "-array",
-                            "zh-Hans",
-                        ])
-                        .output();
+                if state.prefer_chinese_ui {
+                    Self::set_desktop_locale_zh_cn(&mut doc);
+                    sync_managed_chinese_markdown(
+                        paths,
+                        "codex",
+                        "AGENTS.md",
+                        &Self::agents_md_path(paths),
+                        true,
+                        CODEX_CHINESE_AGENTS_BODY,
+                    )?;
+                    #[cfg(target_os = "macos")]
+                    sync_macos_apple_languages(paths, CODEX_MACOS_BUNDLE_ID, true);
+                } else {
+                    Self::restore_backup_desktop_locale(&mut doc, paths);
+                    sync_managed_chinese_markdown(
+                        paths,
+                        "codex",
+                        "AGENTS.md",
+                        &Self::agents_md_path(paths),
+                        false,
+                        "",
+                    )?;
+                    #[cfg(target_os = "macos")]
+                    sync_macos_apple_languages(paths, CODEX_MACOS_BUNDLE_ID, false);
                 }
 
                 if state.codex_preserve_official_auth {
@@ -419,6 +503,9 @@ impl DesktopAppAdapter for CodexAdapter {
                                 }
                             }
                         }
+                    }
+                    if read_switch_state(paths).prefer_chinese_ui {
+                        notes.push("中文增强: 已启用 (localeOverride=zh-CN / AGENTS.md 简体中文规则)".to_string());
                     }
                 }
                 if Self::has_tako_mcp(&doc) {
@@ -569,5 +656,138 @@ trust_level = "trusted"
             r#"{"tokens":{"access":"untouched"}}"#
         );
         assert!(adapter.diagnose(&paths).ok);
+    }
+
+    #[test]
+    fn codex_chinese_i18n_preserves_existing_desktop_and_agents_md_and_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        fs::create_dir_all(&paths.codex_dir).unwrap();
+        fs::write(
+            paths.codex_dir.join("config.toml"),
+            r#"model = "gpt-5.4"
+
+[desktop]
+reviewDelivery = "inline"
+localeOverride = "ja-JP"
+"#,
+        )
+        .unwrap();
+        let user_agents = "# My Codex Rules\nAlways run cargo test.\n";
+        fs::write(CodexAdapter::agents_md_path(&paths), user_agents).unwrap();
+
+        save_switch_auth(&paths, Some("cr_codex_secret"), Some("1"), Some("oauth")).unwrap();
+        let adapter = CodexAdapter;
+
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        let tako_toml = fs::read_to_string(paths.codex_dir.join("config.toml")).unwrap();
+        let tako_doc = tako_toml.parse::<DocumentMut>().unwrap();
+        let desktop_tbl = tako_doc.get("desktop").and_then(|i| i.as_table_like()).unwrap();
+        assert_eq!(
+            desktop_tbl.get("localeOverride").and_then(|v| v.as_str()),
+            Some("zh-CN")
+        );
+        assert_eq!(
+            desktop_tbl.get("reviewDelivery").and_then(|v| v.as_str()),
+            Some("inline")
+        );
+
+        let agents_first = fs::read_to_string(CodexAdapter::agents_md_path(&paths)).unwrap();
+        assert!(agents_first.contains("# My Codex Rules"));
+        assert!(agents_first.contains("Always run cargo test."));
+        assert!(agents_first.contains(crate::adapters::TAKO_CHINESE_BLOCK_START));
+        assert!(agents_first.contains(crate::adapters::TAKO_CHINESE_BLOCK_END));
+        assert!(agents_first.contains("简体中文"));
+
+        assert!(adapter
+            .diagnose(&paths)
+            .notes
+            .iter()
+            .any(|n| n.contains("中文增强: 已启用")));
+
+        // Applying Tako again must be idempotent
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        let agents_second = fs::read_to_string(CodexAdapter::agents_md_path(&paths)).unwrap();
+        assert_eq!(agents_first, agents_second);
+        assert_eq!(
+            agents_second
+                .matches(crate::adapters::TAKO_CHINESE_BLOCK_START)
+                .count(),
+            1
+        );
+
+        // Disabling prefer_chinese_ui in Tako mode restores localeOverride and AGENTS.md
+        let mut st = read_switch_state(&paths);
+        st.prefer_chinese_ui = false;
+        save_switch_state(&paths, &st).unwrap();
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        let disabled_doc = fs::read_to_string(paths.codex_dir.join("config.toml"))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let disabled_desktop = disabled_doc
+            .get("desktop")
+            .and_then(|i| i.as_table_like())
+            .unwrap();
+        assert_eq!(
+            disabled_desktop.get("localeOverride").and_then(|v| v.as_str()),
+            Some("ja-JP")
+        );
+        assert_eq!(
+            disabled_desktop.get("reviewDelivery").and_then(|v| v.as_str()),
+            Some("inline")
+        );
+        assert_eq!(
+            fs::read_to_string(CodexAdapter::agents_md_path(&paths)).unwrap(),
+            user_agents
+        );
+        assert!(!adapter
+            .diagnose(&paths)
+            .notes
+            .iter()
+            .any(|n| n.contains("中文增强: 已启用")));
+
+        // Re-enable then switch to Official -> full restoration
+        st.prefer_chinese_ui = true;
+        save_switch_state(&paths, &st).unwrap();
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        adapter.apply_mode(&paths, AppMode::Official).unwrap();
+
+        let off_doc = fs::read_to_string(paths.codex_dir.join("config.toml"))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let off_desktop = off_doc.get("desktop").and_then(|i| i.as_table_like()).unwrap();
+        assert_eq!(
+            off_desktop.get("localeOverride").and_then(|v| v.as_str()),
+            Some("ja-JP")
+        );
+        assert_eq!(
+            off_desktop.get("reviewDelivery").and_then(|v| v.as_str()),
+            Some("inline")
+        );
+        assert_eq!(
+            fs::read_to_string(CodexAdapter::agents_md_path(&paths)).unwrap(),
+            user_agents
+        );
+    }
+
+    #[test]
+    fn codex_chinese_i18n_cleans_up_absent_files_on_official() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        save_switch_auth(&paths, Some("cr_codex_secret"), Some("1"), Some("oauth")).unwrap();
+        let adapter = CodexAdapter;
+
+        assert!(!CodexAdapter::config_path(&paths).exists());
+        assert!(!CodexAdapter::agents_md_path(&paths).exists());
+
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        assert!(CodexAdapter::config_path(&paths).exists());
+        assert!(CodexAdapter::agents_md_path(&paths).exists());
+
+        adapter.apply_mode(&paths, AppMode::Official).unwrap();
+        assert!(!CodexAdapter::config_path(&paths).exists());
+        assert!(!CodexAdapter::agents_md_path(&paths).exists());
     }
 }

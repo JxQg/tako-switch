@@ -201,6 +201,130 @@ pub fn has_tako_mcp_server(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+pub const TAKO_CHINESE_BLOCK_START: &str = "<!-- tako-switch:chinese-ui:start -->";
+pub const TAKO_CHINESE_BLOCK_END: &str = "<!-- tako-switch:chinese-ui:end -->";
+
+fn strip_managed_chinese_blocks(raw: &str) -> (String, bool) {
+    let mut current = raw.to_string();
+    let mut found = false;
+
+    while let Some(start_idx) = current.find(TAKO_CHINESE_BLOCK_START) {
+        let search_from = start_idx + TAKO_CHINESE_BLOCK_START.len();
+        let Some(end_rel) = current[search_from..].find(TAKO_CHINESE_BLOCK_END) else {
+            break;
+        };
+        found = true;
+        let end_idx = search_from + end_rel + TAKO_CHINESE_BLOCK_END.len();
+        let before_trimmed = current[..start_idx].trim_end_matches(['\r', '\n']);
+        let after_trimmed = current[end_idx..].trim_start_matches(['\r', '\n']);
+
+        current = if before_trimmed.is_empty() && after_trimmed.is_empty() {
+            String::new()
+        } else if before_trimmed.is_empty() {
+            after_trimmed.to_string()
+        } else if after_trimmed.is_empty() {
+            format!("{before_trimmed}\n")
+        } else {
+            format!("{before_trimmed}\n\n{after_trimmed}")
+        };
+    }
+
+    (current, found)
+}
+
+pub fn sync_managed_chinese_markdown(
+    paths: &AppPaths,
+    app_key: &str,
+    backup_name: &str,
+    target_path: &Path,
+    enable: bool,
+    body: &str,
+) -> Result<(), String> {
+    if !enable && !target_path.exists() {
+        return Ok(());
+    }
+
+    crate::config::backup_file_once(paths, app_key, backup_name, target_path)?;
+
+    let existing = if target_path.exists() {
+        fs::read_to_string(target_path)
+            .map_err(|e| format!("读取 {} 失败: {e}", target_path.display()))?
+    } else {
+        String::new()
+    };
+
+    if enable {
+        let block = format!(
+            "{TAKO_CHINESE_BLOCK_START}\n{}\n{TAKO_CHINESE_BLOCK_END}",
+            body.trim()
+        );
+        let next = if let Some(start_idx) = existing.find(TAKO_CHINESE_BLOCK_START) {
+            let search_from = start_idx + TAKO_CHINESE_BLOCK_START.len();
+            if let Some(end_rel) = existing[search_from..].find(TAKO_CHINESE_BLOCK_END) {
+                let end_idx = search_from + end_rel + TAKO_CHINESE_BLOCK_END.len();
+                let mut replaced = String::with_capacity(existing.len() + block.len());
+                replaced.push_str(&existing[..start_idx]);
+                replaced.push_str(&block);
+                replaced.push_str(&existing[end_idx..]);
+                if replaced.ends_with(TAKO_CHINESE_BLOCK_END) {
+                    replaced.push('\n');
+                }
+                replaced
+            } else if existing.trim().is_empty() {
+                format!("{block}\n")
+            } else if existing.ends_with("\n\n") {
+                format!("{existing}{block}\n")
+            } else if existing.ends_with('\n') {
+                format!("{existing}\n{block}\n")
+            } else {
+                format!("{existing}\n\n{block}\n")
+            }
+        } else if existing.is_empty() {
+            format!("{block}\n")
+        } else if existing.ends_with("\n\n") {
+            format!("{existing}{block}\n")
+        } else if existing.ends_with('\n') {
+            format!("{existing}\n{block}\n")
+        } else {
+            format!("{existing}\n\n{block}\n")
+        };
+        write_atomic(target_path, next.as_bytes(), false)
+    } else {
+        let (stripped, found) = strip_managed_chinese_blocks(&existing);
+        if !found {
+            return Ok(());
+        }
+        let absent_marker = paths
+            .backups_dir(app_key)
+            .join(format!("{backup_name}.absent"));
+        if stripped.trim().is_empty() && absent_marker.exists() {
+            if target_path.exists() {
+                fs::remove_file(target_path)
+                    .map_err(|e| format!("移除临时 {} 失败: {e}", target_path.display()))?;
+            }
+            Ok(())
+        } else {
+            write_atomic(target_path, stripped.as_bytes(), false)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn sync_macos_apple_languages(paths: &AppPaths, bundle_id: &str, enable: bool) {
+    if paths.is_test {
+        return;
+    }
+    if enable {
+        let _ = std::process::Command::new("/usr/bin/defaults")
+            .args(["write", bundle_id, "AppleLanguages", "-array", "zh-Hans"])
+            .output();
+    } else {
+        let _ = std::process::Command::new("/usr/bin/defaults")
+            .args(["delete", bundle_id, "AppleLanguages"])
+            .output();
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub fn read_macos_app_bundle_version(app_path: &Path) -> Option<String> {
     let plist = app_path.join("Contents").join("Info.plist");
@@ -325,5 +449,40 @@ pub fn find_macos_app(paths: &AppPaths, candidates: &[&str], expected_bundle_id:
     #[cfg(not(target_os = "macos"))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn sync_managed_chinese_markdown_roundtrip_and_middle_block() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let md_path = tmp.path().join("AGENTS.md");
+
+        // Disabling on absent file must not create .absent or target file
+        sync_managed_chinese_markdown(&paths, "codex", "AGENTS.md", &md_path, false, "").unwrap();
+        assert!(!md_path.exists());
+        assert!(!paths.backups_dir("codex").join("AGENTS.md.absent").exists());
+
+        // Middle block replacement & clean stripping
+        fs::write(
+            &md_path,
+            "# Top Rule\n\n<!-- tako-switch:chinese-ui:start -->\nold\n<!-- tako-switch:chinese-ui:end -->\n\n# Bottom Rule\n",
+        )
+        .unwrap();
+        sync_managed_chinese_markdown(&paths, "codex", "AGENTS.md", &md_path, true, "new rule").unwrap();
+        let updated = fs::read_to_string(&md_path).unwrap();
+        assert_eq!(
+            updated,
+            "# Top Rule\n\n<!-- tako-switch:chinese-ui:start -->\nnew rule\n<!-- tako-switch:chinese-ui:end -->\n\n# Bottom Rule\n"
+        );
+
+        sync_managed_chinese_markdown(&paths, "codex", "AGENTS.md", &md_path, false, "").unwrap();
+        let stripped = fs::read_to_string(&md_path).unwrap();
+        assert_eq!(stripped, "# Top Rule\n\n# Bottom Rule\n");
     }
 }

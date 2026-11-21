@@ -1,12 +1,15 @@
 use crate::adapters::{
-    has_tako_mcp_server, merge_tako_mcp_server, read_json_object_or_empty, AppId, AppMode,
-    DesktopAppAdapter, DiagnosticResult, InstallInfo,
+    has_tako_mcp_server, merge_tako_mcp_server, read_json_object_or_empty,
+    sync_managed_chinese_markdown, AppId, AppMode, DesktopAppAdapter, DiagnosticResult,
+    InstallInfo,
 };
 use crate::agy_proxy::{
     ensure_gateway_service, is_proxy_healthy, stop_gateway_service_if_unused, LOCAL_GATEWAY_PORT,
     LOCAL_GATEWAY_URL,
 };
-use crate::config::{backup_file_once, effective_agy_api_key, write_atomic, AppPaths};
+use crate::config::{
+    backup_file_once, effective_agy_api_key, read_switch_state, write_atomic, AppPaths,
+};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fs;
@@ -15,7 +18,7 @@ use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use crate::adapters::{
     find_macos_app, is_macos_bundle_id_running, launch_macos_app, quit_macos_bundle_id,
-    read_macos_app_bundle_version,
+    read_macos_app_bundle_version, sync_macos_apple_languages,
 };
 
 #[cfg(not(target_os = "windows"))]
@@ -26,6 +29,10 @@ const AGY_ENV_PLIST_LABEL: &str = "tech.shiroha.tako-switch.agy-env";
 const AGY_MACOS_BUNDLE_ID: &str = "com.google.antigravity";
 const AGY_TAKO_MCP_GRANT: &str = "mcp(tako/*)";
 
+const AGY_CHINESE_AGENTS_BODY: &str = "\
+- 默认使用简体中文回复用户，思考摘要、任务清单、实现计划与验收说明等产物默认使用简体中文（除非用户明确指定其他语言）。\n\
+- 代码标识符、文件路径、命令行命令与配置键名保持原样，不擅自翻译专有名词。";
+
 pub struct AntigravityAdapter;
 
 impl AntigravityAdapter {
@@ -35,6 +42,10 @@ impl AntigravityAdapter {
 
     fn config_path(paths: &AppPaths) -> PathBuf {
         paths.agy_gemini_config_dir.join("config.json")
+    }
+
+    pub fn gemini_agents_md_path(paths: &AppPaths) -> PathBuf {
+        paths.home.join(".gemini").join("AGENTS.md")
     }
 
     fn has_tako_mcp_permission(paths: &AppPaths) -> bool {
@@ -306,16 +317,38 @@ impl DesktopAppAdapter for AntigravityAdapter {
                 Self::clear_gateway_env(paths)?;
                 merge_tako_mcp_server(&mcp_path, paths, false)?;
                 Self::set_tako_mcp_permission(paths, false)?;
+                sync_managed_chinese_markdown(
+                    paths,
+                    "antigravity",
+                    "AGENTS.md",
+                    &Self::gemini_agents_md_path(paths),
+                    false,
+                    "",
+                )?;
+                #[cfg(target_os = "macos")]
+                sync_macos_apple_languages(paths, AGY_MACOS_BUNDLE_ID, false);
                 stop_gateway_service_if_unused(paths)
             }
             AppMode::Tako => {
                 let api_key = effective_agy_api_key(paths).ok_or_else(|| {
                     "请先登录 Tako 账号或配置专用反重力 Key，再切换到全 Tako 模式".to_string()
                 })?;
+                let state = read_switch_state(paths);
                 ensure_gateway_service(paths)?;
                 Self::set_gateway_env(paths, LOCAL_GATEWAY_URL, &api_key)?;
                 merge_tako_mcp_server(&mcp_path, paths, true)?;
-                Self::set_tako_mcp_permission(paths, true)
+                Self::set_tako_mcp_permission(paths, true)?;
+                sync_managed_chinese_markdown(
+                    paths,
+                    "antigravity",
+                    "AGENTS.md",
+                    &Self::gemini_agents_md_path(paths),
+                    state.prefer_chinese_ui,
+                    AGY_CHINESE_AGENTS_BODY,
+                )?;
+                #[cfg(target_os = "macos")]
+                sync_macos_apple_languages(paths, AGY_MACOS_BUNDLE_ID, state.prefer_chinese_ui);
+                Ok(())
             }
         }
     }
@@ -360,6 +393,9 @@ impl DesktopAppAdapter for AntigravityAdapter {
                     "提示: 未检测到 mcp(tako/*) 自动放行规则，重新点击 Tako 可自动补全"
                         .to_string(),
                 );
+            }
+            if read_switch_state(paths).prefer_chinese_ui {
+                notes.push("中文增强: 已启用 (~/.gemini/AGENTS.md 简体中文规则)".to_string());
             }
             notes.push("提示: 新建 Antigravity 网关环境变量需完整退出并重启应用后生效".to_string());
         }
@@ -744,5 +780,96 @@ mod tests {
         assert!(allow_off
             .iter()
             .any(|v| v.as_str() == Some("command(git status)")));
+    }
+
+    #[test]
+    fn antigravity_chinese_i18n_preserves_existing_agents_md_and_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        fs::create_dir_all(&paths.agy_gemini_config_dir).unwrap();
+        let agents_path = AntigravityAdapter::gemini_agents_md_path(&paths);
+        fs::create_dir_all(agents_path.parent().unwrap()).unwrap();
+        let user_agents = "# My Gemini Rules\n- Always write unit tests.\n";
+        fs::write(&agents_path, user_agents).unwrap();
+
+        save_switch_auth(&paths, Some("cr_main_key"), Some("1"), Some("oauth")).unwrap();
+        let adapter = AntigravityAdapter;
+
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        let first = fs::read_to_string(&agents_path).unwrap();
+        assert!(first.contains("# My Gemini Rules"));
+        assert!(first.contains("- Always write unit tests."));
+        assert!(first.contains(crate::adapters::TAKO_CHINESE_BLOCK_START));
+        assert!(first.contains(crate::adapters::TAKO_CHINESE_BLOCK_END));
+        assert!(first.contains("简体中文"));
+
+        let diag_on = adapter.diagnose(&paths);
+        assert!(diag_on
+            .notes
+            .iter()
+            .any(|n| n.contains("中文增强: 已启用")));
+
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        let second = fs::read_to_string(&agents_path).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            second
+                .matches(crate::adapters::TAKO_CHINESE_BLOCK_START)
+                .count(),
+            1
+        );
+
+        let mut state = read_switch_state(&paths);
+        state.prefer_chinese_ui = false;
+        save_switch_state(&paths, &state).unwrap();
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        let disabled = fs::read_to_string(&agents_path).unwrap();
+        assert_eq!(disabled, user_agents);
+        assert!(!disabled.contains(crate::adapters::TAKO_CHINESE_BLOCK_START));
+        assert!(!adapter
+            .diagnose(&paths)
+            .notes
+            .iter()
+            .any(|n| n.contains("中文增强: 已启用")));
+
+        state.prefer_chinese_ui = true;
+        save_switch_state(&paths, &state).unwrap();
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        assert!(fs::read_to_string(&agents_path)
+            .unwrap()
+            .contains(crate::adapters::TAKO_CHINESE_BLOCK_START));
+
+        adapter.apply_mode(&paths, AppMode::Official).unwrap();
+        assert_eq!(fs::read_to_string(&agents_path).unwrap(), user_agents);
+    }
+
+    #[test]
+    fn antigravity_chinese_i18n_deletes_absent_agents_md_on_disable_and_official() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        save_switch_auth(&paths, Some("cr_main_key"), Some("1"), Some("oauth")).unwrap();
+        let adapter = AntigravityAdapter;
+        let agents_path = AntigravityAdapter::gemini_agents_md_path(&paths);
+        assert!(!agents_path.exists());
+
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        assert!(agents_path.exists());
+        assert!(fs::read_to_string(&agents_path)
+            .unwrap()
+            .contains("简体中文"));
+
+        let mut state = read_switch_state(&paths);
+        state.prefer_chinese_ui = false;
+        save_switch_state(&paths, &state).unwrap();
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        assert!(!agents_path.exists());
+
+        state.prefer_chinese_ui = true;
+        save_switch_state(&paths, &state).unwrap();
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        assert!(agents_path.exists());
+
+        adapter.apply_mode(&paths, AppMode::Official).unwrap();
+        assert!(!agents_path.exists());
     }
 }

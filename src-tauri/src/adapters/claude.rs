@@ -11,14 +11,14 @@ use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine;
 use serde_json::{Map, Value};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const TAKO_LOGO_PNG: &[u8] = include_bytes!("../../icons/128x128.png");
 
 #[cfg(target_os = "macos")]
 use crate::adapters::{
     find_macos_app, is_macos_bundle_id_running, launch_macos_app, quit_macos_bundle_id,
-    read_macos_app_bundle_version,
+    read_macos_app_bundle_version, sync_macos_apple_languages,
 };
 
 pub const TAKO_CLAUDE_3P_UUID: &str = "7a405017-c100-4a80-9000-7a4050170001";
@@ -49,6 +49,10 @@ impl ClaudeAdapter {
 
     fn claude_3p_app_config_path(paths: &AppPaths) -> PathBuf {
         paths.claude_3p_dir.join("config.json")
+    }
+
+    pub fn claude_1p_app_config_path(paths: &AppPaths) -> PathBuf {
+        paths.claude_1p_dir.join("config.json")
     }
 
     fn claude_code_settings_path(paths: &AppPaths) -> PathBuf {
@@ -105,17 +109,34 @@ impl ClaudeAdapter {
                     }
                 }
             }
-        } else if let Some(arr) = root
-            .get_mut("permissions")
-            .and_then(Value::as_object_mut)
-            .and_then(|p| p.get_mut("allow"))
-            .and_then(Value::as_array_mut)
-        {
-            arr.retain(|v| {
-                v.as_str()
-                    .map(|s| !rules.iter().any(|r| r == s))
-                    .unwrap_or(true)
-            });
+        } else {
+            let backup_obj = read_backup(paths, "claude", "claude_code_settings.json")
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|v| v.as_object().cloned());
+            let backup_had_permissions = backup_obj
+                .as_ref()
+                .is_some_and(|o| o.contains_key("permissions"));
+            let backup_had_allow = backup_obj
+                .as_ref()
+                .and_then(|o| o.get("permissions"))
+                .and_then(Value::as_object)
+                .is_some_and(|p| p.contains_key("allow"));
+
+            if let Some(perm_obj) = root.get_mut("permissions").and_then(Value::as_object_mut) {
+                if let Some(arr) = perm_obj.get_mut("allow").and_then(Value::as_array_mut) {
+                    arr.retain(|v| {
+                        v.as_str()
+                            .map(|s| !rules.iter().any(|r| r == s))
+                            .unwrap_or(true)
+                    });
+                    if arr.is_empty() && !backup_had_allow {
+                        perm_obj.remove("allow");
+                    }
+                }
+                if perm_obj.is_empty() && !backup_had_permissions {
+                    root.remove("permissions");
+                }
+            }
         }
 
         let bytes = serde_json::to_vec_pretty(&Value::Object(root))
@@ -127,26 +148,74 @@ impl ClaudeAdapter {
         format!("data:image/png;base64,{}", BASE64_STD.encode(TAKO_LOGO_PNG))
     }
 
-    fn apply_claude_chinese_locale(paths: &AppPaths) {
-        let cfg_path = Self::claude_3p_app_config_path(paths);
-        if let Ok(mut cfg) = read_json_object_or_empty(&cfg_path) {
-            cfg.insert("locale".to_string(), Value::String("zh-Hans".to_string()));
-            if let Ok(bytes) = serde_json::to_vec_pretty(&Value::Object(cfg)) {
-                let _ = write_atomic(&cfg_path, &bytes, false);
+    fn sync_claude_json_locale_field(
+        paths: &AppPaths,
+        path: &Path,
+        backup_name: &str,
+        key: &str,
+        target_value: &str,
+        enable: bool,
+    ) -> Result<(), String> {
+        if !enable && !path.exists() {
+            return Ok(());
+        }
+        backup_file_once(paths, "claude", backup_name, path)?;
+        let mut root = read_json_object_or_empty(path)?;
+        if enable {
+            root.insert(key.to_string(), Value::String(target_value.to_string()));
+        } else {
+            let restored = read_backup(paths, "claude", backup_name)
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|v| v.as_object().and_then(|o| o.get(key)).cloned());
+            if let Some(orig_val) = restored {
+                root.insert(key.to_string(), orig_val);
+            } else {
+                root.remove(key);
+            }
+            let absent_marker = paths
+                .backups_dir("claude")
+                .join(format!("{backup_name}.absent"));
+            if root.is_empty() && absent_marker.exists() {
+                if path.exists() {
+                    fs::remove_file(path)
+                        .map_err(|e| format!("移除临时 {} 失败: {e}", path.display()))?;
+                }
+                return Ok(());
             }
         }
+        let bytes = serde_json::to_vec_pretty(&Value::Object(root))
+            .map_err(|e| format!("序列化 {} 失败: {e}", path.display()))?;
+        write_atomic(path, &bytes, false)
+    }
+
+    fn sync_claude_chinese_locale(paths: &AppPaths, enable: bool) -> Result<(), String> {
+        Self::sync_claude_json_locale_field(
+            paths,
+            &Self::claude_3p_app_config_path(paths),
+            "claude_3p_config.json",
+            "locale",
+            "zh-Hans",
+            enable,
+        )?;
+        Self::sync_claude_json_locale_field(
+            paths,
+            &Self::claude_1p_app_config_path(paths),
+            "claude_1p_config.json",
+            "locale",
+            "zh-Hans",
+            enable,
+        )?;
+        Self::sync_claude_json_locale_field(
+            paths,
+            &Self::claude_code_settings_path(paths),
+            "claude_code_settings.json",
+            "language",
+            "Simplified Chinese",
+            enable,
+        )?;
         #[cfg(target_os = "macos")]
-        if !paths.is_test {
-            let _ = std::process::Command::new("/usr/bin/defaults")
-                .args([
-                    "write",
-                    CLAUDE_MACOS_BUNDLE_ID,
-                    "AppleLanguages",
-                    "-array",
-                    "zh-Hans",
-                ])
-                .output();
-        }
+        sync_macos_apple_languages(paths, CLAUDE_MACOS_BUNDLE_ID, enable);
+        Ok(())
     }
 
     fn deactivate_3p(paths: &AppPaths) -> Result<(), String> {
@@ -306,6 +375,7 @@ impl DesktopAppAdapter for ClaudeAdapter {
                 merge_tako_mcp_server(&mcp_1p, paths, false)?;
                 merge_tako_mcp_server(&mcp_3p, paths, false)?;
                 Self::set_claude_code_mcp_permissions(paths, false)?;
+                Self::sync_claude_chinese_locale(paths, false)?;
                 stop_gateway_service_if_unused(paths)
             }
             AppMode::Tako => {
@@ -441,15 +511,12 @@ impl DesktopAppAdapter for ClaudeAdapter {
                     .map_err(|e| format!("序列化 Claude 3p _meta.json 失败: {e}"))?;
                 write_atomic(&meta_3p, &meta_bytes, false)?;
 
-                if state.prefer_chinese_ui {
-                    Self::apply_claude_chinese_locale(paths);
-                }
-
                 merge_tako_mcp_server(&mcp_1p, paths, false)?;
                 // The 3p slot gets tako from the managed profile entry, not the user config,
                 // so leave the user config alone to avoid starting a second instance.
                 merge_tako_mcp_server(&mcp_3p, paths, false)?;
                 Self::set_claude_code_mcp_permissions(paths, true)?;
+                Self::sync_claude_chinese_locale(paths, state.prefer_chinese_ui)?;
                 Ok(())
             }
         }
@@ -508,6 +575,9 @@ impl DesktopAppAdapter for ClaudeAdapter {
             }
             if !Self::has_managed_tako_mcp(paths) {
                 notes.push("提示: Claude-3p profile 尚未下发 tako MCP".to_string());
+            }
+            if read_switch_state(paths).prefer_chinese_ui {
+                notes.push("中文增强: 已启用 (locale=zh-Hans / Claude Code language=Simplified Chinese)".to_string());
             }
         }
 
@@ -595,7 +665,7 @@ fn launch_windows_claude(paths: &AppPaths) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::save_switch_auth;
+    use crate::config::{read_switch_state, save_switch_auth, save_switch_state};
     use tempfile::TempDir;
 
     #[test]
@@ -753,5 +823,141 @@ mod tests {
         assert!(cc_allow_after.iter().any(|v| v.as_str() == Some("Bash(git status)")));
         assert!(!cc_allow_after.iter().any(|v| v.as_str() == Some("mcp__tako__*")));
         assert!(!cc_allow_after.iter().any(|v| v.as_str() == Some("mcp__tako__tako_generate_image")));
+    }
+
+    #[test]
+    fn claude_chinese_i18n_preserves_existing_keys_and_restores_original_locale() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        fs::create_dir_all(&paths.claude_3p_dir).unwrap();
+        fs::create_dir_all(&paths.claude_1p_dir).unwrap();
+        fs::create_dir_all(paths.home.join(".claude")).unwrap();
+
+        fs::write(
+            ClaudeAdapter::claude_3p_app_config_path(&paths),
+            r#"{"darkMode":"dark","locale":"en-US"}"#,
+        )
+        .unwrap();
+        fs::write(
+            ClaudeAdapter::claude_1p_app_config_path(&paths),
+            r#"{"scale":1.25}"#,
+        )
+        .unwrap();
+        fs::write(
+            ClaudeAdapter::claude_code_settings_path(&paths),
+            r#"{"language":"Japanese","model":"claude-opus-5-5","permissions":{"allow":["Bash(ls)"]}}"#,
+        )
+        .unwrap();
+
+        save_switch_auth(&paths, Some("cr_claude_secret"), Some("2"), Some("oauth")).unwrap();
+        let adapter = ClaudeAdapter;
+
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        // Idempotent second apply
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+
+        let cfg_3p = read_json_object_or_empty(&ClaudeAdapter::claude_3p_app_config_path(&paths)).unwrap();
+        assert_eq!(cfg_3p.get("locale").and_then(Value::as_str), Some("zh-Hans"));
+        assert_eq!(cfg_3p.get("darkMode").and_then(Value::as_str), Some("dark"));
+
+        let cfg_1p = read_json_object_or_empty(&ClaudeAdapter::claude_1p_app_config_path(&paths)).unwrap();
+        assert_eq!(cfg_1p.get("locale").and_then(Value::as_str), Some("zh-Hans"));
+        assert_eq!(cfg_1p.get("scale").and_then(Value::as_f64), Some(1.25));
+
+        let cc_tako = read_json_object_or_empty(&ClaudeAdapter::claude_code_settings_path(&paths)).unwrap();
+        assert_eq!(
+            cc_tako.get("language").and_then(Value::as_str),
+            Some("Simplified Chinese")
+        );
+        assert_eq!(
+            cc_tako.get("model").and_then(Value::as_str),
+            Some("claude-opus-5-5")
+        );
+        let cc_allow = cc_tako
+            .get("permissions")
+            .and_then(Value::as_object)
+            .and_then(|p| p.get("allow"))
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(cc_allow.iter().any(|v| v.as_str() == Some("Bash(ls)")));
+        assert!(cc_allow.iter().any(|v| v.as_str() == Some("mcp__tako__*")));
+
+        assert!(adapter
+            .diagnose(&paths)
+            .notes
+            .iter()
+            .any(|n| n.contains("中文增强: 已启用")));
+
+        // Turn off prefer_chinese_ui while staying in Tako mode
+        let mut st = read_switch_state(&paths);
+        st.prefer_chinese_ui = false;
+        save_switch_state(&paths, &st).unwrap();
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+
+        let cfg_3p_off = read_json_object_or_empty(&ClaudeAdapter::claude_3p_app_config_path(&paths)).unwrap();
+        assert_eq!(cfg_3p_off.get("locale").and_then(Value::as_str), Some("en-US"));
+        assert_eq!(cfg_3p_off.get("darkMode").and_then(Value::as_str), Some("dark"));
+
+        let cfg_1p_off = read_json_object_or_empty(&ClaudeAdapter::claude_1p_app_config_path(&paths)).unwrap();
+        assert!(cfg_1p_off.get("locale").is_none());
+        assert_eq!(cfg_1p_off.get("scale").and_then(Value::as_f64), Some(1.25));
+
+        let cc_off = read_json_object_or_empty(&ClaudeAdapter::claude_code_settings_path(&paths)).unwrap();
+        assert_eq!(cc_off.get("language").and_then(Value::as_str), Some("Japanese"));
+        assert!(!adapter
+            .diagnose(&paths)
+            .notes
+            .iter()
+            .any(|n| n.contains("中文增强: 已启用")));
+
+        // Re-enable then switch to Official -> full restoration
+        st.prefer_chinese_ui = true;
+        save_switch_state(&paths, &st).unwrap();
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        adapter.apply_mode(&paths, AppMode::Official).unwrap();
+
+        let cfg_3p_final = read_json_object_or_empty(&ClaudeAdapter::claude_3p_app_config_path(&paths)).unwrap();
+        assert_eq!(cfg_3p_final.get("locale").and_then(Value::as_str), Some("en-US"));
+        assert_eq!(cfg_3p_final.get("darkMode").and_then(Value::as_str), Some("dark"));
+
+        let cfg_1p_final = read_json_object_or_empty(&ClaudeAdapter::claude_1p_app_config_path(&paths)).unwrap();
+        assert!(cfg_1p_final.get("locale").is_none());
+        assert_eq!(cfg_1p_final.get("scale").and_then(Value::as_f64), Some(1.25));
+
+        let cc_final = read_json_object_or_empty(&ClaudeAdapter::claude_code_settings_path(&paths)).unwrap();
+        assert_eq!(cc_final.get("language").and_then(Value::as_str), Some("Japanese"));
+        let cc_final_allow = cc_final
+            .get("permissions")
+            .and_then(Value::as_object)
+            .and_then(|p| p.get("allow"))
+            .and_then(Value::as_array)
+            .unwrap();
+        assert!(cc_final_allow.iter().any(|v| v.as_str() == Some("Bash(ls)")));
+        assert!(!cc_final_allow.iter().any(|v| v.as_str() == Some("mcp__tako__*")));
+    }
+
+    #[test]
+    fn claude_chinese_i18n_cleans_up_absent_files_on_official() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        save_switch_auth(&paths, Some("cr_claude_secret"), Some("2"), Some("oauth")).unwrap();
+        let adapter = ClaudeAdapter;
+
+        let cfg_3p = ClaudeAdapter::claude_3p_app_config_path(&paths);
+        let cfg_1p = ClaudeAdapter::claude_1p_app_config_path(&paths);
+        let cc_settings = ClaudeAdapter::claude_code_settings_path(&paths);
+        assert!(!cfg_3p.exists());
+        assert!(!cfg_1p.exists());
+        assert!(!cc_settings.exists());
+
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        assert!(cfg_3p.exists());
+        assert!(cfg_1p.exists());
+        assert!(cc_settings.exists());
+
+        adapter.apply_mode(&paths, AppMode::Official).unwrap();
+        assert!(!cfg_3p.exists());
+        assert!(!cfg_1p.exists());
+        assert!(!cc_settings.exists());
     }
 }
