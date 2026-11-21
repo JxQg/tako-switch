@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-21T04:45:00Z",
+  "generatedAt": "2026-11-21T13:53:23Z",
   "apps": {
     "dsh-tako": {
       "displayName": "DSH Tako",
@@ -48,10 +48,10 @@
         },
         "windows-x64": {
           "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix",
-          "version": "26.1117.3838.0",
+          "version": "26.1117.4957.0",
           "installType": "msix",
           "packageFamilyName": "OpenAI.Codex_2p2nqsd0c76g0",
-          "size": 811237227
+          "size": 796523063
         }
       }
     },
