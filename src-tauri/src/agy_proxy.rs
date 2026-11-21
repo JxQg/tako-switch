@@ -51,6 +51,8 @@ const LEGACY_AGY_PROXY_PLIST_LABEL: &str = "tech.shiroha.tako-switch.agy-proxy";
 const PRICING_CACHE_TTL: Duration = Duration::from_secs(300);
 const ALLOWED_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const AGY_MAX_CUSTOM_PLACEHOLDERS: usize = 32;
+pub const OFFICIAL_PRICE_RATIO_BASE: f64 = 20.4;
+pub const GEMINI_4_PROMO_CUTOFF: &str = "2026-11-30";
 const DEFAULT_CODEX_BASE_INSTRUCTIONS: &str = "You are Codex, an expert AI software engineering assistant. Follow user instructions carefully, inspect files before editing, and verify changes using available tools.";
 
 static IN_PROCESS_PROXY_STARTED: AtomicBool = AtomicBool::new(false);
@@ -81,8 +83,17 @@ pub struct ModelPricingInfo {
     pub realized_usd_per_m: Option<f64>,
     pub cache_hit_rate: Option<f64>,
     pub input_usd_per_m: Option<f64>,
+    pub cache_usd_per_m: Option<f64>,
     pub output_usd_per_m: Option<f64>,
     pub request_usd: Option<f64>,
+    pub quota_type: i64,
+    pub model_ratio: Option<f64>,
+    pub official_multiplier: Option<f64>,
+    pub promo_ends_on: Option<String>,
+    pub capabilities: Vec<String>,
+    pub tags: Vec<String>,
+    pub vendor_name: Option<String>,
+    pub context_window: Option<u64>,
     pub channels: Vec<ModelChannelPrice>,
 }
 
@@ -125,8 +136,16 @@ pub struct ClientModelOption {
     pub realized_usd_per_m: Option<f64>,
     pub cache_hit_rate: Option<f64>,
     pub input_usd_per_m: Option<f64>,
+    pub cache_usd_per_m: Option<f64>,
     pub output_usd_per_m: Option<f64>,
     pub request_usd: Option<f64>,
+    pub quota_type: i64,
+    pub model_ratio: Option<f64>,
+    pub official_multiplier: Option<f64>,
+    pub promo_ends_on: Option<String>,
+    pub capabilities: Vec<String>,
+    pub tags: Vec<String>,
+    pub vendor_name: Option<String>,
     pub channels: Vec<ModelChannelPrice>,
     pub avg_tps: Option<f64>,
     pub avg_latency_ms: Option<f64>,
@@ -222,6 +241,647 @@ struct ProxyState {
     pricing_cache: RwLock<Option<(String, Instant, PricingCache)>>,
     synthetic_routes: RwLock<HashMap<String, SyntheticRoute>>,
     codex_model_messages: RwLock<Option<Value>>,
+}
+
+fn current_utc_ymd() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}")
+}
+
+pub fn resolve_promo_ends_on_at_date(
+    model_id: &str,
+    item: Option<&Value>,
+    today_ymd: &str,
+) -> Option<String> {
+    if let Some(explicit) = item
+        .and_then(|v| v.get("promo_ends_on").or_else(|| v.get("promoEndsOn")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if explicit >= today_ymd {
+            return Some(explicit.to_string());
+        }
+        return None;
+    }
+    let lower = model_id.trim().to_ascii_lowercase();
+    let (base, _) = split_effort_slug(&lower);
+    if matches!(base, "gemini-4-carbon" | "gemini-4-argon") && today_ymd <= GEMINI_4_PROMO_CUTOFF {
+        return Some(GEMINI_4_PROMO_CUTOFF.to_string());
+    }
+    None
+}
+
+pub fn resolve_promo_ends_on(model_id: &str, item: Option<&Value>) -> Option<String> {
+    let today = current_utc_ymd();
+    resolve_promo_ends_on_at_date(model_id, item, &today)
+}
+
+fn extract_expr_named_f64(expr: &str, keys: &[&str]) -> Option<f64> {
+    for &key in keys {
+        let mut cursor = expr;
+        while let Some(idx) = cursor.find(key) {
+            let after_key = &cursor[idx + key.len()..];
+            let trimmed = after_key.trim_start_matches(['"', '\'', ' ', '\t', ':', '=']);
+            if trimmed.len() < after_key.len() {
+                let num_len = trimmed
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                    .count();
+                if num_len > 0 {
+                    if let Ok(val) = trimmed[..num_len].parse::<f64>() {
+                        if val.is_finite() && val > 0.0 {
+                            return Some(val);
+                        }
+                    }
+                }
+            }
+            cursor = after_key;
+        }
+    }
+    None
+}
+
+fn extract_first_tier_prices(
+    item: &Value,
+    billing_expr: &str,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let read_from_tier_obj = |tier: &Value| -> (Option<f64>, Option<f64>, Option<f64>) {
+        let inp = tier
+            .get("inputPrice")
+            .or_else(|| tier.get("input_price"))
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && *n > 0.0);
+        let cache = tier
+            .get("cacheReadPrice")
+            .or_else(|| tier.get("cache_read_price"))
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && *n > 0.0);
+        let out = tier
+            .get("outputPrice")
+            .or_else(|| tier.get("output_price"))
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && *n > 0.0);
+        (inp, cache, out)
+    };
+
+    for field in ["tiered_prices", "tiers", "pricing_tiers", "billing_tiers"] {
+        if let Some(first) = item
+            .get(field)
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+        {
+            let res = read_from_tier_obj(first);
+            if res.0.is_some() || res.1.is_some() || res.2.is_some() {
+                return res;
+            }
+        }
+    }
+
+    if !billing_expr.is_empty() {
+        if let Ok(parsed) = serde_json::from_str::<Value>(billing_expr) {
+            if let Some(first) = parsed.as_array().and_then(|a| a.first()).or_else(|| {
+                parsed
+                    .get("tiers")
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+            }) {
+                let res = read_from_tier_obj(first);
+                if res.0.is_some() || res.1.is_some() || res.2.is_some() {
+                    return res;
+                }
+            } else if parsed.is_object() {
+                let res = read_from_tier_obj(&parsed);
+                if res.0.is_some() || res.1.is_some() || res.2.is_some() {
+                    return res;
+                }
+            }
+        }
+        let inp = extract_expr_named_f64(billing_expr, &["inputPrice", "input_price"]);
+        let cache = extract_expr_named_f64(billing_expr, &["cacheReadPrice", "cache_read_price"]);
+        let out = extract_expr_named_f64(billing_expr, &["outputPrice", "output_price"]);
+        if inp.is_some() || cache.is_some() || out.is_some() {
+            return (inp, cache, out);
+        }
+    }
+
+    (None, None, None)
+}
+
+fn has_tiered_plugin_variant(item: &Value) -> bool {
+    if item
+        .get("has_tiered_plugin_variant")
+        .or_else(|| item.get("hasTieredPluginVariant"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
+    item.get("channels")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| {
+            arr.iter().any(|ch| {
+                ch.get("has_tiered_plugin_variant")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                    || ch.get("is_tiered").and_then(Value::as_bool) == Some(true)
+                    || ch.get("billing_mode").and_then(Value::as_str) == Some("tiered_expr")
+                    || ch
+                        .get("billing_expr")
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.trim().is_empty())
+            })
+        })
+}
+
+fn extract_item_tags(item: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_tag = |raw: &str| {
+        let t = raw.trim();
+        if !t.is_empty() && seen.insert(t.to_ascii_lowercase()) {
+            out.push(t.to_string());
+        }
+    };
+    if let Some(arr) = item.get("tags").and_then(Value::as_array) {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                push_tag(s);
+            }
+        }
+    } else if let Some(s) = item.get("tags").and_then(Value::as_str) {
+        for part in s.split([',', '，', ';']) {
+            push_tag(part);
+        }
+    }
+    out
+}
+
+pub fn infer_vendor_name(model_id: &str, item: Option<&Value>) -> Option<String> {
+    if let Some(raw_vendor) = item
+        .and_then(|v| {
+            v.get("vendor_name")
+                .or_else(|| v.get("vendorName"))
+                .or_else(|| v.get("vendor"))
+                .or_else(|| v.get("provider"))
+                .or_else(|| v.get("owned_by"))
+        })
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let norm = match raw_vendor.to_ascii_lowercase().as_str() {
+            "openai" => Some("OpenAI"),
+            "anthropic" | "claude" => Some("Anthropic"),
+            "google" | "gemini" | "vertex" | "vertex-ai" => Some("Google"),
+            "deepseek" => Some("DeepSeek"),
+            "xai" | "grok" => Some("xAI"),
+            "moonshot" | "kimi" => Some("Moonshot"),
+            "zhipu" | "glm" | "bigmodel" => Some("Zhipu"),
+            "minimax" => Some("MiniMax"),
+            "xiaomi" | "mimo" => Some("Xiaomi"),
+            "tencent" | "hunyuan" => Some("Tencent"),
+            "bytedance" | "doubao" | "volcengine" | "seed" => Some("ByteDance"),
+            "alibaba" | "qwen" | "dashscope" => Some("Alibaba"),
+            "custom" | "system" | "default" | "tako" => None,
+            _ => Some(raw_vendor),
+        };
+        if let Some(v) = norm {
+            return Some(v.to_string());
+        }
+    }
+
+    let lower = model_id.trim().to_ascii_lowercase();
+    let inferred = if lower.starts_with("gpt-")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+        || lower.starts_with("sora")
+        || lower.starts_with("dall-e")
+        || lower.starts_with("whisper")
+        || lower.starts_with("text-embedding-")
+    {
+        Some("OpenAI")
+    } else if lower.starts_with("claude-") {
+        Some("Anthropic")
+    } else if lower.starts_with("gemini-")
+        || lower.starts_with("gemma-")
+        || lower.starts_with("imagen")
+        || lower.starts_with("veo")
+    {
+        Some("Google")
+    } else if lower.starts_with("deepseek-") {
+        Some("DeepSeek")
+    } else if lower.starts_with("grok-") {
+        Some("xAI")
+    } else if lower.starts_with("kimi-") {
+        Some("Moonshot")
+    } else if lower.starts_with("glm-") || lower.starts_with("cogvideo") {
+        Some("Zhipu")
+    } else if lower.starts_with("minimax-") || lower.starts_with("hailuo") {
+        Some("MiniMax")
+    } else if lower.starts_with("mimo-") {
+        Some("Xiaomi")
+    } else if lower == "hy3" || lower.starts_with("hunyuan") || lower.starts_with("hy-") {
+        Some("Tencent")
+    } else if lower.starts_with("qwen") || lower.starts_with("wan") || lower.starts_with("cosyvoice") {
+        Some("Alibaba")
+    } else if lower.starts_with("seed") || lower.starts_with("doubao") {
+        Some("ByteDance")
+    } else if lower.starts_with("flux") {
+        Some("Black Forest Labs")
+    } else if lower.starts_with("kling") {
+        Some("Kuaishou")
+    } else if lower.starts_with("vidu") {
+        Some("Shengshu")
+    } else if lower.starts_with("swe-") || lower.starts_with("composer-") {
+        Some("Cognition / Cursor")
+    } else {
+        None
+    };
+    inferred.map(str::to_string)
+}
+
+fn parse_compact_token_count(token_str: &str) -> Option<u64> {
+    let cleaned = token_str
+        .trim()
+        .trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '，' | ',' | '。' | '.'))
+        .replace("上下文", "")
+        .replace("context", "")
+        .replace("Context", "")
+        .replace("tokens", "")
+        .replace("Tokens", "");
+    let s = cleaned.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let last = s.chars().last()?;
+    if matches!(last, 'm' | 'M') {
+        let num = s[..s.len() - 1].trim().parse::<f64>().ok()?;
+        if (0.1..=100.0).contains(&num) {
+            return Some((num * 1_000_000.0).round() as u64);
+        }
+    } else if matches!(last, 'k' | 'K') {
+        let num = s[..s.len() - 1].trim().parse::<f64>().ok()?;
+        if (4.0..=9999.0).contains(&num) {
+            return Some((num * 1_000.0).round() as u64);
+        }
+    }
+    None
+}
+
+fn extract_context_from_description(desc: &str) -> Option<u64> {
+    if desc.trim().is_empty() {
+        return None;
+    }
+    for marker in ["上下文", "context", "Context"] {
+        if let Some(idx) = desc.find(marker) {
+            let after = desc[idx + marker.len()..]
+                .trim_start_matches([' ', ':', '：', '为', '达', '长']);
+            let tok_after: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '.')
+                .collect();
+            if let Some(v) = parse_compact_token_count(&tok_after) {
+                return Some(v);
+            }
+
+            let before = desc[..idx].trim_end();
+            let rev_tok: String = before
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '.')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if let Some(v) = parse_compact_token_count(&rev_tok) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+pub fn derive_model_capabilities(
+    model_id: &str,
+    item: Option<&Value>,
+    tags: &[String],
+    desc: &str,
+    has_reasoning_levels: bool,
+) -> Vec<String> {
+    let lower = model_id.trim().to_ascii_lowercase();
+    let desc_lower = desc.to_ascii_lowercase();
+    let tags_joined = tags.join(" ").to_ascii_lowercase();
+    let endpoints: Vec<String> = item
+        .map(extract_endpoint_types)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+
+    let mut set: HashSet<&'static str> = HashSet::new();
+    if let Some(arr) = item
+        .and_then(|v| v.get("capabilities"))
+        .and_then(Value::as_array)
+    {
+        for cap in arr.iter().filter_map(Value::as_str) {
+            match cap.trim().to_ascii_lowercase().as_str() {
+                "chat" => {
+                    set.insert("chat");
+                }
+                "reason" | "reasoning" | "thinking" => {
+                    set.insert("reason");
+                }
+                "vision" | "multimodal" => {
+                    set.insert("vision");
+                }
+                "code" | "coding" => {
+                    set.insert("code");
+                }
+                "image" | "images" => {
+                    set.insert("image");
+                }
+                "video" => {
+                    set.insert("video");
+                }
+                "audio" | "speech" | "voice" => {
+                    set.insert("audio");
+                }
+                "embed" | "embedding" | "embeddings" => {
+                    set.insert("embed");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let is_embed = lower.contains("embed")
+        || lower.contains("rerank")
+        || lower.starts_with("bge-")
+        || endpoints.iter().any(|e| e.contains("embed"))
+        || tags_joined.contains("向量")
+        || tags_joined.contains("embedding");
+    if is_embed {
+        set.insert("embed");
+    }
+
+    let is_image = lower.contains("image")
+        || lower.contains("imagen")
+        || lower.starts_with("flux")
+        || lower.starts_with("dall-e")
+        || lower.contains("ideogram")
+        || lower.contains("recraft")
+        || lower.contains("midjourney")
+        || lower.contains("seedream")
+        || lower.contains("kolors")
+        || endpoints.iter().any(|e| e.contains("image") || e.contains("dall-e"))
+        || tags_joined.contains("生图")
+        || tags_joined.contains("文生图")
+        || tags_joined.contains("改图")
+        || desc_lower.contains("图像生成")
+        || desc_lower.contains("生图");
+    if is_image {
+        set.insert("image");
+    }
+
+    let is_video = lower.contains("video")
+        || lower.starts_with("veo")
+        || lower.contains("-veo")
+        || lower.starts_with("sora")
+        || lower.starts_with("kling")
+        || lower.starts_with("vidu")
+        || lower.starts_with("hailuo")
+        || lower.starts_with("wan-")
+        || lower.starts_with("wan2")
+        || lower.contains("seedance")
+        || lower.contains("luma")
+        || lower.contains("runway")
+        || endpoints.iter().any(|e| e.contains("video"))
+        || tags_joined.contains("视频")
+        || desc_lower.contains("视频生成");
+    if is_video {
+        set.insert("video");
+    }
+
+    let is_audio = lower.contains("tts")
+        || lower.contains("asr")
+        || lower.contains("whisper")
+        || lower.contains("speech")
+        || lower.contains("audio")
+        || lower.contains("voice")
+        || lower.contains("cosyvoice")
+        || endpoints.iter().any(|e| e.contains("audio") || e.contains("speech"))
+        || tags_joined.contains("语音")
+        || tags_joined.contains("声音")
+        || tags_joined.contains("tts")
+        || desc_lower.contains("语音合成")
+        || desc_lower.contains("语音识别");
+    if is_audio {
+        set.insert("audio");
+    }
+
+    let has_chat_endpoint = endpoints.iter().any(|e| {
+        matches!(
+            e.as_str(),
+            "openai" | "openai-response" | "anthropic" | "gemini" | "chat"
+        )
+    });
+    let pure_media_or_embed =
+        (is_embed || is_video || is_audio || (is_image && !lower.starts_with("gpt-4o")))
+            && !has_chat_endpoint;
+    let is_search_tool_only = lower == "web_search";
+
+    if !pure_media_or_embed
+        && !is_search_tool_only
+        && !is_embed
+        && !is_video
+        && !(is_image
+            && (lower.starts_with("flux")
+                || lower.starts_with("dall-e")
+                || lower.starts_with("imagen")
+                || lower.starts_with("gpt-image")
+                || lower.contains("seedream")
+                || lower.contains("recraft")
+                || lower.contains("ideogram")))
+        && !(is_audio
+            && (lower.contains("tts") || lower.contains("asr") || lower.contains("whisper")))
+    {
+        set.insert("chat");
+    }
+
+    if set.contains("chat") {
+        let is_reason = has_reasoning_levels
+            || lower.contains("reason")
+            || lower.contains("thinking")
+            || lower.contains("qwq")
+            || lower.starts_with("o1")
+            || lower.starts_with("o3")
+            || lower.starts_with("o4")
+            || lower.starts_with("gpt-5")
+            || lower.starts_with("gpt-6")
+            || lower.starts_with("claude-opus")
+            || lower.starts_with("claude-sonnet")
+            || lower.starts_with("gemini-3")
+            || lower.starts_with("gemini-4")
+            || lower.starts_with("deepseek-r")
+            || lower.starts_with("deepseek-v4")
+            || lower.starts_with("kimi-k3")
+            || lower.starts_with("glm-5")
+            || lower.starts_with("grok-4")
+            || lower.starts_with("minimax-m")
+            || lower.starts_with("mimo-v2")
+            || lower.starts_with("swe-")
+            || tags_joined.contains("推理")
+            || tags_joined.contains("思考")
+            || desc_lower.contains("推理")
+            || desc_lower.contains("reasoning");
+        if is_reason && !is_image {
+            set.insert("reason");
+        }
+
+        let is_vision = lower.contains("vision")
+            || lower.contains("-vl")
+            || lower.contains("4o")
+            || lower.starts_with("gpt-5")
+            || lower.starts_with("gpt-6")
+            || lower.starts_with("claude-")
+            || lower.starts_with("gemini-")
+            || lower.starts_with("grok-4")
+            || lower.starts_with("kimi-k3")
+            || lower.starts_with("glm-5")
+            || lower.starts_with("deepseek-v4")
+            || lower.starts_with("minimax-m3")
+            || tags_joined.contains("视觉")
+            || tags_joined.contains("看图")
+            || tags_joined.contains("多模态")
+            || desc_lower.contains("多模态")
+            || desc_lower.contains("看图")
+            || desc_lower.contains("视觉")
+            || desc_lower.contains("vision");
+        if is_vision {
+            set.insert("vision");
+        }
+
+        let is_code = lower.contains("code")
+            || lower.contains("codex")
+            || lower.starts_with("swe-")
+            || lower.starts_with("composer-")
+            || lower.starts_with("claude-opus")
+            || lower.starts_with("claude-sonnet")
+            || lower.starts_with("gpt-5")
+            || lower.starts_with("gpt-6")
+            || lower.starts_with("deepseek-v")
+            || lower.starts_with("deepseek-coder")
+            || lower.starts_with("glm-5")
+            || lower.starts_with("kimi-k3")
+            || lower.starts_with("grok-4")
+            || lower.starts_with("minimax-m3")
+            || lower.starts_with("mimo-v2")
+            || (lower.starts_with("gemini-3") && !is_image && !lower.contains("lite"))
+            || (lower.starts_with("gemini-4") && !is_image)
+            || tags_joined.contains("编程")
+            || tags_joined.contains("编码")
+            || tags_joined.contains("代码")
+            || desc_lower.contains("编程")
+            || desc_lower.contains("编码")
+            || desc_lower.contains("代码")
+            || desc_lower.contains("coding");
+        if is_code {
+            set.insert("code");
+        }
+    }
+
+    const ORDER: &[&str] = &[
+        "chat", "reason", "vision", "code", "image", "video", "audio", "embed",
+    ];
+    ORDER
+        .iter()
+        .filter(|&&c| set.contains(c))
+        .map(|&c| c.to_string())
+        .collect()
+}
+
+pub fn extract_pricing_context_window(
+    model_id: &str,
+    item: Option<&Value>,
+    tags: &[String],
+    desc: &str,
+    capabilities: &[String],
+) -> Option<u64> {
+    if let Some(obj) = item {
+        for field in [
+            "context_length",
+            "contextLength",
+            "context_window",
+            "contextWindow",
+            "max_context_length",
+            "max_input_tokens",
+        ] {
+            if let Some(n) = obj.get(field).and_then(Value::as_u64) {
+                if n >= 1_000 {
+                    return Some(n);
+                }
+            }
+            if let Some(s) = obj.get(field).and_then(Value::as_str) {
+                if let Some(parsed) = parse_compact_token_count(s) {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+
+    for tag in tags {
+        if let Some(parsed) = parse_compact_token_count(tag) {
+            return Some(parsed);
+        }
+    }
+
+    if let Some(parsed) = extract_context_from_description(desc) {
+        return Some(parsed);
+    }
+
+    let is_chat_llm = capabilities.iter().any(|c| c == "chat");
+    let is_media_only = !is_chat_llm
+        && capabilities
+            .iter()
+            .any(|c| matches!(c.as_str(), "image" | "video" | "audio" | "embed"));
+    if is_media_only {
+        return None;
+    }
+
+    let lower = model_id.trim().to_ascii_lowercase();
+    if lower.starts_with("claude-")
+        || lower.starts_with("gpt-")
+        || lower.starts_with("gemini-")
+        || lower.starts_with("gemma-")
+        || lower.starts_with("deepseek-")
+        || lower.starts_with("glm-")
+        || lower.starts_with("kimi-")
+        || lower.starts_with("grok-")
+        || lower.starts_with("minimax-")
+        || lower.starts_with("mimo-")
+        || lower.starts_with("swe-")
+        || lower.starts_with("composer-")
+        || lower == "hy3"
+    {
+        return Some(model_context_window(model_id));
+    }
+    None
 }
 
 pub fn parse_pricing_metadata(body: &Value) -> PricingCache {
@@ -399,13 +1059,44 @@ pub fn parse_pricing_metadata(body: &Value) -> PricingCache {
         } else {
             None
         };
+        let (tier_in, tier_cache, tier_out) = extract_first_tier_prices(item, billing_expr);
+        let cache_ratio = item
+            .get("cache_ratio")
+            .and_then(Value::as_f64)
+            .filter(|n| n.is_finite() && *n > 0.0);
+
         let input_usd_per_m = if quota_type == 0 && model_ratio > 0.0 {
             Some(model_ratio * 2.0 * display_group_ratio).filter(|v| v.is_finite() && *v > 0.0)
+        } else if quota_type == 0 && is_dynamic_pricing {
+            tier_in
+                .map(|p| p * display_group_ratio)
+                .filter(|v| v.is_finite() && *v > 0.0)
+        } else {
+            None
+        };
+        let cache_usd_per_m = if quota_type == 0 {
+            if is_dynamic_pricing {
+                tier_cache
+                    .map(|p| p * display_group_ratio)
+                    .or_else(|| {
+                        input_usd_per_m.zip(cache_ratio).map(|(inp, cr)| inp * cr)
+                    })
+                    .filter(|v| v.is_finite() && *v > 0.0)
+            } else {
+                input_usd_per_m
+                    .zip(cache_ratio)
+                    .map(|(inp, cr)| inp * cr)
+                    .filter(|v| v.is_finite() && *v > 0.0)
+            }
         } else {
             None
         };
         let output_usd_per_m = if quota_type == 0 && model_ratio > 0.0 && completion_ratio > 0.0 {
             Some(model_ratio * 2.0 * completion_ratio * display_group_ratio)
+                .filter(|v| v.is_finite() && *v > 0.0)
+        } else if quota_type == 0 && is_dynamic_pricing {
+            tier_out
+                .map(|p| p * display_group_ratio)
                 .filter(|v| v.is_finite() && *v > 0.0)
         } else {
             None
@@ -415,7 +1106,7 @@ pub fn parse_pricing_metadata(body: &Value) -> PricingCache {
         } else {
             None
         };
-        let channels = item
+        let channels: Vec<ModelChannelPrice> = item
             .get("channels")
             .and_then(Value::as_array)
             .map(|arr| {
@@ -449,6 +1140,57 @@ pub fn parse_pricing_metadata(body: &Value) -> PricingCache {
             })
             .unwrap_or_default();
 
+        let min_channel_ratio = item
+            .get("channels")
+            .and_then(Value::as_array)
+            .and_then(|arr| {
+                arr.iter()
+                    .filter_map(|ch| {
+                        ch.get("channel_ratio")
+                            .and_then(Value::as_f64)
+                            .filter(|r| r.is_finite() && *r > 0.0)
+                    })
+                    .reduce(f64::min)
+            })
+            .or_else(|| {
+                if ch_min_map.is_some() && min_ratio.is_finite() && min_ratio > 0.0 {
+                    Some(min_ratio)
+                } else {
+                    None
+                }
+            });
+
+        let official_multiplier = if quota_type == 0
+            && model_ratio > 0.0
+            && !has_usage_schema
+            && !is_dynamic_pricing
+            && !has_tiered_plugin_variant(item)
+        {
+            min_channel_ratio
+                .map(|r| r / OFFICIAL_PRICE_RATIO_BASE)
+                .filter(|m| m.is_finite() && *m > 0.0)
+        } else {
+            None
+        };
+
+        let raw_desc = item
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let tags = extract_item_tags(item);
+        let has_levels = cache.reasoning_levels.contains_key(model_name);
+        let capabilities =
+            derive_model_capabilities(model_name, Some(item), &tags, raw_desc, has_levels);
+        let context_window = extract_pricing_context_window(
+            model_name,
+            Some(item),
+            &tags,
+            raw_desc,
+            &capabilities,
+        );
+        let promo_ends_on = resolve_promo_ends_on(model_name, Some(item));
+        let vendor_name = infer_vendor_name(model_name, Some(item));
+
         cache.prices.insert(
             model_name.to_ascii_lowercase(),
             ModelPricingInfo {
@@ -459,8 +1201,17 @@ pub fn parse_pricing_metadata(body: &Value) -> PricingCache {
                 realized_usd_per_m,
                 cache_hit_rate,
                 input_usd_per_m,
+                cache_usd_per_m,
                 output_usd_per_m,
                 request_usd,
+                quota_type,
+                model_ratio: (model_ratio > 0.0).then_some(model_ratio),
+                official_multiplier,
+                promo_ends_on,
+                capabilities,
+                tags,
+                vendor_name,
+                context_window,
                 channels,
             },
         );
@@ -2448,13 +3199,25 @@ pub fn build_claude_model_options(
                     let family = model_family_label(AppId::Claude, &id).to_string();
                     let (price_info, perf_info) =
                         resolve_model_metrics(&id, pricing, perf);
+                    let capabilities = if price_info.capabilities.is_empty() {
+                        derive_model_capabilities(&id, None, &price_info.tags, &description, false)
+                    } else {
+                        price_info.capabilities
+                    };
+                    let promo_ends_on = price_info
+                        .promo_ends_on
+                        .or_else(|| resolve_promo_ends_on(&id, None));
+                    let vendor_name = price_info
+                        .vendor_name
+                        .or_else(|| infer_vendor_name(&id, None));
+                    let resolved_ctx = price_info.context_window.or(context_window);
                     Some(ClientModelOption {
                         family,
                         recommended: is_recommended_model(AppId::Claude, &id),
                         id,
                         display_name,
                         description,
-                        context_window,
+                        context_window: resolved_ctx,
                         visible,
                         effort_levels: Vec::new(),
                         is_free: price_info.is_free,
@@ -2464,8 +3227,16 @@ pub fn build_claude_model_options(
                         realized_usd_per_m: price_info.realized_usd_per_m,
                         cache_hit_rate: price_info.cache_hit_rate,
                         input_usd_per_m: price_info.input_usd_per_m,
+                        cache_usd_per_m: price_info.cache_usd_per_m,
                         output_usd_per_m: price_info.output_usd_per_m,
                         request_usd: price_info.request_usd,
+                        quota_type: price_info.quota_type,
+                        model_ratio: price_info.model_ratio,
+                        official_multiplier: price_info.official_multiplier,
+                        promo_ends_on,
+                        capabilities,
+                        tags: price_info.tags,
+                        vendor_name,
                         channels: price_info.channels,
                         avg_tps: perf_info.avg_tps,
                         avg_latency_ms: perf_info.avg_latency_ms,
@@ -2533,7 +3304,7 @@ pub fn build_codex_model_options(
                         .unwrap_or("Tako 托管模型")
                         .to_string();
                     let context_window = m.get("context_window").and_then(Value::as_u64);
-                    let effort_levels = m
+                    let effort_levels: Vec<String> = m
                         .get("supported_reasoning_levels")
                         .and_then(Value::as_array)
                         .map(|lvls| {
@@ -2546,13 +3317,31 @@ pub fn build_codex_model_options(
                         .unwrap_or_default();
                     let visible = visible_ids.contains(&id.to_ascii_lowercase());
                     let (price_info, perf_info) = resolve_model_metrics(&id, pricing, perf);
+                    let capabilities = if price_info.capabilities.is_empty() {
+                        derive_model_capabilities(
+                            &id,
+                            None,
+                            &price_info.tags,
+                            &description,
+                            !effort_levels.is_empty(),
+                        )
+                    } else {
+                        price_info.capabilities
+                    };
+                    let promo_ends_on = price_info
+                        .promo_ends_on
+                        .or_else(|| resolve_promo_ends_on(&id, None));
+                    let vendor_name = price_info
+                        .vendor_name
+                        .or_else(|| infer_vendor_name(&id, None));
+                    let resolved_ctx = price_info.context_window.or(context_window);
                     Some(ClientModelOption {
                         family: model_family_label(AppId::Codex, &id).to_string(),
                         recommended: is_recommended_model(AppId::Codex, &id),
                         id,
                         display_name,
                         description,
-                        context_window,
+                        context_window: resolved_ctx,
                         visible,
                         effort_levels,
                         is_free: price_info.is_free,
@@ -2562,8 +3351,16 @@ pub fn build_codex_model_options(
                         realized_usd_per_m: price_info.realized_usd_per_m,
                         cache_hit_rate: price_info.cache_hit_rate,
                         input_usd_per_m: price_info.input_usd_per_m,
+                        cache_usd_per_m: price_info.cache_usd_per_m,
                         output_usd_per_m: price_info.output_usd_per_m,
                         request_usd: price_info.request_usd,
+                        quota_type: price_info.quota_type,
+                        model_ratio: price_info.model_ratio,
+                        official_multiplier: price_info.official_multiplier,
+                        promo_ends_on,
+                        capabilities,
+                        tags: price_info.tags,
+                        vendor_name,
                         channels: price_info.channels,
                         avg_tps: perf_info.avg_tps,
                         avg_latency_ms: perf_info.avg_latency_ms,
@@ -2610,12 +3407,30 @@ pub fn build_antigravity_model_options(
             let recommended = is_recommended_model(AppId::Antigravity, &cand.base_id)
                 || is_recommended_model(AppId::Antigravity, &cand.variant_prefix);
             let (price_info, perf_info) = resolve_model_metrics(&cand.base_id, pricing, perf);
+            let capabilities = if price_info.capabilities.is_empty() {
+                derive_model_capabilities(
+                    &cand.base_id,
+                    None,
+                    &price_info.tags,
+                    &description,
+                    !cand.effort_levels.is_empty(),
+                )
+            } else {
+                price_info.capabilities
+            };
+            let promo_ends_on = price_info
+                .promo_ends_on
+                .or_else(|| resolve_promo_ends_on(&cand.base_id, None));
+            let vendor_name = price_info
+                .vendor_name
+                .or_else(|| infer_vendor_name(&cand.base_id, None));
+            let resolved_ctx = price_info.context_window.or(context_window);
             ClientModelOption {
                 family: model_family_label(AppId::Antigravity, &cand.base_id).to_string(),
                 id: cand.base_id,
                 display_name: cand.display_name,
                 description,
-                context_window,
+                context_window: resolved_ctx,
                 recommended,
                 visible,
                 effort_levels: cand.effort_levels,
@@ -2626,8 +3441,16 @@ pub fn build_antigravity_model_options(
                 realized_usd_per_m: price_info.realized_usd_per_m,
                 cache_hit_rate: price_info.cache_hit_rate,
                 input_usd_per_m: price_info.input_usd_per_m,
+                cache_usd_per_m: price_info.cache_usd_per_m,
                 output_usd_per_m: price_info.output_usd_per_m,
                 request_usd: price_info.request_usd,
+                quota_type: price_info.quota_type,
+                model_ratio: price_info.model_ratio,
+                official_multiplier: price_info.official_multiplier,
+                promo_ends_on,
+                capabilities,
+                tags: price_info.tags,
+                vendor_name,
                 channels: price_info.channels,
                 avg_tps: perf_info.avg_tps,
                 avg_latency_ms: perf_info.avg_latency_ms,
@@ -2651,20 +3474,217 @@ pub fn build_antigravity_model_options(
     }
 }
 
+fn plaza_family_label(id: &str, capabilities: &[String], vendor: Option<&str>) -> String {
+    let base_fam = model_family_label(AppId::Codex, id);
+    if base_fam != "其他" {
+        return base_fam.to_string();
+    }
+    if capabilities.iter().any(|c| c == "image") && !capabilities.iter().any(|c| c == "chat") {
+        return "生图".to_string();
+    }
+    if capabilities.iter().any(|c| c == "video") {
+        return "视频".to_string();
+    }
+    if capabilities.iter().any(|c| c == "audio") && !capabilities.iter().any(|c| c == "chat") {
+        return "语音".to_string();
+    }
+    if capabilities.iter().any(|c| c == "embed") {
+        return "向量".to_string();
+    }
+    if let Some(v) = vendor.filter(|s| !s.is_empty()) {
+        return v.to_string();
+    }
+    "其他".to_string()
+}
+
+fn is_plaza_recommended(id: &str) -> bool {
+    is_recommended_model(AppId::Codex, id)
+        || is_recommended_model(AppId::Claude, id)
+        || is_recommended_model(AppId::Antigravity, id)
+        || matches!(
+            id.trim().to_ascii_lowercase().as_str(),
+            "gemini-4-carbon" | "gemini-4-argon"
+        )
+}
+
+fn plaza_sort_key(m: &ClientModelOption) -> (u8, u16, String) {
+    let promo_rank = if m.promo_ends_on.is_some() {
+        0
+    } else if m.recommended {
+        1
+    } else if m.capabilities.iter().any(|c| c == "chat") {
+        2
+    } else {
+        3
+    };
+    let fam_prio = antigravity_model_sort_key(&m.id).0;
+    (promo_rank, fam_prio, m.id.to_ascii_lowercase())
+}
+
+pub fn build_plaza_model_options(
+    pricing_body: &Value,
+    perf: &HashMap<String, ModelPerfInfo>,
+) -> ClientModelsResponse {
+    let pricing = parse_pricing_metadata(pricing_body);
+    let raw_items = pricing_body
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut seen = HashSet::new();
+    let mut models = Vec::with_capacity(raw_items.len());
+    let mut recommended_ids = Vec::new();
+
+    for item in &raw_items {
+        let Some(id_raw) = item
+            .get("model_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let lower = id_raw.to_ascii_lowercase();
+        if lower == "codex-auto-review" || lower.starts_with("jev-") {
+            continue;
+        }
+        if !seen.insert(lower.clone()) {
+            continue;
+        }
+
+        let (price_info, perf_info) = resolve_model_metrics(id_raw, &pricing, perf);
+        let raw_desc = item.get("description").and_then(Value::as_str);
+        let description = if let Some(d) = raw_desc.map(str::trim).filter(|s| !s.is_empty()) {
+            let concise = concise_model_description(id_raw, Some(d));
+            if concise == "Tako 托管模型" {
+                d.chars().take(48).collect()
+            } else {
+                concise
+            }
+        } else {
+            concise_model_description(id_raw, None)
+        };
+        let display_name = display_base_name(
+            id_raw,
+            item.get("display_name")
+                .or_else(|| item.get("displayName"))
+                .and_then(Value::as_str),
+        );
+        let effort_levels = pricing
+            .reasoning_levels
+            .get(id_raw)
+            .cloned()
+            .unwrap_or_default();
+        let recommended = is_plaza_recommended(id_raw);
+        if recommended {
+            recommended_ids.push(id_raw.to_string());
+        }
+        let family = plaza_family_label(
+            id_raw,
+            &price_info.capabilities,
+            price_info.vendor_name.as_deref(),
+        );
+
+        models.push(ClientModelOption {
+            id: id_raw.to_string(),
+            display_name,
+            family,
+            description,
+            context_window: price_info.context_window,
+            recommended,
+            visible: true,
+            effort_levels,
+            is_free: price_info.is_free,
+            is_dynamic_pricing: price_info.is_dynamic_pricing,
+            standard_load_usd_per_m: price_info.standard_load_usd_per_m,
+            standard_load_max_usd_per_m: price_info.standard_load_max_usd_per_m,
+            realized_usd_per_m: price_info.realized_usd_per_m,
+            cache_hit_rate: price_info.cache_hit_rate,
+            input_usd_per_m: price_info.input_usd_per_m,
+            cache_usd_per_m: price_info.cache_usd_per_m,
+            output_usd_per_m: price_info.output_usd_per_m,
+            request_usd: price_info.request_usd,
+            quota_type: price_info.quota_type,
+            model_ratio: price_info.model_ratio,
+            official_multiplier: price_info.official_multiplier,
+            promo_ends_on: price_info.promo_ends_on,
+            capabilities: price_info.capabilities,
+            tags: price_info.tags,
+            vendor_name: price_info.vendor_name,
+            channels: price_info.channels,
+            avg_tps: perf_info.avg_tps,
+            avg_latency_ms: perf_info.avg_latency_ms,
+            success_rate: perf_info.success_rate,
+        });
+    }
+
+    models.sort_by_key(plaza_sort_key);
+    let total_count = models.len();
+    ClientModelsResponse {
+        app_id: AppId::DshTako,
+        filter: ClientModelFilter {
+            mode: ModelFilterMode::All,
+            enabled_ids: Vec::new(),
+        },
+        recommended_ids,
+        visible_count: total_count,
+        total_count,
+        models,
+    }
+}
+
+pub async fn fetch_plaza_models_for_ui(paths: &AppPaths) -> Result<ClientModelsResponse, String> {
+    let switch_state = read_switch_state(paths);
+    let base_url = switch_state.normalized_base_url();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| format!("创建模型广场客户端失败: {e}"))?;
+
+    let pricing_url = format!("{base_url}/api/pricing");
+    let perf_url = format!("{base_url}/api/perf-metrics/summary");
+    let (pricing_res, perf_res) = tokio::join!(
+        client.get(&pricing_url).send(),
+        client
+            .get(&perf_url)
+            .timeout(Duration::from_secs(6))
+            .send()
+    );
+
+    let resp = pricing_res.map_err(|e| format!("拉取模型广场定价失败: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body_text = resp.text().await.unwrap_or_default();
+        let snippet: String = body_text.chars().take(160).collect();
+        return Err(format!(
+            "模型广场接口返回 HTTP {}: {snippet}",
+            status.as_u16()
+        ));
+    }
+    let pricing_body: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("解析模型广场定价数据失败: {e}"))?;
+
+    let perf = match perf_res {
+        Ok(r) if r.status().is_success() => r
+            .json::<Value>()
+            .await
+            .map(|v| parse_perf_metrics_summary(&v))
+            .unwrap_or_default(),
+        _ => HashMap::new(),
+    };
+
+    Ok(build_plaza_model_options(&pricing_body, &perf))
+}
+
 pub async fn fetch_client_models_for_ui(
     paths: &AppPaths,
     app_id: AppId,
 ) -> Result<ClientModelsResponse, String> {
     if app_id == AppId::DshTako {
-        let switch_state = read_switch_state(paths);
-        return Ok(ClientModelsResponse {
-            app_id,
-            filter: switch_state.model_filters.dsh_tako,
-            recommended_ids: Vec::new(),
-            visible_count: 0,
-            total_count: 0,
-            models: Vec::new(),
-        });
+        return fetch_plaza_models_for_ui(paths).await;
     }
 
     let switch_state = read_switch_state(paths);
@@ -4271,5 +5291,109 @@ mod tests {
         assert!((ds.standard_load_usd_per_m.unwrap() - (0.03852 * 2.63)).abs() < 1e-6);
         assert_eq!(ds.standard_load_max_usd_per_m, None);
         assert_eq!(ds.avg_tps, Some(297.57));
+    }
+
+    #[test]
+    fn plaza_model_options_syncs_pr296_pricing_multipliers_promos_and_capabilities() {
+        let pricing_body = json!({
+            "group_ratio": { "default": 1.0 },
+            "data": [
+                {
+                    "model_name": "gemini-4-carbon",
+                    "description": "Google 旗舰多模态编程推理模型，支持 2M 上下文。",
+                    "quota_type": 0,
+                    "model_ratio": 1.5,
+                    "completion_ratio": 4.0,
+                    "cache_ratio": 0.1,
+                    "enable_groups": ["default"],
+                    "reasoning_levels": ["low", "medium", "high"],
+                    "tags": ["限时特惠", "编程"],
+                    "channels": [
+                        { "channel_name": "official-pool", "channel_ratio": 1.224, "standard_load_price_per_million": 0.42 },
+                        { "channel_name": "backup", "channel_ratio": 2.04, "standard_load_price_per_million": 0.70 }
+                    ]
+                },
+                {
+                    "model_name": "claude-opus-5-5",
+                    "description": "旗舰长程智能体",
+                    "quota_type": 0,
+                    "billing_mode": "tiered_expr",
+                    "tiered_prices": [
+                        { "inputPrice": 5.0, "cacheReadPrice": 0.5, "outputPrice": 25.0 }
+                    ],
+                    "enable_groups": ["default"],
+                    "tags": ["1M", "智能体"],
+                    "channels": [
+                        { "channel_name": "tiered", "channel_ratio": 2.0 }
+                    ]
+                },
+                {
+                    "model_name": "flux-1.1-pro",
+                    "description": "高质量文生图模型",
+                    "quota_type": 1,
+                    "model_price": 0.12,
+                    "enable_groups": ["default"],
+                    "supported_endpoint_types": ["image"]
+                }
+            ]
+        });
+        let perf = parse_perf_metrics_summary(&json!({
+            "data": {
+                "models": [
+                    { "model_name": "gemini-4-carbon", "avg_tps": 168.5, "avg_latency_ms": 2100.0, "success_rate": 99.8 }
+                ]
+            }
+        }));
+
+        let resp = build_plaza_model_options(&pricing_body, &perf);
+        assert_eq!(resp.app_id, AppId::DshTako);
+        assert_eq!(resp.total_count, 3);
+
+        let carbon = resp
+            .models
+            .iter()
+            .find(|m| m.id == "gemini-4-carbon")
+            .unwrap();
+        assert_eq!(carbon.vendor_name.as_deref(), Some("Google"));
+        assert_eq!(carbon.context_window, Some(2_000_000));
+        assert!((carbon.input_usd_per_m.unwrap() - 3.0).abs() < 1e-6);
+        assert!((carbon.cache_usd_per_m.unwrap() - 0.3).abs() < 1e-6);
+        assert!((carbon.output_usd_per_m.unwrap() - 12.0).abs() < 1e-6);
+        assert!((carbon.official_multiplier.unwrap() - 0.06).abs() < 1e-6);
+        assert_eq!(
+            resolve_promo_ends_on_at_date("gemini-4-carbon", None, "2026-11-22").as_deref(),
+            Some("2026-11-30")
+        );
+        assert_eq!(
+            resolve_promo_ends_on_at_date("gemini-4-carbon", None, "2026-12-01"),
+            None
+        );
+        assert!(carbon.capabilities.contains(&"chat".to_string()));
+        assert!(carbon.capabilities.contains(&"reason".to_string()));
+        assert!(carbon.capabilities.contains(&"vision".to_string()));
+        assert!(carbon.capabilities.contains(&"code".to_string()));
+        assert_eq!(carbon.avg_tps, Some(168.5));
+
+        let opus = resp
+            .models
+            .iter()
+            .find(|m| m.id == "claude-opus-5-5")
+            .unwrap();
+        assert!(opus.is_dynamic_pricing);
+        assert_eq!(opus.official_multiplier, None);
+        assert!((opus.cache_usd_per_m.unwrap() - 0.5).abs() < 1e-6);
+        assert_eq!(opus.context_window, Some(1_000_000));
+
+        let flux = resp
+            .models
+            .iter()
+            .find(|m| m.id == "flux-1.1-pro")
+            .unwrap();
+        assert_eq!(flux.quota_type, 1);
+        assert!((flux.request_usd.unwrap() - 0.12).abs() < 1e-6);
+        assert_eq!(flux.official_multiplier, None);
+        assert!(flux.capabilities.contains(&"image".to_string()));
+        assert!(!flux.capabilities.contains(&"chat".to_string()));
+        assert_eq!(flux.context_window, None);
     }
 }

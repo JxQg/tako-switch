@@ -40,6 +40,52 @@ impl CodexAdapter {
         paths.codex_dir.join("AGENTS.md")
     }
 
+    pub fn is_chinese_configured(paths: &AppPaths) -> bool {
+        let has_locale = Self::read_doc(paths)
+            .ok()
+            .and_then(|doc| {
+                doc.get("desktop")
+                    .and_then(|i| i.as_table_like())
+                    .and_then(|t| t.get("localeOverride"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s == "zh-CN")
+            })
+            .unwrap_or(false);
+        has_locale && crate::adapters::has_managed_chinese_block(&Self::agents_md_path(paths))
+    }
+
+    pub fn sync_standalone_chinese_locale(paths: &AppPaths, enable: bool) -> Result<(), String> {
+        let config_path = Self::config_path(paths);
+        if enable || config_path.exists() {
+            backup_file_once(paths, "codex", "config.toml", &config_path)?;
+            let mut doc = Self::read_doc(paths)?;
+            if enable {
+                Self::set_desktop_locale_zh_cn(&mut doc);
+                write_atomic(&config_path, doc.to_string().as_bytes(), false)?;
+            } else {
+                Self::restore_backup_desktop_locale(&mut doc, paths);
+                let absent_marker = paths.backups_dir("codex").join("config.toml.absent");
+                if doc.as_table().is_empty() && absent_marker.exists() && config_path.exists() {
+                    fs::remove_file(&config_path)
+                        .map_err(|e| format!("移除临时 config.toml 失败: {e}"))?;
+                } else {
+                    write_atomic(&config_path, doc.to_string().as_bytes(), false)?;
+                }
+            }
+        }
+        sync_managed_chinese_markdown(
+            paths,
+            "codex",
+            "AGENTS.md",
+            &Self::agents_md_path(paths),
+            enable,
+            CODEX_CHINESE_AGENTS_BODY,
+        )?;
+        #[cfg(target_os = "macos")]
+        sync_macos_apple_languages(paths, CODEX_MACOS_BUNDLE_ID, enable);
+        Ok(())
+    }
+
     fn is_oauth_auth_json(bytes: &[u8]) -> bool {
         let Ok(val) = serde_json::from_slice::<JsonValue>(bytes) else {
             return false;
@@ -504,9 +550,11 @@ impl DesktopAppAdapter for CodexAdapter {
                             }
                         }
                     }
-                    if read_switch_state(paths).prefer_chinese_ui {
+                    if read_switch_state(paths).prefer_chinese_ui || Self::is_chinese_configured(paths) {
                         notes.push("中文增强: 已启用 (localeOverride=zh-CN / AGENTS.md 简体中文规则)".to_string());
                     }
+                } else if Self::is_chinese_configured(paths) {
+                    notes.push("中文增强: 已启用 (localeOverride=zh-CN / AGENTS.md 简体中文规则)".to_string());
                 }
                 if Self::has_tako_mcp(&doc) {
                     if let Some(cmd) = doc
@@ -787,6 +835,22 @@ localeOverride = "ja-JP"
         assert!(CodexAdapter::agents_md_path(&paths).exists());
 
         adapter.apply_mode(&paths, AppMode::Official).unwrap();
+        assert!(!CodexAdapter::config_path(&paths).exists());
+        assert!(!CodexAdapter::agents_md_path(&paths).exists());
+    }
+
+    #[test]
+    fn codex_standalone_chinese_locale_works_in_official_mode_and_restores_cleanly() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        assert!(!CodexAdapter::is_chinese_configured(&paths));
+
+        CodexAdapter::sync_standalone_chinese_locale(&paths, true).unwrap();
+        assert!(CodexAdapter::is_chinese_configured(&paths));
+        assert_eq!(CodexAdapter.read_mode(&paths), AppMode::Official);
+
+        CodexAdapter::sync_standalone_chinese_locale(&paths, false).unwrap();
+        assert!(!CodexAdapter::is_chinese_configured(&paths));
         assert!(!CodexAdapter::config_path(&paths).exists());
         assert!(!CodexAdapter::agents_md_path(&paths).exists());
     }

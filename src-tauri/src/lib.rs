@@ -688,9 +688,177 @@ async fn save_settings(app: AppHandle, input: SettingsPatch) -> Result<SwitchSta
             }
         }
     }
+    if prev_zh != state.prefer_chinese_ui {
+        sync_standalone_chinese_for_installed(&paths, state.prefer_chinese_ui);
+    }
 
     refresh_tray(&app, &paths);
     Ok(state)
+}
+
+fn should_sync_standalone_locale(paths: &AppPaths, app_id: AppId, enable: bool) -> bool {
+    if !enable {
+        return true;
+    }
+    let adapter = get_adapter(app_id);
+    if adapter.detect_install(paths).installed || adapter.read_mode(paths) == AppMode::Tako {
+        return true;
+    }
+    match app_id {
+        AppId::DshTako => false,
+        AppId::Codex => paths.codex_dir.exists(),
+        AppId::Claude => {
+            paths.claude_1p_dir.exists()
+                || paths.claude_3p_dir.exists()
+                || paths.home.join(".claude").exists()
+        }
+        AppId::Antigravity => paths.home.join(".gemini").exists(),
+    }
+}
+
+pub fn sync_standalone_chinese_for_installed(paths: &AppPaths, enable: bool) {
+    if should_sync_standalone_locale(paths, AppId::Codex, enable) {
+        let _ = adapters::codex::CodexAdapter::sync_standalone_chinese_locale(paths, enable);
+    }
+    if should_sync_standalone_locale(paths, AppId::Claude, enable) {
+        let _ = adapters::claude::ClaudeAdapter::sync_standalone_chinese_locale(paths, enable);
+    }
+    if should_sync_standalone_locale(paths, AppId::Antigravity, enable) {
+        let _ =
+            adapters::antigravity::AntigravityAdapter::sync_standalone_chinese_locale(paths, enable);
+    }
+}
+
+#[tauri::command]
+async fn set_prefer_chinese_ui(
+    app: AppHandle,
+    enable: bool,
+    patch_antigravity: bool,
+    auto_restart: bool,
+) -> Result<DashboardPayload, String> {
+    let paths_for_sync = AppPaths::detect()?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let mut state = read_switch_state(&paths_for_sync);
+        state.prefer_chinese_ui = enable;
+        save_switch_state(&paths_for_sync, &state)?;
+
+        let agy_adapter = get_adapter(AppId::Antigravity);
+        let agy_was_running = agy_adapter.is_running(&paths_for_sync);
+
+        let should_patch_agy = patch_antigravity
+            && enable
+            && matches!(
+                adapters::inspect_antigravity_ui_patch(&paths_for_sync).status,
+                adapters::UiPatchStatus::Unpatched
+                    | adapters::UiPatchStatus::OutdatedAfterUpgrade
+                    | adapters::UiPatchStatus::Patched
+            );
+
+        if should_patch_agy && auto_restart && agy_was_running {
+            let _ = agy_adapter.quit_app(&paths_for_sync);
+            std::thread::sleep(std::time::Duration::from_millis(450));
+        }
+
+        for &app_id in &[AppId::Codex, AppId::Claude, AppId::Antigravity] {
+            let adapter = get_adapter(app_id);
+            if adapter.read_mode(&paths_for_sync) == AppMode::Tako
+                && adapter.apply_mode(&paths_for_sync, AppMode::Tako).is_err()
+            {
+                sync_standalone_chinese_for_installed(&paths_for_sync, enable);
+            }
+        }
+        sync_standalone_chinese_for_installed(&paths_for_sync, enable);
+
+        if should_patch_agy {
+            adapters::patch_antigravity_ui_for_paths(&paths_for_sync)?;
+        }
+
+        if auto_restart {
+            for &app_id in &[AppId::Codex, AppId::Claude, AppId::Antigravity] {
+                let adapter = get_adapter(app_id);
+                if app_id == AppId::Antigravity && should_patch_agy && agy_was_running {
+                    let _ = adapter.launch_app(&paths_for_sync);
+                    continue;
+                }
+                if adapter.is_running(&paths_for_sync) {
+                    let _ = adapter.quit_app(&paths_for_sync);
+                    std::thread::sleep(std::time::Duration::from_millis(450));
+                    let _ = adapter.launch_app(&paths_for_sync);
+                }
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|err| format!("同步中文设置失败: {err}"))??;
+
+    if let Ok(paths) = AppPaths::detect() {
+        refresh_tray(&app, &paths);
+    }
+    get_dashboard(app, false).await
+}
+
+#[tauri::command]
+async fn patch_antigravity_ui(app: AppHandle, auto_restart: bool) -> Result<AppSnapshot, String> {
+    let paths = AppPaths::detect()?;
+    let paths_clone = paths.clone();
+    let snapshot = tauri::async_runtime::spawn_blocking(move || -> Result<AppSnapshot, String> {
+        let adapter = get_adapter(AppId::Antigravity);
+        let was_running = adapter.is_running(&paths_clone);
+        if auto_restart && was_running {
+            adapter.quit_app(&paths_clone)?;
+            std::thread::sleep(std::time::Duration::from_millis(450));
+        }
+        adapters::patch_antigravity_ui_for_paths(&paths_clone)?;
+        if read_switch_state(&paths_clone).prefer_chinese_ui {
+            let _ = adapters::antigravity::AntigravityAdapter::sync_standalone_chinese_locale(
+                &paths_clone,
+                true,
+            );
+        }
+        if auto_restart && was_running {
+            adapter.launch_app(&paths_clone)?;
+        }
+        Ok(snapshot_app(&paths_clone, AppId::Antigravity))
+    })
+    .await
+    .map_err(|err| format!("执行界面汉化失败: {err}"))??;
+
+    refresh_tray(&app, &paths);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn restore_antigravity_ui(
+    app: AppHandle,
+    auto_restart: bool,
+) -> Result<AppSnapshot, String> {
+    let paths = AppPaths::detect()?;
+    let paths_clone = paths.clone();
+    let snapshot = tauri::async_runtime::spawn_blocking(move || -> Result<AppSnapshot, String> {
+        let adapter = get_adapter(AppId::Antigravity);
+        let was_running = adapter.is_running(&paths_clone);
+        if auto_restart && was_running {
+            adapter.quit_app(&paths_clone)?;
+            std::thread::sleep(std::time::Duration::from_millis(450));
+        }
+        adapters::restore_antigravity_ui_for_paths(&paths_clone)?;
+        if auto_restart && was_running {
+            adapter.launch_app(&paths_clone)?;
+        }
+        Ok(snapshot_app(&paths_clone, AppId::Antigravity))
+    })
+    .await
+    .map_err(|err| format!("还原原版界面失败: {err}"))??;
+
+    refresh_tray(&app, &paths);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn list_plaza_models() -> Result<agy_proxy::ClientModelsResponse, String> {
+    let paths = AppPaths::detect()?;
+    agy_proxy::fetch_plaza_models_for_ui(&paths).await
 }
 
 #[tauri::command]
@@ -1100,12 +1268,16 @@ pub fn run() {
             logout_account,
             open_url,
             save_settings,
+            set_prefer_chinese_ui,
+            patch_antigravity_ui,
+            restore_antigravity_ui,
             set_app_mode,
             restart_app,
             close_app,
             launch_app,
             diagnose_app,
             list_client_models,
+            list_plaza_models,
             save_client_model_filter,
             check_app_updates,
             install_or_upgrade_app,

@@ -73,8 +73,16 @@ export interface ClientModelOption {
   realizedUsdPerM: number | null;
   cacheHitRate: number | null;
   inputUsdPerM: number | null;
+  cacheUsdPerM: number | null;
   outputUsdPerM: number | null;
   requestUsd: number | null;
+  quotaType: number;
+  modelRatio: number | null;
+  officialMultiplier: number | null;
+  promoEndsOn: string | null;
+  capabilities: string[];
+  tags: string[];
+  vendorName: string | null;
   channels: ModelChannelPrice[];
   avgTps: number | null;
   avgLatencyMs: number | null;
@@ -118,6 +126,22 @@ export interface DiagnosticResult {
   notes: string[];
 }
 
+export type UiPatchStatus =
+  | "not_applicable"
+  | "not_installed"
+  | "unpatched"
+  | "patched"
+  | "outdated_after_upgrade"
+  | "unsupported";
+
+export interface UiPatchInfo {
+  status: UiPatchStatus;
+  patchVersion: string | null;
+  hasValidBackup: boolean;
+  targetAsarPath: string | null;
+  note: string | null;
+}
+
 export interface AppSnapshot {
   id: AppId;
   name: string;
@@ -127,6 +151,8 @@ export interface AppSnapshot {
   running: boolean;
   install: InstallInfo;
   diagnostic: DiagnosticResult;
+  chineseConfigured: boolean;
+  uiPatch: UiPatchInfo;
 }
 
 export interface PlatformArtifact {
@@ -268,6 +294,20 @@ export const api = {
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   saveSettings: (input: SettingsPatch) =>
     invoke<SwitchState>("save_settings", { input }),
+  setPreferChineseUi: (
+    enable: boolean,
+    patchAntigravity: boolean,
+    autoRestart: boolean,
+  ) =>
+    invoke<DashboardPayload>("set_prefer_chinese_ui", {
+      enable,
+      patchAntigravity,
+      autoRestart,
+    }),
+  patchAntigravityUi: (autoRestart: boolean) =>
+    invoke<AppSnapshot>("patch_antigravity_ui", { autoRestart }),
+  restoreAntigravityUi: (autoRestart: boolean) =>
+    invoke<AppSnapshot>("restore_antigravity_ui", { autoRestart }),
   setAppMode: (appId: AppId, mode: AppMode, autoRestart: boolean) =>
     invoke<AppSnapshot>("set_app_mode", { appId, mode, autoRestart }),
   restartApp: (appId: AppId) => invoke<AppSnapshot>("restart_app", { appId }),
@@ -276,6 +316,7 @@ export const api = {
   diagnoseApp: (appId: AppId) => invoke<DiagnosticResult>("diagnose_app", { appId }),
   listClientModels: (appId: AppId) =>
     invoke<ClientModelsResponse>("list_client_models", { appId }),
+  listPlazaModels: () => invoke<ClientModelsResponse>("list_plaza_models"),
   saveClientModelFilter: (appId: AppId, filter: ClientModelFilter) =>
     invoke<SwitchState>("save_client_model_filter", { appId, filter }),
   checkAppUpdates: () => invoke<ManifestCheckResult>("check_app_updates"),
