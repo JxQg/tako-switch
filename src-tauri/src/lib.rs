@@ -832,6 +832,14 @@ fn ensure_local_gateway() -> Result<bool, String> {
 }
 
 #[tauri::command]
+async fn run_mcp_live_demo(
+    input: mcp_server::LiveDemoRequest,
+) -> Result<mcp_server::LiveDemoResult, String> {
+    let paths = AppPaths::detect()?;
+    mcp_server::execute_live_demo_for_paths(&paths, input).await
+}
+
+#[tauri::command]
 async fn check_self_update_smart(app: AppHandle) -> Result<SelfUpdateCheckResult, String> {
     perform_self_update_check(&app).await
 }
@@ -1105,6 +1113,7 @@ pub fn run() {
             ensure_local_gateway,
             check_self_update_smart,
             install_self_update,
+            run_mcp_live_demo,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tako Switch");

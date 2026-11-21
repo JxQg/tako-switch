@@ -7,13 +7,15 @@ use base64::Engine;
 use reqwest::multipart;
 use reqwest::redirect::Policy;
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const MAX_VOICE_SAMPLE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_LIVE_DEMO_PREVIEW_BYTES: u64 = 15 * 1024 * 1024;
 
 fn build_api_client(timeout_secs: u64) -> Result<Client, String> {
     Client::builder()
@@ -1447,6 +1449,434 @@ async fn exec_account_status(paths: &AppPaths) -> Result<String, String> {
     serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveDemoRequest {
+    pub tool: String, // "image" | "video" | "audio" | "search" | "consult"
+    pub prompt: String,
+    pub model: Option<String>,
+    pub voice: Option<String>,
+    pub instructions: Option<String>,
+    pub aspect_ratio: Option<String>,
+    pub provider: Option<String>,
+    pub resume_task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveDemoCitation {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+    pub domain: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveDemoResult {
+    pub tool: String,
+    pub status: String, // "completed" | "pending"
+    pub model: String,
+    pub elapsed_ms: u64,
+    pub saved_path: Option<String>,
+    pub preview_data_url: Option<String>,
+    pub text_output: Option<String>,
+    pub task_id: Option<String>,
+    pub citations: Vec<LiveDemoCitation>,
+}
+
+fn read_base64_preview(saved_path: Option<&str>, mime: &str) -> Option<String> {
+    let path_str = saved_path?;
+    let path = Path::new(path_str);
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_LIVE_DEMO_PREVIEW_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    Some(format!("data:{mime};base64,{}", STANDARD.encode(&bytes)))
+}
+
+fn extract_domain_from_url(raw_url: &str) -> String {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let after_scheme = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| trimmed.strip_prefix("//").unwrap_or(trimmed));
+    let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    host.trim().to_ascii_lowercase()
+}
+
+fn parse_live_demo_search_result(
+    body: &Value,
+    provider: Option<String>,
+    elapsed_ms: u64,
+) -> LiveDemoResult {
+    let text_output = ["/answer", "/summary", "/content", "/data/answer"]
+        .into_iter()
+        .find_map(|ptr| {
+            body.pointer(ptr)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+
+    let items = ["/results", "/data/results", "/data", "/organic"]
+        .into_iter()
+        .find_map(|ptr| body.pointer(ptr).and_then(Value::as_array));
+
+    let mut citations = Vec::new();
+    if let Some(arr) = items {
+        for item in arr {
+            let url = item
+                .get("url")
+                .or_else(|| item.get("link"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            if url.is_empty() {
+                continue;
+            }
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            let snippet = ["snippet", "content", "description"]
+                .into_iter()
+                .find_map(|k| {
+                    item.get(k)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or("")
+                .to_string();
+            let domain = extract_domain_from_url(url);
+            citations.push(LiveDemoCitation {
+                title,
+                url: url.to_string(),
+                snippet,
+                domain,
+            });
+        }
+    }
+
+    let model = provider
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "deepseek".to_string());
+
+    LiveDemoResult {
+        tool: "search".to_string(),
+        status: "completed".to_string(),
+        model,
+        elapsed_ms,
+        saved_path: None,
+        preview_data_url: None,
+        text_output,
+        task_id: None,
+        citations,
+    }
+}
+
+fn strip_consult_model_prefix(raw: String, fallback_model: String) -> (String, String) {
+    if let Some(rest) = raw.strip_prefix('[') {
+        if let Some((m, body)) = rest.split_once("]\n") {
+            let trimmed_model = m.trim();
+            if !trimmed_model.is_empty() {
+                return (trimmed_model.to_string(), body.to_string());
+            }
+        }
+    }
+    (fallback_model, raw)
+}
+
+pub async fn execute_live_demo_for_paths(
+    paths: &AppPaths,
+    input: LiveDemoRequest,
+) -> Result<LiveDemoResult, String> {
+    let api_key = read_main_api_key(paths).ok_or_else(|| {
+        "未登录 Tako 账号，请先在右上角登录或填入 API Key 后再现场试跑".to_string()
+    })?;
+    let state = read_switch_state(paths);
+    let base_url = state.normalized_base_url();
+    let started = Instant::now();
+
+    match input.tool.trim() {
+        "image" => {
+            let mut args = json!({ "prompt": input.prompt });
+            if let Some(m) = input
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                args["model"] = Value::String(m.to_string());
+            }
+            if let Some(ar) = input
+                .aspect_ratio
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                args["aspect_ratio"] = Value::String(ar.to_string());
+            }
+
+            let raw = exec_generate_image(paths, &state.mcp, &base_url, &api_key, args).await?;
+            let v: Value =
+                serde_json::from_str(&raw).map_err(|e| format!("解析生图结果失败: {e}"))?;
+            let saved_path = v
+                .get("saved_path")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let model = v
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    input
+                        .model
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "gpt-image-2".to_string())
+                });
+            let note = v.get("note").and_then(Value::as_str).map(str::to_string);
+
+            let preview_data_url = match saved_path.as_deref() {
+                Some(p) => {
+                    let path = Path::new(p);
+                    match std::fs::metadata(path) {
+                        Ok(meta) if meta.is_file() && meta.len() <= MAX_LIVE_DEMO_PREVIEW_BYTES => {
+                            encode_image_data_uri(path).ok().map(|(uri, _, _)| uri)
+                        }
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+
+            Ok(LiveDemoResult {
+                tool: "image".to_string(),
+                status: "completed".to_string(),
+                model,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                saved_path,
+                preview_data_url,
+                text_output: note,
+                task_id: None,
+                citations: Vec::new(),
+            })
+        }
+        "video" => {
+            let mut args = json!({
+                "prompt": input.prompt,
+                "duration": 5,
+                "resolution": "480p",
+                "aspect_ratio": input
+                    .aspect_ratio
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("1:1"),
+                "wait_timeout_secs": 90,
+            });
+            if let Some(m) = input
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                args["model"] = Value::String(m.to_string());
+            }
+            if let Some(tid) = input
+                .resume_task_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                args["resume_task_id"] = Value::String(tid.to_string());
+            }
+
+            let raw = exec_generate_video(paths, &state.mcp, &base_url, &api_key, args).await?;
+            let v: Value =
+                serde_json::from_str(&raw).map_err(|e| format!("解析视频结果失败: {e}"))?;
+            let raw_status = v.get("status").and_then(Value::as_str).unwrap_or("");
+            let task_id = v.get("task_id").and_then(Value::as_str).map(str::to_string);
+            let model = v
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    input
+                        .model
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "grok-imagine-video-1.5".to_string())
+                });
+
+            if raw_status == "completed" {
+                let saved_path = v
+                    .get("saved_path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let preview_data_url = read_base64_preview(saved_path.as_deref(), "video/mp4");
+                Ok(LiveDemoResult {
+                    tool: "video".to_string(),
+                    status: "completed".to_string(),
+                    model,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    saved_path,
+                    preview_data_url,
+                    text_output: None,
+                    task_id,
+                    citations: Vec::new(),
+                })
+            } else {
+                let message = v.get("message").and_then(Value::as_str).map(str::to_string);
+                Ok(LiveDemoResult {
+                    tool: "video".to_string(),
+                    status: "pending".to_string(),
+                    model,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                    saved_path: None,
+                    preview_data_url: None,
+                    text_output: message,
+                    task_id,
+                    citations: Vec::new(),
+                })
+            }
+        }
+        "audio" => {
+            let mut args = json!({
+                "input": input.prompt,
+                "voice": input
+                    .voice
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("冰糖"),
+                "model": input
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("mimo-v2.5-tts"),
+                "response_format": "mp3",
+            });
+            if let Some(inst) = input
+                .instructions
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                args["instructions"] = Value::String(inst.to_string());
+            }
+
+            let raw = exec_generate_audio(paths, &state.mcp, &base_url, &api_key, args).await?;
+            let v: Value =
+                serde_json::from_str(&raw).map_err(|e| format!("解析音频结果失败: {e}"))?;
+            let saved_path = v
+                .get("saved_path")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let model = v
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    input
+                        .model
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "mimo-v2.5-tts".to_string())
+                });
+            let preview_data_url = read_base64_preview(saved_path.as_deref(), "audio/mpeg");
+            let text_output = v
+                .get("final_text_preview")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+
+            Ok(LiveDemoResult {
+                tool: "audio".to_string(),
+                status: "completed".to_string(),
+                model,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                saved_path,
+                preview_data_url,
+                text_output,
+                task_id: None,
+                citations: Vec::new(),
+            })
+        }
+        "search" => {
+            let provider = input.provider.clone().filter(|s| !s.trim().is_empty());
+            let raw = exec_web_search(
+                &base_url,
+                &api_key,
+                json!({
+                    "query": input.prompt,
+                    "count": 4,
+                    "provider": provider,
+                }),
+            )
+            .await?;
+            let body: Value =
+                serde_json::from_str(&raw).map_err(|e| format!("解析搜索结果失败: {e}"))?;
+            Ok(parse_live_demo_search_result(
+                &body,
+                provider,
+                started.elapsed().as_millis() as u64,
+            ))
+        }
+        "consult" => {
+            let fallback_model = input
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&state.mcp.consult_model)
+                .to_string();
+            let raw = exec_consult(
+                &state.mcp,
+                &base_url,
+                &api_key,
+                json!({
+                    "question": input.prompt,
+                    "model": input.model,
+                }),
+            )
+            .await?;
+            let (model, text) = strip_consult_model_prefix(raw, fallback_model);
+
+            Ok(LiveDemoResult {
+                tool: "consult".to_string(),
+                status: "completed".to_string(),
+                model,
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                saved_path: None,
+                preview_data_url: None,
+                text_output: Some(text),
+                task_id: None,
+                citations: Vec::new(),
+            })
+        }
+        _ => Err(format!("不支持的现场试跑工具: {}", input.tool)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1712,5 +2142,188 @@ mod tests {
         )
         .unwrap();
         assert!(pc["voice"].as_str().unwrap().starts_with("data:audio/wav;base64,"));
+    }
+
+    #[tokio::test]
+    async fn live_demo_requires_login_and_rejects_unknown_tool() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+
+        let err_unauth = execute_live_demo_for_paths(
+            &paths,
+            LiveDemoRequest {
+                tool: "search".to_string(),
+                prompt: "tauri v2".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err_unauth,
+            "未登录 Tako 账号，请先在右上角登录或填入 API Key 后再现场试跑"
+        );
+
+        crate::config::save_switch_auth(&paths, Some("cr_test_key"), None, None).unwrap();
+        let err_unknown = execute_live_demo_for_paths(
+            &paths,
+            LiveDemoRequest {
+                tool: "magic".to_string(),
+                prompt: "test".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err_unknown, "不支持的现场试跑工具: magic");
+    }
+
+    #[test]
+    fn live_demo_search_extracts_citations_summary_and_domains() {
+        assert_eq!(
+            extract_domain_from_url("https://v2.tauri.app/start/create-project/?q=1#top"),
+            "v2.tauri.app"
+        );
+        assert_eq!(
+            extract_domain_from_url("http://user:pass@Docs.Example.org:8443/path"),
+            "docs.example.org"
+        );
+        assert_eq!(extract_domain_from_url("https://[::1]:8080/api"), "::1");
+
+        let body = json!({
+            "data": {
+                "answer": "Tauri 2.0 supports desktop and mobile.",
+                "results": [
+                    {
+                        "title": "Tauri 2.0 Docs",
+                        "url": "https://v2.tauri.app/start/",
+                        "description": "Official Tauri v2 documentation"
+                    },
+                    {
+                        "title": "Empty URL should be filtered",
+                        "url": "   ",
+                        "snippet": "ignored"
+                    },
+                    {
+                        "title": "GitHub Repo",
+                        "link": "https://github.com/tauri-apps/tauri",
+                        "content": "Build smaller, faster desktop apps"
+                    }
+                ]
+            }
+        });
+        let res = parse_live_demo_search_result(&body, None, 42);
+        assert_eq!(res.tool, "search");
+        assert_eq!(res.status, "completed");
+        assert_eq!(res.model, "deepseek");
+        assert_eq!(res.elapsed_ms, 42);
+        assert_eq!(
+            res.text_output.as_deref(),
+            Some("Tauri 2.0 supports desktop and mobile.")
+        );
+        assert_eq!(
+            res.citations,
+            vec![
+                LiveDemoCitation {
+                    title: "Tauri 2.0 Docs".to_string(),
+                    url: "https://v2.tauri.app/start/".to_string(),
+                    snippet: "Official Tauri v2 documentation".to_string(),
+                    domain: "v2.tauri.app".to_string(),
+                },
+                LiveDemoCitation {
+                    title: "GitHub Repo".to_string(),
+                    url: "https://github.com/tauri-apps/tauri".to_string(),
+                    snippet: "Build smaller, faster desktop apps".to_string(),
+                    domain: "github.com".to_string(),
+                }
+            ]
+        );
+
+        let organic_body = json!({
+            "organic": [
+                {
+                    "title": "Rust Book",
+                    "url": "https://doc.rust-lang.org/book/",
+                    "snippet": "The Rust Programming Language"
+                }
+            ]
+        });
+        let res2 = parse_live_demo_search_result(&organic_body, Some("grok".to_string()), 15);
+        assert_eq!(res2.model, "grok");
+        assert!(res2.text_output.is_none());
+        assert_eq!(res2.citations.len(), 1);
+        assert_eq!(res2.citations[0].domain, "doc.rust-lang.org");
+    }
+
+    #[tokio::test]
+    async fn live_demo_bypasses_mcp_tool_toggles_and_strips_consult_prefix() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("POST /v1/search ") {
+                    r#"{"summary":"Search summary","results":[{"title":"Example","url":"https://example.com/a","snippet":"hello"}]}"#
+                } else {
+                    r#"{"choices":[{"message":{"content":"Second opinion body"}}]}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        crate::config::save_switch_auth(&paths, Some("cr_test_key"), None, None).unwrap();
+        let mut st = read_switch_state(&paths);
+        st.base_url = format!("http://{addr}");
+        st.mcp.search = false;
+        st.mcp.consult = false;
+        save_switch_state(&paths, &st).unwrap();
+
+        let search_res = execute_live_demo_for_paths(
+            &paths,
+            LiveDemoRequest {
+                tool: "search".to_string(),
+                prompt: "hello".to_string(),
+                provider: Some("grok_x".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(search_res.status, "completed");
+        assert_eq!(search_res.model, "grok_x");
+        assert_eq!(search_res.text_output.as_deref(), Some("Search summary"));
+        assert_eq!(search_res.citations.len(), 1);
+        assert_eq!(search_res.citations[0].domain, "example.com");
+
+        let consult_res = execute_live_demo_for_paths(
+            &paths,
+            LiveDemoRequest {
+                tool: "consult".to_string(),
+                prompt: "review this".to_string(),
+                model: Some("claude-opus-5-5".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(consult_res.status, "completed");
+        assert_eq!(consult_res.model, "claude-opus-5-5");
+        assert_eq!(consult_res.text_output.as_deref(), Some("Second opinion body"));
+
+        server.await.unwrap();
     }
 }
