@@ -6,9 +6,9 @@ import {
   Brain,
   CheckCircle2,
   ChevronDown,
+  ChevronUp,
   Download,
   ExternalLink,
-  Eye,
   Film,
   Globe,
   Headphones,
@@ -45,7 +45,7 @@ import {
   type SelfUpdateProgressEvent,
 } from "./lib/api";
 import { AppBrandIcon, TakoBrandMark } from "./components/BrandIcons";
-import { McpShowcaseModal, type McpToolKey } from "./components/McpShowcaseModal";
+import { McpInlineTheater, type McpToolKey } from "./components/McpInlineTheater";
 import { ModelPickerModal } from "./components/ModelPickerModal";
 
 type ThemePref = "system" | "light" | "dark";
@@ -75,18 +75,18 @@ const FOCUS_RECHECK_THRESHOLD_MS = 10 * 60 * 1000;
 
 interface McpToolItem {
   key: McpToolKey;
+  toolId: string;
   label: string;
   subtitle: string;
-  desc: string;
   Icon: typeof ImageIcon;
 }
 
 const MCP_TOOLS: McpToolItem[] = [
-  { key: "image", label: "生图", subtitle: "文生图 · 改图", desc: "tako_generate_image", Icon: ImageIcon },
-  { key: "video", label: "生视频", subtitle: "首尾帧 · 续写", desc: "tako_generate_video", Icon: Film },
-  { key: "audio", label: "声音", subtitle: "冰糖语音 · 克隆", desc: "tako_generate_audio", Icon: Headphones },
-  { key: "search", label: "联网", subtitle: "实时信源检索", desc: "tako_web_search", Icon: Globe },
-  { key: "consult", label: "外脑", subtitle: "跨模型会诊", desc: "tako_consult", Icon: Brain },
+  { key: "image", toolId: "tako_generate_image", label: "生图", subtitle: "改图 · 多图融合", Icon: ImageIcon },
+  { key: "video", toolId: "tako_generate_video", label: "生视频", subtitle: "首尾帧 · 动态成片", Icon: Film },
+  { key: "audio", toolId: "tako_generate_audio", label: "声音", subtitle: "冰糖多情绪真声", Icon: Headphones },
+  { key: "search", toolId: "tako_web_search", label: "联网", subtitle: "实时信源溯源", Icon: Globe },
+  { key: "consult", toolId: "tako_consult", label: "外脑", subtitle: "双模型交叉会诊", Icon: Brain },
 ];
 
 const MODE_OPTIONS: { id: AppMode; label: string }[] = [
@@ -240,8 +240,10 @@ export default function App() {
   const [needsRestart, setNeedsRestart] = useState<Partial<Record<AppId, boolean>>>({});
   const [expandedApp, setExpandedApp] = useState<AppId | null>(null);
   const [modelModalApp, setModelModalApp] = useState<AppId | null>(null);
-  const [showMcpShowcase, setShowMcpShowcase] = useState(false);
-  const [mcpShowcaseTab, setMcpShowcaseTab] = useState<McpToolKey>("image");
+  const [theaterOpen, setTheaterOpen] = useState(false);
+  const [theaterTab, setTheaterTab] = useState<McpToolKey>("image");
+  const theaterRef = useRef<HTMLDivElement | null>(null);
+  const hoverDebounceRef = useRef<number | null>(null);
 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -878,9 +880,47 @@ export default function App() {
   };
 
   const openMcpDemo = (tab: McpToolKey = "image") => {
-    setMcpShowcaseTab(tab);
-    setShowMcpShowcase(true);
+    setTheaterTab(tab);
+    setTheaterOpen(true);
   };
+
+  const toggleMcpTheater = () => {
+    setTheaterOpen((prev) => !prev);
+  };
+
+  const handleMcpCardHoverEnter = (key: McpToolKey) => {
+    if (!theaterOpen) return;
+    if (hoverDebounceRef.current !== null) {
+      window.clearTimeout(hoverDebounceRef.current);
+    }
+    hoverDebounceRef.current = window.setTimeout(() => {
+      setTheaterTab(key);
+      hoverDebounceRef.current = null;
+    }, 150);
+  };
+
+  const handleMcpCardHoverLeave = () => {
+    if (hoverDebounceRef.current !== null) {
+      window.clearTimeout(hoverDebounceRef.current);
+      hoverDebounceRef.current = null;
+    }
+  };
+
+  useEffect(() => {
+    if (!theaterOpen) return;
+    const id = window.setTimeout(() => {
+      theaterRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }, 160);
+    return () => window.clearTimeout(id);
+  }, [theaterOpen]);
+
+  useEffect(() => {
+    return () => {
+      if (hoverDebounceRef.current !== null) {
+        window.clearTimeout(hoverDebounceRef.current);
+      }
+    };
+  }, []);
 
   const openSettings = () => {
     if (!dashboard) return;
@@ -1138,7 +1178,7 @@ export default function App() {
       </header>
 
       {/* Main Content Container */}
-      <main className="flex-1 min-h-0 overflow-y-auto subtle-scroll px-4 pt-3 pb-2.5 flex flex-col gap-3">
+      <main className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden subtle-scroll px-4 pt-3 pb-2.5 flex flex-col gap-3">
         {/* Self-Update Banner */}
         {(selfUpdate ||
           selfUpdateStatus === "downloading" ||
@@ -1620,55 +1660,95 @@ export default function App() {
               <button
                 type="button"
                 data-testid="open-mcp-demo"
-                onClick={() => openMcpDemo("image")}
-                className="h-7 px-2.5 rounded-full bg-[var(--accent-soft)] hover:bg-[var(--accent-border)] border border-[var(--accent-border)] text-[var(--accent)] text-[11.5px] font-medium inline-flex items-center gap-1 transition cursor-pointer"
+                onClick={toggleMcpTheater}
+                className={`h-7 px-2.5 rounded-full border text-[11.5px] font-medium inline-flex items-center gap-1 transition cursor-pointer ${
+                  theaterOpen
+                    ? "bg-[var(--bg-subtle)] hover:bg-[var(--bg-hover)] border-[var(--border-strong)] text-[var(--text-primary)]"
+                    : "bg-[var(--accent-soft)] hover:bg-[var(--accent-border)] border-[var(--accent-border)] text-[var(--accent)]"
+                }`}
               >
-                <Eye className="h-3.5 w-3.5 shrink-0" />
-                <span>能力演示</span>
+                {theaterOpen ? (
+                  <>
+                    <ChevronUp className="h-3.5 w-3.5 shrink-0" />
+                    <span>收起剧场</span>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="h-3.5 w-3.5 shrink-0" />
+                    <span>实景体验</span>
+                  </>
+                )}
               </button>
             </div>
           </div>
 
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
-            {MCP_TOOLS.map(({ key, label, subtitle, desc, Icon }) => {
+            {MCP_TOOLS.map(({ key, toolId, label, subtitle, Icon }) => {
               const enabled = Boolean(dashboard?.state.mcp[key]);
               const interactive = Boolean(dashboard) && !savingMcp;
+              const isSelected = theaterOpen && theaterTab === key;
               return (
                 <div
                   key={key}
                   role="button"
-                  tabIndex={interactive ? 0 : -1}
-                  aria-disabled={!interactive}
-                  aria-pressed={enabled}
-                  title={desc}
-                  onClick={() => {
-                    if (interactive) void handleToggleMcpTool(key);
-                  }}
+                  tabIndex={0}
+                  data-mcp-tool={toolId}
+                  title={`${label} · ${subtitle}`}
+                  onClick={() => openMcpDemo(key)}
+                  onMouseEnter={() => handleMcpCardHoverEnter(key)}
+                  onMouseLeave={handleMcpCardHoverLeave}
                   onKeyDown={(e) => {
-                    if (interactive && (e.key === "Enter" || e.key === " ")) {
+                    if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault();
-                      void handleToggleMcpTool(key);
+                      openMcpDemo(key);
                     }
                   }}
-                  className={`rounded-[10px] border px-2.5 py-2 flex flex-col justify-between gap-1.5 transition select-none min-w-0 ${
-                    interactive ? "cursor-pointer" : "opacity-60 cursor-not-allowed"
-                  } ${
-                    enabled
-                      ? "bg-[var(--accent-soft)] border-[var(--accent-border)] text-[var(--accent)]"
-                      : "bg-[var(--bg-subtle)]/60 border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--text-primary)]"
+                  className={`relative rounded-[10px] border px-2.5 py-2 flex flex-col justify-between gap-1.5 transition-all duration-200 select-none min-w-0 cursor-pointer ${
+                    isSelected
+                      ? "-translate-y-[1.5px] border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)] shadow-[0_6px_16px_-8px_var(--accent)]"
+                      : enabled
+                        ? "bg-[var(--accent-soft)]/55 border-[var(--accent-border)] text-[var(--accent)] hover:bg-[var(--accent-soft)]"
+                        : "bg-[var(--bg-subtle)]/60 border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--text-primary)]"
                   }`}
                 >
+                  {isSelected && (
+                    <span
+                      aria-hidden="true"
+                      className="pointer-events-none absolute inset-x-2 bottom-0 h-[2px] rounded-full bg-gradient-to-r from-transparent via-[var(--accent)] to-transparent"
+                    />
+                  )}
+
                   <div className="flex items-center justify-between gap-1.5 min-w-0">
                     <span className="flex items-center gap-1.5 min-w-0 text-[12px] font-semibold">
                       <Icon className="h-3.5 w-3.5 shrink-0" />
                       <span className="truncate">{label}</span>
                     </span>
-                    <span
-                      className={`h-1.5 w-1.5 rounded-full shrink-0 ${
-                        enabled ? "bg-[var(--success)]" : "bg-[var(--border-strong)]"
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={enabled}
+                      aria-label={`切换${label}开关`}
+                      data-testid={`toggle-mcp-${key}`}
+                      disabled={!interactive}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (interactive) void handleToggleMcpTool(key);
+                      }}
+                      title={enabled ? "已开启 · 点击关闭" : "已关闭 · 点击开启"}
+                      className={`h-[18px] px-1.5 rounded-full border inline-flex items-center gap-1 shrink-0 transition cursor-pointer disabled:opacity-50 ${
+                        enabled
+                          ? "bg-[var(--success-soft)] border-[var(--success-border)]"
+                          : "bg-[var(--bg-card)]/80 border-[var(--border-strong)]"
                       }`}
-                      title={enabled ? "已开启" : "已关闭"}
-                    />
+                    >
+                      <span
+                        className={`h-2 w-2 rounded-full transition-colors ${
+                          enabled
+                            ? "bg-[var(--success)] shadow-[0_0_6px_var(--success-ring)]"
+                            : "bg-[var(--text-muted)]/60"
+                        }`}
+                      />
+                    </button>
                   </div>
 
                   <div className="flex items-center justify-between gap-1 min-w-0">
@@ -1682,14 +1762,40 @@ export default function App() {
                         e.stopPropagation();
                         openMcpDemo(key);
                       }}
-                      className="px-1.5 py-0.5 rounded bg-[var(--bg-card)]/90 hover:bg-[var(--bg-card)] border border-[var(--border)] text-[10px] font-medium text-[var(--text-secondary)] hover:text-[var(--accent)] shrink-0 transition cursor-pointer"
+                      className={`px-1.5 py-0.5 rounded border text-[10px] font-medium shrink-0 transition cursor-pointer ${
+                        isSelected
+                          ? "bg-[var(--accent)] border-transparent text-white"
+                          : "bg-[var(--bg-card)]/90 hover:bg-[var(--bg-card)] border-[var(--border)] text-[var(--text-secondary)] hover:text-[var(--accent)]"
+                      }`}
                     >
-                      演示
+                      体验
                     </button>
                   </div>
                 </div>
               );
             })}
+          </div>
+
+          <div
+            ref={theaterRef}
+            data-open={theaterOpen ? "true" : "false"}
+            aria-hidden={!theaterOpen}
+            className="mcp-theater-collapse"
+          >
+            <div className="mcp-theater-inner">
+              <McpInlineTheater
+                open={theaterOpen}
+                activeTab={theaterTab}
+                mcp={dashboard?.state.mcp ?? null}
+                savingMcp={savingMcp}
+                loggedIn={Boolean(dashboard?.account?.loggedIn)}
+                loggingIn={loggingIn}
+                onSelectTab={(tab) => setTheaterTab(tab)}
+                onToggleMcp={(key) => void handleToggleMcpTool(key)}
+                onSelectConsultModel={(model) => void handleSelectConsultModel(model)}
+                onRequestLogin={() => void handleOAuthLogin()}
+              />
+            </div>
           </div>
         </section>
       </main>
@@ -2267,16 +2373,6 @@ export default function App() {
           </form>
         </div>
       )}
-
-      <McpShowcaseModal
-        open={showMcpShowcase}
-        initialTab={mcpShowcaseTab}
-        mcp={dashboard?.state.mcp ?? null}
-        savingMcp={savingMcp}
-        onClose={() => setShowMcpShowcase(false)}
-        onToggleMcp={(key) => void handleToggleMcpTool(key)}
-        onSelectConsultModel={(model) => void handleSelectConsultModel(model)}
-      />
 
       <ModelPickerModal
         appId={modelModalApp}
