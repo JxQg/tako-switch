@@ -63,6 +63,7 @@ fn make_asar_file_entry(data: &[u8], payload: &mut Vec<u8>) -> Value {
 /// - `u1 = 8 + padded_len`
 /// - `u2 = 4 + padded_len`
 /// - `strlen = json_len`
+///
 /// Followed by `padded_len` bytes (UTF-8 JSON + zero padding) and packed file payloads.
 fn build_clean_antigravity_asar(app_version: &str) -> (Vec<u8>, String) {
     let mut payload = Vec::new();
@@ -808,23 +809,23 @@ fn tc_v208_10_antigravity_standalone_chinese_locale_in_official_mode() {
 fn tc_v208_12_to_14_plaza_pricing_multiplier_request_promo_and_capabilities() {
     // Promo date boundary checks
     assert_eq!(
-        resolve_promo_ends_on_at_date("gemini-4-carbon", "2026-11-22"),
+        resolve_promo_ends_on_at_date("gemini-4-carbon", None, "2026-11-22"),
         Some("2026-11-30".to_string())
     );
     assert_eq!(
-        resolve_promo_ends_on_at_date("gemini-4-argon", "2026-11-22"),
+        resolve_promo_ends_on_at_date("gemini-4-argon", None, "2026-11-22"),
         Some("2026-11-30".to_string())
     );
     assert_eq!(
-        resolve_promo_ends_on_at_date("gemini-4-carbon", "2026-12-01"),
+        resolve_promo_ends_on_at_date("gemini-4-carbon", None, "2026-12-01"),
         None
     );
     assert_eq!(
-        resolve_promo_ends_on_at_date("gemini-4-argon", "2026-12-01"),
+        resolve_promo_ends_on_at_date("gemini-4-argon", None, "2026-12-01"),
         None
     );
     assert_eq!(
-        resolve_promo_ends_on_at_date("gpt-6.2-sol", "2026-11-22"),
+        resolve_promo_ends_on_at_date("gpt-6.2-sol", None, "2026-11-22"),
         None
     );
 
@@ -901,7 +902,9 @@ fn tc_v208_12_to_14_plaza_pricing_multiplier_request_promo_and_capabilities() {
     });
 
     let empty_perf: HashMap<String, ModelPerfInfo> = HashMap::new();
-    let models = build_plaza_model_options(&pricing_body, &empty_perf);
+    let plaza_resp = build_plaza_model_options(&pricing_body, &empty_perf);
+    assert_eq!(plaza_resp.app_id, AppId::DshTako);
+    let models = &plaza_resp.models;
 
     let swe = models
         .iter()
