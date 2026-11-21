@@ -8,6 +8,7 @@ import {
   ChevronDown,
   Download,
   ExternalLink,
+  Eye,
   Film,
   Globe,
   Headphones,
@@ -44,6 +45,7 @@ import {
   type SelfUpdateProgressEvent,
 } from "./lib/api";
 import { AppBrandIcon, TakoBrandMark } from "./components/BrandIcons";
+import { McpShowcaseModal, type McpToolKey } from "./components/McpShowcaseModal";
 import { ModelPickerModal } from "./components/ModelPickerModal";
 
 type ThemePref = "system" | "light" | "dark";
@@ -72,18 +74,19 @@ const SELF_UPDATE_INTERVAL_MS = 30 * 60 * 1000;
 const FOCUS_RECHECK_THRESHOLD_MS = 10 * 60 * 1000;
 
 interface McpToolItem {
-  key: keyof Pick<McpToolsConfig, "image" | "video" | "audio" | "search" | "consult">;
+  key: McpToolKey;
   label: string;
+  subtitle: string;
   desc: string;
   Icon: typeof ImageIcon;
 }
 
 const MCP_TOOLS: McpToolItem[] = [
-  { key: "image", label: "生图", desc: "tako_generate_image", Icon: ImageIcon },
-  { key: "video", label: "生视频", desc: "tako_generate_video", Icon: Film },
-  { key: "audio", label: "音频", desc: "tako_generate_audio", Icon: Headphones },
-  { key: "search", label: "联网", desc: "tako_web_search", Icon: Globe },
-  { key: "consult", label: "外脑", desc: "tako_consult", Icon: Brain },
+  { key: "image", label: "生图", subtitle: "文生图 · 改图", desc: "tako_generate_image", Icon: ImageIcon },
+  { key: "video", label: "生视频", subtitle: "首尾帧 · 续写", desc: "tako_generate_video", Icon: Film },
+  { key: "audio", label: "声音", subtitle: "冰糖语音 · 克隆", desc: "tako_generate_audio", Icon: Headphones },
+  { key: "search", label: "联网", subtitle: "实时信源检索", desc: "tako_web_search", Icon: Globe },
+  { key: "consult", label: "外脑", subtitle: "跨模型会诊", desc: "tako_consult", Icon: Brain },
 ];
 
 const MODE_OPTIONS: { id: AppMode; label: string }[] = [
@@ -237,6 +240,8 @@ export default function App() {
   const [needsRestart, setNeedsRestart] = useState<Partial<Record<AppId, boolean>>>({});
   const [expandedApp, setExpandedApp] = useState<AppId | null>(null);
   const [modelModalApp, setModelModalApp] = useState<AppId | null>(null);
+  const [showMcpShowcase, setShowMcpShowcase] = useState(false);
+  const [mcpShowcaseTab, setMcpShowcaseTab] = useState<McpToolKey>("image");
 
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -823,9 +828,7 @@ export default function App() {
     }
   };
 
-  const handleToggleMcpTool = async (
-    key: keyof Pick<McpToolsConfig, "image" | "video" | "audio" | "search" | "consult">,
-  ) => {
+  const handleToggleMcpTool = async (key: McpToolKey) => {
     if (!dashboard || savingMcp) return;
     const currentMcp = dashboard.state.mcp;
     const nextMcp: McpToolsConfig = { ...currentMcp, [key]: !currentMcp[key] };
@@ -846,6 +849,37 @@ export default function App() {
     } finally {
       setSavingMcp(false);
     }
+  };
+
+  const handleSelectConsultModel = async (model: string) => {
+    if (!dashboard || savingMcp) return;
+    const currentMcp = dashboard.state.mcp;
+    if (currentMcp.consultModel === model) return;
+    const nextMcp: McpToolsConfig = { ...currentMcp, consultModel: model };
+
+    setSavingMcp(true);
+    setDashboard((prev) =>
+      prev ? { ...prev, state: { ...prev.state, mcp: nextMcp } } : prev,
+    );
+
+    try {
+      const savedState = await api.saveSettings({ mcp: nextMcp });
+      setDashboard((prev) => (prev ? { ...prev, state: savedState } : prev));
+      setSettingsForm((prev) => ({ ...prev, consultModel: savedState.mcp.consultModel }));
+      showTransientNote(`默认外脑参谋模型已切换为 ${model}`);
+    } catch (err) {
+      setDashboard((prev) =>
+        prev ? { ...prev, state: { ...prev.state, mcp: currentMcp } } : prev,
+      );
+      setErrorMsg(`更新外脑模型失败：${String(err)}`);
+    } finally {
+      setSavingMcp(false);
+    }
+  };
+
+  const openMcpDemo = (tab: McpToolKey = "image") => {
+    setMcpShowcaseTab(tab);
+    setShowMcpShowcase(true);
   };
 
   const openSettings = () => {
@@ -962,46 +996,46 @@ export default function App() {
       : "var(--text-primary)";
 
   return (
-    <div className="h-screen w-screen flex flex-col app-surface overflow-hidden">
-      {/* Unified Native-Integrated Header (52px) */}
+    <div className="h-screen w-full flex flex-col app-surface overflow-x-hidden overflow-y-hidden">
+      {/* Unified Native-Integrated Header (52px on desktop, wraps cleanly on <640px) */}
       <header
         data-tauri-drag-region
-        className={`h-[52px] shrink-0 flex items-center justify-between border-b border-[var(--border)] pr-3.5 ${
+        className={`min-h-[52px] sm:h-[52px] shrink-0 flex flex-wrap sm:flex-nowrap items-center justify-between gap-x-2 gap-y-1.5 border-b border-[var(--border)] py-1.5 sm:py-0 pr-3.5 ${
           isMac ? "pl-[82px]" : "pl-4"
         }`}
       >
         {/* Left Brand */}
-        <div data-tauri-drag-region className="flex items-center gap-2.5 shrink-0">
-          <div data-tauri-drag-region className="pointer-events-none">
+        <div data-tauri-drag-region className="flex items-center gap-2 sm:gap-2.5 min-w-0 shrink-0 max-w-full">
+          <div data-tauri-drag-region className="pointer-events-none shrink-0">
             <TakoBrandMark className="h-[26px] w-[26px]" />
           </div>
           <span
             data-tauri-drag-region
-            className="text-[14px] font-semibold tracking-[-0.015em] text-[var(--text-primary)]"
+            className="text-[14px] font-semibold tracking-[-0.015em] text-[var(--text-primary)] truncate"
           >
             Tako Switch
           </span>
           <span
             data-tauri-drag-region
-            className="tabular-nums text-[12px] font-medium text-[var(--text-muted)] bg-[var(--bg-subtle)] border border-[var(--border)] rounded-full px-2 py-0.5"
+            className="tabular-nums text-[12px] font-medium text-[var(--text-muted)] bg-[var(--bg-subtle)] border border-[var(--border)] rounded-full px-2 py-0.5 shrink-0"
           >
             v{dashboard?.appVersion ?? "2.0.1"}
           </span>
         </div>
 
         {/* Flexible drag region spacer */}
-        <div data-tauri-drag-region className="flex-1 h-full min-w-[16px]" />
+        <div data-tauri-drag-region className="hidden sm:block flex-1 h-full min-w-[16px]" />
 
         {/* Right Controls */}
-        <div className="flex items-center gap-1.5 shrink-0">
+        <div className="flex items-center flex-wrap sm:flex-nowrap justify-end gap-1.5 min-w-0 max-w-full">
           {account?.loggedIn ? (
-            <div className="h-8 px-2.5 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] flex items-center gap-2.5 shadow-[var(--shadow-card)]">
-              <div className="flex items-center gap-1.5">
+            <div className="min-h-8 sm:h-8 px-2 sm:px-2.5 py-1 sm:py-0 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] flex flex-wrap sm:flex-nowrap items-center gap-x-2 sm:gap-x-2.5 gap-y-1 shadow-[var(--shadow-card)] max-w-full min-w-0">
+              <div className="flex items-center gap-1.5 min-w-0">
                 <span className="text-[12px] font-medium text-[var(--text-primary)] max-w-[84px] truncate">
                   {account.userName ?? "Tako 用户"}
                 </span>
                 {account.planName && (
-                  <span className="text-[12px] font-medium text-[var(--accent)]">
+                  <span className="text-[12px] font-medium text-[var(--accent)] shrink-0">
                     {account.planName}
                   </span>
                 )}
@@ -1009,9 +1043,9 @@ export default function App() {
 
               {remainUsd !== null && remainUsd !== undefined && (
                 <>
-                  <span className="h-3.5 w-px bg-[var(--border)]" />
+                  <span className="hidden sm:inline-block h-3.5 w-px bg-[var(--border)]" />
                   <div
-                    className="flex items-center gap-1 tabular-nums text-[12px]"
+                    className="flex items-center gap-1 tabular-nums text-[12px] shrink-0"
                     title={`钱包余额 $${remainUsd.toFixed(2)}（累计已用 $${(usedUsd ?? 0).toFixed(2)}）`}
                   >
                     <span className="text-[var(--text-muted)]">余额</span>
@@ -1024,8 +1058,8 @@ export default function App() {
 
               {hasSubQuota && (
                 <>
-                  <span className="h-3.5 w-px bg-[var(--border)]" />
-                  <div className="flex items-center gap-2 tabular-nums text-[12px] text-[var(--text-secondary)]">
+                  <span className="hidden sm:inline-block h-3.5 w-px bg-[var(--border)]" />
+                  <div className="flex items-center gap-2 tabular-nums text-[12px] text-[var(--text-secondary)] shrink-0">
                     <div className="flex items-center gap-1" title={`5 小时窗口已用 ${pct5h}%`}>
                       <span className="text-[var(--text-muted)]">5h</span>
                       <span>{pct5h}%</span>
@@ -1042,13 +1076,13 @@ export default function App() {
                 type="button"
                 onClick={handleLogout}
                 title="退出登录"
-                className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] transition cursor-pointer"
+                className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] transition cursor-pointer shrink-0"
               >
                 <LogOut className="h-3.5 w-3.5" />
               </button>
             </div>
           ) : (
-            <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-1.5 shrink-0">
               <button
                 type="button"
                 onClick={() => setShowKeyModal(true)}
@@ -1197,18 +1231,18 @@ export default function App() {
         )}
 
         {/* Client Rows Section */}
-        <section className="flex flex-col gap-2">
-          <div className="flex items-center justify-between px-0.5">
-            <h2 className="text-[12px] font-medium text-[var(--text-secondary)]">
+        <section className="flex flex-col gap-2 min-w-0">
+          <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-0.5 min-w-0">
+            <h2 className="text-[12px] font-medium text-[var(--text-secondary)] shrink-0">
               桌面客户端
             </h2>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center flex-wrap gap-2 min-w-0 max-w-full">
               {updatableApps.length >= 2 && (
                 <button
                   type="button"
                   disabled={batchUpdatingApps || busyApp !== null}
                   onClick={handleBatchUpgradeApps}
-                  className="px-2 py-0.5 rounded-md bg-[var(--accent-soft)] hover:bg-[var(--accent-border)] text-[var(--accent)] border border-[var(--accent-border)] text-[11px] font-medium flex items-center gap-1 transition cursor-pointer disabled:opacity-60"
+                  className="px-2 py-0.5 rounded-md bg-[var(--accent-soft)] hover:bg-[var(--accent-border)] text-[var(--accent)] border border-[var(--accent-border)] text-[11px] font-medium flex items-center gap-1 transition cursor-pointer disabled:opacity-60 shrink-0"
                 >
                   <ArrowUpCircle className="h-3 w-3" />
                   <span>
@@ -1218,7 +1252,7 @@ export default function App() {
                   </span>
                 </button>
               )}
-              <span className="text-[12px] text-[var(--text-muted)]">
+              <span className="text-[12px] text-[var(--text-muted)] truncate max-w-full">
                 官方直连 · Tako 全接管（免官方登录）
               </span>
             </div>
@@ -1248,15 +1282,15 @@ export default function App() {
                     }`}
                   >
                     <div
-                      className={`px-3.5 py-3 flex items-center gap-3.5 ${
+                      className={`px-3.5 py-3 flex flex-wrap sm:flex-nowrap items-center gap-x-3.5 gap-y-2.5 ${
                         app.running ? "tako-running-row" : ""
                       }`}
                     >
                       {/* App Brand & Info */}
-                      <div className="flex-1 min-w-0 flex items-center gap-3">
+                      <div className="w-full sm:w-auto sm:flex-1 min-w-0 flex items-center gap-3">
                         <AppBrandIcon appId={app.id} />
                         <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2 min-w-0">
+                          <div className="flex flex-wrap sm:flex-nowrap items-center gap-1.5 sm:gap-2 min-w-0">
                             <span className="text-[14px] font-semibold tracking-[-0.01em] text-[var(--text-primary)] truncate">
                               {APP_DISPLAY_NAMES[app.id] ?? app.name}
                             </span>
@@ -1297,7 +1331,7 @@ export default function App() {
                             )}
                           </div>
 
-                          <div className="mt-0.5 flex items-center gap-2 text-[12px] text-[var(--text-secondary)] min-w-0">
+                          <div className="mt-0.5 flex flex-wrap sm:flex-nowrap items-center gap-x-2 gap-y-1 text-[12px] text-[var(--text-secondary)] min-w-0">
                             <span className="truncate">{modeSummary(app)}</span>
                             <span className="text-[var(--text-muted)]">·</span>
                             <button
@@ -1336,7 +1370,7 @@ export default function App() {
                       </div>
 
                       {/* Fixed-Width Mode Switcher (Aligned Across All Rows) */}
-                      <div className="w-[132px] shrink-0 grid grid-cols-2 p-0.5 rounded-[10px] bg-[var(--bg-pill)] border border-[var(--border)]">
+                      <div className="flex-1 sm:flex-none sm:w-[132px] shrink-0 grid grid-cols-2 p-0.5 rounded-[10px] bg-[var(--bg-pill)] border border-[var(--border)]">
                         {MODE_OPTIONS.map((option) => {
                           const active = app.mode === option.id;
                           const label =
@@ -1374,7 +1408,7 @@ export default function App() {
                       </div>
 
                       {/* Fixed-Width Primary Action Slot (Aligned Across All 3 Rows) */}
-                      <div className="w-[126px] shrink-0 flex items-center justify-end gap-1.5">
+                      <div className="flex-1 sm:flex-none sm:w-[126px] shrink-0 flex items-center justify-end gap-1.5">
                         {progress ? (
                           progress.stage === "downloading" ? (
                             <div className="w-full h-8 px-2 rounded-[9px] bg-[var(--accent-soft)] border border-[var(--accent-border)] flex items-center justify-between gap-1 text-[12px] font-medium text-[var(--accent)] tabular-nums">
@@ -1514,14 +1548,14 @@ export default function App() {
                     {/* Inline Expandable Detail Strip */}
                     {isExpanded && (
                       <div className="border-t border-[var(--border)] bg-[var(--bg-subtle)]/55 px-3.5 py-2.5 text-[12px] flex flex-col gap-1.5">
-                        <div className="flex items-center justify-between gap-2">
-                          <div className="min-w-0 flex items-center gap-2 text-[var(--text-secondary)]">
+                        <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-2 min-w-0">
+                          <div className="min-w-0 flex items-center gap-2 text-[var(--text-secondary)] max-w-full">
                             <span className="text-[var(--text-muted)] shrink-0">安装位置:</span>
                             <code className="truncate font-mono text-[var(--text-primary)]">
                               {app.install.installPath ?? "未检测到应用路径"}
                             </code>
                           </div>
-                          <div className="flex items-center gap-2 shrink-0">
+                          <div className="flex flex-wrap items-center gap-2 shrink-0">
                             {update?.hasUpdate && artifactSizeLabel && (
                               <span className="tabular-nums text-[var(--accent)]">
                                 更新包 {artifactSizeLabel}
@@ -1567,41 +1601,93 @@ export default function App() {
         </section>
 
         {/* Super MCP Card */}
-        <section className="rounded-[14px] border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-card)] p-3.5">
-          <div className="flex items-center justify-between mb-2.5">
-            <div className="flex items-center gap-2 min-w-0">
+        <section className="rounded-[14px] border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-card)] p-3.5 min-w-0">
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-2.5">
+            <div className="flex items-center gap-2 min-w-0 flex-wrap sm:flex-nowrap">
               <Sparkles className="h-4 w-4 text-[var(--accent)] shrink-0" />
-              <span className="text-[13px] font-semibold text-[var(--text-primary)]">
+              <span className="text-[13px] font-semibold text-[var(--text-primary)] shrink-0">
                 Tako 超级 MCP
               </span>
               <span className="text-[12px] text-[var(--text-muted)] truncate">
                 Tako 模式下自动注入，开关即时生效
               </span>
             </div>
-            <span className="tabular-nums text-[12px] font-medium text-[var(--text-secondary)] shrink-0">
-              {mcpEnabledCount}/5 已开启
-            </span>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <span className="tabular-nums text-[12px] font-medium text-[var(--text-secondary)]">
+                {mcpEnabledCount}/5 已开启
+              </span>
+              <button
+                type="button"
+                data-testid="open-mcp-demo"
+                onClick={() => openMcpDemo("image")}
+                className="h-7 px-2.5 rounded-full bg-[var(--accent-soft)] hover:bg-[var(--accent-border)] border border-[var(--accent-border)] text-[var(--accent)] text-[11.5px] font-medium inline-flex items-center gap-1 transition cursor-pointer"
+              >
+                <Eye className="h-3.5 w-3.5 shrink-0" />
+                <span>能力演示</span>
+              </button>
+            </div>
           </div>
 
-          <div className="grid grid-cols-5 gap-2">
-            {MCP_TOOLS.map(({ key, label, desc, Icon }) => {
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+            {MCP_TOOLS.map(({ key, label, subtitle, desc, Icon }) => {
               const enabled = Boolean(dashboard?.state.mcp[key]);
+              const interactive = Boolean(dashboard) && !savingMcp;
               return (
-                <button
+                <div
                   key={key}
-                  type="button"
+                  role="button"
+                  tabIndex={interactive ? 0 : -1}
+                  aria-disabled={!interactive}
+                  aria-pressed={enabled}
                   title={desc}
-                  disabled={!dashboard || savingMcp}
-                  onClick={() => handleToggleMcpTool(key)}
-                  className={`h-9 px-2.5 rounded-[10px] border text-[12px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60 ${
+                  onClick={() => {
+                    if (interactive) void handleToggleMcpTool(key);
+                  }}
+                  onKeyDown={(e) => {
+                    if (interactive && (e.key === "Enter" || e.key === " ")) {
+                      e.preventDefault();
+                      void handleToggleMcpTool(key);
+                    }
+                  }}
+                  className={`rounded-[10px] border px-2.5 py-2 flex flex-col justify-between gap-1.5 transition select-none min-w-0 ${
+                    interactive ? "cursor-pointer" : "opacity-60 cursor-not-allowed"
+                  } ${
                     enabled
                       ? "bg-[var(--accent-soft)] border-[var(--accent-border)] text-[var(--accent)]"
                       : "bg-[var(--bg-subtle)]/60 border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--text-primary)]"
                   }`}
                 >
-                  <Icon className="h-3.5 w-3.5 shrink-0" />
-                  <span>{label}</span>
-                </button>
+                  <div className="flex items-center justify-between gap-1.5 min-w-0">
+                    <span className="flex items-center gap-1.5 min-w-0 text-[12px] font-semibold">
+                      <Icon className="h-3.5 w-3.5 shrink-0" />
+                      <span className="truncate">{label}</span>
+                    </span>
+                    <span
+                      className={`h-1.5 w-1.5 rounded-full shrink-0 ${
+                        enabled ? "bg-[var(--success)]" : "bg-[var(--border-strong)]"
+                      }`}
+                      title={enabled ? "已开启" : "已关闭"}
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between gap-1 min-w-0">
+                    <span className="text-[10.5px] leading-tight text-[var(--text-muted)] truncate">
+                      {subtitle}
+                    </span>
+                    <button
+                      type="button"
+                      data-testid={`open-mcp-demo-${key}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openMcpDemo(key);
+                      }}
+                      className="px-1.5 py-0.5 rounded bg-[var(--bg-card)]/90 hover:bg-[var(--bg-card)] border border-[var(--border)] text-[10px] font-medium text-[var(--text-secondary)] hover:text-[var(--accent)] shrink-0 transition cursor-pointer"
+                    >
+                      演示
+                    </button>
+                  </div>
+                </div>
               );
             })}
           </div>
@@ -1609,28 +1695,30 @@ export default function App() {
       </main>
 
       {/* Slim Bottom Status Bar */}
-      <footer className="h-8 shrink-0 px-4 border-t border-[var(--border)] bg-[var(--bg-card)]/75 flex items-center justify-between text-[12px] text-[var(--text-secondary)]">
-        <div className="flex items-center gap-2 min-w-0">
+      <footer className="min-h-8 sm:h-8 shrink-0 px-4 py-1.5 sm:py-0 border-t border-[var(--border)] bg-[var(--bg-card)]/75 flex flex-wrap sm:flex-nowrap items-center justify-between gap-x-3 gap-y-1 text-[12px] text-[var(--text-secondary)]">
+        <div className="flex items-center gap-2 min-w-0 max-w-full">
           {!anyTakoMode ? (
-            <span className="inline-flex items-center gap-1.5 text-[var(--text-muted)]">
-              <span className="h-1.5 w-1.5 rounded-full bg-[var(--text-muted)]" />
-              本地网关待机
+            <span className="inline-flex items-center gap-1.5 text-[var(--text-muted)] truncate">
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--text-muted)] shrink-0" />
+              <span className="truncate">本地网关待机</span>
             </span>
           ) : dashboard?.localGatewayHealthy ? (
-            <span className="inline-flex items-center gap-1.5 text-[var(--text-secondary)] tabular-nums">
-              <span className="h-1.5 w-1.5 rounded-full bg-[var(--success)]" />
-              <span>本地网关 127.0.0.1:18419</span>
-              <span className="text-[var(--success)] font-medium">· 运行中</span>
+            <span className="inline-flex items-center gap-1.5 text-[var(--text-secondary)] tabular-nums min-w-0">
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--success)] shrink-0" />
+              <span className="truncate">本地网关 127.0.0.1:18419</span>
+              <span className="text-[var(--success)] font-medium shrink-0">· 运行中</span>
             </span>
           ) : (
             <button
               type="button"
               disabled={fixingGateway}
               onClick={handleEnsureGateway}
-              className="inline-flex items-center gap-1.5 text-[var(--warning)] hover:underline cursor-pointer disabled:opacity-60"
+              className="inline-flex items-center gap-1.5 text-[var(--warning)] hover:underline cursor-pointer disabled:opacity-60 min-w-0"
             >
-              <span className="h-1.5 w-1.5 rounded-full bg-[var(--warning)]" />
-              <span>{fixingGateway ? "正在修复网关..." : "本地网关未运行 · 点击修复"}</span>
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--warning)] shrink-0" />
+              <span className="truncate">
+                {fixingGateway ? "正在修复网关..." : "本地网关未运行 · 点击修复"}
+              </span>
             </button>
           )}
         </div>
@@ -1792,7 +1880,7 @@ export default function App() {
                         客户端优先简体中文
                       </div>
                       <div className="text-[11px] text-[var(--text-muted)]">
-                        Codex 界面 · Claude 菜单与回复
+                        Codex / Claude 界面与中文回复 · 反重力系统菜单与中文交互
                       </div>
                     </div>
                     <ToggleSwitch
@@ -2003,7 +2091,7 @@ export default function App() {
                       />
                     </label>
 
-                    <div className="grid grid-cols-2 gap-2.5">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                       <label className="flex flex-col gap-1">
                         <span className="text-[var(--text-secondary)]">Claude 网关副标题</span>
                         <input
@@ -2037,7 +2125,7 @@ export default function App() {
                       </label>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-2.5">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                       <label className="flex flex-col gap-1">
                         <span className="text-[var(--text-secondary)]">媒体输出目录</span>
                         <input
@@ -2179,6 +2267,16 @@ export default function App() {
           </form>
         </div>
       )}
+
+      <McpShowcaseModal
+        open={showMcpShowcase}
+        initialTab={mcpShowcaseTab}
+        mcp={dashboard?.state.mcp ?? null}
+        savingMcp={savingMcp}
+        onClose={() => setShowMcpShowcase(false)}
+        onToggleMcp={(key) => void handleToggleMcpTool(key)}
+        onSelectConsultModel={(model) => void handleSelectConsultModel(model)}
+      />
 
       <ModelPickerModal
         appId={modelModalApp}
