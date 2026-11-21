@@ -448,7 +448,7 @@ export function McpInlineTheater({
 
   // Image before/after slider + multi-ref toggle
   const [sliderPos, setSliderPos] = useState(50);
-  const [multiRefView, setMultiRefView] = useState<"comparison" | "cabin">("comparison");
+  const [multiRefView, setMultiRefView] = useState<"comparison" | "cabin">("cabin");
   const hasWiggledRef = useRef(false);
   const wiggleCancelRef = useRef<(() => void) | null>(null);
 
@@ -1037,13 +1037,13 @@ export function McpInlineTheater({
                 {agentPhase === "streaming" ? (
                   <>
                     <Sparkles className="h-3 w-3 animate-pulse shrink-0" />
-                    <span>✦ 正在调用 · {currentMeta.agentAction}</span>
+                    <span>正在调用 · {currentMeta.agentAction}</span>
                   </>
                 ) : (
                   <>
                     <Check className="h-3 w-3 shrink-0" />
                     <span>
-                      ✓ 生成完毕 · {currentScene.elapsedLabel}
+                      生成完毕 · {currentScene.elapsedLabel}
                     </span>
                   </>
                 )}
@@ -1121,8 +1121,14 @@ export function McpInlineTheater({
                   </div>
                 </div>
               ) : (
-                <div className="relative rounded-2xl overflow-hidden border border-[var(--border)] bg-[var(--bg-card)]/80 min-w-0">
-                  <div className="relative w-full aspect-[16/10] sm:aspect-[16/9] max-h-[320px] overflow-hidden bg-black/5">
+                <div className="flex flex-col items-center gap-2 min-w-0">
+                  <div
+                    className={`relative w-full rounded-2xl overflow-hidden shadow-md border border-[var(--border)] bg-[var(--bg-card)] ${
+                      multiRefView === "comparison"
+                        ? "max-w-[540px] aspect-[1080/740]"
+                        : "max-w-[380px] aspect-square"
+                    }`}
+                  >
                     <img
                       src={
                         multiRefView === "comparison"
@@ -1130,44 +1136,34 @@ export function McpInlineTheater({
                           : "/mcp-demo/forest-cabin.webp"
                       }
                       alt="双参考图跨风格合成作品"
-                      className="w-full h-full object-cover transition-opacity duration-300"
+                      className={`w-full h-full transition-opacity duration-300 ${
+                        multiRefView === "comparison" ? "object-contain bg-white" : "object-cover"
+                      }`}
                     />
 
                     {/* Left Floating Reference Thumbnails */}
-                    <div className="absolute top-2.5 left-2.5 flex items-center gap-1.5 p-1.5 rounded-xl bg-black/50 backdrop-blur-md border border-white/15">
+                    <div className="absolute bottom-2.5 left-2.5 flex items-center gap-1.5 p-1.5 rounded-xl bg-black/55 backdrop-blur-md border border-white/15">
                       <div className="flex flex-col items-center gap-0.5">
                         <img
                           src="/mcp-demo/multi-reference-1.webp"
                           alt="@image0"
-                          className="h-10 w-10 rounded-lg object-cover border border-white/25"
+                          className="h-8 w-8 rounded-lg object-cover border border-white/25"
                         />
-                        <span className="text-[9.5px] font-mono text-white/90">@image0</span>
+                        <span className="text-[9px] font-mono text-white/90">@image0</span>
                       </div>
-                      <span className="text-white/75 text-[11px] font-bold">+</span>
+                      <span className="text-white/75 text-[10px] font-bold">+</span>
                       <div className="flex flex-col items-center gap-0.5">
                         <img
                           src="/mcp-demo/multi-reference-2.webp"
                           alt="@image1"
-                          className="h-10 w-10 rounded-lg object-cover border border-white/25"
+                          className="h-8 w-8 rounded-lg object-cover border border-white/25"
                         />
-                        <span className="text-[9.5px] font-mono text-white/90">@image1</span>
+                        <span className="text-[9px] font-mono text-white/90">@image1</span>
                       </div>
                     </div>
 
                     {/* Top-right Output Switcher */}
                     <div className="absolute top-2.5 right-2.5 inline-flex p-0.5 rounded-full bg-black/55 backdrop-blur-md border border-white/15">
-                      <button
-                        type="button"
-                        onClick={() => setMultiRefView("comparison")}
-                        className={`px-2.5 py-1 rounded-full text-[10.5px] font-medium transition cursor-pointer inline-flex items-center gap-1 ${
-                          multiRefView === "comparison"
-                            ? "bg-white text-slate-900"
-                            : "text-white/80 hover:text-white"
-                        }`}
-                      >
-                        <Layers className="h-3 w-3" />
-                        <span>融合对比图</span>
-                      </button>
                       <button
                         type="button"
                         onClick={() => setMultiRefView("cabin")}
@@ -1179,7 +1175,22 @@ export function McpInlineTheater({
                       >
                         实景成片
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => setMultiRefView("comparison")}
+                        className={`px-2.5 py-1 rounded-full text-[10.5px] font-medium transition cursor-pointer inline-flex items-center gap-1 ${
+                          multiRefView === "comparison"
+                            ? "bg-white text-slate-900"
+                            : "text-white/80 hover:text-white"
+                        }`}
+                      >
+                        <Layers className="h-3 w-3" />
+                        <span>多模型对比</span>
+                      </button>
                     </div>
+                  </div>
+                  <div className="text-[11px] text-[var(--text-muted)] text-center">
+                    同时挂载多张 @image 参考图锁定构图与光影基调 · 一键切换实景成片与多模型对比
                   </div>
                 </div>
               )
@@ -1187,9 +1198,9 @@ export function McpInlineTheater({
 
             {/* 2. VIDEO CANVAS */}
             {activeTab === "video" && (
-              <div className="flex flex-col gap-2 min-w-0">
-                <div className="relative rounded-2xl overflow-hidden border border-[var(--border)] bg-black shadow-md min-w-0">
-                  <div className="relative w-full aspect-video max-h-[320px] bg-black overflow-hidden">
+              <div className="flex flex-col items-center gap-2 min-w-0">
+                <div className="relative w-full max-w-[420px] aspect-square rounded-2xl overflow-hidden border border-[var(--border)] bg-black shadow-md min-w-0">
+                  <div className="relative w-full h-full bg-black overflow-hidden">
                     <video
                       ref={videoRef}
                       data-testid="mcp-demo-video"
@@ -1230,7 +1241,7 @@ export function McpInlineTheater({
                     )}
 
                     {/* Floating Frosted Bottom Control Bar */}
-                    <div className="absolute inset-x-2.5 bottom-2.5 px-3 py-2 rounded-xl bg-black/55 backdrop-blur-md border border-white/15 flex flex-wrap sm:flex-nowrap items-center gap-2.5 text-white">
+                    <div className="absolute inset-x-2.5 bottom-2.5 px-2.5 py-2 rounded-xl bg-black/60 backdrop-blur-md border border-white/15 flex flex-wrap sm:flex-nowrap items-center gap-2 text-white">
                       <button
                         type="button"
                         data-testid="mcp-demo-play-video"
@@ -1261,7 +1272,7 @@ export function McpInlineTheater({
                             handleScrubVideo(e.clientX, e.currentTarget.getBoundingClientRect());
                           }
                         }}
-                        className="flex-1 min-w-[90px] py-2 cursor-pointer flex items-center"
+                        className="flex-1 min-w-[72px] py-2 cursor-pointer flex items-center"
                       >
                         <div className="w-full h-1.5 rounded-full bg-white/25 overflow-hidden">
                           <div
@@ -1271,7 +1282,7 @@ export function McpInlineTheater({
                         </div>
                       </div>
 
-                      <span className="text-[11px] font-mono tabular-nums text-white/90 shrink-0">
+                      <span className="text-[10.5px] font-mono tabular-nums text-white/90 shrink-0">
                         {videoCurrentTime.toFixed(1)}s / {videoDur.toFixed(1)}s
                       </span>
 
@@ -1293,7 +1304,7 @@ export function McpInlineTheater({
                 </div>
 
                 {/* Single-line capability pills */}
-                <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-[var(--text-secondary)]">
+                <div className="flex flex-wrap items-center justify-center gap-1.5 text-[11px] text-[var(--text-secondary)]">
                   {["首尾帧插值", "@image0 角色锁定", "MP4 尾帧续写", "超时凭任务号续传免重扣"].map(
                     (cap) => (
                       <span
@@ -1616,7 +1627,7 @@ export function McpInlineTheater({
               className="h-7 px-3 rounded-full bg-[var(--accent-soft)] hover:bg-[var(--accent)] text-[var(--accent)] hover:text-white border border-[var(--accent-border)] text-[11.5px] font-semibold inline-flex items-center gap-1 transition cursor-pointer"
             >
               <Zap className="h-3 w-3" />
-              <span>⚡ 改词现场试跑</span>
+              <span>改词现场试跑</span>
             </button>
           </div>
         </div>
