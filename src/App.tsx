@@ -9,6 +9,7 @@ import {
   ChevronUp,
   Download,
   ExternalLink,
+  FileText,
   Film,
   Globe,
   Headphones,
@@ -49,6 +50,7 @@ import {
 import { AppBrandIcon, TakoBrandMark } from "./components/BrandIcons";
 import { McpInlineTheater, type McpToolKey } from "./components/McpInlineTheater";
 import { ModelPickerModal } from "./components/ModelPickerModal";
+import { CHANGELOG_RELEASES, parseReleaseNotesLines } from "./lib/changelog";
 
 type ThemePref = "system" | "light" | "dark";
 type SelfUpdateStatus =
@@ -274,7 +276,12 @@ export default function App() {
   const [apiKeyInput, setApiKeyInput] = useState("");
 
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [showChangelogModal, setShowChangelogModal] = useState(false);
   const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
+  const selfUpdateNoteLines = useMemo(
+    () => parseReleaseNotesLines(selfUpdate?.notes),
+    [selfUpdate?.notes],
+  );
   const [settingsForm, setSettingsForm] = useState({
     baseUrl: "",
     agyApiKey: "",
@@ -1308,9 +1315,6 @@ export default function App() {
                         ? `正在下载 Tako Switch v${selfUpdate?.version ?? ""} · ${formatBytes(selfUpdateProgress.downloaded)}${selfUpdateProgress.total ? ` / ${formatBytes(selfUpdateProgress.total)}` : ""}`
                         : `Tako Switch v${selfUpdate?.version ?? ""} 已发布${selfUpdate?.source === "github" ? "（GitHub 同步源）" : ""}，可一键更新并重启`}
                   </div>
-                  {selfUpdate?.notes && selfUpdateStatus === "available" && (
-                    <div className="text-[11px] opacity-80 truncate">{selfUpdate.notes}</div>
-                  )}
                 </div>
               </div>
 
@@ -1331,6 +1335,13 @@ export default function App() {
                   )}
                   <button
                     type="button"
+                    onClick={() => setShowChangelogModal(true)}
+                    className="px-2 py-1 rounded-md border border-[var(--accent-border)] text-[12px] font-medium hover:bg-[var(--bg-card)]/40 cursor-pointer"
+                  >
+                    更新说明
+                  </button>
+                  <button
+                    type="button"
                     onClick={handleInstallSelfUpdate}
                     className="px-2.5 py-1 rounded-md bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12px] font-medium cursor-pointer"
                   >
@@ -1339,6 +1350,30 @@ export default function App() {
                 </div>
               )}
             </div>
+
+            {selfUpdateStatus !== "downloading" &&
+              selfUpdateStatus !== "installing" &&
+              selfUpdateNoteLines.length > 0 && (
+                <div className="rounded-[8px] bg-[var(--bg-card)]/65 border border-[var(--accent-border)]/70 px-2.5 py-2 text-[11px] text-[var(--text-primary)] flex flex-col gap-1">
+                  <ul className="space-y-1 leading-relaxed">
+                    {selfUpdateNoteLines.slice(0, 3).map((line, idx) => (
+                      <li key={idx} className="flex items-start gap-1.5">
+                        <span className="text-[var(--accent)] select-none shrink-0">•</span>
+                        <span>{line}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  {selfUpdateNoteLines.length > 3 && (
+                    <button
+                      type="button"
+                      onClick={() => setShowChangelogModal(true)}
+                      className="self-start text-[11px] font-medium text-[var(--accent)] hover:underline cursor-pointer mt-0.5"
+                    >
+                      查看全部 {selfUpdateNoteLines.length} 项更新 →
+                    </button>
+                  )}
+                </div>
+              )}
 
             {(selfUpdateStatus === "downloading" || selfUpdateStatus === "installing") &&
               selfUpdateProgress && (
@@ -2325,13 +2360,21 @@ export default function App() {
                   <div className="settings-row px-3.5 py-2.5 flex flex-col gap-2">
                     <div className="flex items-center justify-between gap-2">
                       <div className="min-w-0">
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <span className="text-[13px] font-medium text-[var(--text-primary)]">
                             Tako Switch
                           </span>
                           <span className="tabular-nums text-[11px] px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] text-[var(--text-secondary)]">
                             v{dashboard?.appVersion ?? "2.0.3"}
                           </span>
+                          <button
+                            type="button"
+                            onClick={() => setShowChangelogModal(true)}
+                            className="inline-flex items-center gap-1 text-[11px] text-[var(--accent)] hover:underline cursor-pointer"
+                          >
+                            <FileText className="h-3 w-3" />
+                            <span>更新日志</span>
+                          </button>
                           {selfUpdateStatus === "latest" && (
                             <span className="inline-flex items-center gap-1 text-[11px] text-[var(--success)] font-medium">
                               <CheckCircle2 className="h-3 w-3" />
@@ -2390,6 +2433,20 @@ export default function App() {
                         </button>
                       )}
                     </div>
+
+                    {selfUpdate &&
+                      selfUpdateStatus !== "downloading" &&
+                      selfUpdateStatus !== "installing" &&
+                      selfUpdateNoteLines.length > 0 && (
+                        <ul className="rounded-[8px] bg-[var(--bg-subtle)]/75 border border-[var(--border)] px-2.5 py-2 text-[11px] text-[var(--text-secondary)] space-y-1 leading-relaxed">
+                          {selfUpdateNoteLines.map((line, idx) => (
+                            <li key={idx} className="flex items-start gap-1.5">
+                              <span className="text-[var(--accent)] select-none shrink-0">•</span>
+                              <span>{line}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
 
                     {(selfUpdateStatus === "downloading" || selfUpdateStatus === "installing") &&
                       selfUpdateProgress && (
@@ -2646,6 +2703,139 @@ export default function App() {
               </div>
             </div>
           </form>
+        </div>
+      )}
+
+      {showChangelogModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[2px] p-4"
+          onClick={() => setShowChangelogModal(false)}
+        >
+          <div
+            className="w-full max-w-[520px] max-h-[82vh] flex flex-col rounded-[16px] border border-[var(--border)] bg-[var(--bg-card)] shadow-2xl overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-5 py-3.5 border-b border-[var(--border)] flex items-center justify-between gap-2 shrink-0">
+              <div className="flex items-center gap-2">
+                <FileText className="h-4 w-4 text-[var(--accent)]" />
+                <h2 className="text-[14px] font-semibold text-[var(--text-primary)]">
+                  更新日志
+                </h2>
+                {dashboard?.appVersion && (
+                  <span className="tabular-nums text-[11px] px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] text-[var(--text-secondary)]">
+                    当前 v{dashboard.appVersion}
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                aria-label="关闭更新日志"
+                onClick={() => setShowChangelogModal(false)}
+                className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] cursor-pointer"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-3.5">
+              {selfUpdate &&
+                !CHANGELOG_RELEASES.some((rel) => rel.version === selfUpdate.version) && (
+                  <div className="rounded-[12px] border border-[var(--accent-border)] bg-[var(--accent-soft)]/70 p-3.5 flex flex-col gap-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[13px] font-semibold text-[var(--accent)] tabular-nums">
+                          v{selfUpdate.version}
+                        </span>
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--accent)] text-white font-medium">
+                          新版本可更新
+                        </span>
+                      </div>
+                      {selfUpdateStatus !== "downloading" &&
+                        selfUpdateStatus !== "installing" && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setShowChangelogModal(false);
+                              void handleInstallSelfUpdate();
+                            }}
+                            className="h-6 px-2.5 rounded-md bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[11px] font-medium cursor-pointer"
+                          >
+                            立即更新
+                          </button>
+                        )}
+                    </div>
+                    {selfUpdateNoteLines.length > 0 ? (
+                      <ul className="space-y-1.5 text-[12px] text-[var(--text-primary)] leading-relaxed">
+                        {selfUpdateNoteLines.map((line, idx) => (
+                          <li key={idx} className="flex items-start gap-2">
+                            <span className="text-[var(--accent)] select-none shrink-0">•</span>
+                            <span>{line}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <div className="text-[12px] text-[var(--text-secondary)]">
+                        包含稳定性与体验优化，点击「立即更新」即可升级。
+                      </div>
+                    )}
+                  </div>
+                )}
+
+              {CHANGELOG_RELEASES.map((release) => {
+                const isCurrent = dashboard?.appVersion === release.version;
+                return (
+                  <div
+                    key={release.version}
+                    className="rounded-[12px] border border-[var(--border)] bg-[var(--bg-subtle)]/45 p-3.5 flex flex-col gap-2"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[13px] font-semibold text-[var(--text-primary)] tabular-nums">
+                          v{release.version}
+                        </span>
+                        {isCurrent && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--accent-soft)] border border-[var(--accent-border)] text-[var(--accent)] font-medium">
+                            当前版本
+                          </span>
+                        )}
+                      </div>
+                      {release.date && (
+                        <span className="text-[11px] text-[var(--text-muted)] tabular-nums">
+                          {release.date}
+                        </span>
+                      )}
+                    </div>
+                    <ul className="space-y-1.5 text-[12px] text-[var(--text-secondary)] leading-relaxed">
+                      {release.items.map((item, idx) => (
+                        <li key={idx} className="flex items-start gap-2">
+                          <span className="text-[var(--accent)] select-none shrink-0">•</span>
+                          <span>{item}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="px-5 py-3 border-t border-[var(--border)] flex items-center justify-between gap-2 shrink-0 bg-[var(--bg-card)]">
+              <button
+                type="button"
+                onClick={() => void api.openUrl(TAKO_RELEASES_URL)}
+                className="inline-flex items-center gap-1.5 text-[12px] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
+              >
+                <ExternalLink className="h-3.5 w-3.5" />
+                <span>GitHub Releases</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowChangelogModal(false)}
+                className="h-8 px-3.5 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-primary)] cursor-pointer"
+              >
+                关闭
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

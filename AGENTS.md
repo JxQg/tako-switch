@@ -96,8 +96,10 @@ npm run typecheck && npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
-# 3. 清单同步脚本测试与结构校验
+# 3. 清单同步脚本、更新日志提取测试与结构校验
 python3 -m unittest -v scripts/test_sync_manifest.py
+python3 -m unittest -v scripts/test_extract_release_notes.py
+python3 scripts/extract_release_notes.py --changelog CHANGELOG.md --check-package-json package.json
 python3 -c 'import json; d=json.load(open("manifest/manifest.json")); assert set(d["apps"])=={"dsh-tako","codex","claude","antigravity"}'
 
 # 4. 超级 MCP 内联剧场与安全门禁校验
@@ -108,10 +110,11 @@ python3 scripts/verify_client_mcp_ui.py --self-test && python3 scripts/verify_cl
 
 ## 发版规程（Release SOP）
 
-1. **同步升级版本号（三处必须严格一致）**：
+1. **同步升级版本号并补齐更新日志（四处必须严格一致）**：
    - `package.json`（及 `package-lock.json` 根 `"version"`）
    - `src-tauri/tauri.conf.json`
    - `src-tauri/Cargo.toml`（跑一次 `cargo check` 更新 `src-tauri/Cargo.lock`）
+   - `CHANGELOG.md`：在顶部新增 `## vX.Y.Z (YYYY-MM-DD)` 与面向用户的分条更新说明；CI 会校验并用 `scripts/extract_release_notes.py` 自动写入 `latest.json` 与 GitHub Release 正文。
 2. **先同步远端清单自动提交**：`sync-manifest.yml` 每 6 小时可能向 `main` 推送 `chore(manifest): sync desktop app versions [skip ci]`，push 前先 `git fetch origin main && git merge origin/main --no-edit`（不要 `git push --force`）。
 3. **显式路径提交并推 tag**：
    - 用 `git commit ... -- <文件列表>` 提交，并核对 `git show --stat HEAD`。
