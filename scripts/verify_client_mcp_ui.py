@@ -57,6 +57,8 @@ REQUIRED_TESTIDS = [
     "open-model-square-btn",
     "agy-ui-patch-btn",
     "agy-ui-restore-btn",
+    "claude-ui-patch-btn",
+    "ui-patch-permission-modal",
     "plaza-price-mode-detail",
     "plaza-price-mode-avg",
     "plaza-currency-cny",
@@ -100,6 +102,13 @@ FORBIDDEN_LEGACY_FILES = [
 ]
 
 CONTROLLED_AGY_I18N_REL = Path("src-tauri/src/adapters/antigravity_i18n.rs")
+CONTROLLED_CLAUDE_I18N_REL = Path("src-tauri/src/adapters/claude_i18n.rs")
+CONTROLLED_ASAR_PATCH_REL = Path("src-tauri/src/adapters/asar_patch.rs")
+CONTROLLED_ASAR_RELS = (
+    CONTROLLED_AGY_I18N_REL,
+    CONTROLLED_CLAUDE_I18N_REL,
+    CONTROLLED_ASAR_PATCH_REL,
+)
 
 REQUIRED_AGY_I18N_SYMBOLS = [
     "app.asar.orig",
@@ -627,9 +636,10 @@ def run_checks(repo_root: Path) -> List[Tuple[str, bool, str]]:
                 )
             )
 
-    # 4. Controlled Antigravity i18n backup & forbidden app.asar tampering scan
+    # 4. Controlled Antigravity/Claude i18n backup & forbidden app.asar tampering scan
     self_path = Path(__file__).resolve()
     controlled_i18n_path = (repo_root / CONTROLLED_AGY_I18N_REL).resolve()
+    controlled_asar_paths = {(repo_root / rel).resolve() for rel in CONTROLLED_ASAR_RELS}
     scan_dirs = [
         (repo_root / "src-tauri" / "src", (".rs",)),
         (repo_root / "src", (".ts", ".tsx", ".js", ".jsx")),
@@ -643,7 +653,7 @@ def run_checks(repo_root: Path) -> List[Tuple[str, bool, str]]:
                 continue
             patterns = (
                 FORBIDDEN_EXTERNAL_ASAR_PATTERNS
-                if resolved == controlled_i18n_path
+                if resolved in controlled_asar_paths
                 else FORBIDDEN_ASAR_PATTERNS
             )
             for idx, line in enumerate(content.splitlines(), start=1):
@@ -852,6 +862,8 @@ export const McpInlineTheater = () => (
     <button data-testid="open-model-square-btn" />
     <button data-testid="agy-ui-patch-btn" />
     <button data-testid="agy-ui-restore-btn" />
+    <button data-testid="claude-ui-patch-btn" />
+    <div data-testid="ui-patch-permission-modal" />
     <button data-testid="plaza-price-mode-detail" />
     <button data-testid="plaza-price-mode-avg" />
     <button data-testid="plaza-currency-cny" />

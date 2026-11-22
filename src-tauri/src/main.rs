@@ -67,5 +67,60 @@ fn main() {
         return;
     }
 
+    if matches!(
+        subcmd.as_deref(),
+        Some("ui-patch-worker") | Some("--ui-patch-worker")
+    ) {
+        std::env::set_var("TAKO_SWITCH_ELEVATED", "1");
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let mut app_arg: Option<String> = None;
+        let mut action_arg: Option<String> = None;
+        let mut idx = 0usize;
+        while idx < args.len() {
+            match args[idx].as_str() {
+                "--app" => {
+                    if let Some(val) = args.get(idx + 1) {
+                        app_arg = Some(val.clone());
+                        idx += 2;
+                        continue;
+                    }
+                }
+                "--action" => {
+                    if let Some(val) = args.get(idx + 1) {
+                        action_arg = Some(val.clone());
+                        idx += 2;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+        let Ok(paths) = tako_switch_lib::config::AppPaths::detect() else {
+            eprintln!("tako-switch ui-patch-worker error: failed to detect AppPaths");
+            std::process::exit(1);
+        };
+        let res = match (app_arg.as_deref(), action_arg.as_deref()) {
+            (Some("claude"), Some("patch")) => {
+                tako_switch_lib::adapters::patch_claude_ui_for_paths(&paths).map(|_| ())
+            }
+            (Some("claude"), Some("restore")) => {
+                tako_switch_lib::adapters::restore_claude_ui_for_paths(&paths).map(|_| ())
+            }
+            (Some("antigravity"), Some("patch")) => {
+                tako_switch_lib::adapters::patch_antigravity_ui_for_paths(&paths).map(|_| ())
+            }
+            (Some("antigravity"), Some("restore")) => {
+                tako_switch_lib::adapters::restore_antigravity_ui_for_paths(&paths).map(|_| ())
+            }
+            _ => Err("invalid arguments; expected --app <claude|antigravity> --action <patch|restore>".to_string()),
+        };
+        if let Err(err) = res {
+            eprintln!("tako-switch ui-patch-worker error: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     tako_switch_lib::run();
 }

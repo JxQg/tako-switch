@@ -333,8 +333,8 @@ fn tc_v208_01_antigravity_patch_not_installed_and_unsupported_states() {
     let info_unsupported = inspect_antigravity_ui_patch(&paths);
     assert_eq!(info_unsupported.status, UiPatchStatus::Unsupported);
 
-    // 3) Non-Antigravity snapshots report NotApplicable, and DshTako is natively Chinese
-    for app_id in [AppId::DshTako, AppId::Codex, AppId::Claude] {
+    // 3) Non-ASAR-patched snapshots (DshTako, Codex) report NotApplicable, Claude reports NotInstalled when absent, and DshTako is natively Chinese
+    for app_id in [AppId::DshTako, AppId::Codex] {
         let snap = snapshot_app(&paths, app_id);
         assert_eq!(snap.ui_patch.status, UiPatchStatus::NotApplicable);
         if app_id == AppId::DshTako {
@@ -344,6 +344,8 @@ fn tc_v208_01_antigravity_patch_not_installed_and_unsupported_states() {
             );
         }
     }
+    let claude_snap = snapshot_app(&paths, AppId::Claude);
+    assert_eq!(claude_snap.ui_patch.status, UiPatchStatus::NotInstalled);
 }
 
 #[test]

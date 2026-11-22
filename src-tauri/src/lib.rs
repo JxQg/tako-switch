@@ -77,6 +77,8 @@ pub struct DashboardPayload {
     pub local_gateway_url: String,
     pub app_version: String,
     pub os: String,
+    #[serde(default)]
+    pub ui_patch_prompts: Vec<adapters::UiPatchPermissionPrompt>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -562,6 +564,7 @@ async fn get_dashboard(app: AppHandle, refresh_account: bool) -> Result<Dashboar
         local_gateway_url: agy_proxy::LOCAL_GATEWAY_URL.to_string(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
+        ui_patch_prompts: Vec::new(),
     })
 }
 
@@ -715,8 +718,11 @@ fn should_sync_standalone_locale(paths: &AppPaths, app_id: AppId, enable: bool) 
             paths.claude_1p_dir.exists()
                 || paths.claude_3p_dir.exists()
                 || paths.home.join(".claude").exists()
+                || paths.claude_app_override_dir.is_some()
         }
-        AppId::Antigravity => paths.home.join(".gemini").exists(),
+        AppId::Antigravity => {
+            paths.home.join(".gemini").exists() || paths.agy_app_override_dir.is_some()
+        }
     }
 }
 
@@ -733,6 +739,204 @@ pub fn sync_standalone_chinese_for_installed(paths: &AppPaths, enable: bool) {
     }
 }
 
+fn inspect_ui_patch_for_app(paths: &AppPaths, app_id: AppId) -> adapters::UiPatchInfo {
+    match app_id {
+        AppId::Claude => adapters::inspect_claude_ui_patch(paths),
+        AppId::Antigravity => adapters::inspect_antigravity_ui_patch(paths),
+        _ => adapters::UiPatchInfo::not_applicable(),
+    }
+}
+
+fn run_raw_ui_patch_action(
+    paths: &AppPaths,
+    app_id: AppId,
+    action: &str,
+) -> Result<adapters::UiPatchInfo, String> {
+    match (app_id, action) {
+        (AppId::Claude, "patch") => adapters::patch_claude_ui_for_paths(paths),
+        (AppId::Claude, "restore") => adapters::restore_claude_ui_for_paths(paths),
+        (AppId::Antigravity, "patch") => adapters::patch_antigravity_ui_for_paths(paths),
+        (AppId::Antigravity, "restore") => adapters::restore_antigravity_ui_for_paths(paths),
+        (_, "patch" | "restore") => Err(format!("{} 不支持界面资源包补丁操作", app_id.display_name())),
+        _ => Err(format!("不支持的界面补丁动作: {action}")),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn try_windows_elevated_ui_patch(
+    paths: &AppPaths,
+    app_id: AppId,
+    action: &str,
+) -> Result<bool, String> {
+    if paths.is_test || std::env::var("TAKO_SWITCH_ELEVATED").as_deref() == Ok("1") {
+        return Ok(false);
+    }
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let exe = std::env::current_exe().map_err(|e| format!("无法定位当前程序路径: {e}"))?;
+    let exe_escaped = exe.to_string_lossy().replace('\'', "''");
+    let app_str = app_id.as_str();
+    let script = format!(
+        "$p = Start-Process -FilePath '{exe_escaped}' -ArgumentList 'ui-patch-worker','--app','{app_str}','--action','{action}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if ($null -eq $p) {{ exit 1 }}; exit $p.ExitCode"
+    );
+    let out = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("拉起管理员提权进程失败: {e}"))?;
+    Ok(out.status.success())
+}
+
+fn quit_app_and_wait_for_ui_patch(
+    paths: &AppPaths,
+    app_id: AppId,
+    force_on_windows: bool,
+    auto_restart: bool,
+) -> Result<bool, String> {
+    if paths.is_test {
+        return Ok(false);
+    }
+    let adapter = get_adapter(app_id);
+    let was_running = adapter.is_running(paths);
+    if !was_running {
+        return Ok(false);
+    }
+    let should_quit = auto_restart || (cfg!(target_os = "windows") && force_on_windows);
+    if !should_quit {
+        return Ok(false);
+    }
+    adapter.quit_app(paths)?;
+    let max_polls = if cfg!(target_os = "windows") { 20 } else { 3 };
+    let poll_ms = if cfg!(target_os = "windows") { 200 } else { 150 };
+    for _ in 0..max_polls {
+        if !adapter.is_running(paths) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(poll_ms));
+    }
+    Ok(true)
+}
+
+fn execute_ui_patch_action_for_paths(
+    paths: &AppPaths,
+    app_id: AppId,
+    action: &str,
+    auto_restart: bool,
+) -> Result<adapters::UiPatchInfo, String> {
+    let quit_for_patch = quit_app_and_wait_for_ui_patch(paths, app_id, true, auto_restart)?;
+
+    let res = {
+        #[cfg(target_os = "windows")]
+        {
+            match run_raw_ui_patch_action(paths, app_id, action) {
+                Ok(info) => Ok(info),
+                Err(err) => {
+                    if !paths.is_test
+                        && adapters::parse_ui_patch_block_error(&err)
+                            .is_some_and(|p| p.kind == adapters::UiPatchBlockKind::WindowsUac)
+                    {
+                        if let Ok(true) = try_windows_elevated_ui_patch(paths, app_id, action) {
+                            Ok(inspect_ui_patch_for_app(paths, app_id))
+                        } else {
+                            Err(err)
+                        }
+                    } else {
+                        Err(err)
+                    }
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            run_raw_ui_patch_action(paths, app_id, action)
+        }
+    };
+
+    if quit_for_patch && !paths.is_test {
+        let _ = get_adapter(app_id).launch_app(paths);
+    }
+    res
+}
+
+/// Decoupled Chinese UI toggle & ASAR synchronization for tests and runtime commands.
+/// Step 1 & 2 (config-layer Chinese localization) ALWAYS commit first; Step 3/4 ASAR
+/// permission blocks are collected as `UiPatchPermissionPrompt` without rolling back config.
+pub fn apply_prefer_chinese_ui_for_paths(
+    paths: &AppPaths,
+    enable: bool,
+    patch_ui: bool,
+    auto_restart: bool,
+) -> Result<Vec<adapters::UiPatchPermissionPrompt>, String> {
+    let mut state = read_switch_state(paths);
+    state.prefer_chinese_ui = enable;
+    save_switch_state(paths, &state)?;
+
+    for &app_id in &[AppId::Codex, AppId::Claude, AppId::Antigravity] {
+        let adapter = get_adapter(app_id);
+        if adapter.read_mode(paths) == AppMode::Tako {
+            let _ = adapter.apply_mode(paths, AppMode::Tako);
+        }
+    }
+    sync_standalone_chinese_for_installed(paths, enable);
+
+    let mut prompts: Vec<adapters::UiPatchPermissionPrompt> = Vec::new();
+    let mut handled_restarts: std::collections::HashSet<AppId> = std::collections::HashSet::new();
+
+    if patch_ui {
+        for &app_id in &[AppId::Claude, AppId::Antigravity] {
+            let info = inspect_ui_patch_for_app(paths, app_id);
+            if enable {
+                let needs_patch = matches!(
+                    info.status,
+                    adapters::UiPatchStatus::Unpatched
+                        | adapters::UiPatchStatus::OutdatedAfterUpgrade
+                ) || (info.status == adapters::UiPatchStatus::Patched
+                    && info.patch_version.as_deref()
+                        != Some(adapters::antigravity_i18n::CURRENT_UI_PATCH_VERSION));
+                if needs_patch {
+                    match execute_ui_patch_action_for_paths(paths, app_id, "patch", auto_restart) {
+                        Ok(_) => {
+                            handled_restarts.insert(app_id);
+                        }
+                        Err(err) => {
+                            if let Some(prompt) = adapters::parse_ui_patch_block_error(&err) {
+                                prompts.push(prompt);
+                            }
+                        }
+                    }
+                }
+            } else if info.status == adapters::UiPatchStatus::Patched {
+                match execute_ui_patch_action_for_paths(paths, app_id, "restore", auto_restart) {
+                    Ok(_) => {
+                        handled_restarts.insert(app_id);
+                    }
+                    Err(err) => {
+                        if let Some(prompt) = adapters::parse_ui_patch_block_error(&err) {
+                            prompts.push(prompt);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if auto_restart && !paths.is_test {
+        for &app_id in &[AppId::Codex, AppId::Claude, AppId::Antigravity] {
+            if handled_restarts.contains(&app_id) {
+                continue;
+            }
+            let adapter = get_adapter(app_id);
+            if adapter.is_running(paths) {
+                let _ = adapter.quit_app(paths);
+                std::thread::sleep(std::time::Duration::from_millis(450));
+                let _ = adapter.launch_app(paths);
+            }
+        }
+    }
+
+    Ok(prompts)
+}
+
 #[tauri::command]
 async fn set_prefer_chinese_ui(
     app: AppHandle,
@@ -741,57 +945,8 @@ async fn set_prefer_chinese_ui(
     auto_restart: bool,
 ) -> Result<DashboardPayload, String> {
     let paths_for_sync = AppPaths::detect()?;
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-        let mut state = read_switch_state(&paths_for_sync);
-        state.prefer_chinese_ui = enable;
-        save_switch_state(&paths_for_sync, &state)?;
-
-        let agy_adapter = get_adapter(AppId::Antigravity);
-        let agy_was_running = agy_adapter.is_running(&paths_for_sync);
-
-        let should_patch_agy = patch_antigravity
-            && enable
-            && matches!(
-                adapters::inspect_antigravity_ui_patch(&paths_for_sync).status,
-                adapters::UiPatchStatus::Unpatched
-                    | adapters::UiPatchStatus::OutdatedAfterUpgrade
-                    | adapters::UiPatchStatus::Patched
-            );
-
-        if should_patch_agy && auto_restart && agy_was_running {
-            let _ = agy_adapter.quit_app(&paths_for_sync);
-            std::thread::sleep(std::time::Duration::from_millis(450));
-        }
-
-        for &app_id in &[AppId::Codex, AppId::Claude, AppId::Antigravity] {
-            let adapter = get_adapter(app_id);
-            if adapter.read_mode(&paths_for_sync) == AppMode::Tako
-                && adapter.apply_mode(&paths_for_sync, AppMode::Tako).is_err()
-            {
-                sync_standalone_chinese_for_installed(&paths_for_sync, enable);
-            }
-        }
-        sync_standalone_chinese_for_installed(&paths_for_sync, enable);
-
-        if should_patch_agy {
-            adapters::patch_antigravity_ui_for_paths(&paths_for_sync)?;
-        }
-
-        if auto_restart {
-            for &app_id in &[AppId::Codex, AppId::Claude, AppId::Antigravity] {
-                let adapter = get_adapter(app_id);
-                if app_id == AppId::Antigravity && should_patch_agy && agy_was_running {
-                    let _ = adapter.launch_app(&paths_for_sync);
-                    continue;
-                }
-                if adapter.is_running(&paths_for_sync) {
-                    let _ = adapter.quit_app(&paths_for_sync);
-                    std::thread::sleep(std::time::Duration::from_millis(450));
-                    let _ = adapter.launch_app(&paths_for_sync);
-                }
-            }
-        }
-        Ok(())
+    let prompts = tauri::async_runtime::spawn_blocking(move || {
+        apply_prefer_chinese_ui_for_paths(&paths_for_sync, enable, patch_antigravity, auto_restart)
     })
     .await
     .map_err(|err| format!("同步中文设置失败: {err}"))??;
@@ -799,31 +954,39 @@ async fn set_prefer_chinese_ui(
     if let Ok(paths) = AppPaths::detect() {
         refresh_tray(&app, &paths);
     }
-    get_dashboard(app, false).await
+    let mut dashboard = get_dashboard(app, false).await?;
+    dashboard.ui_patch_prompts = prompts;
+    Ok(dashboard)
 }
 
 #[tauri::command]
-async fn patch_antigravity_ui(app: AppHandle, auto_restart: bool) -> Result<AppSnapshot, String> {
+async fn patch_app_ui(
+    app: AppHandle,
+    app_id: AppId,
+    auto_restart: bool,
+) -> Result<AppSnapshot, String> {
     let paths = AppPaths::detect()?;
     let paths_clone = paths.clone();
     let snapshot = tauri::async_runtime::spawn_blocking(move || -> Result<AppSnapshot, String> {
-        let adapter = get_adapter(AppId::Antigravity);
-        let was_running = adapter.is_running(&paths_clone);
-        if auto_restart && was_running {
-            adapter.quit_app(&paths_clone)?;
-            std::thread::sleep(std::time::Duration::from_millis(450));
-        }
-        adapters::patch_antigravity_ui_for_paths(&paths_clone)?;
+        execute_ui_patch_action_for_paths(&paths_clone, app_id, "patch", auto_restart)?;
         if read_switch_state(&paths_clone).prefer_chinese_ui {
-            let _ = adapters::antigravity::AntigravityAdapter::sync_standalone_chinese_locale(
-                &paths_clone,
-                true,
-            );
+            match app_id {
+                AppId::Antigravity => {
+                    let _ = adapters::antigravity::AntigravityAdapter::sync_standalone_chinese_locale(
+                        &paths_clone,
+                        true,
+                    );
+                }
+                AppId::Claude => {
+                    let _ = adapters::claude::ClaudeAdapter::sync_standalone_chinese_locale(
+                        &paths_clone,
+                        true,
+                    );
+                }
+                _ => {}
+            }
         }
-        if auto_restart && was_running {
-            adapter.launch_app(&paths_clone)?;
-        }
-        Ok(snapshot_app(&paths_clone, AppId::Antigravity))
+        Ok(snapshot_app(&paths_clone, app_id))
     })
     .await
     .map_err(|err| format!("执行界面汉化失败: {err}"))??;
@@ -833,27 +996,101 @@ async fn patch_antigravity_ui(app: AppHandle, auto_restart: bool) -> Result<AppS
 }
 
 #[tauri::command]
-async fn restore_antigravity_ui(
+async fn restore_app_ui(
     app: AppHandle,
+    app_id: AppId,
     auto_restart: bool,
 ) -> Result<AppSnapshot, String> {
     let paths = AppPaths::detect()?;
     let paths_clone = paths.clone();
     let snapshot = tauri::async_runtime::spawn_blocking(move || -> Result<AppSnapshot, String> {
-        let adapter = get_adapter(AppId::Antigravity);
-        let was_running = adapter.is_running(&paths_clone);
-        if auto_restart && was_running {
-            adapter.quit_app(&paths_clone)?;
-            std::thread::sleep(std::time::Duration::from_millis(450));
-        }
-        adapters::restore_antigravity_ui_for_paths(&paths_clone)?;
-        if auto_restart && was_running {
-            adapter.launch_app(&paths_clone)?;
-        }
-        Ok(snapshot_app(&paths_clone, AppId::Antigravity))
+        execute_ui_patch_action_for_paths(&paths_clone, app_id, "restore", auto_restart)?;
+        Ok(snapshot_app(&paths_clone, app_id))
     })
     .await
     .map_err(|err| format!("还原原版界面失败: {err}"))??;
+
+    refresh_tray(&app, &paths);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+async fn patch_antigravity_ui(app: AppHandle, auto_restart: bool) -> Result<AppSnapshot, String> {
+    patch_app_ui(app, AppId::Antigravity, auto_restart).await
+}
+
+#[tauri::command]
+async fn restore_antigravity_ui(
+    app: AppHandle,
+    auto_restart: bool,
+) -> Result<AppSnapshot, String> {
+    restore_app_ui(app, AppId::Antigravity, auto_restart).await
+}
+
+#[tauri::command]
+fn open_macos_app_management_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("/usr/bin/open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles")
+            .output()
+            .map_err(|e| format!("打开系统设置失败: {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let fallback = std::process::Command::new("/usr/bin/open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy")
+            .output()
+            .map_err(|e| format!("打开隐私与安全性设置失败: {e}"))?;
+        if fallback.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "无法打开系统设置: {}",
+                String::from_utf8_lossy(&fallback.stderr).trim()
+            ))
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("仅支持在 macOS 上打开「隐私与安全性 -> App 管理」设置".to_string())
+    }
+}
+
+#[tauri::command]
+async fn run_elevated_ui_patch_worker(
+    app: AppHandle,
+    app_id: AppId,
+    action: String,
+) -> Result<AppSnapshot, String> {
+    let normalized_action = match action.trim() {
+        "patch" => "patch",
+        "restore" => "restore",
+        other => return Err(format!("不支持的界面补丁动作: {other}")),
+    };
+    let paths = AppPaths::detect()?;
+    let paths_clone = paths.clone();
+    let snapshot = tauri::async_runtime::spawn_blocking(move || -> Result<AppSnapshot, String> {
+        #[cfg(target_os = "windows")]
+        {
+            let quit_for_patch = quit_app_and_wait_for_ui_patch(&paths_clone, app_id, true, false)?;
+            let elevated_ok = try_windows_elevated_ui_patch(&paths_clone, app_id, normalized_action)?;
+            if quit_for_patch && !paths_clone.is_test {
+                let _ = get_adapter(app_id).launch_app(&paths_clone);
+            }
+            if !elevated_ok {
+                return Err("管理员授权被取消或执行失败".to_string());
+            }
+            Ok(snapshot_app(&paths_clone, app_id))
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = (paths_clone, app_id, normalized_action);
+            Err("管理员提权补丁模式仅适用于 Windows".to_string())
+        }
+    })
+    .await
+    .map_err(|err| format!("执行管理员提权补丁失败: {err}"))??;
 
     refresh_tray(&app, &paths);
     Ok(snapshot)
@@ -1273,8 +1510,12 @@ pub fn run() {
             open_url,
             save_settings,
             set_prefer_chinese_ui,
+            patch_app_ui,
+            restore_app_ui,
             patch_antigravity_ui,
             restore_antigravity_ui,
+            open_macos_app_management_settings,
+            run_elevated_ui_patch_worker,
             set_app_mode,
             restart_app,
             close_app,

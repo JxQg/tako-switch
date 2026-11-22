@@ -2,6 +2,12 @@
 
 所有 Tako Switch 的重要版本更新说明都会记录在这里。每次发版时，CI 会自动提取对应版本段落，同步写入 `latest.json`（供客户端自更新与官网下载页展示）及 GitHub Release 正文。
 
+## v2.1.0 (2026-11-22)
+
+- 新增 Claude Desktop 全量简体中文界面汉化补丁器（纯 Rust 双 ASAR 架构）：同步修补 `app.asar` 与 `ion-dist.asar`，完整覆盖 Chat、Cowork 与 Claude Code Desktop 工作台界面及 51 个动态模型/思考强度词条，内置 ICU 占位符与富文本标签兼容性校验，并支持 macOS 双 `Info.plist` 完整性哈希更新与字节级原厂签名无损还原
+- 新增跨平台权限引导与配置/资源包解耦机制：当 macOS「App 管理」权限、Windows UAC 或文件占用拦截安装包写入时，配置文件级简体中文与中文回复规则仍会正常生效，并弹出分步授权引导弹窗支持一键直达系统设置与重试
+- 新增 Windows Squirrel 多版本数值语义排序、Electron FuseV1 完整性校验探测、PE32/PE32+ 哈希修补与 Authenticode 清理、Microsoft Store (MSIX) 只读保护识别以及临时 UAC 提权工作进程
+
 ## v2.0.10 (2026-11-22)
 
 - 新增版本更新说明体系：发版流水线自动从 `CHANGELOG.md` 提取对应版本说明，同步写入 `latest.json` 与 GitHub Release 正文

@@ -556,66 +556,6 @@ pub fn update_info_plist_asar_key_hash(
     Some(updated)
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn resign_macos_outer_bundle_checked(
-    app_id: AppId,
-    action: &str,
-    bundle_root: &Path,
-    backup_dir: &Path,
-) -> Result<(), String> {
-    fs::create_dir_all(backup_dir)
-        .map_err(|e| format!("创建临时目录 {} 失败: {e}", backup_dir.display()))?;
-    let tmp_ent_path = backup_dir.join(format!(".entitlements.{}.plist", std::process::id()));
-
-    let mut has_entitlements = false;
-    if let Ok(ent_out) = std::process::Command::new("/usr/bin/codesign")
-        .args(["-d", "--entitlements", ":-"])
-        .arg(bundle_root)
-        .output()
-    {
-        if ent_out.status.success() && !ent_out.stdout.is_empty() {
-            let stdout_str = String::from_utf8_lossy(&ent_out.stdout);
-            if stdout_str.contains("<plist") {
-                fs::write(&tmp_ent_path, &ent_out.stdout)
-                    .map_err(|e| format!("写入临时 entitlements 失败: {e}"))?;
-                has_entitlements = true;
-            }
-        }
-    }
-
-    // Never pass `--deep` so inner Electron Framework, Helpers, and sub-binaries keep original signatures.
-    let mut cmd = std::process::Command::new("/usr/bin/codesign");
-    cmd.arg("--force");
-    if has_entitlements {
-        cmd.arg("--entitlements").arg(&tmp_ent_path);
-    }
-    cmd.args(["--sign", "-"]).arg(bundle_root);
-
-    let sign_res = cmd.output();
-    if tmp_ent_path.exists() {
-        let _ = fs::remove_file(&tmp_ent_path);
-    }
-
-    let out = sign_res.map_err(|e| map_bundle_io_err(app_id, action, bundle_root, "调用 codesign", e))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let lower = stderr.to_ascii_lowercase();
-        if lower.contains("operation not permitted") || lower.contains("permission denied") {
-            let io_err = std::io::Error::from_raw_os_error(1);
-            if let Some(prompt) =
-                classify_io_error_for_os("macos", app_id, action, bundle_root, &io_err)
-            {
-                return Err(format_ui_patch_block_error(&prompt));
-            }
-        }
-        return Err(format!(
-            "本地重签 {} 失败: {stderr}",
-            bundle_root.display()
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

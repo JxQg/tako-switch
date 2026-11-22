@@ -91,7 +91,7 @@ enum TargetResolution {
     Found(ResolvedAgyTarget),
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
@@ -194,6 +194,21 @@ pub struct AsarArchive {
 }
 
 impl AsarArchive {
+    #[cfg(test)]
+    pub(crate) fn new_empty() -> Self {
+        Self {
+            header: json!({ "files": {} }),
+            packed_files: HashMap::new(),
+            modified_files: HashSet::new(),
+        }
+    }
+
+    pub fn file_paths(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.packed_files.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() < 16 {
             return Err("ASAR 文件过短，不足 16 字节头部".to_string());
@@ -1174,30 +1189,7 @@ fn verify_clean_backup_asar(paths: &AppPaths, expected_sha256: &str) -> Result<V
 }
 
 pub fn update_info_plist_asar_hash(plist_xml: &str, new_header_sha256: &str) -> Option<String> {
-    let asar_key = "<key>Resources/app.asar</key>";
-    let key_pos = plist_xml.find(asar_key)?;
-    let after_asar_key = key_pos + asar_key.len();
-    let dict_end_rel = plist_xml[after_asar_key..].find("</dict>")?;
-    let dict_end = after_asar_key + dict_end_rel;
-    let dict_slice = &plist_xml[after_asar_key..dict_end];
-
-    let hash_key = "<key>hash</key>";
-    let hash_key_rel = dict_slice.find(hash_key)?;
-    let after_hash_key = after_asar_key + hash_key_rel + hash_key.len();
-    let sub_slice = &plist_xml[after_hash_key..dict_end];
-
-    let str_open = "<string>";
-    let str_close = "</string>";
-    let open_rel = sub_slice.find(str_open)?;
-    let val_start = after_hash_key + open_rel + str_open.len();
-    let close_rel = plist_xml[val_start..dict_end].find(str_close)?;
-    let val_end = val_start + close_rel;
-
-    let mut updated = String::with_capacity(plist_xml.len());
-    updated.push_str(&plist_xml[..val_start]);
-    updated.push_str(new_header_sha256);
-    updated.push_str(&plist_xml[val_end..]);
-    Some(updated)
+    update_info_plist_asar_key_hash(plist_xml, "Resources/app.asar", new_header_sha256)
 }
 
 fn update_target_info_plist_integrity(
@@ -1213,7 +1205,13 @@ fn update_target_info_plist_integrity(
 
     if let Ok(xml_text) = std::str::from_utf8(&raw_bytes) {
         if let Some(updated_xml) = update_info_plist_asar_hash(xml_text, new_header_sha256) {
-            return write_atomic(info_plist_path, updated_xml.as_bytes(), false);
+            return write_bundle_file_checked(
+                AppId::Antigravity,
+                "patch",
+                info_plist_path,
+                updated_xml.as_bytes(),
+                false,
+            );
         }
         return Ok(());
     }
@@ -1237,7 +1235,12 @@ fn update_target_info_plist_integrity(
 }
 
 #[cfg(target_os = "macos")]
-fn resign_macos_outer_bundle(bundle_root: &Path, backup_dir: &Path) -> Result<(), String> {
+pub(crate) fn resign_macos_outer_bundle_for(
+    app_id: AppId,
+    action: &str,
+    bundle_root: &Path,
+    backup_dir: &Path,
+) -> Result<(), String> {
     fs::create_dir_all(backup_dir)
         .map_err(|e| format!("创建临时目录 {} 失败: {e}", backup_dir.display()))?;
     let tmp_ent_path = backup_dir.join(format!(".entitlements.{}.plist", std::process::id()));
@@ -1273,9 +1276,25 @@ fn resign_macos_outer_bundle(bundle_root: &Path, backup_dir: &Path) -> Result<()
 
     let out = sign_res.map_err(|e| format!("调用 codesign 失败: {e}"))?;
     if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let lower = stderr.to_ascii_lowercase();
+        if lower.contains("operation not permitted") || lower.contains("permission denied") {
+            let prompt = UiPatchPermissionPrompt {
+                app_id,
+                app_name: app_id.display_name().to_string(),
+                action: action.to_string(),
+                kind: UiPatchBlockKind::MacosAppManagement,
+                target_path: Some(bundle_root.to_string_lossy().to_string()),
+                message: format!(
+                    "macOS 拦截了对 {} 安装包的本地重签操作。请前往「系统设置 -> 隐私与安全性 -> App 管理」开启 Tako Switch 授权后点击重试；配置文件级简体中文已正常生效。",
+                    app_id.display_name()
+                ),
+            };
+            return Err(format_ui_patch_block_error(&prompt));
+        }
         return Err(format!(
-            "本地重签 Antigravity.app 失败: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            "本地重签 {} 失败: {stderr}",
+            app_id.display_name()
         ));
     }
     Ok(())
@@ -1406,6 +1425,18 @@ pub fn patch_antigravity_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, S
 
     let current_bytes = fs::read(&target.asar_path)
         .map_err(|e| format!("读取 {} 失败: {e}", target.asar_path.display()))?;
+    if target
+        .asar_path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .contains("windowsapps")
+    {
+        return Err(format_ui_patch_block_error(&make_msix_readonly_prompt(
+            AppId::Antigravity,
+            "patch",
+            Some(&target.asar_path),
+        )));
+    }
     let current_archive = AsarArchive::parse(&current_bytes)?;
     let backup_dir = ui_patch_backup_dir(paths);
 
@@ -1424,12 +1455,24 @@ pub fn patch_antigravity_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, S
                 return Ok(inspect_antigravity_ui_patch(paths));
             }
 
+            probe_bundle_write_access(AppId::Antigravity, "patch", &target.asar_path)?;
+            if let Some(ref plist_path) = target.info_plist_path {
+                if plist_path.is_file() {
+                    probe_bundle_write_access(AppId::Antigravity, "patch", plist_path)?;
+                }
+            }
             let clean_orig_bytes = verify_clean_backup_asar(paths, &expected_orig_sha)?;
             let clean_archive = AsarArchive::parse(&clean_orig_bytes)?;
             (clean_archive, expected_orig_sha)
         } else {
             if !is_patchable_asar(&current_archive) {
                 return Err("当前 Antigravity 版本目录结构不受支持，已安全跳过修改".to_string());
+            }
+            probe_bundle_write_access(AppId::Antigravity, "patch", &target.asar_path)?;
+            if let Some(ref plist_path) = target.info_plist_path {
+                if plist_path.is_file() {
+                    probe_bundle_write_access(AppId::Antigravity, "patch", plist_path)?;
+                }
             }
             let clean_sha = sha256_hex(&current_bytes);
             // Current ASAR is guaranteed unpatched (no __tako_i18n_patch.json), safe to write/refresh .orig backups.
@@ -1498,7 +1541,13 @@ pub fn patch_antigravity_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, S
     let patched_asar_sha256 = sha256_hex(&patched_asar_bytes);
     let header_sha256 = sha256_hex(header_json.as_bytes());
 
-    write_atomic(&target.asar_path, &patched_asar_bytes, false)?;
+    write_bundle_file_checked(
+        AppId::Antigravity,
+        "patch",
+        &target.asar_path,
+        &patched_asar_bytes,
+        false,
+    )?;
 
     if let Some(ref plist_path) = target.info_plist_path {
         update_target_info_plist_integrity(plist_path, &header_sha256, paths.is_test)?;
@@ -1518,7 +1567,7 @@ pub fn patch_antigravity_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, S
     #[cfg(target_os = "macos")]
     if !paths.is_test {
         if let Some(ref bundle_root) = target.bundle_root {
-            resign_macos_outer_bundle(bundle_root, &backup_dir)?;
+            resign_macos_outer_bundle_for(AppId::Antigravity, "patch", bundle_root, &backup_dir)?;
         }
     }
 
@@ -1538,6 +1587,19 @@ pub fn restore_antigravity_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo,
         }
         TargetResolution::Found(t) => t,
     };
+
+    if target
+        .asar_path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .contains("windowsapps")
+    {
+        return Err(format_ui_patch_block_error(&make_msix_readonly_prompt(
+            AppId::Antigravity,
+            "restore",
+            Some(&target.asar_path),
+        )));
+    }
 
     let current_bytes = fs::read(&target.asar_path)
         .map_err(|e| format!("读取 {} 失败: {e}", target.asar_path.display()))?;
@@ -1561,7 +1623,14 @@ pub fn restore_antigravity_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo,
         .unwrap_or_default();
 
     let clean_orig_bytes = verify_clean_backup_asar(paths, &expected_orig_sha)?;
-    write_atomic(&target.asar_path, &clean_orig_bytes, false)?;
+    probe_bundle_write_access(AppId::Antigravity, "restore", &target.asar_path)?;
+    write_bundle_file_checked(
+        AppId::Antigravity,
+        "restore",
+        &target.asar_path,
+        &clean_orig_bytes,
+        false,
+    )?;
 
     let mut restored_full_signature = false;
     if target.bundle_root.is_some() {
@@ -1570,7 +1639,7 @@ pub fn restore_antigravity_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo,
             if let Some(ref dst_plist) = target.info_plist_path {
                 let bytes = fs::read(&orig_plist)
                     .map_err(|e| format!("读取 {} 失败: {e}", orig_plist.display()))?;
-                write_atomic(dst_plist, &bytes, false)?;
+                write_bundle_file_checked(AppId::Antigravity, "restore", dst_plist, &bytes, false)?;
             }
         }
 
@@ -1581,22 +1650,9 @@ pub fn restore_antigravity_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo,
 
         if orig_bin.is_file() {
             if let Some(ref dst_bin) = target.macos_bin_path {
-                #[cfg(unix)]
-                let prev_mode = fs::metadata(dst_bin)
-                    .map(|m| m.permissions().mode())
-                    .unwrap_or(0o755);
                 let bytes = fs::read(&orig_bin)
                     .map_err(|e| format!("读取 {} 失败: {e}", orig_bin.display()))?;
-                write_atomic(dst_bin, &bytes, false)?;
-                #[cfg(unix)]
-                {
-                    let mode = if prev_mode & 0o111 != 0 {
-                        prev_mode
-                    } else {
-                        0o755
-                    };
-                    let _ = fs::set_permissions(dst_bin, fs::Permissions::from_mode(mode));
-                }
+                write_bundle_file_checked(AppId::Antigravity, "restore", dst_bin, &bytes, true)?;
                 restored_bin = true;
             }
         }
@@ -1605,7 +1661,7 @@ pub fn restore_antigravity_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo,
             if let Some(ref dst_cr) = target.code_resources_path {
                 let bytes = fs::read(&orig_cr)
                     .map_err(|e| format!("读取 {} 失败: {e}", orig_cr.display()))?;
-                write_atomic(dst_cr, &bytes, false)?;
+                write_bundle_file_checked(AppId::Antigravity, "restore", dst_cr, &bytes, false)?;
                 restored_cr = true;
             }
         }
@@ -1621,7 +1677,7 @@ pub fn restore_antigravity_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo,
     #[cfg(target_os = "macos")]
     if !paths.is_test && !restored_full_signature {
         if let Some(ref bundle_root) = target.bundle_root {
-            resign_macos_outer_bundle(bundle_root, &backup_dir)?;
+            resign_macos_outer_bundle_for(AppId::Antigravity, "restore", bundle_root, &backup_dir)?;
         }
     }
     #[cfg(not(target_os = "macos"))]

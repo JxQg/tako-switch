@@ -33,6 +33,7 @@ import {
   api,
   DEFAULT_FALLBACK_MANIFEST_URL,
   DEFAULT_MANIFEST_URL,
+  parseUiPatchBlockError,
   TAKO_FEEDBACK_URL,
   TAKO_RELEASES_URL,
   type AccountStatus,
@@ -46,10 +47,12 @@ import {
   type McpToolsConfig,
   type SelfUpdateCheckResult,
   type SelfUpdateProgressEvent,
+  type UiPatchPermissionPrompt,
 } from "./lib/api";
 import { AppBrandIcon, TakoBrandMark } from "./components/BrandIcons";
 import { McpInlineTheater, type McpToolKey } from "./components/McpInlineTheater";
 import { ModelPickerModal } from "./components/ModelPickerModal";
+import { UiPatchPermissionModal } from "./components/UiPatchPermissionModal";
 import { CHANGELOG_RELEASES, parseReleaseNotesLines } from "./lib/changelog";
 
 type ThemePref = "system" | "light" | "dark";
@@ -844,29 +847,25 @@ export default function App() {
   };
 
   const [togglingChineseUi, setTogglingChineseUi] = useState(false);
+  const [permissionPrompts, setPermissionPrompts] = useState<UiPatchPermissionPrompt[]>([]);
+  const [retryingPermission, setRetryingPermission] = useState(false);
+  const permissionRetryRef = useRef<(() => Promise<void>) | null>(null);
 
-  const handleToggleMainChineseUi = async () => {
-    if (!dashboard || togglingChineseUi || busyApp !== null) return;
-    const currentEnabled = dashboard.state.preferChineseUi ?? true;
-    const agySnap = dashboard.apps.find((a) => a.id === "antigravity");
-    const agyNeedsPatch =
-      Boolean(agySnap?.install.installed) &&
-      (agySnap?.uiPatch.status === "unpatched" ||
-        agySnap?.uiPatch.status === "outdated_after_upgrade");
-    const anyInstalledMissingZh = dashboard.apps.some(
-      (a) => a.id !== "dsh-tako" && a.install.installed && !a.chineseConfigured,
-    );
-    // If preferChineseUi is already true in state, but some installed client or Antigravity UI isn't localized yet,
-    // clicking applies full 3-client localization + Antigravity UI patch first instead of unexpectedly disabling!
-    const nextEnable =
-      currentEnabled && (agyNeedsPatch || anyInstalledMissingZh) ? true : !currentEnabled;
-
+  const runSetPreferChineseUi = async (nextEnable: boolean) => {
     setTogglingChineseUi(true);
     setErrorMsg(null);
     try {
-      const nextDashboard = await api.setPreferChineseUi(nextEnable, nextEnable, false);
+      const nextDashboard = await api.setPreferChineseUi(nextEnable, true, false);
       setDashboard(nextDashboard);
       setSettingsForm((prev) => ({ ...prev, preferChineseUi: nextEnable }));
+      const prompts = nextDashboard.uiPatchPrompts ?? [];
+      if (prompts.length > 0) {
+        permissionRetryRef.current = () => runSetPreferChineseUi(nextEnable);
+        setPermissionPrompts(prompts);
+      } else {
+        setPermissionPrompts([]);
+        permissionRetryRef.current = null;
+      }
       const runningTargets = nextDashboard.apps.filter(
         (a) => a.id !== "dsh-tako" && a.running,
       );
@@ -877,7 +876,13 @@ export default function App() {
           return copy;
         });
       }
-      if (nextEnable) {
+      if (prompts.length > 0) {
+        showTransientNote(
+          nextEnable
+            ? "配置文件级简体中文已生效，界面资源包需授权后完成注入"
+            : "配置文件级中文增强已还原，界面资源包需授权后完成还原",
+        );
+      } else if (nextEnable) {
         showTransientNote(
           runningTargets.length > 0
             ? "三端简体中文汉化已写入，运行中客户端点击「重启生效」即可应用"
@@ -887,63 +892,127 @@ export default function App() {
         showTransientNote("已关闭客户端中文增强并无损恢复原配置");
       }
     } catch (err) {
-      setErrorMsg(`切换三端汉化失败：${String(err)}`);
+      const block = parseUiPatchBlockError(err);
+      if (block) {
+        permissionRetryRef.current = () => runSetPreferChineseUi(nextEnable);
+        setPermissionPrompts([block]);
+      } else {
+        setErrorMsg(`切换三端汉化失败：${String(err)}`);
+      }
     } finally {
       setTogglingChineseUi(false);
     }
   };
 
-  const handlePatchAntigravityUi = async (app: AppSnapshot) => {
+  const handleToggleMainChineseUi = async () => {
+    if (!dashboard || togglingChineseUi || busyApp !== null) return;
+    const currentEnabled = dashboard.state.preferChineseUi ?? true;
+    const needsUiPatch = dashboard.apps.some(
+      (a) =>
+        (a.id === "antigravity" || a.id === "claude") &&
+        a.install.installed &&
+        (a.uiPatch.status === "unpatched" ||
+          a.uiPatch.status === "outdated_after_upgrade"),
+    );
+    const anyInstalledMissingZh = dashboard.apps.some(
+      (a) => a.id !== "dsh-tako" && a.install.installed && !a.chineseConfigured,
+    );
+    // If preferChineseUi is already true in state, but some installed client or Claude/Antigravity UI isn't localized yet,
+    // clicking applies full 3-client localization + UI patch first instead of unexpectedly disabling!
+    const nextEnable =
+      currentEnabled && (needsUiPatch || anyInstalledMissingZh) ? true : !currentEnabled;
+
+    await runSetPreferChineseUi(nextEnable);
+  };
+
+  const handlePatchAppUi = async (app: AppSnapshot) => {
     if (busyApp !== null) return;
-    setBusyApp("antigravity");
+    const label = APP_DISPLAY_NAMES[app.id] ?? app.name;
+    setBusyApp(app.id);
     setErrorMsg(null);
     try {
-      const updated = await api.patchAntigravityUi(false);
+      const updated = await api.patchAppUi(app.id, false);
+      setPermissionPrompts([]);
+      permissionRetryRef.current = null;
       setDashboard((prev) =>
         prev
           ? {
               ...prev,
-              apps: prev.apps.map((item) => (item.id === "antigravity" ? updated : item)),
+              apps: prev.apps.map((item) => (item.id === app.id ? updated : item)),
             }
           : prev,
       );
       if (app.running || updated.running) {
-        setNeedsRestart((prev) => ({ ...prev, antigravity: true }));
-        showTransientNote("Antigravity 界面汉化补丁已注入，点击「重启生效」即可应用");
+        setNeedsRestart((prev) => ({ ...prev, [app.id]: true }));
+        showTransientNote(`${label} 界面汉化补丁已注入，点击「重启生效」即可应用`);
       } else {
-        showTransientNote("Antigravity 菜单与界面汉化已完成");
+        showTransientNote(`${label} 简体中文界面汉化已完成`);
       }
     } catch (err) {
-      setErrorMsg(`Antigravity 界面汉化失败：${String(err)}`);
+      const block = parseUiPatchBlockError(err);
+      if (block) {
+        permissionRetryRef.current = () => handlePatchAppUi(app);
+        setPermissionPrompts([block]);
+      } else {
+        setErrorMsg(`${label} 界面汉化失败：${String(err)}`);
+      }
     } finally {
       setBusyApp(null);
     }
   };
 
-  const handleRestoreAntigravityUi = async (app: AppSnapshot) => {
+  const handleRestoreAppUi = async (app: AppSnapshot) => {
     if (busyApp !== null) return;
-    setBusyApp("antigravity");
+    const label = APP_DISPLAY_NAMES[app.id] ?? app.name;
+    setBusyApp(app.id);
     setErrorMsg(null);
     try {
-      const updated = await api.restoreAntigravityUi(false);
+      const updated = await api.restoreAppUi(app.id, false);
+      setPermissionPrompts([]);
+      permissionRetryRef.current = null;
       setDashboard((prev) =>
         prev
           ? {
               ...prev,
-              apps: prev.apps.map((item) => (item.id === "antigravity" ? updated : item)),
+              apps: prev.apps.map((item) => (item.id === app.id ? updated : item)),
             }
           : prev,
       );
       if (app.running || updated.running) {
-        setNeedsRestart((prev) => ({ ...prev, antigravity: true }));
-        showTransientNote("已无损还原原版 Antigravity，重启应用后生效");
+        setNeedsRestart((prev) => ({ ...prev, [app.id]: true }));
+        showTransientNote(`已无损还原原版 ${label}，重启应用后生效`);
       } else {
-        showTransientNote("已字节级无损还原原版 Antigravity");
+        showTransientNote(`已字节级无损还原原版 ${label}`);
       }
     } catch (err) {
-      setErrorMsg(`还原 Antigravity 原版失败：${String(err)}`);
+      const block = parseUiPatchBlockError(err);
+      if (block) {
+        permissionRetryRef.current = () => handleRestoreAppUi(app);
+        setPermissionPrompts([block]);
+      } else {
+        setErrorMsg(`还原 ${label} 原版失败：${String(err)}`);
+      }
     } finally {
       setBusyApp(null);
+    }
+  };
+
+  const handleOpenMacosAppManagementSettings = async () => {
+    try {
+      await api.openMacosAppManagementSettings();
+    } catch (err) {
+      setErrorMsg(`打开系统设置失败：${String(err)}`);
+    }
+  };
+
+  const handleRetryPermissionAction = async () => {
+    const retryFn = permissionRetryRef.current;
+    if (!retryFn || retryingPermission) return;
+    setRetryingPermission(true);
+    try {
+      await retryFn();
+    } finally {
+      setRetryingPermission(false);
     }
   };
 
@@ -1427,17 +1496,21 @@ export default function App() {
               </h2>
               {(() => {
                 const zhPrefOn = dashboard?.state.preferChineseUi ?? true;
-                const agyApp = dashboard?.apps.find((a) => a.id === "antigravity");
-                const agyNeedsPatch =
-                  Boolean(agyApp?.install.installed) &&
-                  (agyApp?.uiPatch.status === "unpatched" ||
-                    agyApp?.uiPatch.status === "outdated_after_upgrade");
+                const uiNeedsPatch = Boolean(
+                  dashboard?.apps.some(
+                    (a) =>
+                      (a.id === "antigravity" || a.id === "claude") &&
+                      a.install.installed &&
+                      (a.uiPatch.status === "unpatched" ||
+                        a.uiPatch.status === "outdated_after_upgrade"),
+                  ),
+                );
                 const anyInstalledMissingZh = Boolean(
                   dashboard?.apps.some(
                     (a) => a.id !== "dsh-tako" && a.install.installed && !a.chineseConfigured,
                   ),
                 );
-                const fullyActive = zhPrefOn && !agyNeedsPatch && !anyInstalledMissingZh;
+                const fullyActive = zhPrefOn && !uiNeedsPatch && !anyInstalledMissingZh;
                 return (
                   <button
                     type="button"
@@ -1446,8 +1519,8 @@ export default function App() {
                     onClick={() => void handleToggleMainChineseUi()}
                     title={
                       fullyActive
-                        ? "三端简体中文配置已生效 · 点击可一键关闭并恢复原配置"
-                        : "一键同步 Codex / Claude / Antigravity 简体中文配置并注入反重力界面汉化"
+                        ? "三端简体中文配置与界面汉化已生效 · 点击可一键关闭并恢复原配置"
+                        : "一键同步 Codex / Claude / Antigravity 简体中文配置并注入 Claude 与反重力界面汉化"
                     }
                     className={`h-6 px-2 rounded-full border text-[11px] font-medium inline-flex items-center gap-1 transition cursor-pointer disabled:opacity-60 shrink-0 ${
                       fullyActive
@@ -1617,6 +1690,85 @@ export default function App() {
                                 </button>
                               </>
                             )}
+                            {app.id === "claude" && (
+                              <>
+                                <span className="text-[var(--text-muted)]">·</span>
+                                {app.uiPatch.status === "patched" ? (
+                                  <span className="inline-flex items-center flex-wrap gap-1 shrink-0">
+                                    <button
+                                      type="button"
+                                      data-testid="claude-ui-patch-btn"
+                                      disabled={isBusy}
+                                      onClick={() => void handlePatchAppUi(app)}
+                                      title={
+                                        app.uiPatch.note ??
+                                        "Claude Desktop 全量简体中文界面补丁已生效"
+                                      }
+                                      className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-[var(--success-soft)] border border-[var(--success-border)] text-[var(--success)] text-[11px] font-medium transition cursor-pointer disabled:opacity-60 shrink-0"
+                                    >
+                                      <CheckCircle2 className="h-3 w-3" />
+                                      <span>界面已汉化</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      data-testid="claude-ui-restore-btn"
+                                      disabled={isBusy}
+                                      onClick={() => void handleRestoreAppUi(app)}
+                                      title="从受控备份字节级无损还原 Claude Desktop 原版安装包与签名"
+                                      className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] text-[11px] font-medium transition cursor-pointer disabled:opacity-60 shrink-0"
+                                    >
+                                      <RotateCcw className="h-2.5 w-2.5" />
+                                      <span>还原原版</span>
+                                    </button>
+                                  </span>
+                                ) : app.uiPatch.status === "outdated_after_upgrade" ? (
+                                  <button
+                                    type="button"
+                                    data-testid="claude-ui-patch-btn"
+                                    disabled={isBusy}
+                                    onClick={() => void handlePatchAppUi(app)}
+                                    title={
+                                      app.uiPatch.note ??
+                                      "检测到 Claude Desktop 已升级，点击基于新版重新注入简体中文界面补丁"
+                                    }
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[11px] font-medium transition cursor-pointer disabled:opacity-60 shrink-0"
+                                    style={{
+                                      backgroundColor: "var(--warning-soft)",
+                                      color: "var(--warning)",
+                                    }}
+                                  >
+                                    <Globe className="h-3 w-3" />
+                                    <span>升级后重打汉化</span>
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    data-testid="claude-ui-patch-btn"
+                                    disabled={
+                                      isBusy ||
+                                      !app.install.installed ||
+                                      app.uiPatch.status === "not_installed" ||
+                                      app.uiPatch.status === "unsupported"
+                                    }
+                                    onClick={() => void handlePatchAppUi(app)}
+                                    title={
+                                      !app.install.installed
+                                        ? "安装 Claude Desktop 后可一键注入全量简体中文界面补丁"
+                                        : (app.uiPatch.note ??
+                                          "自动备份原版包并注入 Claude Desktop Chat / Cowork / Claude Code 全量简体中文界面")
+                                    }
+                                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border border-[var(--border)] bg-[var(--bg-subtle)]/80 hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] text-[11px] font-medium transition cursor-pointer disabled:opacity-50 shrink-0"
+                                  >
+                                    <Globe className="h-3 w-3 text-[var(--accent)]" />
+                                    <span>
+                                      {app.uiPatch.status === "unsupported"
+                                        ? "暂不支持汉化"
+                                        : "界面汉化"}
+                                    </span>
+                                  </button>
+                                )}
+                              </>
+                            )}
                             {app.id === "antigravity" && (
                               <>
                                 <span className="text-[var(--text-muted)]">·</span>
@@ -1626,7 +1778,7 @@ export default function App() {
                                       type="button"
                                       data-testid="agy-ui-patch-btn"
                                       disabled={isBusy}
-                                      onClick={() => void handlePatchAntigravityUi(app)}
+                                      onClick={() => void handlePatchAppUi(app)}
                                       title={
                                         app.uiPatch.note ??
                                         "Antigravity 菜单与 Hub 界面简体中文补丁已生效"
@@ -1640,7 +1792,7 @@ export default function App() {
                                       type="button"
                                       data-testid="agy-ui-restore-btn"
                                       disabled={isBusy}
-                                      onClick={() => void handleRestoreAntigravityUi(app)}
+                                      onClick={() => void handleRestoreAppUi(app)}
                                       title="从受控备份字节级无损还原 Antigravity 原版安装包与签名"
                                       className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] text-[11px] font-medium transition cursor-pointer disabled:opacity-60 shrink-0"
                                     >
@@ -1653,7 +1805,7 @@ export default function App() {
                                     type="button"
                                     data-testid="agy-ui-patch-btn"
                                     disabled={isBusy}
-                                    onClick={() => void handlePatchAntigravityUi(app)}
+                                    onClick={() => void handlePatchAppUi(app)}
                                     title={
                                       app.uiPatch.note ??
                                       "检测到 Antigravity 已升级，点击基于新版重新注入简体中文界面补丁"
@@ -1677,7 +1829,7 @@ export default function App() {
                                       app.uiPatch.status === "not_installed" ||
                                       app.uiPatch.status === "unsupported"
                                     }
-                                    onClick={() => void handlePatchAntigravityUi(app)}
+                                    onClick={() => void handlePatchAppUi(app)}
                                     title={
                                       !app.install.installed
                                         ? "安装 Google Antigravity 后可一键注入菜单与界面汉化"
@@ -2838,6 +2990,14 @@ export default function App() {
           </div>
         </div>
       )}
+
+      <UiPatchPermissionModal
+        prompts={permissionPrompts}
+        retrying={retryingPermission || togglingChineseUi || busyApp !== null}
+        onOpenMacosSettings={() => void handleOpenMacosAppManagementSettings()}
+        onRetry={() => void handleRetryPermissionAction()}
+        onDismiss={() => setPermissionPrompts([])}
+      />
 
       <ModelPickerModal
         appId={modelModalApp}

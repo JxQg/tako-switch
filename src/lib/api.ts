@@ -135,6 +135,81 @@ export type UiPatchStatus =
   | "outdated_after_upgrade"
   | "unsupported";
 
+export type UiPatchBlockKind =
+  | "macos_app_management"
+  | "windows_uac"
+  | "windows_file_lock"
+  | "windows_msix_read_only";
+
+export interface UiPatchPermissionPrompt {
+  appId: AppId;
+  appName: string;
+  action: "patch" | "restore" | string;
+  kind: UiPatchBlockKind;
+  targetPath: string | null;
+  message: string;
+}
+
+export const UI_PATCH_BLOCK_PREFIX = "[TAKO_UI_PATCH_BLOCK]";
+
+export function parseUiPatchBlockError(err: unknown): UiPatchPermissionPrompt | null {
+  const raw = typeof err === "string" ? err : err instanceof Error ? err.message : String(err ?? "");
+  const idx = raw.indexOf(UI_PATCH_BLOCK_PREFIX);
+  if (idx < 0) return null;
+  const rest = raw.slice(idx + UI_PATCH_BLOCK_PREFIX.length).trimStart();
+  if (!rest.startsWith("{")) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let endIdx = -1;
+  for (let i = 0; i < rest.length; i += 1) {
+    const ch = rest[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      depth += 1;
+    } else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        endIdx = i + 1;
+        break;
+      }
+    }
+  }
+  if (endIdx < 0) return null;
+  try {
+    const parsed = JSON.parse(rest.slice(0, endIdx)) as Partial<UiPatchPermissionPrompt>;
+    if (!parsed || !parsed.appId || !parsed.kind || !parsed.message) {
+      return null;
+    }
+    return {
+      appId: parsed.appId,
+      appName: parsed.appName ?? parsed.appId,
+      action: parsed.action ?? "patch",
+      kind: parsed.kind,
+      targetPath: parsed.targetPath ?? null,
+      message: parsed.message,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export interface UiPatchInfo {
   status: UiPatchStatus;
   patchVersion: string | null;
@@ -205,6 +280,7 @@ export interface DashboardPayload {
   localGatewayUrl: string;
   appVersion: string;
   os: string;
+  uiPatchPrompts?: UiPatchPermissionPrompt[];
 }
 
 export const DEFAULT_MANIFEST_URL =
@@ -306,10 +382,18 @@ export const api = {
       patchAntigravity,
       autoRestart,
     }),
+  patchAppUi: (appId: AppId, autoRestart: boolean) =>
+    invoke<AppSnapshot>("patch_app_ui", { appId, autoRestart }),
+  restoreAppUi: (appId: AppId, autoRestart: boolean) =>
+    invoke<AppSnapshot>("restore_app_ui", { appId, autoRestart }),
   patchAntigravityUi: (autoRestart: boolean) =>
     invoke<AppSnapshot>("patch_antigravity_ui", { autoRestart }),
   restoreAntigravityUi: (autoRestart: boolean) =>
     invoke<AppSnapshot>("restore_antigravity_ui", { autoRestart }),
+  openMacosAppManagementSettings: () =>
+    invoke<void>("open_macos_app_management_settings"),
+  runElevatedUiPatchWorker: (appId: AppId, action: "patch" | "restore") =>
+    invoke<AppSnapshot>("run_elevated_ui_patch_worker", { appId, action }),
   setAppMode: (appId: AppId, mode: AppMode, autoRestart: boolean) =>
     invoke<AppSnapshot>("set_app_mode", { appId, mode, autoRestart }),
   restartApp: (appId: AppId) => invoke<AppSnapshot>("restart_app", { appId }),
