@@ -1,4 +1,6 @@
-# Tako Switch v2.0.9 黑盒测试计划（Claude Desktop 全量 ASAR 汉化 + 跨平台权限引导与解耦）
+# Tako Switch v2.0.9 / v2.1.0 黑盒测试计划（Claude Desktop 全量 ASAR 汉化 + 跨平台权限引导与解耦）
+
+> 版本顺延说明：本计划与双盲黑盒套件最初按冻结规格 `v2.0.9` 设计；因同日并行发版已占用 `v2.0.9` 与 `v2.0.10`，合流后统一随 **`v2.1.0`** 发布，套件内版本断言统一对齐 `env!("CARGO_PKG_VERSION")`（`2.1.0`）。
 
 ## 1. `v2.0.8` 基线差异验证（Baseline Differential Verification）
 

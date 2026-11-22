@@ -945,7 +945,7 @@ fn build_synthetic_pe32_plus_exe(
     );
     exe.extend_from_slice(b"\0\0ELECTRONASARINTEGRITY\0\0");
     exe.extend_from_slice(integrity_rc.as_bytes());
-    while exe.len() % 8 != 0 {
+    while !exe.len().is_multiple_of(8) {
         exe.push(0);
     }
 
@@ -976,7 +976,7 @@ fn read_json_object(path: &Path) -> Map<String, Value> {
 #[test]
 fn tc_209_01_macos_claude_bundle_lifecycle_and_snapshot() {
     let (tmp, mut paths) = setup_sandbox();
-    assert_eq!(env!("CARGO_PKG_VERSION"), "2.0.9");
+    assert!(!env!("CARGO_PKG_VERSION").is_empty());
 
     // 1) Non-existent Claude.app -> NotInstalled
     paths.claude_app_override_dir = Some(tmp.path().join("MissingClaude.app"));
@@ -1040,7 +1040,10 @@ fn tc_209_01_macos_claude_bundle_lifecycle_and_snapshot() {
     let patched = patch_claude_ui_for_paths(&paths).expect("patch_claude_ui_for_paths must succeed");
     assert_eq!(patched.status, UiPatchStatus::Patched);
     assert!(patched.has_valid_backup);
-    assert_eq!(patched.patch_version.as_deref(), Some("2.0.9"));
+    assert_eq!(
+        patched.patch_version.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
     let target_str = patched
         .target_asar_path
         .as_deref()
@@ -1087,7 +1090,7 @@ fn tc_209_02_dual_asar_deep_binary_i18n_and_icu_invariants() {
     assert_eq!(app_marker.get("schema").and_then(Value::as_u64), Some(1));
     assert_eq!(
         app_marker.get("patchVersion").and_then(Value::as_str),
-        Some("2.0.9")
+        Some(env!("CARGO_PKG_VERSION"))
     );
     assert_eq!(
         app_marker
@@ -1189,7 +1192,7 @@ fn tc_209_02_dual_asar_deep_binary_i18n_and_icu_invariants() {
     assert_eq!(ion_marker.get("schema").and_then(Value::as_u64), Some(1));
     assert_eq!(
         ion_marker.get("patchVersion").and_then(Value::as_str),
-        Some("2.0.9")
+        Some(env!("CARGO_PKG_VERSION"))
     );
     assert_eq!(
         ion_marker
