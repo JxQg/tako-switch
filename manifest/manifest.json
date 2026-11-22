@@ -1,27 +1,27 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-21T13:53:23Z",
+  "generatedAt": "2026-11-21T22:35:04Z",
   "apps": {
     "dsh-tako": {
       "displayName": "DSH Tako",
-      "version": "0.1.56",
+      "version": "0.1.57",
       "platforms": {
         "macos-arm64": {
-          "url": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.56/DSH-Tako-0.1.56-mac-arm64.dmg",
-          "version": "0.1.56",
+          "url": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.57/DSH-Tako-0.1.57-mac-arm64.dmg",
+          "version": "0.1.57",
           "installType": "dmg",
-          "fallbackUrl": "https://github.com/tako-dev/dsh-tako-desktop/releases/download/v0.1.56/DSH-Tako-0.1.56-mac-arm64.dmg",
-          "sha256": "3bf34434aba316543777a61665dd62d0f7f6580ccfb1144da0cf51492b4dfa3e",
-          "size": 270742385,
+          "fallbackUrl": "https://github.com/tako-dev/dsh-tako-desktop/releases/download/v0.1.57/DSH-Tako-0.1.57-mac-arm64.dmg",
+          "sha256": "d44e429325e125577712950a25d8d013b4db3ae347a41da5b005fb8755e80250",
+          "size": 270914084,
           "appBundleName": "DSH Tako.app"
         },
         "windows-x64": {
-          "url": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.56/DSH-Tako-0.1.56-win-x64.exe",
-          "version": "0.1.56",
+          "url": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.57/DSH-Tako-0.1.57-win-x64.exe",
+          "version": "0.1.57",
           "installType": "exe",
-          "fallbackUrl": "https://github.com/tako-dev/dsh-tako-desktop/releases/download/v0.1.56/DSH-Tako-0.1.56-win-x64.exe",
-          "sha256": "8c35f091d16482c540a8834d428bd6c1c638d42f783c149fea8ae39aaa246d32",
-          "size": 313575019,
+          "fallbackUrl": "https://github.com/tako-dev/dsh-tako-desktop/releases/download/v0.1.57/DSH-Tako-0.1.57-win-x64.exe",
+          "sha256": "75b92541429182c75f26d840668eaaca2e4c8a65ef99ebc506820d16af102b1a",
+          "size": 313562816,
           "silentArgs": [
             "/S"
           ]

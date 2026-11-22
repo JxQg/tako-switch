@@ -178,11 +178,13 @@ pub fn mask_api_key(key: &str) -> String {
     format!("{head}…{tail}")
 }
 
-fn build_http_client() -> Result<Client, String> {
-    Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|e| format!("初始化 HTTP 客户端失败: {e}"))
+fn build_http_client(bypass_system_proxy: bool) -> Result<Client, String> {
+    crate::config::apply_proxy_policy(
+        Client::builder().timeout(Duration::from_secs(20)),
+        bypass_system_proxy,
+    )
+    .build()
+    .map_err(|e| format!("初始化 HTTP 客户端失败: {e}"))
 }
 
 fn generate_random_url_safe(num_bytes: usize) -> String {
@@ -371,7 +373,8 @@ pub async fn exchange_desktop_token(
     code_verifier: &str,
     redirect_uri: &str,
 ) -> Result<(), String> {
-    let client = build_http_client()?;
+    let bypass_proxy = read_switch_state(paths).bypass_system_proxy;
+    let client = build_http_client(bypass_proxy)?;
     let resp = client
         .post(format!("{base_url}/api/desktop/token"))
         .json(&serde_json::json!({
@@ -413,8 +416,9 @@ pub async fn login_with_key(paths: &AppPaths, raw_key: &str) -> Result<AccountSt
     if key.is_empty() {
         return Err("API Key 不能为空".to_string());
     }
-    let base_url = read_switch_state(paths).normalized_base_url();
-    let client = build_http_client()?;
+    let state = read_switch_state(paths);
+    let base_url = state.normalized_base_url();
+    let client = build_http_client(state.bypass_system_proxy)?;
 
     let verify_resp = client
         .post(format!("{base_url}/apiStats/api/verify-identity"))
@@ -446,7 +450,7 @@ pub async fn logout(paths: &AppPaths) -> Result<AccountStatus, String> {
     let auth = read_switch_auth(paths);
     if auth.auth_source.as_deref() == Some("oauth") {
         if let Some(key) = auth.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            if let Ok(client) = build_http_client() {
+            if let Ok(client) = build_http_client(state.bypass_system_proxy) {
                 let _ = client
                     .post(format!("{base_url}/api/desktop/revoke"))
                     .header("Authorization", format!("Bearer {key}"))
@@ -478,7 +482,8 @@ async fn get_key_id(client: &Client, base_url: &str, key: &str) -> Result<String
 }
 
 pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
-    let base_url = read_switch_state(paths).normalized_base_url();
+    let state = read_switch_state(paths);
+    let base_url = state.normalized_base_url();
     let Some(key) = read_main_api_key(paths) else {
         return AccountStatus {
             logged_in: false,
@@ -496,7 +501,7 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
     };
 
     let masked = Some(mask_api_key(&key));
-    let Ok(client) = build_http_client() else {
+    let Ok(client) = build_http_client(state.bypass_system_proxy) else {
         return AccountStatus {
             logged_in: true,
             base_url,

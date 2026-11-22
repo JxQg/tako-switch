@@ -2,13 +2,13 @@ use crate::adapters::{get_adapter, AppId, AppMode};
 #[cfg(not(target_os = "windows"))]
 use crate::config::write_atomic;
 use crate::config::{
-    effective_agy_api_key, read_main_api_key, read_switch_state, AppPaths, ClientModelFilter,
-    ModelFilterMode,
+    apply_proxy_policy, effective_agy_api_key, read_main_api_key, read_switch_state, AppPaths,
+    ClientModelFilter, ModelFilterMode,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
-use hyper::body::{Frame, Incoming};
+use hyper::body::{Body as HttpBody, Frame, Incoming};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -23,11 +23,14 @@ use std::convert::Infallible;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream as TokioTcpStream};
+use tokio::sync::{Notify, RwLock};
 
 pub const AGY_PROXY_PORT: u16 = 18419;
 pub const AGY_PROXY_URL: &str = "http://127.0.0.1:18419";
@@ -235,12 +238,163 @@ fn model_family_label(app_id: AppId, id: &str) -> &'static str {
     }
 }
 
+const PASSTHROUGH_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
+
 struct ProxyState {
     paths: AppPaths,
-    client: Client,
+    direct_client: Client,
+    system_proxy_client: Client,
     pricing_cache: RwLock<Option<(String, Instant, PricingCache)>>,
     synthetic_routes: RwLock<HashMap<String, SyntheticRoute>>,
     codex_model_messages: RwLock<Option<Value>>,
+}
+
+impl ProxyState {
+    fn upstream_client(&self, bypass_system_proxy: bool) -> &Client {
+        if bypass_system_proxy {
+            &self.direct_client
+        } else {
+            &self.system_proxy_client
+        }
+    }
+}
+
+struct SharedClientTcp {
+    inner: Arc<std::sync::Mutex<TokioTcpStream>>,
+}
+
+impl AsyncRead for SharedClientTcp {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Pin::new(&mut *guard).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SharedClientTcp {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Pin::new(&mut *guard).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Pin::new(&mut *guard).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Pin::new(&mut *guard).poll_shutdown(cx)
+    }
+}
+
+struct BodyDoneSignal {
+    done: AtomicBool,
+    notify: Notify,
+}
+
+impl BodyDoneSignal {
+    fn new(already_done: bool) -> Arc<Self> {
+        Arc::new(Self {
+            done: AtomicBool::new(already_done),
+            notify: Notify::new(),
+        })
+    }
+
+    fn mark_done(&self) {
+        self.done.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.done.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+async fn wait_for_client_disconnect(
+    downstream_tcp: Option<Arc<std::sync::Mutex<TokioTcpStream>>>,
+    body_done: Arc<BodyDoneSignal>,
+) {
+    let Some(tcp) = downstream_tcp else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    body_done.wait().await;
+    let outcome = std::future::poll_fn(|cx| {
+        let guard = tcp
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut raw = [0u8; 1];
+        let mut buf = ReadBuf::new(&mut raw);
+        guard.poll_peek(cx, &mut buf)
+    })
+    .await;
+    match outcome {
+        Ok(0) | Err(_) => {}
+        Ok(_) => {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+fn wrap_incoming_body_stream(incoming: Incoming, body_done: Arc<BodyDoneSignal>) -> reqwest::Body {
+    let stream = futures_util::stream::unfold(
+        (incoming.into_data_stream(), body_done, false),
+        |(mut data_stream, signal, finished)| async move {
+            if finished {
+                return None;
+            }
+            match data_stream.next().await {
+                Some(Ok(chunk)) => Some((
+                    Ok::<Bytes, std::io::Error>(chunk),
+                    (data_stream, signal, false),
+                )),
+                Some(Err(err)) => {
+                    signal.mark_done();
+                    Some((
+                        Err(std::io::Error::other(format!("读取下游请求体中断: {err}"))),
+                        (data_stream, signal, true),
+                    ))
+                }
+                None => {
+                    signal.mark_done();
+                    None
+                }
+            }
+        },
+    );
+    reqwest::Body::wrap_stream(stream)
 }
 
 fn current_utc_ymd() -> String {
@@ -2790,10 +2944,12 @@ pub async fn refresh_claude_catalog_cache(paths: &AppPaths) -> Result<(), String
     let base_url = state.normalized_base_url();
     let api_key = read_main_api_key(paths)
         .ok_or_else(|| "未登录 Tako 账号或缺少 API Key".to_string())?;
-    let client = Client::builder()
-        .timeout(Duration::from_secs(12))
-        .build()
-        .map_err(|e| format!("创建模型请求客户端失败: {e}"))?;
+    let client = apply_proxy_policy(
+        Client::builder().timeout(Duration::from_secs(12)),
+        state.bypass_system_proxy,
+    )
+    .build()
+    .map_err(|e| format!("创建模型请求客户端失败: {e}"))?;
 
     let (models_res, pricing_res) = tokio::join!(
         client
@@ -2987,7 +3143,11 @@ fn json_error_response(status: StatusCode, message: &str) -> Response<ProxyBody>
         .unwrap_or_else(|_| Response::new(full_body(Bytes::new())))
 }
 
-async fn get_pricing_cache(state: &ProxyState, base_url: &str) -> PricingCache {
+async fn get_pricing_cache(
+    state: &ProxyState,
+    base_url: &str,
+    bypass_system_proxy: bool,
+) -> PricingCache {
     {
         let guard = state.pricing_cache.read().await;
         if let Some((ref cached_base, fetched_at, ref cached)) = *guard {
@@ -2998,11 +3158,8 @@ async fn get_pricing_cache(state: &ProxyState, base_url: &str) -> PricingCache {
     }
 
     let url = format!("{base_url}/api/pricing");
-    let fetched = tokio::time::timeout(
-        Duration::from_secs(5),
-        state.client.get(&url).send(),
-    )
-    .await;
+    let client = state.upstream_client(bypass_system_proxy);
+    let fetched = tokio::time::timeout(Duration::from_secs(5), client.get(&url).send()).await;
 
     if let Ok(Ok(resp)) = fetched {
         if resp.status().is_success() {
@@ -3637,10 +3794,12 @@ pub fn build_plaza_model_options(
 pub async fn fetch_plaza_models_for_ui(paths: &AppPaths) -> Result<ClientModelsResponse, String> {
     let switch_state = read_switch_state(paths);
     let base_url = switch_state.normalized_base_url();
-    let client = Client::builder()
-        .timeout(Duration::from_secs(12))
-        .build()
-        .map_err(|e| format!("创建模型广场客户端失败: {e}"))?;
+    let client = apply_proxy_policy(
+        Client::builder().timeout(Duration::from_secs(12)),
+        switch_state.bypass_system_proxy,
+    )
+    .build()
+    .map_err(|e| format!("创建模型广场客户端失败: {e}"))?;
 
     let pricing_url = format!("{base_url}/api/pricing");
     let perf_url = format!("{base_url}/api/perf-metrics/summary");
@@ -3689,10 +3848,12 @@ pub async fn fetch_client_models_for_ui(
 
     let switch_state = read_switch_state(paths);
     let base_url = switch_state.normalized_base_url();
-    let client = Client::builder()
-        .timeout(Duration::from_secs(12))
-        .build()
-        .map_err(|e| format!("创建模型请求客户端失败: {e}"))?;
+    let client = apply_proxy_policy(
+        Client::builder().timeout(Duration::from_secs(12)),
+        switch_state.bypass_system_proxy,
+    )
+    .build()
+    .map_err(|e| format!("创建模型请求客户端失败: {e}"))?;
 
     let models_req = match app_id {
         AppId::DshTako => unreachable!(),
@@ -3797,12 +3958,14 @@ async fn handle_models_list(
 ) -> Response<ProxyBody> {
     let switch_state = read_switch_state(&state.paths);
     let base_url = switch_state.normalized_base_url();
+    let bypass_proxy = switch_state.bypass_system_proxy;
     let target_url = format!("{base_url}{path_and_query}");
     let headers = build_upstream_headers(&state.paths, incoming_headers, ClientKind::Antigravity);
+    let client = state.upstream_client(bypass_proxy);
 
     let (upstream_res, pricing) = tokio::join!(
-        state.client.get(&target_url).headers(headers).send(),
-        get_pricing_cache(&state, &base_url)
+        client.get(&target_url).headers(headers).send(),
+        get_pricing_cache(&state, &base_url, bypass_proxy)
     );
 
     let resp = match upstream_res {
@@ -3865,12 +4028,14 @@ async fn handle_codex_models(
 ) -> Response<ProxyBody> {
     let switch_state = read_switch_state(&state.paths);
     let base_url = switch_state.normalized_base_url();
+    let bypass_proxy = switch_state.bypass_system_proxy;
     let target_url = format!("{base_url}/v1/models");
     let headers = build_upstream_headers(&state.paths, incoming_headers, ClientKind::Codex);
+    let client = state.upstream_client(bypass_proxy);
 
     let (upstream_res, pricing, cached_mm) = tokio::join!(
-        state.client.get(&target_url).headers(headers).send(),
-        get_pricing_cache(&state, &base_url),
+        client.get(&target_url).headers(headers).send(),
+        get_pricing_cache(&state, &base_url, bypass_proxy),
         get_codex_model_messages(&state)
     );
 
@@ -3929,12 +4094,14 @@ async fn handle_claude_models(
 ) -> Response<ProxyBody> {
     let switch_state = read_switch_state(&state.paths);
     let base_url = switch_state.normalized_base_url();
+    let bypass_proxy = switch_state.bypass_system_proxy;
     let target_url = format!("{base_url}/v1/models");
     let headers = build_upstream_headers(&state.paths, incoming_headers, ClientKind::Claude);
+    let client = state.upstream_client(bypass_proxy);
 
     let (upstream_res, pricing) = tokio::join!(
-        state.client.get(&target_url).headers(headers).send(),
-        get_pricing_cache(&state, &base_url)
+        client.get(&target_url).headers(headers).send(),
+        get_pricing_cache(&state, &base_url, bypass_proxy)
     );
 
     let resp = match upstream_res {
@@ -4000,6 +4167,7 @@ fn strip_route_prefix(path_and_query: &str, prefix: &str) -> String {
 
 async fn handle_request(
     state: Arc<ProxyState>,
+    downstream_tcp: Option<Arc<std::sync::Mutex<TokioTcpStream>>>,
     req: Request<Incoming>,
 ) -> Result<Response<ProxyBody>, Infallible> {
     let path = req.uri().path().to_string();
@@ -4076,50 +4244,95 @@ async fn handle_request(
         }
     };
     let incoming_headers = req.headers().clone();
-    let body_bytes = match req.into_body().collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(err) => {
-            return Ok(json_error_response(
-                StatusCode::BAD_REQUEST,
-                &format!("读取请求体失败: {err}"),
-            ));
+    let stream_untouched = req
+        .body()
+        .size_hint()
+        .upper()
+        .map(|u| u > PASSTHROUGH_STREAM_THRESHOLD_BYTES)
+        .unwrap_or(true);
+    let incoming_body = req.into_body();
+
+    let switch_state = read_switch_state(&state.paths);
+    let base_url = switch_state.normalized_base_url();
+    let bypass_proxy = switch_state.bypass_system_proxy;
+
+    let collect_body = |body: Incoming| async move {
+        body.collect()
+            .await
+            .map(|c| c.to_bytes())
+            .map_err(|err| json_error_response(StatusCode::BAD_REQUEST, &format!("读取请求体失败: {err}")))
+    };
+
+    let passthrough_body = |body: Incoming| async move {
+        if stream_untouched {
+            let signal = BodyDoneSignal::new(false);
+            Ok((wrap_incoming_body_stream(body, signal.clone()), signal))
+        } else {
+            let bytes = collect_body(body).await?;
+            Ok((reqwest::Body::from(bytes), BodyDoneSignal::new(true)))
         }
     };
 
-    let base_url = read_switch_state(&state.paths).normalized_base_url();
-    let (client_kind, target_path_and_query, outbound_body) =
+    let (client_kind, target_path_and_query, outbound_body, body_done) =
         if path == "/codex" || path.starts_with("/codex/") {
             let stripped = strip_route_prefix(&path_and_query, "/codex");
-            (ClientKind::Codex, stripped, body_bytes)
+            let (body, sig) = match passthrough_body(incoming_body).await {
+                Ok(pair) => pair,
+                Err(resp) => return Ok(resp),
+            };
+            (ClientKind::Codex, stripped, body, sig)
         } else if path == "/claude" || path.starts_with("/claude/") {
             let stripped_path = path.strip_prefix("/claude").unwrap_or(&path);
-            let body = if method == Method::POST
+            let target_pq = strip_route_prefix(&path_and_query, "/claude");
+            if method == Method::POST
                 && (stripped_path == "/v1/messages"
                     || stripped_path == "/v1/messages/count_tokens")
             {
-                Bytes::from(normalize_claude_request_body(&body_bytes))
+                let bytes = match collect_body(incoming_body).await {
+                    Ok(b) => b,
+                    Err(resp) => return Ok(resp),
+                };
+                let normalized = Bytes::from(normalize_claude_request_body(&bytes));
+                (
+                    ClientKind::Claude,
+                    target_pq,
+                    reqwest::Body::from(normalized),
+                    BodyDoneSignal::new(true),
+                )
             } else {
-                body_bytes
-            };
-            (
-                ClientKind::Claude,
-                strip_route_prefix(&path_and_query, "/claude"),
-                body,
-            )
+                let (body, sig) = match passthrough_body(incoming_body).await {
+                    Ok(pair) => pair,
+                    Err(resp) => return Ok(resp),
+                };
+                (ClientKind::Claude, target_pq, body, sig)
+            }
         } else if path.starts_with("/v1/messages")
             || incoming_headers.contains_key("anthropic-version")
         {
-            let body = if method == Method::POST
+            if method == Method::POST
                 && (path == "/v1/messages" || path == "/v1/messages/count_tokens")
             {
-                Bytes::from(normalize_claude_request_body(&body_bytes))
+                let bytes = match collect_body(incoming_body).await {
+                    Ok(b) => b,
+                    Err(resp) => return Ok(resp),
+                };
+                let normalized = Bytes::from(normalize_claude_request_body(&bytes));
+                (
+                    ClientKind::Claude,
+                    path_and_query,
+                    reqwest::Body::from(normalized),
+                    BodyDoneSignal::new(true),
+                )
             } else {
-                body_bytes
-            };
-            (ClientKind::Claude, path_and_query, body)
+                let (body, sig) = match passthrough_body(incoming_body).await {
+                    Ok(pair) => pair,
+                    Err(resp) => return Ok(resp),
+                };
+                (ClientKind::Claude, path_and_query, body, sig)
+            }
         } else {
             let mut next_path = path_and_query;
-            let mut next_body = body_bytes;
+            let mut rewrite_effort: Option<String> = None;
             if let Some((model, action)) = parse_gemini_action_path(&path) {
                 let cached_route = {
                     let routes = state.synthetic_routes.read().await;
@@ -4128,7 +4341,7 @@ async fn handle_request(
                 let route = if let Some(hit) = cached_route {
                     Some(hit)
                 } else {
-                    let pricing = get_pricing_cache(&state, &base_url).await;
+                    let pricing = get_pricing_cache(&state, &base_url, bypass_proxy).await;
                     let routes = state.synthetic_routes.read().await;
                     resolve_synthetic_route(&model, &routes, &pricing)
                 };
@@ -4141,30 +4354,56 @@ async fn handle_request(
                         _ => format!("/v1beta/models/{}:{action}", route.base_model),
                     };
                     if action == "generateContent" || action == "streamGenerateContent" {
-                        next_body =
-                            Bytes::from(inject_thinking_effort(&next_body, &route.effort));
+                        rewrite_effort = Some(route.effort);
                     }
                 }
             }
-            (ClientKind::Antigravity, next_path, next_body)
+
+            if let Some(effort) = rewrite_effort {
+                let bytes = match collect_body(incoming_body).await {
+                    Ok(b) => b,
+                    Err(resp) => return Ok(resp),
+                };
+                let rewritten = Bytes::from(inject_thinking_effort(&bytes, &effort));
+                (
+                    ClientKind::Antigravity,
+                    next_path,
+                    reqwest::Body::from(rewritten),
+                    BodyDoneSignal::new(true),
+                )
+            } else {
+                let (body, sig) = match passthrough_body(incoming_body).await {
+                    Ok(pair) => pair,
+                    Err(resp) => return Ok(resp),
+                };
+                (ClientKind::Antigravity, next_path, body, sig)
+            }
         };
 
     let target_url = format!("{base_url}{target_path_and_query}");
     let upstream_headers = build_upstream_headers(&state.paths, &incoming_headers, client_kind);
+    let client = state.upstream_client(bypass_proxy);
 
-    let resp = match state
-        .client
+    let send_fut = client
         .request(method, &target_url)
         .headers(upstream_headers)
         .body(outbound_body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(err) => {
+        .send();
+
+    let resp = tokio::select! {
+        res = send_fut => match res {
+            Ok(r) => r,
+            Err(err) => {
+                return Ok(json_error_response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("转发上游请求失败: {err}"),
+                ));
+            }
+        },
+        () = wait_for_client_disconnect(downstream_tcp, body_done) => {
             return Ok(json_error_response(
-                StatusCode::BAD_GATEWAY,
-                &format!("转发上游请求失败: {err}"),
+                StatusCode::REQUEST_TIMEOUT,
+                "下游客户端连接已关闭，已取消上游转发",
             ));
         }
     };
@@ -4181,26 +4420,26 @@ async fn handle_request(
     }))
 }
 
-/// Runs the local unified Tako HTTP/SSE gateway on `127.0.0.1:<port>`.
-pub async fn run_proxy_server(port: u16) -> Result<(), String> {
-    let paths = AppPaths::detect()?;
-    let client = Client::builder()
+/// Serves the local unified Tako HTTP/SSE gateway on an already-bound `TcpListener`.
+pub async fn serve_proxy_on_listener(listener: TcpListener, paths: AppPaths) -> Result<(), String> {
+    let direct_client = Client::builder()
+        .no_proxy()
         .connect_timeout(Duration::from_secs(15))
         .build()
-        .map_err(|e| format!("创建代理 HTTP 客户端失败: {e}"))?;
+        .map_err(|e| format!("创建直连 HTTP 客户端失败: {e}"))?;
+    let system_proxy_client = Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_else(|_| direct_client.clone());
 
     let state = Arc::new(ProxyState {
         paths,
-        client,
+        direct_client,
+        system_proxy_client,
         pricing_cache: RwLock::new(None),
         synthetic_routes: RwLock::new(HashMap::new()),
         codex_model_messages: RwLock::new(None),
     });
-
-    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|e| format!("绑定 {addr} 失败: {e}"))?;
 
     loop {
         let (stream, _) = listener
@@ -4209,11 +4448,26 @@ pub async fn run_proxy_server(port: u16) -> Result<(), String> {
             .map_err(|e| format!("接受代理连接失败: {e}"))?;
         let state_clone = state.clone();
         tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let svc = service_fn(move |req| handle_request(state_clone.clone(), req));
+            let shared_tcp = Arc::new(std::sync::Mutex::new(stream));
+            let io = TokioIo::new(SharedClientTcp {
+                inner: shared_tcp.clone(),
+            });
+            let svc = service_fn(move |req| {
+                handle_request(state_clone.clone(), Some(shared_tcp.clone()), req)
+            });
             let _ = http1::Builder::new().serve_connection(io, svc).await;
         });
     }
+}
+
+/// Runs the local unified Tako HTTP/SSE gateway on `127.0.0.1:<port>`.
+pub async fn run_proxy_server(port: u16) -> Result<(), String> {
+    let paths = AppPaths::detect()?;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("绑定 {addr} 失败: {e}"))?;
+    serve_proxy_on_listener(listener, paths).await
 }
 
 fn probe_health_text(port: u16) -> Option<String> {

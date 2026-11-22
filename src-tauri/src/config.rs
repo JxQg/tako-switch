@@ -397,6 +397,8 @@ pub struct SwitchState {
     pub prefer_chinese_ui: bool,
     #[serde(default = "default_true")]
     pub show_tray_balance: bool,
+    #[serde(default = "default_true")]
+    pub bypass_system_proxy: bool,
     #[serde(default)]
     pub mcp: McpToolsConfig,
     #[serde(default)]
@@ -416,6 +418,7 @@ impl SwitchState {
             gateway_display_subtitle: DEFAULT_GATEWAY_DISPLAY_SUBTITLE.to_string(),
             prefer_chinese_ui: true,
             show_tray_balance: true,
+            bypass_system_proxy: true,
             mcp: McpToolsConfig::with_default_dir(paths),
             model_filters: ModelFiltersConfig::default(),
         }
@@ -449,6 +452,17 @@ impl SwitchState {
         } else {
             Some(trimmed.chars().take(60).collect())
         }
+    }
+}
+
+pub fn apply_proxy_policy(
+    builder: reqwest::ClientBuilder,
+    bypass_system_proxy: bool,
+) -> reqwest::ClientBuilder {
+    if bypass_system_proxy {
+        builder.no_proxy()
+    } else {
+        builder
     }
 }
 
@@ -831,6 +845,7 @@ mod tests {
         .unwrap();
 
         let loaded = read_switch_state(&paths);
+        assert!(loaded.bypass_system_proxy);
         assert_eq!(
             loaded.model_filters.claude.mode,
             ModelFilterMode::Recommended

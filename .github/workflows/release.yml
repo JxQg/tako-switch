@@ -228,6 +228,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           path: collected
@@ -242,6 +246,9 @@ jobs:
           tag="${TAG_INPUT:-${GITHUB_REF_NAME}}"
           version="${tag#v}"
           mkdir -p release-files
+          python3 scripts/extract_release_notes.py --changelog CHANGELOG.md --tag "$tag" --out release-notes.md
+          echo "=== Extracted release notes for $tag ==="
+          cat release-notes.md
           python3 - <<'PY'
           import datetime, glob, hashlib, json, os, shutil
 
@@ -265,10 +272,12 @@ jobs:
                   "url": f"{gh_base}/{asset}",
               }
 
+          notes = open("release-notes.md", encoding="utf-8").read().strip() or f"Tako Switch {tag}"
           now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
           json.dump(
-              {"version": version, "notes": f"Tako Switch {tag}", "pub_date": now, "platforms": platforms_gh},
+              {"version": version, "notes": notes, "pub_date": now, "platforms": platforms_gh},
               open("release-files/latest.json", "w", encoding="utf-8"),
+              ensure_ascii=False,
               indent=2,
           )
 
@@ -282,8 +291,9 @@ jobs:
 
           if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" release-files/* -R "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$tag" -R "$GITHUB_REPOSITORY" --notes-file release-notes.md
           else
-            gh release create "$tag" release-files/* -R "$GITHUB_REPOSITORY" --title "Tako Switch $tag" --generate-notes --latest
+            gh release create "$tag" release-files/* -R "$GITHUB_REPOSITORY" --title "Tako Switch $tag" --notes-file release-notes.md --latest
           fi
 
           # Retain only the newest v2.* release on GitHub Releases (never touch legacy v4.* releases).

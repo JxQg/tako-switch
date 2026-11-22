@@ -27,8 +27,11 @@ jobs:
       - name: Typecheck and build frontend
         run: npm run build
 
-      - name: Validate manifest sync unit tests
-        run: python3 -m unittest -v scripts/test_sync_manifest.py
+      - name: Validate manifest sync and release notes unit tests
+        run: |
+          python3 -m unittest -v scripts/test_sync_manifest.py
+          python3 -m unittest -v scripts/test_extract_release_notes.py
+          python3 scripts/extract_release_notes.py --changelog CHANGELOG.md --check-package-json package.json
 
       - name: Validate manifest.json structure
         run: |

@@ -78,6 +78,9 @@
 6. **双端点自更新与官方清单约定（`lib.rs`、`manifest.rs`、`scripts/sync-manifest.py`）**：
    - `tako-switch` 自身更新器在 `tauri.conf.json` 与 `lib.rs` 中同时支持阿里云上海 OSS 与 GitHub Releases 回退，通过 `choose_self_update_endpoints` 按 Semver 决定优先端点。
    - `manifest/manifest.json` 中的第三方客户端安装 URL 始终指向原厂官方无墙分发域名，不在仓库或自建 OSS 中转存第三方二进制包。
+7. **默认绕过系统代理与本地网关断连中止规则（`config.rs`、`agy_proxy.rs`、`auth.rs`、`mcp_server.rs`）**：
+   - `SwitchState.bypass_system_proxy`（JSON 键 `bypassSystemProxy`）默认值为 `true`（直连 Tako 网关 `.no_proxy()`），避免用户开启慢速全局/系统代理时劫持网关上行；在设置中关闭后无需重启守护进程即可动态切回系统代理。
+   - 本地网关转发无需改写的超大请求体（> 64 KiB）时采用流式透传，并在下游客户端断开 TCP 连接时立即中止上游请求，防止超时重试堆积僵尸上传。
 
 ---
 
@@ -93,8 +96,10 @@ npm run typecheck && npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
-# 3. 清单同步脚本测试与结构校验
+# 3. 清单同步脚本、更新日志提取测试与结构校验
 python3 -m unittest -v scripts/test_sync_manifest.py
+python3 -m unittest -v scripts/test_extract_release_notes.py
+python3 scripts/extract_release_notes.py --changelog CHANGELOG.md --check-package-json package.json
 python3 -c 'import json; d=json.load(open("manifest/manifest.json")); assert set(d["apps"])=={"dsh-tako","codex","claude","antigravity"}'
 
 # 4. 超级 MCP 内联剧场与安全门禁校验
@@ -105,10 +110,11 @@ python3 scripts/verify_client_mcp_ui.py --self-test && python3 scripts/verify_cl
 
 ## 发版规程（Release SOP）
 
-1. **同步升级版本号（三处必须严格一致）**：
+1. **同步升级版本号并补齐更新日志（四处必须严格一致）**：
    - `package.json`（及 `package-lock.json` 根 `"version"`）
    - `src-tauri/tauri.conf.json`
    - `src-tauri/Cargo.toml`（跑一次 `cargo check` 更新 `src-tauri/Cargo.lock`）
+   - `CHANGELOG.md`：在顶部新增 `## vX.Y.Z (YYYY-MM-DD)` 与面向用户的分条更新说明；CI 会校验并用 `scripts/extract_release_notes.py` 自动写入 `latest.json` 与 GitHub Release 正文。
 2. **先同步远端清单自动提交**：`sync-manifest.yml` 每 6 小时可能向 `main` 推送 `chore(manifest): sync desktop app versions [skip ci]`，push 前先 `git fetch origin main && git merge origin/main --no-edit`（不要 `git push --force`）。
 3. **显式路径提交并推 tag**：
    - 用 `git commit ... -- <文件列表>` 提交，并核对 `git show --stat HEAD`。
