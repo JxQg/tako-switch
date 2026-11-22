@@ -92,6 +92,7 @@ pub struct SettingsPatch {
     pub gateway_display_subtitle: Option<String>,
     pub prefer_chinese_ui: Option<bool>,
     pub show_tray_balance: Option<bool>,
+    pub bypass_system_proxy: Option<bool>,
     pub mcp: Option<McpToolsConfig>,
 }
 
@@ -661,6 +662,9 @@ async fn save_settings(app: AppHandle, input: SettingsPatch) -> Result<SwitchSta
     }
     if let Some(show_tray) = input.show_tray_balance {
         state.show_tray_balance = show_tray;
+    }
+    if let Some(bypass_proxy) = input.bypass_system_proxy {
+        state.bypass_system_proxy = bypass_proxy;
     }
     if let Some(mcp) = input.mcp {
         state.mcp = mcp;

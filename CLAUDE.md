@@ -78,6 +78,9 @@
 6. **双端点自更新与官方清单约定（`lib.rs`、`manifest.rs`、`scripts/sync-manifest.py`）**：
    - `tako-switch` 自身更新器在 `tauri.conf.json` 与 `lib.rs` 中同时支持阿里云上海 OSS 与 GitHub Releases 回退，通过 `choose_self_update_endpoints` 按 Semver 决定优先端点。
    - `manifest/manifest.json` 中的第三方客户端安装 URL 始终指向原厂官方无墙分发域名，不在仓库或自建 OSS 中转存第三方二进制包。
+7. **默认绕过系统代理与本地网关断连中止规则（`config.rs`、`agy_proxy.rs`、`auth.rs`、`mcp_server.rs`）**：
+   - `SwitchState.bypass_system_proxy`（JSON 键 `bypassSystemProxy`）默认值为 `true`（直连 Tako 网关 `.no_proxy()`），避免用户开启慢速全局/系统代理时劫持网关上行；在设置中关闭后无需重启守护进程即可动态切回系统代理。
+   - 本地网关转发无需改写的超大请求体（> 64 KiB）时采用流式透传，并在下游客户端断开 TCP 连接时立即中止上游请求，防止超时重试堆积僵尸上传。
 
 ---
 

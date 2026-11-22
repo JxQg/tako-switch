@@ -17,12 +17,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 const MAX_VOICE_SAMPLE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_LIVE_DEMO_PREVIEW_BYTES: u64 = 15 * 1024 * 1024;
 
-fn build_api_client(timeout_secs: u64) -> Result<Client, String> {
-    Client::builder()
-        .redirect(Policy::none())
-        .timeout(Duration::from_secs(timeout_secs))
-        .build()
-        .map_err(|e| format!("初始化 Tako API HTTP 客户端失败: {e}"))
+fn build_api_client(timeout_secs: u64, bypass_system_proxy: bool) -> Result<Client, String> {
+    crate::config::apply_proxy_policy(
+        Client::builder()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(timeout_secs)),
+        bypass_system_proxy,
+    )
+    .build()
+    .map_err(|e| format!("初始化 Tako API HTTP 客户端失败: {e}"))
 }
 
 fn build_cdn_client(timeout_secs: u64) -> Result<Client, String> {
@@ -444,8 +447,12 @@ async fn call_tool(paths: &AppPaths, name: &str, args: Value) -> Result<String, 
         "tako_generate_audio" => {
             exec_generate_audio(paths, &state.mcp, &base_url, &api_key, args).await
         }
-        "tako_web_search" => exec_web_search(&base_url, &api_key, args).await,
-        "tako_consult" => exec_consult(&state.mcp, &base_url, &api_key, args).await,
+        "tako_web_search" => {
+            exec_web_search(&base_url, &api_key, state.bypass_system_proxy, args).await
+        }
+        "tako_consult" => {
+            exec_consult(&state.mcp, &base_url, &api_key, state.bypass_system_proxy, args).await
+        }
         _ => unreachable!(),
     }
 }
@@ -577,7 +584,8 @@ async fn exec_generate_image(
     let refs = collect_reference_images(paths, &args);
     let mode = image_request_mode(model, refs.len())?;
 
-    let api_client = build_api_client(240)?;
+    let bypass_proxy = read_switch_state(paths).bypass_system_proxy;
+    let api_client = build_api_client(240, bypass_proxy)?;
 
     match mode {
         ImageRequestMode::GeminiNative => {
@@ -975,7 +983,8 @@ async fn exec_generate_video(
         .clamp(5, 300);
     let output_path_arg = args.get("output_path").and_then(Value::as_str);
 
-    let api_client = build_api_client(90)?;
+    let bypass_proxy = read_switch_state(paths).bypass_system_proxy;
+    let api_client = build_api_client(90, bypass_proxy)?;
 
     let task_id = if let Some(existing) = args
         .get("resume_task_id")
@@ -1287,7 +1296,8 @@ async fn exec_generate_audio(
     let output_path_arg = args.get("output_path").and_then(Value::as_str);
     let (payload, ext, model, voice_used) = build_audio_request_payload(paths, &args)?;
 
-    let client = build_api_client(120)?;
+    let bypass_proxy = read_switch_state(paths).bypass_system_proxy;
+    let client = build_api_client(120, bypass_proxy)?;
     let resp = client
         .post(format!("{base_url}/v1/audio/speech"))
         .header("Authorization", format!("Bearer {api_key}"))
@@ -1331,7 +1341,12 @@ async fn exec_generate_audio(
     serde_json::to_string_pretty(&summary).map_err(|e| e.to_string())
 }
 
-async fn exec_web_search(base_url: &str, api_key: &str, args: Value) -> Result<String, String> {
+async fn exec_web_search(
+    base_url: &str,
+    api_key: &str,
+    bypass_system_proxy: bool,
+    args: Value,
+) -> Result<String, String> {
     let query = args
         .get("query")
         .and_then(Value::as_str)
@@ -1352,7 +1367,7 @@ async fn exec_web_search(base_url: &str, api_key: &str, args: Value) -> Result<S
         payload["provider"] = Value::String(provider.to_string());
     }
 
-    let client = build_api_client(60)?;
+    let client = build_api_client(60, bypass_system_proxy)?;
     let resp = client
         .post(format!("{base_url}/v1/search"))
         .header("Authorization", format!("Bearer {api_key}"))
@@ -1377,6 +1392,7 @@ async fn exec_consult(
     cfg: &McpToolsConfig,
     base_url: &str,
     api_key: &str,
+    bypass_system_proxy: bool,
     args: Value,
 ) -> Result<String, String> {
     let question = args
@@ -1401,7 +1417,7 @@ async fn exec_consult(
         None => question.to_string(),
     };
 
-    let client = build_api_client(120)?;
+    let client = build_api_client(120, bypass_system_proxy)?;
     let resp = client
         .post(format!("{base_url}/v1/chat/completions"))
         .header("Authorization", format!("Bearer {api_key}"))
@@ -1826,6 +1842,7 @@ pub async fn execute_live_demo_for_paths(
             let raw = exec_web_search(
                 &base_url,
                 &api_key,
+                state.bypass_system_proxy,
                 json!({
                     "query": input.prompt,
                     "count": 4,
@@ -1853,6 +1870,7 @@ pub async fn execute_live_demo_for_paths(
                 &state.mcp,
                 &base_url,
                 &api_key,
+                state.bypass_system_proxy,
                 json!({
                     "question": input.prompt,
                     "model": input.model,

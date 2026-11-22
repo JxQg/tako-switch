@@ -206,11 +206,13 @@ function ToggleSwitch({
   onChange,
   disabled = false,
   ariaLabel,
+  testId,
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
   disabled?: boolean;
   ariaLabel?: string;
+  testId?: string;
 }) {
   return (
     <button
@@ -218,6 +220,7 @@ function ToggleSwitch({
       role="switch"
       aria-checked={checked}
       aria-label={ariaLabel}
+      data-testid={testId}
       disabled={disabled}
       onClick={() => onChange(!checked)}
       className={`relative inline-flex h-[20px] w-[36px] shrink-0 items-center rounded-full transition-colors duration-150 cursor-pointer disabled:opacity-50 ${
@@ -285,6 +288,7 @@ export default function App() {
     gatewayDisplaySubtitle: "Tako AI Gateway",
     preferChineseUi: true,
     showTrayBalance: true,
+    bypassSystemProxy: true,
   });
   const [savingSettings, setSavingSettings] = useState(false);
 
@@ -1043,6 +1047,7 @@ export default function App() {
       gatewayDisplaySubtitle: dashboard.state.gatewayDisplaySubtitle ?? "Tako AI Gateway",
       preferChineseUi: dashboard.state.preferChineseUi ?? true,
       showTrayBalance: dashboard.state.showTrayBalance ?? true,
+      bypassSystemProxy: dashboard.state.bypassSystemProxy ?? true,
     });
     setShowAdvancedSettings(false);
     setShowSettingsModal(true);
@@ -1065,6 +1070,7 @@ export default function App() {
         gatewayDisplaySubtitle: settingsForm.gatewayDisplaySubtitle.trim(),
         preferChineseUi: settingsForm.preferChineseUi,
         showTrayBalance: settingsForm.showTrayBalance,
+        bypassSystemProxy: settingsForm.bypassSystemProxy,
         mcp: {
           ...dashboard.state.mcp,
           outputDir: settingsForm.outputDir.trim(),
@@ -2244,6 +2250,25 @@ export default function App() {
                       ariaLabel="客户端优先简体中文"
                       onChange={(next) =>
                         setSettingsForm((s) => ({ ...s, preferChineseUi: next }))
+                      }
+                    />
+                  </div>
+
+                  <div className="settings-row px-3.5 py-2.5 flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="text-[13px] text-[var(--text-primary)]">
+                        直连 Tako 网关（绕过系统代理）
+                      </div>
+                      <div className="text-[11px] text-[var(--text-muted)]">
+                        默认不走系统代理直连网关，避免全局代理拖慢大请求上传与流式响应
+                      </div>
+                    </div>
+                    <ToggleSwitch
+                      checked={settingsForm.bypassSystemProxy}
+                      ariaLabel="直连 Tako 网关（绕过系统代理）"
+                      testId="settings-bypass-system-proxy-toggle"
+                      onChange={(next) =>
+                        setSettingsForm((s) => ({ ...s, bypassSystemProxy: next }))
                       }
                     />
                   </div>

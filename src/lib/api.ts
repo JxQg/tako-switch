@@ -109,6 +109,7 @@ export interface SwitchState {
   gatewayDisplaySubtitle?: string;
   preferChineseUi?: boolean;
   showTrayBalance?: boolean;
+  bypassSystemProxy?: boolean;
   mcp: McpToolsConfig;
   modelFilters?: ModelFiltersConfig;
 }
@@ -250,6 +251,7 @@ export interface SettingsPatch {
   gatewayDisplaySubtitle?: string;
   preferChineseUi?: boolean;
   showTrayBalance?: boolean;
+  bypassSystemProxy?: boolean;
   mcp?: McpToolsConfig;
 }
 
