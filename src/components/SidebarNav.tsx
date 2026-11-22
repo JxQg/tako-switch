@@ -83,7 +83,7 @@ export function SidebarNav({
               className={`h-[36px] w-full rounded-[9px] px-2.5 flex items-center gap-2.5 text-[13px] transition cursor-pointer whitespace-nowrap ${
                 active
                   ? "bg-[var(--bg-card)] text-[var(--text-primary)] font-semibold shadow-[var(--shadow-nav)]"
-                  : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  : "bg-transparent shadow-none text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
               }`}
             >
               <Icon
@@ -144,7 +144,7 @@ export function SidebarNav({
               className={`h-[36px] w-full rounded-[9px] px-2.5 flex items-center gap-2.5 text-[13px] transition cursor-pointer whitespace-nowrap ${
                 active
                   ? "bg-[var(--bg-card)] text-[var(--text-primary)] font-semibold shadow-[var(--shadow-nav)]"
-                  : "text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  : "bg-transparent shadow-none text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
               }`}
             >
               <AppBrandIcon appId={appId} className="h-5 w-5" />

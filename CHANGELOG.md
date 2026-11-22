@@ -2,6 +2,12 @@
 
 所有 Tako Switch 的重要版本更新说明都会记录在这里。每次发版时，CI 会自动提取对应版本段落，同步写入 `latest.json`（供客户端自更新与官网下载页展示）及 GitHub Release 正文。
 
+## v2.2.0 (2026-11-22)
+
+- 全新极简单域界面设计：左侧栏清晰划分「全局（总览 / 通用设置 / MCP 能力）」与「软件独立设置（Claude Desktop / Codex / Antigravity / DSH Tako）」，收拢各客户端专属配置与低频诊断，统一图标层级，MCP 实景剧场升级为按需滑出抽屉
+- 新增「网站上线 · Tako Web Page」MCP 能力（基于腾讯云 EdgeOne Pages）：开启后自动同步至已接管的 Claude Desktop、Codex 与 Antigravity，默认走浏览器一键授权免手动配密钥，支持 Node.js 运行时检测及可选 Token/项目名高级配置
+- 全面升级 Antigravity 简体中文全量汉化引擎：独立词典扩充至 3,041 条真实界面词条，新增标点归一化查表、动态正则模板（计时/相对时间/文件变更/步骤计数）、Shadow DOM 与同源本地 iframe 支持，并严格保护代码块、编辑器、终端与对话正文零误伤，保持原厂签名字节级无损还原
+
 ## v2.1.1 (2026-11-22)
 
 - 修复 Windows 构建 clippy 告警：装箱 Claude 适配器 `ResolvedClaudeTarget` 返回值，并为 v209 黑盒测试中的 Unix 专属辅助函数补充平台门禁；无用户可见行为变化

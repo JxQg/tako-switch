@@ -13,7 +13,8 @@
 | `v2.0.7` | 多机 OAuth 设备隔离与基础中文增强 | 引入持久化 8 位设备指纹 `~/.tako/switch/device-id` 防止多台电脑登录互顶 Token；为三端注入首版配置文件级中文回复与系统语言偏好。 |
 | `v2.0.8` | 三端汉化一步到位 + 模型广场 PR #296 同步 | 主界面一级入口一键三端汉化、Antigravity 纯 Rust 界面汉化补丁器与字节级原厂签名无损还原；完整同步网关模型广场人民币实付计价、明细/均价双视图、官方折扣倍率、限时特惠与 6 场景快捷筛选。 |
 | `v2.0.9` – `v2.0.10` | 代理直连流式优化与更新日志体系 | 新增默认绕过系统代理直连 Tako 网关、大请求体流式透传与下游断连即时中止；建立以 `CHANGELOG.md` 为单一真相源的自动提取发版流水线与客户端内更新日志弹窗。 |
-| **`v2.1.0`（当前）** | **Claude Desktop 全量界面汉化 + 跨平台权限引导解耦** | 新增纯 Rust 双 ASAR（`app.asar` + `ion-dist.asar`）Claude Desktop 全量简体中文补丁与字节级无损还原，覆盖 Chat / Cowork / Claude Code 工作台与 ICU 占位符安全校验；解耦配置文件级汉化与 ASAR 写入，新增 macOS「App 管理」权限弹窗直达、Windows Squirrel 数值排序、PE32+ 完整性修补与临时 UAC 提权工作进程。 |
+| `v2.1.0` – `v2.1.1` | Claude Desktop 全量界面汉化 + 跨平台权限引导解耦 | 新增纯 Rust 双 ASAR（`app.asar` + `ion-dist.asar`）Claude Desktop 全量简体中文补丁与字节级无损还原，覆盖 Chat / Cowork / Claude Code 工作台与 ICU 占位符安全校验；解耦配置文件级汉化与 ASAR 写入，新增 macOS「App 管理」权限弹窗直达、Windows Squirrel 数值排序、PE32+ 完整性修补与临时 UAC 提权工作进程。 |
+| **`v2.2.0`（当前）** | **极简界面重设计 + EdgeOne 网站上线 MCP + Antigravity 全量汉化** | 左侧栏「全局 / 软件独立设置」单域分栏架构与 MCP 抽屉剧场降噪重设计；新增 `Tako Web Page`（腾讯云 EdgeOne Pages）免密钥浏览器授权网站上线 MCP 全客户端同步与 Node.js 运行时检测；Antigravity 独立简体中文词典扩充至 3,041 条并升级动态模板/Shadow DOM/同源本地 iframe 零误伤翻译引擎。 |
 
 ---
 

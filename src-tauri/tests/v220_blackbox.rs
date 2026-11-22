@@ -486,18 +486,22 @@ fn tc_eo_02_build_edgeone_mcp_json_entry_without_credentials_and_whitespace_clea
     );
 
     // Case 1: None / None -> must omit `env` completely
-    let mut mcp_empty = McpToolsConfig::default();
-    mcp_empty.web_page = true;
-    mcp_empty.edgeone_api_token = None;
-    mcp_empty.edgeone_project_name = None;
+    let mcp_empty = McpToolsConfig {
+        web_page: true,
+        edgeone_api_token: None,
+        edgeone_project_name: None,
+        ..Default::default()
+    };
     let entry_empty = build_edgeone_mcp_json_entry(&mcp_empty);
     assert_json_edgeone_entry(&entry_empty, None, None, "no-credentials");
 
     // Case 2: Empty / whitespace-only strings -> sanitized away, must omit `env`
-    let mut mcp_blank = McpToolsConfig::default();
-    mcp_blank.web_page = true;
-    mcp_blank.edgeone_api_token = Some("   \t  ".to_string());
-    mcp_blank.edgeone_project_name = Some("\n  \r\n".to_string());
+    let mcp_blank = McpToolsConfig {
+        web_page: true,
+        edgeone_api_token: Some("   \t  ".to_string()),
+        edgeone_project_name: Some("\n  \r\n".to_string()),
+        ..Default::default()
+    };
     let entry_blank = build_edgeone_mcp_json_entry(&mcp_blank);
     assert_json_edgeone_entry(&entry_blank, None, None, "whitespace-only-credentials");
 }
@@ -505,26 +509,32 @@ fn tc_eo_02_build_edgeone_mcp_json_entry_without_credentials_and_whitespace_clea
 #[test]
 fn tc_eo_03_build_edgeone_mcp_json_entry_with_token_and_project_name() {
     // Only token (with surrounding whitespace), project blank
-    let mut mcp_tok = McpToolsConfig::default();
-    mcp_tok.web_page = true;
-    mcp_tok.edgeone_api_token = Some("  eo_tok_abc123 \n".to_string());
-    mcp_tok.edgeone_project_name = Some("   ".to_string());
+    let mcp_tok = McpToolsConfig {
+        web_page: true,
+        edgeone_api_token: Some("  eo_tok_abc123 \n".to_string()),
+        edgeone_project_name: Some("   ".to_string()),
+        ..Default::default()
+    };
     let entry_tok = build_edgeone_mcp_json_entry(&mcp_tok);
     assert_json_edgeone_entry(&entry_tok, Some("eo_tok_abc123"), None, "token-only");
 
     // Only project (with surrounding whitespace), token None
-    let mut mcp_proj = McpToolsConfig::default();
-    mcp_proj.web_page = true;
-    mcp_proj.edgeone_api_token = None;
-    mcp_proj.edgeone_project_name = Some("  demo-site-cn  ".to_string());
+    let mcp_proj = McpToolsConfig {
+        web_page: true,
+        edgeone_api_token: None,
+        edgeone_project_name: Some("  demo-site-cn  ".to_string()),
+        ..Default::default()
+    };
     let entry_proj = build_edgeone_mcp_json_entry(&mcp_proj);
     assert_json_edgeone_entry(&entry_proj, None, Some("demo-site-cn"), "project-only");
 
     // Both token and project set
-    let mut mcp_both = McpToolsConfig::default();
-    mcp_both.web_page = true;
-    mcp_both.edgeone_api_token = Some("  eo_tok_xyz789 ".to_string());
-    mcp_both.edgeone_project_name = Some(" prod-web ".to_string());
+    let mcp_both = McpToolsConfig {
+        web_page: true,
+        edgeone_api_token: Some("  eo_tok_xyz789 ".to_string()),
+        edgeone_project_name: Some(" prod-web ".to_string()),
+        ..Default::default()
+    };
     let entry_both = build_edgeone_mcp_json_entry(&mcp_both);
     assert_json_edgeone_entry(
         &entry_both,
