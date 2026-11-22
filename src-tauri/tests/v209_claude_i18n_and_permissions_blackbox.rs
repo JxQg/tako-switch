@@ -4,12 +4,19 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use tako_switch_lib::adapters::antigravity::AntigravityAdapter;
+#[cfg(unix)]
 use tako_switch_lib::adapters::claude::ClaudeAdapter;
+#[cfg(unix)]
 use tako_switch_lib::adapters::codex::CodexAdapter;
+#[cfg(unix)]
 use tako_switch_lib::apply_prefer_chinese_ui_for_paths;
-use tako_switch_lib::config::{read_switch_state, AppPaths};
+#[cfg(unix)]
+use tako_switch_lib::config::read_switch_state;
+use tako_switch_lib::config::AppPaths;
 use tempfile::TempDir;
+#[cfg(unix)]
 use toml_edit::DocumentMut;
 
 mod sym {
@@ -19,15 +26,19 @@ mod sym {
     pub use tako_switch_lib::adapters::claude_i18n::*;
 }
 
+#[cfg(unix)]
+use sym::{get_adapter, AppMode};
 use sym::{
-    classify_io_error_for_os, format_ui_patch_block_error, get_adapter, inspect_claude_ui_patch,
+    classify_io_error_for_os, format_ui_patch_block_error, inspect_claude_ui_patch,
     inspect_electron_asar_integrity_fuse, parse_ui_patch_block_error, patch_claude_ui_for_paths,
-    patch_windows_pe_asar_integrity, restore_claude_ui_for_paths, snapshot_app, AppId, AppMode,
+    patch_windows_pe_asar_integrity, restore_claude_ui_for_paths, snapshot_app, AppId,
     UiPatchBlockKind, UiPatchInfo, UiPatchPermissionPrompt, UiPatchStatus,
     CLAUDE_PATCH_GUARD_COMMENT, UI_PATCH_BLOCK_PREFIX,
 };
 
+#[cfg(unix)]
 const BLOCK_START: &str = "<!-- tako-switch:chinese-ui:start -->";
+#[cfg(unix)]
 const BLOCK_END: &str = "<!-- tako-switch:chinese-ui:end -->";
 const ASAR_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 const ELECTRON_FUSE_SENTINEL: &[u8; 32] = b"dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX";
@@ -216,43 +227,38 @@ fn setup_sandbox() -> (TempDir, AppPaths) {
     (tmp, paths)
 }
 
+#[cfg(unix)]
 struct ChmodRestoreGuard {
     dirs: Vec<PathBuf>,
 }
 
+#[cfg(unix)]
 impl ChmodRestoreGuard {
     fn new(dirs: Vec<PathBuf>) -> Self {
         Self { dirs }
     }
 
     fn set_mode(&self, mode: u32) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for dir in &self.dirs {
-                if dir.exists() {
-                    fs::set_permissions(dir, fs::Permissions::from_mode(mode))
-                        .unwrap_or_else(|e| panic!("chmod {mode:#o} on {}: {e}", dir.display()));
-                }
+        use std::os::unix::fs::PermissionsExt;
+        for dir in &self.dirs {
+            if dir.exists() {
+                fs::set_permissions(dir, fs::Permissions::from_mode(mode))
+                    .unwrap_or_else(|e| panic!("chmod {mode:#o} on {}: {e}", dir.display()));
             }
         }
-        #[cfg(not(unix))]
-        let _ = mode;
     }
 
     fn restore_writable(&self) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for dir in &self.dirs {
-                if dir.exists() {
-                    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
-                }
+        use std::os::unix::fs::PermissionsExt;
+        for dir in &self.dirs {
+            if dir.exists() {
+                let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
             }
         }
     }
 }
 
+#[cfg(unix)]
 impl Drop for ChmodRestoreGuard {
     fn drop(&mut self) {
         self.restore_writable();
@@ -674,6 +680,7 @@ fn write_fake_claude_macos_bundle(
     }
 }
 
+#[cfg(unix)]
 fn build_clean_antigravity_bundle(app_dir: &Path, app_version: &str) {
     let contents_dir = app_dir.join("Contents");
     let resources_dir = contents_dir.join("Resources");
@@ -966,6 +973,7 @@ fn build_synthetic_pe32_plus_exe(
     (exe, OPT_HDR_OFFSET, cert_file_offset)
 }
 
+#[cfg(unix)]
 fn read_json_object(path: &Path) -> Map<String, Value> {
     let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let val: Value =
