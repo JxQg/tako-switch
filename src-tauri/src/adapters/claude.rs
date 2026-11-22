@@ -1,12 +1,16 @@
 use crate::adapters::{
-    has_tako_mcp_server, merge_tako_mcp_server, read_json_object_or_empty, AppId, AppMode,
-    DesktopAppAdapter, DiagnosticResult, InstallInfo,
+    build_edgeone_mcp_json_entry, has_edgeone_mcp_server, has_tako_mcp_server,
+    merge_edgeone_mcp_server, merge_tako_mcp_server, read_json_object_or_empty, AppId, AppMode,
+    DesktopAppAdapter, DiagnosticResult, InstallInfo, EDGEONE_MCP_SERVER_KEY,
 };
 use crate::agy_proxy::{
     ensure_gateway_service, is_proxy_healthy, stop_gateway_service_if_unused,
     CLAUDE_PROXY_BASE_URL, LOCAL_GATEWAY_PORT, LOCAL_GATEWAY_URL,
 };
-use crate::config::{backup_file_once, read_backup, read_main_api_key, read_switch_state, write_atomic, AppPaths};
+use crate::config::{
+    backup_file_once, read_backup, read_main_api_key, read_switch_state, write_atomic, AppPaths,
+    McpToolsConfig,
+};
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine;
 use serde_json::{Map, Value};
@@ -73,7 +77,11 @@ impl ClaudeAdapter {
             .unwrap_or(false)
     }
 
-    fn set_claude_code_mcp_permissions(paths: &AppPaths, enable: bool) -> Result<(), String> {
+    fn set_claude_code_mcp_permissions(
+        paths: &AppPaths,
+        enable: bool,
+        enable_edgeone: bool,
+    ) -> Result<(), String> {
         let path = Self::claude_code_settings_path(paths);
         if !enable && !path.exists() {
             return Ok(());
@@ -81,10 +89,11 @@ impl ClaudeAdapter {
         backup_file_once(paths, "claude", "claude_code_settings.json", &path)?;
         let mut root = read_json_object_or_empty(&path)?;
 
-        let mut rules = Vec::with_capacity(crate::adapters::TAKO_MCP_TOOL_NAMES.len() + 1);
-        rules.push("mcp__tako__*".to_string());
+        let edgeone_rule = format!("mcp__{EDGEONE_MCP_SERVER_KEY}__*");
+        let mut tako_rules = Vec::with_capacity(crate::adapters::TAKO_MCP_TOOL_NAMES.len() + 1);
+        tako_rules.push("mcp__tako__*".to_string());
         for &tool_name in crate::adapters::TAKO_MCP_TOOL_NAMES {
-            rules.push(format!("mcp__tako__{tool_name}"));
+            tako_rules.push(format!("mcp__tako__{tool_name}"));
         }
 
         if enable {
@@ -102,10 +111,17 @@ impl ClaudeAdapter {
                     *allow = Value::Array(Vec::new());
                 }
                 if let Some(arr) = allow.as_array_mut() {
-                    for rule in &rules {
+                    for rule in &tako_rules {
                         if !arr.iter().any(|v| v.as_str() == Some(rule.as_str())) {
                             arr.push(Value::String(rule.clone()));
                         }
+                    }
+                    if enable_edgeone {
+                        if !arr.iter().any(|v| v.as_str() == Some(edgeone_rule.as_str())) {
+                            arr.push(Value::String(edgeone_rule));
+                        }
+                    } else {
+                        arr.retain(|v| v.as_str() != Some(edgeone_rule.as_str()));
                     }
                 }
             }
@@ -126,7 +142,7 @@ impl ClaudeAdapter {
                 if let Some(arr) = perm_obj.get_mut("allow").and_then(Value::as_array_mut) {
                     arr.retain(|v| {
                         v.as_str()
-                            .map(|s| !rules.iter().any(|r| r == s))
+                            .map(|s| !tako_rules.iter().any(|r| r == s) && s != edgeone_rule)
                             .unwrap_or(true)
                     });
                     if arr.is_empty() && !backup_had_allow {
@@ -442,7 +458,10 @@ impl DesktopAppAdapter for ClaudeAdapter {
                 Self::deactivate_3p(paths)?;
                 merge_tako_mcp_server(&mcp_1p, paths, false)?;
                 merge_tako_mcp_server(&mcp_3p, paths, false)?;
-                Self::set_claude_code_mcp_permissions(paths, false)?;
+                let empty_mcp = McpToolsConfig::default();
+                merge_edgeone_mcp_server(&mcp_1p, &empty_mcp, false)?;
+                merge_edgeone_mcp_server(&mcp_3p, &empty_mcp, false)?;
+                Self::set_claude_code_mcp_permissions(paths, false, false)?;
                 Self::sync_claude_chinese_locale(paths, false)?;
                 stop_gateway_service_if_unused(paths)
             }
@@ -526,15 +545,45 @@ impl DesktopAppAdapter for ClaudeAdapter {
                 // enforces `toolPolicy` for servers the deployment itself provides, so this
                 // is what makes the Tako tools usable without a per-tool approval prompt.
                 let mcp_entry = crate::adapters::build_stdio_mcp_json_entry(paths);
+                let mut managed_servers = vec![serde_json::json!({
+                    "name": "tako",
+                    "transport": "stdio",
+                    "command": mcp_entry.get("command").cloned().unwrap_or(Value::Null),
+                    "args": mcp_entry.get("args").cloned().unwrap_or_else(|| serde_json::json!([])),
+                    "toolPolicy": Value::Object(tool_policy)
+                })];
+                if state.mcp.web_page {
+                    let edgeone_entry = build_edgeone_mcp_json_entry(&state.mcp);
+                    let mut managed_edgeone = Map::new();
+                    managed_edgeone.insert(
+                        "name".to_string(),
+                        Value::String(EDGEONE_MCP_SERVER_KEY.to_string()),
+                    );
+                    managed_edgeone
+                        .insert("transport".to_string(), Value::String("stdio".to_string()));
+                    managed_edgeone.insert(
+                        "command".to_string(),
+                        edgeone_entry.get("command").cloned().unwrap_or(Value::Null),
+                    );
+                    managed_edgeone.insert(
+                        "args".to_string(),
+                        edgeone_entry
+                            .get("args")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!([])),
+                    );
+                    if let Some(env_val) = edgeone_entry.get("env") {
+                        managed_edgeone.insert("env".to_string(), env_val.clone());
+                    }
+                    managed_edgeone.insert(
+                        "toolPolicy".to_string(),
+                        serde_json::json!({ "*": "allow" }),
+                    );
+                    managed_servers.push(Value::Object(managed_edgeone));
+                }
                 profile.insert(
                     "managedMcpServers".to_string(),
-                    serde_json::json!([{
-                        "name": "tako",
-                        "transport": "stdio",
-                        "command": mcp_entry.get("command").cloned().unwrap_or(Value::Null),
-                        "args": mcp_entry.get("args").cloned().unwrap_or_else(|| serde_json::json!([])),
-                        "toolPolicy": Value::Object(tool_policy)
-                    }]),
+                    Value::Array(managed_servers),
                 );
                 profile.insert(
                     "organizationInstructions".to_string(),
@@ -583,7 +632,9 @@ impl DesktopAppAdapter for ClaudeAdapter {
                 // The 3p slot gets tako from the managed profile entry, not the user config,
                 // so leave the user config alone to avoid starting a second instance.
                 merge_tako_mcp_server(&mcp_3p, paths, false)?;
-                Self::set_claude_code_mcp_permissions(paths, true)?;
+                merge_edgeone_mcp_server(&mcp_1p, &state.mcp, state.mcp.web_page)?;
+                merge_edgeone_mcp_server(&mcp_3p, &state.mcp, state.mcp.web_page)?;
+                Self::set_claude_code_mcp_permissions(paths, true, state.mcp.web_page)?;
                 Self::sync_claude_chinese_locale(paths, state.prefer_chinese_ui)?;
                 Ok(())
             }
@@ -643,6 +694,11 @@ impl DesktopAppAdapter for ClaudeAdapter {
             }
             if !Self::has_managed_tako_mcp(paths) {
                 notes.push("提示: Claude-3p profile 尚未下发 tako MCP".to_string());
+            }
+            if has_edgeone_mcp_server(&Self::mcp_3p_path(paths))
+                || has_edgeone_mcp_server(&Self::mcp_1p_path(paths))
+            {
+                notes.push("网站上线 MCP (EdgeOne): 已启用 (tako-web-page)".to_string());
             }
             if read_switch_state(paths).prefer_chinese_ui || Self::is_chinese_configured(paths) {
                 notes.push("中文增强: 已启用 (locale=zh-Hans / Claude Code language=Simplified Chinese)".to_string());
@@ -1029,5 +1085,101 @@ mod tests {
         assert!(!cfg_3p.exists());
         assert!(!cfg_1p.exists());
         assert!(!cc_settings.exists());
+    }
+
+    #[test]
+    fn claude_edgeone_mcp_sync_enable_disable_and_official_preserves_existing() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        fs::create_dir_all(&paths.claude_1p_dir).unwrap();
+        fs::write(
+            ClaudeAdapter::mcp_1p_path(&paths),
+            r#"{"mcpServers":{"existing":{"command":"foo"}}}"#,
+        )
+        .unwrap();
+        save_switch_auth(&paths, Some("cr_claude_secret"), Some("2"), Some("oauth")).unwrap();
+
+        let mut st = read_switch_state(&paths);
+        st.mcp.web_page = true;
+        save_switch_state(&paths, &st).unwrap();
+
+        let adapter = ClaudeAdapter;
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+
+        assert!(has_edgeone_mcp_server(&ClaudeAdapter::mcp_1p_path(&paths)));
+        assert!(has_edgeone_mcp_server(&ClaudeAdapter::mcp_3p_path(&paths)));
+        let p1 = read_json_object_or_empty(&ClaudeAdapter::mcp_1p_path(&paths)).unwrap();
+        let p1_servers = p1["mcpServers"].as_object().unwrap();
+        assert!(p1_servers.contains_key("existing"));
+        assert!(p1_servers[EDGEONE_MCP_SERVER_KEY].get("env").is_none());
+
+        let prof = read_json_object_or_empty(&ClaudeAdapter::profile_3p_path(&paths)).unwrap();
+        let managed = prof["managedMcpServers"].as_array().unwrap();
+        assert_eq!(managed.len(), 2);
+        let edgeone_managed = managed
+            .iter()
+            .find(|e| e.get("name").and_then(Value::as_str) == Some(EDGEONE_MCP_SERVER_KEY))
+            .unwrap();
+        assert_eq!(edgeone_managed["command"], "npx");
+        assert_eq!(edgeone_managed["toolPolicy"]["*"], "allow");
+        assert!(edgeone_managed.get("env").is_none());
+
+        // Set token & project name and re-apply
+        st.mcp.edgeone_api_token = Some("eo_secret_1".to_string());
+        st.mcp.edgeone_project_name = Some("my-web".to_string());
+        save_switch_state(&paths, &st).unwrap();
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+
+        let p3 = read_json_object_or_empty(&ClaudeAdapter::mcp_3p_path(&paths)).unwrap();
+        assert_eq!(
+            p3["mcpServers"][EDGEONE_MCP_SERVER_KEY]["env"]["EDGEONE_PAGES_API_TOKEN"],
+            "eo_secret_1"
+        );
+        assert_eq!(
+            p3["mcpServers"][EDGEONE_MCP_SERVER_KEY]["env"]["EDGEONE_PAGES_PROJECT_NAME"],
+            "my-web"
+        );
+        let prof_tok = read_json_object_or_empty(&ClaudeAdapter::profile_3p_path(&paths)).unwrap();
+        let edgeone_managed_tok = prof_tok["managedMcpServers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e.get("name").and_then(Value::as_str) == Some(EDGEONE_MCP_SERVER_KEY))
+            .unwrap();
+        assert_eq!(
+            edgeone_managed_tok["env"]["EDGEONE_PAGES_API_TOKEN"],
+            "eo_secret_1"
+        );
+
+        // Disable web_page in Tako mode -> cleans up 1p/3p/managedMcpServers while keeping existing
+        st.mcp.web_page = false;
+        save_switch_state(&paths, &st).unwrap();
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+
+        assert!(!has_edgeone_mcp_server(&ClaudeAdapter::mcp_1p_path(&paths)));
+        assert!(!has_edgeone_mcp_server(&ClaudeAdapter::mcp_3p_path(&paths)));
+        let p1_disabled = read_json_object_or_empty(&ClaudeAdapter::mcp_1p_path(&paths)).unwrap();
+        assert!(p1_disabled["mcpServers"]
+            .as_object()
+            .unwrap()
+            .contains_key("existing"));
+        let prof_disabled =
+            read_json_object_or_empty(&ClaudeAdapter::profile_3p_path(&paths)).unwrap();
+        assert_eq!(prof_disabled["managedMcpServers"].as_array().unwrap().len(), 1);
+
+        // Re-enable then switch to Official -> cleaned up completely
+        st.mcp.web_page = true;
+        save_switch_state(&paths, &st).unwrap();
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        assert!(has_edgeone_mcp_server(&ClaudeAdapter::mcp_1p_path(&paths)));
+
+        adapter.apply_mode(&paths, AppMode::Official).unwrap();
+        assert!(!has_edgeone_mcp_server(&ClaudeAdapter::mcp_1p_path(&paths)));
+        assert!(!has_edgeone_mcp_server(&ClaudeAdapter::mcp_3p_path(&paths)));
+        let p1_off = read_json_object_or_empty(&ClaudeAdapter::mcp_1p_path(&paths)).unwrap();
+        assert!(p1_off["mcpServers"]
+            .as_object()
+            .unwrap()
+            .contains_key("existing"));
     }
 }

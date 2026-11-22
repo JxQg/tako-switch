@@ -22,7 +22,7 @@ pub use claude_i18n::{
     validate_icu_compatibility, CLAUDE_PATCH_GUARD_COMMENT,
 };
 
-use crate::config::{write_atomic, AppPaths};
+use crate::config::{write_atomic, AppPaths, McpToolsConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fs;
@@ -231,6 +231,280 @@ pub fn has_tako_mcp_server(path: &Path) -> bool {
                 .map(|s| s.contains_key("tako"))
         })
         .unwrap_or(false)
+}
+
+pub const EDGEONE_MCP_SERVER_KEY: &str = "tako-web-page";
+pub const EDGEONE_MCP_NPX_ARGS: &[&str] =
+    &["-y", "@edgeone/makers-mcp@latest", "--region", "china"];
+pub const EDGEONE_MCP_MIN_NODE_MAJOR: u32 = 18;
+
+pub fn build_edgeone_mcp_json_entry(mcp: &McpToolsConfig) -> Value {
+    let mut entry = Map::new();
+    entry.insert("command".to_string(), Value::String("npx".to_string()));
+    entry.insert(
+        "args".to_string(),
+        Value::Array(
+            EDGEONE_MCP_NPX_ARGS
+                .iter()
+                .map(|arg| Value::String((*arg).to_string()))
+                .collect(),
+        ),
+    );
+    let mut env = Map::new();
+    if let Some(token) = mcp.normalized_edgeone_api_token() {
+        env.insert(
+            "EDGEONE_PAGES_API_TOKEN".to_string(),
+            Value::String(token.to_string()),
+        );
+    }
+    if let Some(project) = mcp.normalized_edgeone_project_name() {
+        env.insert(
+            "EDGEONE_PAGES_PROJECT_NAME".to_string(),
+            Value::String(project.to_string()),
+        );
+    }
+    if !env.is_empty() {
+        entry.insert("env".to_string(), Value::Object(env));
+    }
+    Value::Object(entry)
+}
+
+pub fn merge_edgeone_mcp_server(
+    path: &Path,
+    mcp: &McpToolsConfig,
+    enable: bool,
+) -> Result<(), String> {
+    let mut root = if path.exists() {
+        read_json_object_or_empty(path)?
+    } else if !enable {
+        return Ok(());
+    } else {
+        Map::new()
+    };
+
+    if enable {
+        let servers = root
+            .entry("mcpServers".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !servers.is_object() {
+            *servers = Value::Object(Map::new());
+        }
+        if let Some(map) = servers.as_object_mut() {
+            map.insert(
+                EDGEONE_MCP_SERVER_KEY.to_string(),
+                build_edgeone_mcp_json_entry(mcp),
+            );
+        }
+    } else if let Some(servers) = root.get_mut("mcpServers").and_then(Value::as_object_mut) {
+        servers.remove(EDGEONE_MCP_SERVER_KEY);
+    }
+
+    let bytes = serde_json::to_vec_pretty(&Value::Object(root))
+        .map_err(|e| format!("序列化 {} 失败: {e}", path.display()))?;
+    write_atomic(path, &bytes, false)
+}
+
+pub fn has_edgeone_mcp_server(path: &Path) -> bool {
+    read_json_object_or_empty(path)
+        .ok()
+        .and_then(|m| {
+            m.get("mcpServers")
+                .and_then(Value::as_object)
+                .map(|s| s.contains_key(EDGEONE_MCP_SERVER_KEY))
+        })
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeRuntimeInfo {
+    pub available: bool,
+    pub version: Option<String>,
+    pub major: Option<u32>,
+    pub meets_min_version: bool,
+    pub node_path: Option<String>,
+    pub npx_path: Option<String>,
+}
+
+impl NodeRuntimeInfo {
+    pub fn unavailable() -> Self {
+        Self {
+            available: false,
+            version: None,
+            major: None,
+            meets_min_version: false,
+            node_path: None,
+            npx_path: None,
+        }
+    }
+}
+
+pub fn parse_node_version(raw: &str) -> Option<(String, u32)> {
+    let token = raw.split_whitespace().next()?.trim();
+    let stripped = token.strip_prefix('v').or_else(|| token.strip_prefix('V')).unwrap_or(token);
+    if stripped.is_empty() {
+        return None;
+    }
+    let core = stripped.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
+    let major_str = parts.next()?;
+    let major = major_str.parse::<u32>().ok()?;
+    for part in parts {
+        if part.is_empty() || part.parse::<u32>().is_err() {
+            return None;
+        }
+    }
+    Some((format!("v{stripped}"), major))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        (meta.permissions().mode() & 0o111) != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn node_search_dirs() -> Vec<PathBuf> {
+    let mut dirs_out = Vec::new();
+    if let Some(path_os) = std::env::var_os("PATH") {
+        dirs_out.extend(std::env::split_paths(&path_os));
+    }
+
+    #[cfg(not(windows))]
+    {
+        for fixed in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            dirs_out.push(PathBuf::from(fixed));
+        }
+        if let Some(home) = dirs::home_dir() {
+            for rel in [
+                ".volta/bin",
+                ".fnm/current/bin",
+                ".asdf/shims",
+                ".mise/shims",
+                ".nodenv/shims",
+            ] {
+                dirs_out.push(home.join(rel));
+            }
+            let nvm_dir = home.join(".nvm").join("versions").join("node");
+            if let Ok(entries) = fs::read_dir(nvm_dir) {
+                let mut versioned: Vec<((u32, u32, u32), PathBuf)> = entries
+                    .flatten()
+                    .filter_map(|entry| {
+                        let name = entry.file_name();
+                        let name_str = name.to_string_lossy();
+                        let stripped = name_str
+                            .strip_prefix('v')
+                            .or_else(|| name_str.strip_prefix('V'))
+                            .unwrap_or(&name_str);
+                        let core = stripped.split(['-', '+']).next()?;
+                        let mut parts = core.split('.');
+                        let major = parts.next()?.parse::<u32>().ok()?;
+                        let minor = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+                        let patch = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+                        Some(((major, minor, patch), entry.path().join("bin")))
+                    })
+                    .collect();
+                versioned.sort_by_key(|b| std::cmp::Reverse(b.0));
+                for (_, bin_dir) in versioned {
+                    dirs_out.push(bin_dir);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        dirs_out.push(PathBuf::from(r"C:\Program Files\nodejs"));
+        dirs_out.push(PathBuf::from(r"C:\Program Files (x86)\nodejs"));
+        if let Some(nvm_symlink) = std::env::var_os("NVM_SYMLINK") {
+            dirs_out.push(PathBuf::from(nvm_symlink));
+        }
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            dirs_out.push(PathBuf::from(local_app_data).join("Volta").join("bin"));
+        }
+    }
+
+    dirs_out
+}
+
+fn find_in_dirs(dirs: &[PathBuf], names: &[&str]) -> Option<PathBuf> {
+    for dir in dirs {
+        for name in names {
+            let candidate = dir.join(name);
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+pub fn detect_node_runtime() -> NodeRuntimeInfo {
+    #[cfg(windows)]
+    let node_names: &[&str] = &["node.exe", "node.cmd"];
+    #[cfg(not(windows))]
+    let node_names: &[&str] = &["node"];
+
+    #[cfg(windows)]
+    let npx_names: &[&str] = &["npx.cmd", "npx.exe"];
+    #[cfg(not(windows))]
+    let npx_names: &[&str] = &["npx"];
+
+    let search_dirs = node_search_dirs();
+    let node_path = find_in_dirs(&search_dirs, node_names);
+    let npx_path = node_path
+        .as_deref()
+        .and_then(Path::parent)
+        .and_then(|parent| find_in_dirs(&[parent.to_path_buf()], npx_names))
+        .or_else(|| find_in_dirs(&search_dirs, npx_names));
+
+    let mut cmd = match &node_path {
+        Some(p) => std::process::Command::new(p),
+        None => std::process::Command::new("node"),
+    };
+    cmd.arg("-v");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let parsed = cmd
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| parse_node_version(&String::from_utf8_lossy(&out.stdout)));
+
+    match parsed {
+        Some((version, major)) => NodeRuntimeInfo {
+            available: true,
+            version: Some(version),
+            major: Some(major),
+            meets_min_version: major >= EDGEONE_MCP_MIN_NODE_MAJOR,
+            node_path: node_path.map(|p| p.to_string_lossy().to_string()),
+            npx_path: npx_path.map(|p| p.to_string_lossy().to_string()),
+        },
+        None => NodeRuntimeInfo {
+            available: false,
+            version: None,
+            major: None,
+            meets_min_version: false,
+            node_path: node_path.map(|p| p.to_string_lossy().to_string()),
+            npx_path: npx_path.map(|p| p.to_string_lossy().to_string()),
+        },
+    }
 }
 
 pub const TAKO_CHINESE_BLOCK_START: &str = "<!-- tako-switch:chinese-ui:start -->";
@@ -527,5 +801,109 @@ mod tests {
         sync_managed_chinese_markdown(&paths, "codex", "AGENTS.md", &md_path, false, "").unwrap();
         let stripped = fs::read_to_string(&md_path).unwrap();
         assert_eq!(stripped, "# Top Rule\n\n# Bottom Rule\n");
+    }
+
+    #[test]
+    fn edgeone_mcp_entry_omits_env_when_blank_and_includes_non_empty_fields() {
+        let mut mcp = McpToolsConfig::default();
+        let entry_empty = build_edgeone_mcp_json_entry(&mcp);
+        assert_eq!(entry_empty["command"], "npx");
+        assert_eq!(
+            entry_empty["args"],
+            serde_json::json!(["-y", "@edgeone/makers-mcp@latest", "--region", "china"])
+        );
+        assert!(entry_empty.get("env").is_none());
+
+        mcp.edgeone_api_token = Some("   ".to_string());
+        mcp.edgeone_project_name = Some("\n\t ".to_string());
+        assert!(build_edgeone_mcp_json_entry(&mcp).get("env").is_none());
+
+        mcp.edgeone_api_token = Some("  eo_token_abc  ".to_string());
+        let entry_token_only = build_edgeone_mcp_json_entry(&mcp);
+        let env_obj = entry_token_only["env"].as_object().unwrap();
+        assert_eq!(env_obj.len(), 1);
+        assert_eq!(env_obj["EDGEONE_PAGES_API_TOKEN"], "eo_token_abc");
+        assert!(!env_obj.contains_key("EDGEONE_PAGES_PROJECT_NAME"));
+
+        mcp.edgeone_project_name = Some(" landing-prod ".to_string());
+        let entry_both = build_edgeone_mcp_json_entry(&mcp);
+        let env_both = entry_both["env"].as_object().unwrap();
+        assert_eq!(env_both.len(), 2);
+        assert_eq!(env_both["EDGEONE_PAGES_API_TOKEN"], "eo_token_abc");
+        assert_eq!(env_both["EDGEONE_PAGES_PROJECT_NAME"], "landing-prod");
+    }
+
+    #[test]
+    fn merge_edgeone_mcp_server_preserves_other_servers_and_skips_absent_on_disable() {
+        let tmp = TempDir::new().unwrap();
+        let mcp_path = tmp.path().join("mcp_config.json");
+        let mcp = McpToolsConfig {
+            web_page: true,
+            edgeone_api_token: Some("eo_tok".to_string()),
+            ..McpToolsConfig::default()
+        };
+
+        // Disabling when absent must not create the file
+        merge_edgeone_mcp_server(&mcp_path, &mcp, false).unwrap();
+        assert!(!mcp_path.exists());
+        assert!(!has_edgeone_mcp_server(&mcp_path));
+
+        // Preserve existing servers (including tako and user servers)
+        fs::write(
+            &mcp_path,
+            r#"{"mcpServers":{"tako":{"command":"tako-switch","args":["mcp-server"]},"custom":{"command":"my-mcp"}}}"#,
+        )
+        .unwrap();
+        merge_edgeone_mcp_server(&mcp_path, &mcp, true).unwrap();
+        assert!(has_edgeone_mcp_server(&mcp_path));
+        assert!(has_tako_mcp_server(&mcp_path));
+        let enabled_root = read_json_object_or_empty(&mcp_path).unwrap();
+        let servers = enabled_root["mcpServers"].as_object().unwrap();
+        assert!(servers.contains_key("tako"));
+        assert!(servers.contains_key("custom"));
+        assert_eq!(servers[EDGEONE_MCP_SERVER_KEY]["command"], "npx");
+        assert_eq!(
+            servers[EDGEONE_MCP_SERVER_KEY]["env"]["EDGEONE_PAGES_API_TOKEN"],
+            "eo_tok"
+        );
+
+        // Disabling removes only tako-web-page
+        merge_edgeone_mcp_server(&mcp_path, &mcp, false).unwrap();
+        assert!(!has_edgeone_mcp_server(&mcp_path));
+        assert!(has_tako_mcp_server(&mcp_path));
+        let disabled_root = read_json_object_or_empty(&mcp_path).unwrap();
+        let servers_after = disabled_root["mcpServers"].as_object().unwrap();
+        assert!(servers_after.contains_key("tako"));
+        assert!(servers_after.contains_key("custom"));
+        assert!(!servers_after.contains_key(EDGEONE_MCP_SERVER_KEY));
+    }
+
+    #[test]
+    fn parse_node_version_handles_v_prefix_prerelease_and_min_version_boundary() {
+        assert_eq!(
+            parse_node_version("v22.14.0\n"),
+            Some(("v22.14.0".to_string(), 22))
+        );
+        assert_eq!(
+            parse_node_version("v18.0.0"),
+            Some(("v18.0.0".to_string(), 18))
+        );
+        assert_eq!(
+            parse_node_version("v16.20.2"),
+            Some(("v16.20.2".to_string(), 16))
+        );
+        assert_eq!(
+            parse_node_version("20.11.1"),
+            Some(("v20.11.1".to_string(), 20))
+        );
+        assert_eq!(
+            parse_node_version("v23.1.0-nightly.20241101"),
+            Some(("v23.1.0-nightly.20241101".to_string(), 23))
+        );
+        assert!(parse_node_version("v18.0.0").unwrap().1 >= EDGEONE_MCP_MIN_NODE_MAJOR);
+        assert!(parse_node_version("v17.9.1").unwrap().1 < EDGEONE_MCP_MIN_NODE_MAJOR);
+        assert_eq!(parse_node_version(""), None);
+        assert_eq!(parse_node_version("not-a-version"), None);
+        assert_eq!(parse_node_version("v18.abc"), None);
     }
 }

@@ -1,7 +1,7 @@
 use crate::adapters::{
-    has_tako_mcp_server, merge_tako_mcp_server, read_json_object_or_empty,
-    sync_managed_chinese_markdown, AppId, AppMode, DesktopAppAdapter, DiagnosticResult,
-    InstallInfo,
+    has_edgeone_mcp_server, has_tako_mcp_server, merge_edgeone_mcp_server, merge_tako_mcp_server,
+    read_json_object_or_empty, sync_managed_chinese_markdown, AppId, AppMode, DesktopAppAdapter,
+    DiagnosticResult, InstallInfo,
 };
 use crate::agy_proxy::{
     ensure_gateway_service, is_proxy_healthy, stop_gateway_service_if_unused, LOCAL_GATEWAY_PORT,
@@ -9,6 +9,7 @@ use crate::agy_proxy::{
 };
 use crate::config::{
     backup_file_once, effective_agy_api_key, read_switch_state, write_atomic, AppPaths,
+    McpToolsConfig,
 };
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -28,6 +29,7 @@ const AGY_ENV_PLIST_LABEL: &str = "tech.shiroha.tako-switch.agy-env";
 #[cfg(target_os = "macos")]
 const AGY_MACOS_BUNDLE_ID: &str = "com.google.antigravity";
 const AGY_TAKO_MCP_GRANT: &str = "mcp(tako/*)";
+const AGY_EDGEONE_MCP_GRANT: &str = "mcp(tako-web-page/*)";
 
 const AGY_CHINESE_AGENTS_BODY: &str = "\
 - 默认使用简体中文回复用户，思考摘要、任务清单、实现计划与验收说明等产物默认使用简体中文（除非用户明确指定其他语言）。\n\
@@ -83,7 +85,11 @@ impl AntigravityAdapter {
             .unwrap_or(false)
     }
 
-    fn set_tako_mcp_permission(paths: &AppPaths, enable: bool) -> Result<(), String> {
+    fn set_tako_mcp_permission(
+        paths: &AppPaths,
+        enable: bool,
+        enable_edgeone: bool,
+    ) -> Result<(), String> {
         let path = Self::config_path(paths);
         if !enable && !path.exists() {
             return Ok(());
@@ -118,6 +124,13 @@ impl AntigravityAdapter {
                 if !arr.iter().any(|v| v.as_str() == Some(AGY_TAKO_MCP_GRANT)) {
                     arr.push(Value::String(AGY_TAKO_MCP_GRANT.to_string()));
                 }
+                if enable_edgeone {
+                    if !arr.iter().any(|v| v.as_str() == Some(AGY_EDGEONE_MCP_GRANT)) {
+                        arr.push(Value::String(AGY_EDGEONE_MCP_GRANT.to_string()));
+                    }
+                } else {
+                    arr.retain(|v| v.as_str() != Some(AGY_EDGEONE_MCP_GRANT));
+                }
             }
         } else if let Some(arr) = root
             .get_mut("userSettings")
@@ -127,7 +140,10 @@ impl AntigravityAdapter {
             .and_then(|g| g.get_mut("allow"))
             .and_then(Value::as_array_mut)
         {
-            arr.retain(|v| v.as_str() != Some(AGY_TAKO_MCP_GRANT));
+            arr.retain(|v| {
+                v.as_str() != Some(AGY_TAKO_MCP_GRANT)
+                    && v.as_str() != Some(AGY_EDGEONE_MCP_GRANT)
+            });
         }
 
         let bytes = serde_json::to_vec_pretty(&Value::Object(root))
@@ -370,7 +386,8 @@ impl DesktopAppAdapter for AntigravityAdapter {
             AppMode::Official => {
                 Self::clear_gateway_env(paths)?;
                 merge_tako_mcp_server(&mcp_path, paths, false)?;
-                Self::set_tako_mcp_permission(paths, false)?;
+                merge_edgeone_mcp_server(&mcp_path, &McpToolsConfig::default(), false)?;
+                Self::set_tako_mcp_permission(paths, false, false)?;
                 sync_managed_chinese_markdown(
                     paths,
                     "antigravity",
@@ -391,7 +408,8 @@ impl DesktopAppAdapter for AntigravityAdapter {
                 ensure_gateway_service(paths)?;
                 Self::set_gateway_env(paths, LOCAL_GATEWAY_URL, &api_key)?;
                 merge_tako_mcp_server(&mcp_path, paths, true)?;
-                Self::set_tako_mcp_permission(paths, true)?;
+                merge_edgeone_mcp_server(&mcp_path, &state.mcp, state.mcp.web_page)?;
+                Self::set_tako_mcp_permission(paths, true, state.mcp.web_page)?;
                 sync_managed_chinese_markdown(
                     paths,
                     "antigravity",
@@ -447,6 +465,9 @@ impl DesktopAppAdapter for AntigravityAdapter {
                     "提示: 未检测到 mcp(tako/*) 自动放行规则，重新点击 Tako 可自动补全"
                         .to_string(),
                 );
+            }
+            if has_edgeone_mcp_server(&Self::mcp_path(paths)) {
+                notes.push("网站上线 MCP (EdgeOne): 已启用 (tako-web-page)".to_string());
             }
             if read_switch_state(paths).prefer_chinese_ui || Self::is_chinese_configured(paths) {
                 notes.push("中文增强: 已启用 (~/.gemini/AGENTS.md 简体中文规则)".to_string());
@@ -937,5 +958,75 @@ mod tests {
 
         adapter.apply_mode(&paths, AppMode::Official).unwrap();
         assert!(!agents_path.exists());
+    }
+
+    #[test]
+    fn antigravity_edgeone_mcp_sync_enable_disable_and_official_preserves_other_servers() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        fs::create_dir_all(&paths.agy_gemini_config_dir).unwrap();
+        fs::write(
+            AntigravityAdapter::mcp_path(&paths),
+            r#"{"mcpServers":{"other":{"command":"other-mcp"}}}"#,
+        )
+        .unwrap();
+        save_switch_auth(&paths, Some("cr_main_key"), Some("1"), Some("oauth")).unwrap();
+
+        let mut st = read_switch_state(&paths);
+        st.mcp.web_page = true;
+        st.mcp.edgeone_api_token = Some("eo_agy_tok".to_string());
+        save_switch_state(&paths, &st).unwrap();
+
+        let adapter = AntigravityAdapter;
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+
+        assert!(has_tako_mcp_server(&AntigravityAdapter::mcp_path(&paths)));
+        assert!(has_edgeone_mcp_server(&AntigravityAdapter::mcp_path(&paths)));
+        let root = read_json_object_or_empty(&AntigravityAdapter::mcp_path(&paths)).unwrap();
+        let servers = root["mcpServers"].as_object().unwrap();
+        assert!(servers.contains_key("other"));
+        assert_eq!(
+            servers[crate::adapters::EDGEONE_MCP_SERVER_KEY]["env"]["EDGEONE_PAGES_API_TOKEN"],
+            "eo_agy_tok"
+        );
+        let cfg = read_json_object_or_empty(&AntigravityAdapter::config_path(&paths)).unwrap();
+        let allow = cfg["userSettings"]["globalPermissionGrants"]["allow"]
+            .as_array()
+            .unwrap();
+        assert!(allow.iter().any(|v| v.as_str() == Some(AGY_TAKO_MCP_GRANT)));
+        assert!(allow.iter().any(|v| v.as_str() == Some(AGY_EDGEONE_MCP_GRANT)));
+
+        // Disable web_page -> removes tako-web-page & grant, keeps tako and other
+        st.mcp.web_page = false;
+        save_switch_state(&paths, &st).unwrap();
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+
+        assert!(has_tako_mcp_server(&AntigravityAdapter::mcp_path(&paths)));
+        assert!(!has_edgeone_mcp_server(&AntigravityAdapter::mcp_path(&paths)));
+        let cfg_off_web =
+            read_json_object_or_empty(&AntigravityAdapter::config_path(&paths)).unwrap();
+        let allow_off_web = cfg_off_web["userSettings"]["globalPermissionGrants"]["allow"]
+            .as_array()
+            .unwrap();
+        assert!(allow_off_web
+            .iter()
+            .any(|v| v.as_str() == Some(AGY_TAKO_MCP_GRANT)));
+        assert!(!allow_off_web
+            .iter()
+            .any(|v| v.as_str() == Some(AGY_EDGEONE_MCP_GRANT)));
+
+        // Re-enable then switch Official -> cleans up both while preserving other
+        st.mcp.web_page = true;
+        save_switch_state(&paths, &st).unwrap();
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        adapter.apply_mode(&paths, AppMode::Official).unwrap();
+
+        assert!(!has_tako_mcp_server(&AntigravityAdapter::mcp_path(&paths)));
+        assert!(!has_edgeone_mcp_server(&AntigravityAdapter::mcp_path(&paths)));
+        let root_off = read_json_object_or_empty(&AntigravityAdapter::mcp_path(&paths)).unwrap();
+        assert!(root_off["mcpServers"]
+            .as_object()
+            .unwrap()
+            .contains_key("other"));
     }
 }
