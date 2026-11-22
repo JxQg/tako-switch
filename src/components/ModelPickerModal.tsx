@@ -259,6 +259,7 @@ function buildCardTitle(
 
 export function ModelPickerModal({
   appId,
+  appName,
   appRunning,
   loggedIn = true,
   apps,
@@ -599,37 +600,46 @@ export function ModelPickerModal({
         onClick={(e) => e.stopPropagation()}
         className="w-full max-w-[820px] h-[min(640px,92vh)] rounded-[16px] border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-modal)] flex flex-col overflow-hidden"
       >
-        {/* Top Header: View Tabs + Refresh + Close */}
-        <div className="px-3.5 py-2.5 border-b border-[var(--border)] flex flex-wrap items-center justify-between gap-2 shrink-0 bg-[var(--bg-card)]">
-          <div className="flex items-center flex-wrap gap-1.5 min-w-0">
-            <div className="inline-flex items-center flex-wrap p-0.5 rounded-[10px] bg-[var(--bg-pill)] border border-[var(--border)] max-w-full">
-              {VIEW_TABS.map((tab) => {
-                const active = activeView === tab.id;
-                return (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    disabled={saving}
-                    onClick={() => setActiveView(tab.id)}
-                    className={`h-7 px-2.5 rounded-[8px] text-[12px] inline-flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50 ${
-                      active
-                        ? "bg-[var(--bg-card)] text-[var(--accent)] font-semibold shadow-[var(--shadow-segment)]"
-                        : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
-                    }`}
-                  >
-                    <span className="hidden sm:inline-flex items-center shrink-0">
-                      {tab.id === "dsh-tako" ? (
-                        <Sparkles className="h-3.5 w-3.5 text-[var(--accent)]" />
-                      ) : (
-                        <AppBrandIcon appId={tab.id} className="h-4 w-4 rounded-[4px]" />
-                      )}
-                    </span>
-                    <span className="sm:hidden">{tab.shortLabel}</span>
-                    <span className="hidden sm:inline">{tab.label}</span>
-                  </button>
-                );
-              })}
-            </div>
+        {/* Top Header: Context-focused client title (or Plaza tabs) + Mode + Actions */}
+        <div className="px-4 py-3 border-b border-[var(--border)] flex flex-wrap items-center justify-between gap-2.5 shrink-0 bg-[var(--bg-card)]">
+          <div className="flex items-center flex-wrap gap-2 min-w-0">
+            {appId === "dsh-tako" ? (
+              <div className="inline-flex items-center flex-wrap p-0.5 rounded-[10px] bg-[var(--bg-pill)] border border-[var(--border)]/80 max-w-full">
+                {VIEW_TABS.map((tab) => {
+                  const active = activeView === tab.id;
+                  return (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      disabled={saving}
+                      onClick={() => setActiveView(tab.id)}
+                      className={`h-7 px-2.5 rounded-[8px] text-[12px] inline-flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50 ${
+                        active
+                          ? "bg-[var(--bg-card)] text-[var(--accent)] font-semibold shadow-[var(--shadow-segment)]"
+                          : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                      }`}
+                    >
+                      <span className="hidden sm:inline-flex items-center shrink-0">
+                        {tab.id === "dsh-tako" ? (
+                          <Sparkles className="h-3.5 w-3.5 text-[var(--accent)]" />
+                        ) : (
+                          <AppBrandIcon appId={tab.id} className="h-4 w-4 rounded-[4px]" />
+                        )}
+                      </span>
+                      <span className="sm:hidden">{tab.shortLabel}</span>
+                      <span className="hidden sm:inline">{tab.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="flex items-center gap-2 min-w-0">
+                <AppBrandIcon appId={activeView} className="h-5 w-5" />
+                <span className="text-[14px] font-semibold text-[var(--text-primary)] truncate">
+                  {appName || activeView} · 模型列表
+                </span>
+              </div>
+            )}
 
             {data && (
               <span className="tabular-nums text-[11px] font-medium px-2 py-0.5 rounded-full bg-[var(--accent-soft)] text-[var(--accent)] shrink-0">
