@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 pub const PATCH_MARKER_FILE: &str = "__tako_i18n_patch.json";
 pub const PATCH_GUARD_COMMENT: &str = "/* __TAKO_AGY_ZH_PATCH_V1__ */";
 pub const CURRENT_UI_PATCH_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const ANTIGRAVITY_ZH_DICT_JSON: &str = include_str!("antigravity_zh_dict.json");
 const ASAR_INTEGRITY_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,14 +473,23 @@ fn compute_asar_integrity(data: &[u8]) -> Value {
 
 const MENU_LEAF_TRANSLATIONS: &[(&str, &str)] = &[
     ("New Window", "新建窗口"),
+    ("New Tab", "新建标签页"),
     ("New Conversation", "新建对话"),
     ("Open...", "打开…"),
     ("Open Folder...", "打开文件夹…"),
+    ("Open Workspace...", "打开工作区…"),
     ("Open Recent", "打开最近使用"),
     ("Clear Recently Opened", "清除最近打开记录"),
+    ("Close Tab", "关闭标签页"),
     ("Close Window", "关闭窗口"),
     ("Settings...", "设置…"),
     ("Preferences...", "偏好设置…"),
+    ("Undo", "撤销"),
+    ("Redo", "重做"),
+    ("Cut", "剪切"),
+    ("Copy", "复制"),
+    ("Paste", "粘贴"),
+    ("Select All", "全选"),
     ("Actual Size", "实际大小"),
     ("Reset Zoom", "重置缩放"),
     ("Zoom In", "放大"),
@@ -490,6 +500,10 @@ const MENU_LEAF_TRANSLATIONS: &[(&str, &str)] = &[
     ("Force Reload", "强制重新加载"),
     ("Minimize", "最小化"),
     ("Bring All to Front", "前置全部窗口"),
+    ("Hide Antigravity", "隐藏 Antigravity"),
+    ("Hide Others", "隐藏其他"),
+    ("Show All", "显示全部"),
+    ("Services", "服务"),
     ("Docs", "官方文档"),
     ("Documentation", "官方文档"),
     ("Release Notes", "发行说明"),
@@ -505,6 +519,7 @@ const MENU_LEAF_TRANSLATIONS: &[(&str, &str)] = &[
     ("Open Antigravity", "打开 Antigravity"),
     ("Quit Antigravity", "退出 Antigravity"),
     ("Quit", "退出"),
+    ("Check for Updates", "检查更新"),
     ("Check for Updates...", "检查更新…"),
     ("Checking for Updates...", "正在检查更新…"),
     ("Download Update", "下载更新"),
@@ -541,6 +556,32 @@ fn replace_menu_label_literals(src: &str) -> String {
         }
     }
     out
+}
+
+fn patch_updater_dialog_literals(src: &str) -> String {
+    let mut out = src.to_string();
+    for &(from, to) in &[
+        ("title: 'Check for Updates'", "title: '检查更新'"),
+        ("title: \"Check for Updates\"", "title: \"检查更新\""),
+        ("message: 'No updates available'", "message: '暂无可用更新'"),
+        (
+            "message: \"No updates available\"",
+            "message: \"暂无可用更新\"",
+        ),
+        ("buttons: ['OK']", "buttons: ['确定']"),
+        ("buttons: [\"OK\"]", "buttons: [\"确定\"]"),
+    ] {
+        out = out.replace(from, to);
+    }
+    out
+}
+
+fn patch_tray_dynamic_count(src: &str) -> String {
+    const TRAY_COUNT_EXPR: &str = "(count > 0 ? `${count}` : 'No') +\n                    ' agent' +\n                    (count === 1 ? '' : 's') +\n                    ' running'";
+    const TRAY_COUNT_ZH: &str = "count > 0 ? `${count} 个智能体运行中` : '暂无运行中的智能体'";
+    let out = src.replace(TRAY_COUNT_EXPR, TRAY_COUNT_ZH);
+    let compact_expr = "(count > 0 ? `${count}` : 'No') + ' agent' + (count === 1 ? '' : 's') + ' running'";
+    out.replace(compact_expr, TRAY_COUNT_ZH)
 }
 
 fn replace_non_property_key_literal(src: &str, needle: &str, replacement: &str) -> String {
@@ -661,6 +702,7 @@ fn build_electron_menu_runtime_hook() -> String {
 function __takoBindZhUpdateActions(obj) {{
   if (!obj || typeof obj !== "object") return obj;
   var pairs = [
+    ["Check for Updates", "检查更新"],
     ["Check for Updates...", "检查更新…"],
     ["Checking for Updates...", "正在检查更新…"],
     ["Download Update", "下载更新"],
@@ -718,7 +760,9 @@ fn patch_main_process_js(raw_js: &str, is_updater: bool) -> String {
         return raw_js.to_string();
     }
     let mut transformed = replace_menu_label_literals(raw_js);
+    transformed = patch_tray_dynamic_count(&transformed);
     if is_updater {
+        transformed = patch_updater_dialog_literals(&transformed);
         transformed = wrap_update_actions_objects(&transformed);
     }
     let hook = build_electron_menu_runtime_hook();
@@ -737,289 +781,248 @@ fn patch_preload_js(raw_js: &str) -> String {
     }
 }
 
-fn build_preload_iife() -> &'static str {
-    r#"/* __TAKO_AGY_ZH_PATCH_V1__ */
+fn build_preload_iife() -> String {
+    let safe_dict_json = ANTIGRAVITY_ZH_DICT_JSON
+        .trim()
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+        .replace("</script", "<\\/script");
+
+    let mut out = String::with_capacity(safe_dict_json.len() + 12_000);
+    out.push_str(PATCH_GUARD_COMMENT);
+    out.push_str(
+        r#"
 ;(function () {
   try {
     if (typeof window === "undefined" || typeof document === "undefined") return;
-    if (window.top !== window.self) return;
     var host = (window.location && window.location.hostname) || "";
     if (host !== "127.0.0.1" && host !== "localhost") return;
     if (window.__TAKO_AGY_ZH_PATCHED__) return;
     window.__TAKO_AGY_ZH_PATCHED__ = true;
 
-    var DICT = Object.assign(Object.create(null), {
-      // Sidebar & Primary Navigation
-      "New Conversation": "新建对话",
-      "Start New Conversation": "开始新对话",
-      "Conversations": "对话列表",
-      "All Conversations": "全部对话",
-      "Recent Conversations": "最近对话",
-      "Pinned": "已置顶",
-      "Archive": "归档",
-      "Archived": "已归档",
-      "Inbox": "收件箱",
-      "Projects": "项目",
-      "New Project": "新建项目",
-      "Workspaces": "工作区",
-      "Open Workspace": "打开工作区",
-      "Add Workspace": "添加工作区",
-      "Select a workspace": "选择工作区",
-      "No workspace selected": "未选择工作区",
-      "Scheduled Tasks": "定时任务",
-      "New Scheduled Task": "新建定时任务",
-      "Skills & Customizations": "技能与定制",
-      "Customizations": "定制",
-      "Agents": "智能体",
-      "Skills": "技能",
-      "New Skill": "新建技能",
-      "Rules": "规则",
-      "New Rule": "新建规则",
-      "User Rules": "全局规则",
-      "Workspace Rules": "工作区规则",
-      "Memory": "记忆",
-      "Memories": "记忆库",
-      "MCP Servers": "MCP 服务",
-      "Add MCP Server": "添加 MCP 服务",
-      "Configure MCP": "配置 MCP",
-      "History": "历史记录",
-      "Search": "搜索",
-      "Settings": "设置",
-
-      // Settings & Security Policies
-      "Global Settings": "全局设置",
-      "Project-Level Settings": "项目级设置",
-      "Project Settings": "项目设置",
-      "App Settings": "应用设置",
-      "General": "通用",
-      "Appearance": "外观",
-      "Theme": "主题",
-      "Light": "浅色",
-      "Dark": "深色",
-      "System": "跟随系统",
-      "Language": "语言",
-      "Shortcuts": "快捷键",
-      "Keyboard Shortcuts": "键盘快捷键",
-      "Notifications": "通知",
-      "Account": "账号",
-      "Updates": "更新",
-      "Advanced": "高级",
-      "About": "关于",
-      "Model Selection": "模型选择",
-      "Default Model": "默认模型",
-      "Reasoning Effort": "推理强度",
-      "Tool Execution Policy": "工具执行策略",
-      "Terminal Sandbox": "终端沙盒",
-      "Non-Workspace File Access": "工作区外文件访问",
-      "Internet Access Policy": "联网访问策略",
-      "Permission Grants": "权限授权",
-      "Global Permission Grants": "全局权限授权",
-      "Command Allowlist": "命令白名单",
-      "Command Denylist": "命令黑名单",
-      "Browser Allowlist": "浏览器白名单",
-      "Browser Settings": "浏览器设置",
-      "Editor Settings": "编辑器设置",
-      "Auto": "自动",
-      "Always Ask": "每次询问",
-      "Ask": "询问",
-      "Always Allow": "始终允许",
-      "Allow": "允许",
-      "Deny": "拒绝",
-      "Enabled": "已启用",
-      "Disabled": "已禁用",
-      "On": "开启",
-      "Off": "关闭",
-      "Default": "默认",
-      "Custom": "自定义",
-      "Strict": "严格",
-      "Permissive": "宽松",
-      "Read Only": "只读",
-      "Read & Write": "读写",
-
-      // Panels, Tabs & Artifacts
-      "Subagents": "子智能体",
-      "Background Tasks": "后台任务",
-      "Artifacts": "产物",
-      "Files Changed": "变更文件",
-      "Changed Files": "变更文件",
-      "Changes": "变更",
-      "Diff": "差异对比",
-      "Terminals": "终端",
-      "Terminal": "终端",
-      "New Terminal": "新建终端",
-      "Browser": "浏览器",
-      "Files": "文件",
-      "Explorer": "文件浏览",
-      "Output": "输出",
-      "Problems": "问题",
-      "Console": "控制台",
-      "Logs": "日志",
-      "Preview": "预览",
-      "Code": "代码",
-      "Plan": "实现计划",
-      "Implementation Plan": "实现计划",
-      "Task List": "任务清单",
-      "Walkthrough": "验收说明",
-      "Timeline": "时间线",
-      "Outline": "大纲",
-
-      // Actions & Conversation Controls
-      "Send": "发送",
-      "Stop": "停止",
-      "Retry": "重试",
-      "Regenerate": "重新生成",
-      "Continue": "继续",
-      "Approve": "批准",
-      "Reject": "拒绝",
-      "Proceed": "继续执行",
-      "Review": "审查",
-      "Accept": "接受",
-      "Accept All": "全部接受",
-      "Discard": "放弃",
-      "Discard All": "全部放弃",
-      "Cancel": "取消",
-      "Confirm": "确认",
-      "Save": "保存",
-      "Apply": "应用",
-      "Reset": "重置",
-      "Close": "关闭",
-      "Open": "打开",
-      "Open in Editor": "在编辑器中打开",
-      "Open in Terminal": "在终端中打开",
-      "Reveal in Finder": "在访达中显示",
-      "Show in Explorer": "在资源管理器中显示",
-      "Copy": "复制",
-      "Copied": "已复制",
-      "Copied!": "已复制！",
-      "Copy Path": "复制路径",
-      "Paste": "粘贴",
-      "Cut": "剪切",
-      "Edit": "编辑",
-      "Rename": "重命名",
-      "Duplicate": "创建副本",
-      "Delete": "删除",
-      "Remove": "移除",
-      "Clear": "清空",
-      "Refresh": "刷新",
-      "Reload": "重新加载",
-      "Add": "添加",
-      "Create": "创建",
-      "New": "新建",
-      "Import": "导入",
-      "Export": "导出",
-      "Install": "安装",
-      "Uninstall": "卸载",
-      "Update": "更新",
-      "Check for Updates": "检查更新",
-      "Check for Updates...": "检查更新…",
-      "Back": "返回",
-      "Next": "下一步",
-      "Previous": "上一步",
-      "Done": "完成",
-      "Submit": "提交",
-      "Expand": "展开",
-      "Collapse": "收起",
-      "Show More": "显示更多",
-      "Show Less": "收起",
-      "Details": "详情",
-      "View Details": "查看详情",
-      "Filter": "筛选",
-      "Sort": "排序",
-      "Run": "运行",
-      "Run Now": "立即运行",
-      "Pause": "暂停",
-      "Resume": "恢复",
-
-      // Auth, Statuses & Empty States
-      "Sign in": "登录",
-      "Sign In": "登录",
-      "Log in": "登录",
-      "Sign out": "退出登录",
-      "Sign Out": "退出登录",
-      "Log out": "退出登录",
-      "Switch Account": "切换账号",
-      "Loading...": "加载中…",
-      "Thinking...": "思考中…",
-      "Thought": "思考过程",
-      "Running...": "运行中…",
-      "Running": "运行中",
-      "Completed": "已完成",
-      "Failed": "失败",
-      "Pending": "等待中",
-      "Queued": "排队中",
-      "Cancelled": "已取消",
-      "Canceled": "已取消",
-      "Idle": "空闲",
-      "Connected": "已连接",
-      "Disconnected": "已断开",
-      "Online": "在线",
-      "Offline": "离线",
-      "Recent": "最近",
-      "Today": "今天",
-      "Yesterday": "昨天",
-      "No results found": "未找到匹配结果",
-      "No conversations yet": "暂无对话",
-      "No scheduled tasks": "暂无定时任务",
-      "No background tasks": "暂无后台任务",
-      "No files changed": "暂无变更文件",
-      "No artifacts": "暂无产物",
-      "No agents running": "暂无运行中的智能体",
-      "Ask anything...": "输入问题或指令…",
-      "Ask Antigravity...": "向 Antigravity 提问…",
-      "Type a message...": "输入消息…",
-      "Search...": "搜索…",
-      "Search conversations...": "搜索对话…",
-      "Search settings...": "搜索设置…",
-      "Restart Required": "需重启生效",
-      "Restart Now": "立即重启",
-      "Later": "稍后",
-      "Learn more": "了解更多",
-      "Documentation": "官方文档",
-      "Docs": "官方文档",
-      "Feedback": "意见反馈",
-      "Version": "版本",
-      "Status": "状态",
-      "Actions": "操作",
-      "Name": "名称",
-      "Description": "描述",
-      "Command": "命令",
-      "Arguments": "参数",
-      "Environment Variables": "环境变量",
-      "Working Directory": "工作目录",
-      "Schedule": "调度计划"
-    });
+    var DICT = Object.assign(Object.create(null), "#,
+    );
+    out.push_str(&safe_dict_json);
+    out.push_str(
+        r#");
 
     var SKIP_TAGS = {
-      CODE: 1,
-      PRE: 1,
-      KBD: 1,
       SCRIPT: 1,
       STYLE: 1,
+      CODE: 1,
+      PRE: 1,
       TEXTAREA: 1,
-      NOSCRIPT: 1,
+      INPUT: 1,
+      KBD: 1,
+      SAMP: 1,
       SVG: 1,
-      MATH: 1
+      MATH: 1,
+      NOSCRIPT: 1
     };
-    var SKIP_SELECTOR =
-      'code, pre, kbd, script, style, textarea, [contenteditable="true"], [contenteditable=""], .monaco-editor, .xterm, [data-no-i18n]';
+    var SKIP_TEXT_SELECTOR =
+      'script, style, code, pre, textarea, input, kbd, samp, svg, math, noscript, [contenteditable="true"], [contenteditable=""], [role="textbox"], [data-monaco-editor], .monaco-editor, .xterm, [data-no-i18n]';
+    var SKIP_ATTR_SELECTOR =
+      'script, style, code, pre, kbd, samp, svg, math, noscript, [data-monaco-editor], .monaco-editor, .xterm, [data-no-i18n]';
+    var CHAT_BODY_SELECTOR =
+      '.markdown-body, .prose, [data-message-role], [data-testid*="message-content"], [data-testid*="markdown"], .message-content, .chat-markdown';
     var ATTRS = ["placeholder", "title", "aria-label"];
+    var MAX_RAW_LEN = 240;
+    var MAX_TRIMMED_LEN = 220;
 
-    function isSkippedElement(el) {
+    function hasCjk(str) {
+      return /[\u4e00-\u9fff]/.test(str);
+    }
+
+    function looksLikeCodeOrPath(str) {
+      if (!str) return false;
+      if (/https?:\/\/|file:\/\/|ssh:\/\//i.test(str)) return true;
+      if (/^(\/|[A-Za-z]:\\|~\/)[^\s]+/.test(str)) return true;
+      if (/\b(?:function|const|let|var|import|export|return|class|interface|struct|impl|def)\b\s+\w/.test(str)) {
+        return true;
+      }
+      if (/=>|::|<\/?[a-zA-Z][\w-]*[\s>]|^\s*[\{\[\(].*[\}\]\)]\s*$/.test(str)) return true;
+      if (/[\\;]/.test(str) && !/\s/.test(str)) return true;
+      return false;
+    }
+
+    function lookupDict(trimmed) {
+      var direct = DICT[trimmed];
+      if (direct) return direct;
+      if (trimmed.length > 2) {
+        if (trimmed.endsWith(":") && !trimmed.endsWith("://")) {
+          var baseColon = trimmed.slice(0, -1).trim();
+          if (baseColon && DICT[baseColon]) return DICT[baseColon] + "：";
+        } else if (trimmed.endsWith("...")) {
+          var baseDots = trimmed.slice(0, -3).trim();
+          if (baseDots && DICT[baseDots]) return DICT[baseDots] + "...";
+        } else if (trimmed.endsWith("…")) {
+          var baseEllipsis = trimmed.slice(0, -1).trim();
+          if (baseEllipsis && DICT[baseEllipsis]) return DICT[baseEllipsis] + "…";
+        }
+      }
+      return null;
+    }
+
+    function translateShortNoun(phrase) {
+      var trimmed = phrase.trim();
+      if (!trimmed) return phrase;
+      var exact = DICT[trimmed];
+      if (exact) return exact;
+      var cap = trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+      if (DICT[cap]) return DICT[cap];
+      return trimmed;
+    }
+
+    var DYNAMIC_RULES = [
+      // Timing & thinking status
+      [/^Thinking for\s+([0-9]+(?:\.[0-9]+)?\s*(?:ms|s|m|h|sec|secs|second|seconds|min|mins|minute|minutes)(?:\s+[0-9]+\s*(?:s|m))?)$/i, function (m) { return "正在思考 " + m[1]; }],
+      [/^Thought for\s+([0-9]+(?:\.[0-9]+)?\s*(?:ms|s|m|h|sec|secs|second|seconds|min|mins|minute|minutes)(?:\s+[0-9]+\s*(?:s|m))?)$/i, function (m) { return "已思考 " + m[1]; }],
+      [/^Worked for\s+([0-9]+(?:\.[0-9]+)?\s*(?:ms|s|m|h|sec|secs|second|seconds|min|mins|minute|minutes)(?:\s+[0-9]+\s*(?:s|m))?)$/i, function (m) { return "已执行 " + m[1]; }],
+      [/^Running for\s+([0-9]+(?:\.[0-9]+)?\s*(?:ms|s|m|h|sec|secs|second|seconds|min|mins|minute|minutes)(?:\s+[0-9]+\s*(?:s|m))?)$/i, function (m) { return "已运行 " + m[1]; }],
+      [/^Still thinking,\s*(\d+)\s+seconds?$/i, function (m) { return "仍在思考，已用 " + m[1] + " 秒"; }],
+
+      // Relative time
+      [/^(\d+)\s*s\s+ago$/i, function (m) { return m[1] + " 秒前"; }],
+      [/^(\d+)\s*m\s+ago$/i, function (m) { return m[1] + " 分钟前"; }],
+      [/^(\d+)\s*h\s+ago$/i, function (m) { return m[1] + " 小时前"; }],
+      [/^(\d+)\s*d\s+ago$/i, function (m) { return m[1] + " 天前"; }],
+      [/^(\d+)\s+seconds?\s+ago$/i, function (m) { return m[1] + " 秒前"; }],
+      [/^(\d+)\s+minutes?\s+ago$/i, function (m) { return m[1] + " 分钟前"; }],
+      [/^(\d+)\s+hours?\s+ago$/i, function (m) { return m[1] + " 小时前"; }],
+      [/^(\d+)\s+days?\s+ago$/i, function (m) { return m[1] + " 天前"; }],
+      [/^(\d+)\s+weeks?\s+ago$/i, function (m) { return m[1] + " 周前"; }],
+      [/^(\d+)\s+months?\s+ago$/i, function (m) { return m[1] + " 个月前"; }],
+      [/^(\d+)\s+years?\s+ago$/i, function (m) { return m[1] + " 年前"; }],
+      [/^Resets in\s+([<>0-9a-zA-Z\s]{1,20})$/, function (m) { return "将在 " + m[1].trim() + " 后重置"; }],
+
+      // File & diff statistics
+      [/^(\d+)\s+files?\s+changed$/i, function (m) { return "已变更 " + m[1] + " 个文件"; }],
+      [/^(\d+)\s+lines?\s+added$/i, function (m) { return "新增 " + m[1] + " 行"; }],
+      [/^(\d+)\s+lines?\s+(?:removed|deleted)$/i, function (m) { return "删除 " + m[1] + " 行"; }],
+      [/^Showing lines\s+(\d+)\s*[-–]\s*(\d+)\s+of\s+(\d+)$/i, function (m) { return "显示第 " + m[1] + "-" + m[2] + " 行（共 " + m[3] + " 行）"; }],
+      [/^Unfold lines\s+(\d+)\s*[-–]\s*(\d+)$/i, function (m) { return "展开第 " + m[1] + "-" + m[2] + " 行"; }],
+      [/^Fold lines\s+(\d+)\s*[-–]\s*(\d+)$/i, function (m) { return "折叠第 " + m[1] + "-" + m[2] + " 行"; }],
+      [/^Showing first\s+(\d+)\s+references?$/i, function (m) { return "显示前 " + m[1] + " 条引用"; }],
+      [/^Showing latest\s+(\d+)\s+browser steps?$/i, function (m) { return "显示最近 " + m[1] + " 个浏览器步骤"; }],
+
+      // Steps, turns & pagination
+      [/^Plan,\s*(\d+)\s+of\s+(\d+)\s+steps?\s+done$/i, function (m) { return "计划：已完成 " + m[1] + " / " + m[2] + " 步"; }],
+      [/^Step\s+(\d+)\s+of\s+(\d+)$/i, function (m) { return "第 " + m[1] + " / " + m[2] + " 步"; }],
+      [/^Turn\s+(\d+)\s+of\s+(\d+)$/i, function (m) { return "第 " + m[1] + " / " + m[2] + " 轮"; }],
+      [/^Go to turn\s+(\d+)\s+of\s+(\d+)$/i, function (m) { return "跳转到第 " + m[1] + " / " + m[2] + " 轮"; }],
+      [/^Page\s+(\d+)\s+of\s+(\d+)$/i, function (m) { return "第 " + m[1] + " / " + m[2] + " 页"; }],
+      [/^Show\s+(\d+)\s+earlier\s+steps?$/i, function (m) { return "展开更早的 " + m[1] + " 个步骤"; }],
+      [/^Show\s+(\d+)\s+more\s+subagents?$/i, function (m) { return "展开另外 " + m[1] + " 个子智能体"; }],
+      [/^(?:Show|See)\s+(\d+)\s+more$/i, function (m) { return "显示另外 " + m[1] + " 项"; }],
+
+      // Counts & badges
+      [/^(\d+)\s+tool calls?$/i, function (m) { return m[1] + " 次工具调用"; }],
+      [/^(\d+)\s+tools?$/i, function (m) { return m[1] + " 个工具"; }],
+      [/^(\d+)\s+tasks?$/i, function (m) { return m[1] + " 个任务"; }],
+      [/^(\d+)\s+conversations?$/i, function (m) { return m[1] + " 个对话"; }],
+      [/^(\d+)\s+servers?$/i, function (m) { return m[1] + " 个服务"; }],
+      [/^(\d+)\s+subagents?$/i, function (m) { return m[1] + " 个子智能体"; }],
+      [/^(\d+)\s+skills?$/i, function (m) { return m[1] + " 项技能"; }],
+      [/^(\d+)\s+rules?$/i, function (m) { return m[1] + " 条规则"; }],
+      [/^(\d+)\s+matches?$/i, function (m) { return m[1] + " 个匹配"; }],
+      [/^(\d+)\s+results?$/i, function (m) { return m[1] + " 条结果"; }],
+      [/^(\d+)\s+selected$/i, function (m) { return "已选 " + m[1] + " 项"; }],
+      [/^(\d+)\s+unread$/i, function (m) { return m[1] + " 条未读"; }],
+      [/^(\d+)\s+active$/i, function (m) { return m[1] + " 个活跃"; }],
+      [/^(\d+)\s+running$/i, function (m) { return m[1] + " 个运行中"; }],
+      [/^(\d+)\s+agents?\s+running$/i, function (m) { return m[1] + " 个智能体运行中"; }],
+      [/^(\d+)\s+plugins?$/i, function (m) { return m[1] + " 个插件"; }],
+      [/^(\d+)\s+hooks?$/i, function (m) { return m[1] + " 个钩子"; }],
+      [/^(\d+)\s+comments?$/i, function (m) { return m[1] + " 条评论"; }],
+      [/^(\d+)\s+files?$/i, function (m) { return m[1] + " 个文件"; }],
+      [/^(\d+)\s+workspaces?$/i, function (m) { return m[1] + " 个工作区"; }],
+      [/^(\d+)\s+errors?$/i, function (m) { return m[1] + " 个错误"; }],
+      [/^(\d+)\s+warnings?$/i, function (m) { return m[1] + " 条警告"; }],
+
+      // Action summaries & safe short verb phrases
+      [/^Edited\s+(\d+)\s+files?$/i, function (m) { return "已编辑 " + m[1] + " 个文件"; }],
+      [/^Read\s+(\d+)\s+files?$/i, function (m) { return "已读取 " + m[1] + " 个文件"; }],
+      [/^Created\s+(\d+)\s+files?$/i, function (m) { return "已创建 " + m[1] + " 个文件"; }],
+      [/^Deleted\s+(\d+)\s+files?$/i, function (m) { return "已删除 " + m[1] + " 个文件"; }],
+      [/^Marked\s+(\d+)\s+conversations?\s+as\s+read$/i, function (m) { return "已将 " + m[1] + " 个对话标为已读"; }],
+      [/^Stop\s+(\d+)\s+selected$/i, function (m) { return "停止已选的 " + m[1] + " 项"; }],
+      [/^Search\s+([^\n]{1,40})(\.{3}|…)$/, function (m) {
+        if (looksLikeCodeOrPath(m[1])) return null;
+        return "搜索 " + translateShortNoun(m[1]) + m[2];
+      }],
+      [/^Running\s+([^\n]{1,40})(\.{3}|…)$/, function (m) {
+        if (looksLikeCodeOrPath(m[1])) return null;
+        return "正在运行 " + translateShortNoun(m[1]) + m[2];
+      }],
+      [/^Open Subagent:\s*([^\n]{1,48})$/, function (m) {
+        if (looksLikeCodeOrPath(m[1])) return null;
+        return "打开子智能体：" + m[1].trim();
+      }],
+      [/^Used MCP tool:\s*([^\n]{1,48})$/, function (m) {
+        return "已调用 MCP 工具：" + m[1].trim();
+      }],
+      [/^Used tool:\s*([^\n]{1,48})$/, function (m) {
+        return "已调用工具：" + m[1].trim();
+      }],
+      [/^Invoked subagent:\s*([^\n]{1,48})$/, function (m) {
+        return "已调用子智能体：" + m[1].trim();
+      }],
+      [/^Forked from\s+([^\n]{1,48})$/, function (m) {
+        if (looksLikeCodeOrPath(m[1])) return null;
+        return "分支自 " + m[1].trim();
+      }]
+    ];
+
+    function translateText(trimmed) {
+      if (!trimmed || trimmed.length > MAX_TRIMMED_LEN) return null;
+      var exact = lookupDict(trimmed);
+      if (exact) return exact;
+      if (hasCjk(trimmed)) return null;
+      if (looksLikeCodeOrPath(trimmed)) return null;
+      for (var i = 0; i < DYNAMIC_RULES.length; i++) {
+        var rule = DYNAMIC_RULES[i];
+        var m = rule[0].exec(trimmed);
+        if (m) {
+          var out = rule[1](m);
+          if (out) return out;
+        }
+      }
+      return null;
+    }
+
+    function isSkippedForText(el) {
       if (!el || el.nodeType !== 1) return true;
       if (SKIP_TAGS[el.tagName]) return true;
-      if (typeof el.closest === "function" && el.closest(SKIP_SELECTOR)) return true;
+      if (typeof el.closest === "function") {
+        if (el.closest(SKIP_TEXT_SELECTOR)) return true;
+        if (el.closest(CHAT_BODY_SELECTOR) && !el.closest('button, [role="button"]')) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    function isSkippedForAttrs(el) {
+      if (!el || el.nodeType !== 1) return true;
+      if (SKIP_TAGS[el.tagName] && el.tagName !== "INPUT" && el.tagName !== "TEXTAREA") return true;
+      if (typeof el.closest === "function") {
+        if (el.closest(SKIP_ATTR_SELECTOR)) return true;
+        if (el.closest(CHAT_BODY_SELECTOR) && !el.closest('button, [role="button"]')) {
+          return true;
+        }
+      }
       return false;
     }
 
     function translateTextNode(node) {
       if (!node || node.nodeType !== 3) return;
       var parent = node.parentElement;
-      if (!parent || isSkippedElement(parent)) return;
+      if (!parent || isSkippedForText(parent)) return;
       var raw = node.nodeValue;
-      if (!raw || raw.length > 120) return;
+      if (!raw || raw.length > MAX_RAW_LEN) return;
       var trimmed = raw.trim();
-      if (!trimmed || trimmed.length > 96) return;
-      var zh = DICT[trimmed];
+      if (!trimmed || trimmed.length > MAX_TRIMMED_LEN) return;
+      var zh = translateText(trimmed);
       if (!zh) return;
       var idx = raw.indexOf(trimmed);
       if (idx < 0) return;
@@ -1030,60 +1033,23 @@ fn build_preload_iife() -> &'static str {
     }
 
     function translateElementAttrs(el) {
-      if (!el || el.nodeType !== 1 || isSkippedElement(el)) return;
+      if (!el || el.nodeType !== 1 || isSkippedForAttrs(el)) return;
       for (var i = 0; i < ATTRS.length; i++) {
         var attr = ATTRS[i];
         var val = el.getAttribute(attr);
-        if (!val || val.length > 120) continue;
+        if (!val || val.length > MAX_RAW_LEN) continue;
         var trimmed = val.trim();
-        var zh = DICT[trimmed];
+        var zh = translateText(trimmed);
         if (zh && zh !== val) {
           el.setAttribute(attr, zh);
         }
       }
     }
 
-    function walkSubtree(root) {
-      if (!root) return;
-      if (root.nodeType === 3) {
-        translateTextNode(root);
-        return;
-      }
-      if (root.nodeType !== 1 || isSkippedElement(root)) return;
-      translateElementAttrs(root);
-      var walker = document.createTreeWalker(
-        root,
-        NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT,
-        {
-          acceptNode: function (n) {
-            if (n.nodeType === 1) {
-              if (SKIP_TAGS[n.tagName]) return NodeFilter.FILTER_REJECT;
-              if (
-                n.getAttribute("contenteditable") === "true" ||
-                n.getAttribute("contenteditable") === "" ||
-                (n.classList &&
-                  (n.classList.contains("monaco-editor") || n.classList.contains("xterm")))
-              ) {
-                return NodeFilter.FILTER_REJECT;
-              }
-              return NodeFilter.FILTER_ACCEPT;
-            }
-            return NodeFilter.FILTER_ACCEPT;
-          }
-        }
-      );
-      var cur;
-      while ((cur = walker.nextNode())) {
-        if (cur.nodeType === 3) {
-          translateTextNode(cur);
-        } else if (cur.nodeType === 1) {
-          translateElementAttrs(cur);
-        }
-      }
-    }
-
+    var observedRoots = typeof WeakSet === "function" ? new WeakSet() : null;
     var pendingRoots = new Set();
     var scheduled = false;
+
     function flushPending() {
       scheduled = false;
       try {
@@ -1109,10 +1075,13 @@ fn build_preload_iife() -> &'static str {
       }
     }
 
-    function startObserver() {
+    function observeRoot(root) {
+      if (!root) return;
+      if (observedRoots) {
+        if (observedRoots.has(root)) return;
+        observedRoots.add(root);
+      }
       try {
-        if (!document.body) return;
-        walkSubtree(document.body);
         var obs = new MutationObserver(function (mutations) {
           try {
             for (var i = 0; i < mutations.length; i++) {
@@ -1129,7 +1098,7 @@ fn build_preload_iife() -> &'static str {
             }
           } catch (_) {}
         });
-        obs.observe(document.body, {
+        obs.observe(root, {
           childList: true,
           subtree: true,
           characterData: true,
@@ -1139,13 +1108,104 @@ fn build_preload_iife() -> &'static str {
       } catch (_) {}
     }
 
+    function tryAttachIframe(iframeEl) {
+      try {
+        var doc = iframeEl.contentDocument;
+        if (!doc || !doc.body) return;
+        var h = (doc.location && doc.location.hostname) || "";
+        if (h !== "127.0.0.1" && h !== "localhost") return;
+        observeRoot(doc.body);
+        walkSubtree(doc.body);
+      } catch (_) {}
+    }
+
+    function walkSubtree(root) {
+      if (!root) return;
+      if (root.nodeType === 3) {
+        translateTextNode(root);
+        return;
+      }
+      var isShadow = root.nodeType === 11;
+      if (!isShadow && root.nodeType !== 1) return;
+      if (root.nodeType === 1) {
+        if (root.tagName === "IFRAME") {
+          tryAttachIframe(root);
+          return;
+        }
+        if (root.shadowRoot) {
+          observeRoot(root.shadowRoot);
+          walkSubtree(root.shadowRoot);
+        }
+        translateElementAttrs(root);
+        if (isSkippedForText(root)) return;
+      }
+
+      var ownerDoc = root.ownerDocument || document;
+      var walker = ownerDoc.createTreeWalker(
+        root,
+        NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT,
+        {
+          acceptNode: function (n) {
+            if (n.nodeType === 1) {
+              if (n.tagName === "IFRAME") return NodeFilter.FILTER_ACCEPT;
+              if (SKIP_TAGS[n.tagName]) {
+                if (n.tagName === "INPUT" || n.tagName === "TEXTAREA") {
+                  translateElementAttrs(n);
+                }
+                return NodeFilter.FILTER_REJECT;
+              }
+              if (
+                n.getAttribute("contenteditable") === "true" ||
+                n.getAttribute("contenteditable") === "" ||
+                n.getAttribute("role") === "textbox" ||
+                n.hasAttribute("data-monaco-editor") ||
+                n.hasAttribute("data-no-i18n") ||
+                (n.classList &&
+                  (n.classList.contains("monaco-editor") || n.classList.contains("xterm")))
+              ) {
+                return NodeFilter.FILTER_REJECT;
+              }
+              return NodeFilter.FILTER_ACCEPT;
+            }
+            return NodeFilter.FILTER_ACCEPT;
+          }
+        }
+      );
+      var cur;
+      while ((cur = walker.nextNode())) {
+        if (cur.nodeType === 3) {
+          translateTextNode(cur);
+        } else if (cur.nodeType === 1) {
+          if (cur.tagName === "IFRAME") {
+            tryAttachIframe(cur);
+          } else {
+            if (cur.shadowRoot) {
+              observeRoot(cur.shadowRoot);
+              walkSubtree(cur.shadowRoot);
+            }
+            translateElementAttrs(cur);
+          }
+        }
+      }
+    }
+
+    function startObserver() {
+      try {
+        if (!document.body) return;
+        observeRoot(document.body);
+        walkSubtree(document.body);
+      } catch (_) {}
+    }
+
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", startObserver, { once: true });
     } else {
       startObserver();
     }
   } catch (_) {}
-})();"#
+})();"#,
+    );
+    out
 }
 
 fn read_archive_app_version(archive: &AsarArchive) -> Option<String> {
@@ -1961,5 +2021,139 @@ addItemToSubmenu(menu, 'Help', { label: 'Check for Updates...', click: (item) =>
         let refreshed_orig =
             fs::read(ui_patch_backup_dir(&paths).join("app.asar.orig")).unwrap();
         assert_eq!(refreshed_orig, v230_clean_asar);
+    }
+
+    #[test]
+    fn zh_dict_json_is_valid_non_empty_and_meets_scale_target() {
+        let parsed: Value = serde_json::from_str(ANTIGRAVITY_ZH_DICT_JSON)
+            .expect("antigravity_zh_dict.json 必须是合法 JSON");
+        let map = parsed
+            .as_object()
+            .expect("antigravity_zh_dict.json 顶层必须是 JSON 对象");
+        assert!(
+            map.len() >= 1200,
+            "词典有效词条应 >= 1200 条，实际为 {}",
+            map.len()
+        );
+        for (k, v) in map {
+            assert!(!k.trim().is_empty(), "存在空英文键");
+            let zh = v
+                .as_str()
+                .unwrap_or_else(|| panic!("键 `{k}` 对应值必须是字符串"));
+            assert!(!zh.trim().is_empty(), "键 `{k}` 对应中文译文为空");
+            assert_ne!(k, zh, "键 `{k}` 不应为无意义恒等映射");
+        }
+        // Core Antigravity 2.x modules coverage spot-checks
+        for required_key in [
+            "New Conversation",
+            "Scheduled Tasks",
+            "Skills & Customizations",
+            "MCP Servers",
+            "Reasoning Effort",
+            "Terminal Sandbox",
+            "Non-Workspace File Access",
+            "Internet Access Policy",
+            "Implementation Plan",
+            "Walkthrough",
+            "Swarm Board",
+            "Remote Control",
+            "Dev Containers",
+            "Port Forwarding",
+            "Connect to WSL",
+        ] {
+            assert!(
+                map.contains_key(required_key),
+                "词典缺少核心词条: {required_key}"
+            );
+        }
+    }
+
+    #[test]
+    fn preload_iife_contains_upgraded_engine_and_is_idempotent() {
+        let raw = "const { contextBridge } = require('electron');\n";
+        let once = patch_preload_js(raw);
+        let twice = patch_preload_js(&once);
+        assert_eq!(once, twice, "preload 注入必须幂等");
+        assert_eq!(once.matches(PATCH_GUARD_COMMENT).count(), 1);
+
+        // Dictionary, punctuation normalization, dynamic rules
+        assert!(once.contains("\"New Conversation\": \"新建对话\""));
+        assert!(once.contains("DYNAMIC_RULES"));
+        assert!(once.contains("Thinking for"));
+        assert!(once.contains("Thought for"));
+        assert!(once.contains("Worked for"));
+        assert!(once.contains("files?\\s+changed"));
+        assert!(once.contains("Showing lines"));
+        assert!(once.contains("lookupDict"));
+
+        // Shadow DOM & same-origin localhost iframe support
+        assert!(once.contains("shadowRoot"));
+        assert!(once.contains("contentDocument"));
+        assert!(once.contains("WeakSet"));
+        assert!(once.contains("host !== \"127.0.0.1\" && host !== \"localhost\""));
+        assert!(
+            !once.contains("window.top !== window.self"),
+            "不应一刀切禁止同源本地 iframe 翻译"
+        );
+
+        // Strict code & chat body safety guards
+        for guard in [
+            "INPUT: 1",
+            "SAMP: 1",
+            "TEXTAREA: 1",
+            "CODE: 1",
+            "PRE: 1",
+            "SVG: 1",
+            "MATH: 1",
+            "[data-monaco-editor]",
+            "[role=\"textbox\"]",
+            ".monaco-editor",
+            ".xterm",
+            ".markdown-body",
+            ".prose",
+            "[data-message-role]",
+        ] {
+            assert!(once.contains(guard), "preload 注入缺少安全跳过守卫: {guard}");
+        }
+    }
+
+    #[test]
+    fn main_process_static_patches_preserve_top_menus_and_translate_tray_updater() {
+        let tray_src = r#"
+function updateTrayAgentCount(count) {
+    countItem.label =
+        (count > 0 ? `${count}` : 'No') +
+                    ' agent' +
+                    (count === 1 ? '' : 's') +
+                    ' running';
+}
+"#;
+        let tray_patched = patch_main_process_js(tray_src, false);
+        assert!(tray_patched.contains("个智能体运行中"));
+        assert!(tray_patched.contains("暂无运行中的智能体"));
+        assert_eq!(patch_main_process_js(&tray_patched, false), tray_patched);
+
+        let updater_src = r#"
+MenuUpdateStep["CheckForUpdates"] = "Check for Updates";
+exports.updateActions = {
+  [MenuUpdateStep.CheckForUpdates]: () => checkForUpdates(true),
+};
+const options = {
+  type: 'info',
+  title: 'Check for Updates',
+  message: 'No updates available',
+  buttons: ['OK'],
+};
+"#;
+        let updater_patched = patch_main_process_js(updater_src, true);
+        assert!(updater_patched.contains("__takoBindZhUpdateActions"));
+        assert!(updater_patched.contains("[\"Check for Updates\", \"检查更新\"]"));
+        assert!(updater_patched.contains("title: '检查更新'"));
+        assert!(updater_patched.contains("message: '暂无可用更新'"));
+        assert!(updater_patched.contains("buttons: ['确定']"));
+        assert_eq!(
+            patch_main_process_js(&updater_patched, true),
+            updater_patched
+        );
     }
 }
