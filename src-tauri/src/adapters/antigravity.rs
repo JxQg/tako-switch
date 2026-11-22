@@ -238,10 +238,14 @@ impl DesktopAppAdapter for AntigravityAdapter {
     fn detect_install(&self, paths: &AppPaths) -> InstallInfo {
         if let Some(ref override_dir) = paths.agy_app_override_dir {
             if override_dir.exists() {
-                let kind = if override_dir
+                let path_str = override_dir.to_string_lossy().to_string();
+                let kind = if path_str.to_ascii_lowercase().contains("windowsapps") {
+                    "msix"
+                } else if override_dir
                     .extension()
                     .and_then(|s| s.to_str())
                     .is_some_and(|e| e.eq_ignore_ascii_case("app"))
+                    || override_dir.join("Contents").is_dir()
                 {
                     "app_bundle"
                 } else {
@@ -250,7 +254,7 @@ impl DesktopAppAdapter for AntigravityAdapter {
                 return InstallInfo {
                     installed: true,
                     version: None,
-                    install_path: Some(override_dir.to_string_lossy().to_string()),
+                    install_path: Some(path_str),
                     install_kind: Some(kind.to_string()),
                 };
             }

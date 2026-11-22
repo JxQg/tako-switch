@@ -367,7 +367,10 @@ fn tc_v208_02_to_05_asar_patch_idempotency_unpacked_plist_and_byte_exact_restore
         patched_info.has_valid_backup,
         "Patched state must report has_valid_backup == true"
     );
-    assert_eq!(patched_info.patch_version.as_deref(), Some("2.0.8"));
+    assert_eq!(
+        patched_info.patch_version.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(
         snapshot_app(&paths, AppId::Antigravity).ui_patch.status,
         UiPatchStatus::Patched
@@ -401,7 +404,7 @@ fn tc_v208_02_to_05_asar_patch_idempotency_unpacked_plist_and_byte_exact_restore
     assert_eq!(marker_json.get("schema").and_then(Value::as_u64), Some(1));
     assert_eq!(
         marker_json.get("patchVersion").and_then(Value::as_str),
-        Some("2.0.8")
+        Some(env!("CARGO_PKG_VERSION"))
     );
     assert_eq!(
         marker_json

@@ -1,6 +1,8 @@
 pub mod antigravity;
 pub mod antigravity_i18n;
+pub mod asar_patch;
 pub mod claude;
+pub mod claude_i18n;
 pub mod codex;
 pub mod dsh_tako;
 #[cfg(target_os = "windows")]
@@ -9,6 +11,15 @@ pub(crate) mod windows_process;
 pub use antigravity_i18n::{
     inspect_antigravity_ui_patch, patch_antigravity_ui_for_paths,
     restore_antigravity_ui_for_paths, UiPatchInfo, UiPatchStatus,
+};
+pub use asar_patch::{
+    classify_io_error_for_os, format_ui_patch_block_error, inspect_electron_asar_integrity_fuse,
+    parse_ui_patch_block_error, patch_windows_pe_asar_integrity, UiPatchBlockKind,
+    UiPatchPermissionPrompt, UI_PATCH_BLOCK_PREFIX,
+};
+pub use claude_i18n::{
+    inspect_claude_ui_patch, patch_claude_ui_for_paths, restore_claude_ui_for_paths,
+    validate_icu_compatibility, CLAUDE_PATCH_GUARD_COMMENT,
 };
 
 use crate::config::{write_atomic, AppPaths};
@@ -132,6 +143,7 @@ pub fn snapshot_app(paths: &AppPaths, id: AppId) -> AppSnapshot {
         AppId::Antigravity => antigravity::AntigravityAdapter::is_chinese_configured(paths),
     };
     let ui_patch = match id {
+        AppId::Claude => inspect_claude_ui_patch(paths),
         AppId::Antigravity => inspect_antigravity_ui_patch(paths),
         _ => UiPatchInfo::not_applicable(),
     };

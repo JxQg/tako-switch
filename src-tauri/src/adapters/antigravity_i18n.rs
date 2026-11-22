@@ -1,4 +1,13 @@
-use crate::adapters::DesktopAppAdapter;
+use crate::adapters::asar_patch::{
+    make_msix_readonly_prompt, probe_bundle_write_access, update_info_plist_asar_key_hash,
+    write_bundle_file_checked,
+};
+pub use crate::adapters::asar_patch::{
+    classify_io_error_for_os, format_ui_patch_block_error, inspect_electron_asar_integrity_fuse,
+    parse_ui_patch_block_error, patch_windows_pe_asar_integrity, UiPatchBlockKind,
+    UiPatchPermissionPrompt, UI_PATCH_BLOCK_PREFIX,
+};
+use crate::adapters::{AppId, DesktopAppAdapter};
 use crate::config::{write_atomic, AppPaths};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -7,12 +16,9 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 pub const PATCH_MARKER_FILE: &str = "__tako_i18n_patch.json";
 pub const PATCH_GUARD_COMMENT: &str = "/* __TAKO_AGY_ZH_PATCH_V1__ */";
-pub const CURRENT_UI_PATCH_VERSION: &str = "2.0.8";
+pub const CURRENT_UI_PATCH_VERSION: &str = env!("CARGO_PKG_VERSION");
 const ASAR_INTEGRITY_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

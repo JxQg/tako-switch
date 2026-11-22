@@ -53,6 +53,7 @@ pub struct AppPaths {
     pub agy_gemini_config_dir: PathBuf,
     pub launch_agents_dir: PathBuf,
     pub agy_app_override_dir: Option<PathBuf>,
+    pub claude_app_override_dir: Option<PathBuf>,
     pub is_test: bool,
 }
 
@@ -93,6 +94,7 @@ impl AppPaths {
             agy_gemini_config_dir,
             launch_agents_dir,
             agy_app_override_dir: None,
+            claude_app_override_dir: None,
             is_test: false,
         })
     }
@@ -108,6 +110,7 @@ impl AppPaths {
             agy_gemini_config_dir: root.join(".gemini").join("config"),
             launch_agents_dir: root.join("LaunchAgents"),
             agy_app_override_dir: None,
+            claude_app_override_dir: None,
             is_test: true,
         }
     }

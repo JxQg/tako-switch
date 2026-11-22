@@ -300,7 +300,43 @@ impl DesktopAppAdapter for ClaudeAdapter {
     }
 
     fn detect_install(&self, paths: &AppPaths) -> InstallInfo {
-        let _ = paths;
+        if let Some(ref override_dir) = paths.claude_app_override_dir {
+            if override_dir.exists() {
+                let path_str = override_dir.to_string_lossy().to_string();
+                let kind = if path_str.to_ascii_lowercase().contains("windowsapps") {
+                    "msix"
+                } else if override_dir
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("app"))
+                    || override_dir.join("Contents").is_dir()
+                {
+                    "app_bundle"
+                } else {
+                    "exe"
+                };
+                return InstallInfo {
+                    installed: true,
+                    version: None,
+                    install_path: Some(path_str),
+                    install_kind: Some(kind.to_string()),
+                };
+            }
+            return InstallInfo {
+                installed: false,
+                version: None,
+                install_path: None,
+                install_kind: None,
+            };
+        }
+        if paths.is_test {
+            return InstallInfo {
+                installed: false,
+                version: None,
+                install_path: None,
+                install_kind: None,
+            };
+        }
         #[cfg(target_os = "macos")]
         {
             if let Some(app_path) = find_macos_app(paths, &["Claude.app"], CLAUDE_MACOS_BUNDLE_ID) {
