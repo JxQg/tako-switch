@@ -20,9 +20,21 @@ jobs:
           python-version: "3.12"
 
       - name: Fetch latest official upstream releases
+        run: |
+          cp manifest/manifest.json /tmp/prev-manifest.json
+          python3 scripts/sync-manifest.py --out manifest/manifest.json
+
+      - name: Mirror installers to Cloudflare R2 and rewrite manifest mirror URLs (optional)
         env:
-          TAKO_MIRROR_BASE: ${{ vars.MIRROR_APPS_BASE }}
-        run: python3 scripts/sync-manifest.py --out manifest/manifest.json
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          MIRROR_APPS_BASE: ${{ vars.MIRROR_APPS_BASE }}
+          MIRROR_APPS: ${{ vars.MIRROR_APPS }}
+        run: |
+          python3 scripts/mirror-to-r2.py --manifest manifest/manifest.json --prev-manifest /tmp/prev-manifest.json
 
       - name: Commit updated manifest if changed
         run: |
