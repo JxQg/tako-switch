@@ -153,7 +153,7 @@ enum ClaudeTargetResolution {
     NotInstalled,
     MsixReadOnly { root: PathBuf },
     MissingAsar { root: PathBuf },
-    Found(ResolvedClaudeTarget),
+    Found(Box<ResolvedClaudeTarget>),
 }
 
 fn ui_patch_backup_dir(paths: &AppPaths) -> PathBuf {
@@ -226,7 +226,7 @@ fn resolve_target_from_dir(root: &Path, version_hint: Option<String>) -> ClaudeT
         if !app_asar.is_file() || !ion_asar.is_file() {
             return ClaudeTargetResolution::MissingAsar { root: base_dir };
         }
-        return ClaudeTargetResolution::Found(ResolvedClaudeTarget {
+        return ClaudeTargetResolution::Found(Box::new(ResolvedClaudeTarget {
             app_asar_path: app_asar,
             ion_asar_path: ion_asar,
             bundle_root: Some(base_dir.clone()),
@@ -240,7 +240,7 @@ fn resolve_target_from_dir(root: &Path, version_hint: Option<String>) -> ClaudeT
             ),
             win_exe_path: None,
             app_version_hint: version_hint,
-        });
+        }));
     }
 
     // 2. Windows Squirrel app-* layout (numeric semver descending)
@@ -266,7 +266,7 @@ fn resolve_target_from_dir(root: &Path, version_hint: Option<String>) -> ClaudeT
         if let Some((_, _, app_dir, ver_suffix)) = squirrel_dirs.into_iter().next() {
             let res = app_dir.join("resources");
             let win_exe_path = find_windows_claude_exe(&app_dir);
-            return ClaudeTargetResolution::Found(ResolvedClaudeTarget {
+            return ClaudeTargetResolution::Found(Box::new(ResolvedClaudeTarget {
                 app_asar_path: res.join("app.asar"),
                 ion_asar_path: res.join("ion-dist.asar"),
                 bundle_root: None,
@@ -275,14 +275,14 @@ fn resolve_target_from_dir(root: &Path, version_hint: Option<String>) -> ClaudeT
                 code_resources_path: None,
                 win_exe_path,
                 app_version_hint: version_hint.or(Some(ver_suffix)),
-            });
+            }));
         }
     }
 
     // 3. Direct resources/ layout (<dir>/resources/{app.asar, ion-dist.asar})
     let res_dir = base_dir.join("resources");
     if res_dir.join("app.asar").is_file() && res_dir.join("ion-dist.asar").is_file() {
-        return ClaudeTargetResolution::Found(ResolvedClaudeTarget {
+        return ClaudeTargetResolution::Found(Box::new(ResolvedClaudeTarget {
             app_asar_path: res_dir.join("app.asar"),
             ion_asar_path: res_dir.join("ion-dist.asar"),
             bundle_root: None,
@@ -291,7 +291,7 @@ fn resolve_target_from_dir(root: &Path, version_hint: Option<String>) -> ClaudeT
             code_resources_path: None,
             win_exe_path: find_windows_claude_exe(&base_dir),
             app_version_hint: version_hint,
-        });
+        }));
     }
 
     // 4. Flat layout (<dir>/{app.asar, ion-dist.asar})
@@ -304,7 +304,7 @@ fn resolve_target_from_dir(root: &Path, version_hint: Option<String>) -> ClaudeT
                 .and_then(|_| base_dir.parent())
                 .and_then(find_windows_claude_exe)
         });
-        return ClaudeTargetResolution::Found(ResolvedClaudeTarget {
+        return ClaudeTargetResolution::Found(Box::new(ResolvedClaudeTarget {
             app_asar_path: base_dir.join("app.asar"),
             ion_asar_path: base_dir.join("ion-dist.asar"),
             bundle_root: None,
@@ -313,7 +313,7 @@ fn resolve_target_from_dir(root: &Path, version_hint: Option<String>) -> ClaudeT
             code_resources_path: None,
             win_exe_path,
             app_version_hint: version_hint,
-        });
+        }));
     }
 
     ClaudeTargetResolution::MissingAsar { root: base_dir }
@@ -1148,7 +1148,7 @@ pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
                 )),
             };
         }
-        ClaudeTargetResolution::Found(t) => t,
+        ClaudeTargetResolution::Found(t) => *t,
     };
 
     let target_asar_str = target.ion_asar_path.to_string_lossy().to_string();
@@ -1263,7 +1263,7 @@ pub fn patch_claude_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, String
                 root.display()
             ));
         }
-        ClaudeTargetResolution::Found(t) => t,
+        ClaudeTargetResolution::Found(t) => *t,
     };
 
     let current_app_bytes = read_bundle_file_checked(AppId::Claude, "patch", &target.app_asar_path)?;
@@ -1606,7 +1606,7 @@ pub fn restore_claude_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, Stri
                 root.display()
             ));
         }
-        ClaudeTargetResolution::Found(t) => t,
+        ClaudeTargetResolution::Found(t) => *t,
     };
 
     let current_app_bytes =
