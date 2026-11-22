@@ -71,7 +71,19 @@ REQUIRED_TESTIDS = [
     "plaza-quick-code",
     "plaza-quick-long",
     "plaza-quick-image",
+    "mcp-toggle-webpage",
 ]
+
+AGY_ZH_DICT_REL = Path("src-tauri/src/adapters/antigravity_zh_dict.json")
+MIN_AGY_ZH_DICT_ENTRIES = 1200
+REQUIRED_AGY_ZH_DICT_KEYS = (
+    "New Conversation",
+    "Scheduled Tasks",
+    "Skills & Customizations",
+    "Global Settings",
+    "MCP Servers",
+)
+CJK_CHAR_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 
 REQUIRED_WEBP_ASSETS = [
     "ceramic-mug.webp",
@@ -523,6 +535,18 @@ def run_checks(repo_root: Path) -> List[Tuple[str, bool, str]]:
         )
     )
 
+    all_src_lower = all_src.lower()
+    has_webpage_brand = "tako web page" in all_src_lower and "edgeone" in all_src_lower
+    checks.append(
+        (
+            "ui:edgeone-webpage-entry",
+            has_webpage_brand,
+            "found Tako Web Page / EdgeOne entry in src/"
+            if has_webpage_brand
+            else "missing Tako Web Page / EdgeOne entry in src/",
+        )
+    )
+
     for tool_id, capability_kw in REQUIRED_MCP_TOOL_SPECS:
         has_attr = has_mcp_tool_attr(src_files, tool_id)
         has_cn = capability_kw in all_src
@@ -692,7 +716,51 @@ def run_checks(repo_root: Path) -> List[Tuple[str, bool, str]]:
             )
         )
 
+    # 5. Standalone Antigravity Chinese dictionary check (v2.2.0)
+    dict_ok, dict_msg = validate_antigravity_zh_dict(repo_root / AGY_ZH_DICT_REL)
+    checks.append(("i18n:antigravity-zh-dict", dict_ok, dict_msg))
+
     return checks
+
+
+def validate_antigravity_zh_dict(dict_path: Path) -> Tuple[bool, str]:
+    if not dict_path.is_file():
+        return False, f"missing {AGY_ZH_DICT_REL.as_posix()}"
+    try:
+        parsed = json.loads(dict_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"invalid JSON in {AGY_ZH_DICT_REL.as_posix()}: {exc}"
+    if not isinstance(parsed, dict):
+        return False, f"{AGY_ZH_DICT_REL.as_posix()} root must be a JSON object"
+
+    empty_keys = [k for k in parsed.keys() if not isinstance(k, str) or not k.strip()]
+    if empty_keys:
+        return False, f"found {len(empty_keys)} empty/non-string dictionary keys"
+
+    bad_vals = [
+        k for k, v in parsed.items() if not isinstance(v, str) or not v.strip()
+    ]
+    if bad_vals:
+        return False, f"found {len(bad_vals)} empty/non-string dictionary values (e.g. {bad_vals[:3]})"
+
+    total = len(parsed)
+    if total < MIN_AGY_ZH_DICT_ENTRIES:
+        return (
+            False,
+            f"expected >= {MIN_AGY_ZH_DICT_ENTRIES} entries in {AGY_ZH_DICT_REL.as_posix()}, got {total}",
+        )
+
+    missing_core = [k for k in REQUIRED_AGY_ZH_DICT_KEYS if k not in parsed]
+    if missing_core:
+        return False, f"missing required core dictionary keys: {missing_core}"
+
+    non_zh_core = [
+        k for k in REQUIRED_AGY_ZH_DICT_KEYS if not CJK_CHAR_RE.search(parsed[k])
+    ]
+    if non_zh_core:
+        return False, f"core dictionary keys missing Chinese translation: {non_zh_core}"
+
+    return True, f"valid Antigravity zh dict ({total} entries >= {MIN_AGY_ZH_DICT_ENTRIES})"
 
 
 def _build_synthetic_mp4(size: int, include_avc1: bool = True, include_hvc1: bool = False) -> bytes:
@@ -816,6 +884,21 @@ pub fn restore_antigravity_ui_for_paths() {}
             encoding="utf-8",
         )
 
+        # Synthetic valid standalone Antigravity Chinese dictionary (>= 1200 entries)
+        synth_dict = {
+            "New Conversation": "新建对话",
+            "Scheduled Tasks": "定时任务",
+            "Skills & Customizations": "技能与自定义",
+            "Global Settings": "全局设置",
+            "MCP Servers": "MCP 服务器",
+        }
+        for i in range(MIN_AGY_ZH_DICT_ENTRIES):
+            synth_dict[f"Synthetic Label {i}"] = f"合成词条 {i}"
+        (root / AGY_ZH_DICT_REL).write_text(
+            json.dumps(synth_dict, ensure_ascii=False), encoding="utf-8"
+        )
+        assert validate_antigravity_zh_dict(root / AGY_ZH_DICT_REL)[0]
+
         for idx, name in enumerate(REQUIRED_WEBP_ASSETS):
             blob = b"RIFF" + struct.pack("<I", 12) + b"WEBP" + b"VP8 " + bytes([idx, 1, 2, 3])
             (root / "public" / "mcp-demo" / name).write_bytes(blob)
@@ -833,6 +916,7 @@ pub fn restore_antigravity_ui_for_paths() {}
         (root / "src" / "components" / "McpInlineTheater.tsx").write_text(
             f"""
 const TITLE = "Tako 超级 MCP";
+const WEBPAGE_TITLE = "网站上线 · Tako Web Page (EdgeOne)";
 const SUB = "{PREF_CHINESE_SUBTITLE}";
 {asset_refs}
 const TOOLS = [
@@ -845,6 +929,7 @@ const TOOLS = [
 const QUICKS = ["all", "promo", "cheap", "code", "long", "image"];
 export const McpInlineTheater = () => (
   <div data-testid="mcp-inline-theater">
+    <button data-testid="mcp-toggle-webpage" />
     <button data-testid="open-mcp-demo" />
     {{TOOLS.map((t) => <button data-testid={{`mcp-demo-tab-${{t.key}}`}} data-mcp-tool={{t.mcpTool}}>{{t.label}}</button>)}}
     {{QUICKS.map((q) => <button data-testid={{`plaza-quick-${{q}}`}}>{{q}}</button>)}}
@@ -890,6 +975,36 @@ export const McpInlineTheater = () => (
         results = run_checks(root)
         failed = [(n, m) for n, ok, m in results if not ok]
         assert not failed, f"synthetic V2 repo should pass all checks, failed: {failed}"
+
+        # Negative checks for v2.2.0 antigravity_zh_dict.json validator
+        bad_dict_path = root / "bad_dict.json"
+        assert not validate_antigravity_zh_dict(bad_dict_path)[0]
+        bad_dict_path.write_text("{not-json", encoding="utf-8")
+        assert not validate_antigravity_zh_dict(bad_dict_path)[0]
+        bad_dict_path.write_text("[]", encoding="utf-8")
+        assert not validate_antigravity_zh_dict(bad_dict_path)[0]
+        bad_dict_path.write_text(json.dumps({"New Conversation": "新建对话"}), encoding="utf-8")
+        assert not validate_antigravity_zh_dict(bad_dict_path)[0]
+        empty_val_dict = dict(synth_dict)
+        empty_val_dict["Empty Entry"] = "   "
+        bad_dict_path.write_text(json.dumps(empty_val_dict, ensure_ascii=False), encoding="utf-8")
+        assert not validate_antigravity_zh_dict(bad_dict_path)[0]
+        non_zh_dict = dict(synth_dict)
+        non_zh_dict["New Conversation"] = "New Conversation"
+        bad_dict_path.write_text(json.dumps(non_zh_dict, ensure_ascii=False), encoding="utf-8")
+        assert not validate_antigravity_zh_dict(bad_dict_path)[0]
+        bad_dict_path.unlink()
+
+        # Too-small antigravity_zh_dict.json in repo must fail i18n check
+        (root / AGY_ZH_DICT_REL).write_text(
+            json.dumps({"New Conversation": "新建对话"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        small_dict_res = dict((n, ok) for n, ok, _ in run_checks(root))
+        assert not small_dict_res["i18n:antigravity-zh-dict"]
+        (root / AGY_ZH_DICT_REL).write_text(
+            json.dumps(synth_dict, ensure_ascii=False), encoding="utf-8"
+        )
 
         # Unauthorized app.asar outside antigravity_i18n.rs must fail
         (root / "src" / "rogue.ts").write_text('const p = "Resources/app.asar";\n', encoding="utf-8")
