@@ -33,8 +33,20 @@ export interface McpToolsConfig {
   audio: boolean;
   search: boolean;
   consult: boolean;
+  webPage?: boolean;
+  edgeoneApiToken?: string | null;
+  edgeoneProjectName?: string | null;
   outputDir: string;
   consultModel: string;
+}
+
+export interface NodeRuntimeInfo {
+  available: boolean;
+  version: string | null;
+  major: number | null;
+  meetsMinVersion: boolean;
+  nodePath: string | null;
+  npxPath: string | null;
 }
 
 export type ModelFilterMode = "recommended" | "custom" | "all";
@@ -415,4 +427,5 @@ export const api = {
   installSelfUpdate: () => invoke<void>("install_self_update"),
   runMcpLiveDemo: (input: LiveDemoRequest) =>
     invoke<LiveDemoResult>("run_mcp_live_demo", { input }),
+  checkNodeRuntime: () => invoke<NodeRuntimeInfo>("check_node_runtime"),
 };

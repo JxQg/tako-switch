@@ -190,15 +190,28 @@ fn detect_claude_dirs(home: &Path) -> (PathBuf, PathBuf) {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpToolsConfig {
+    #[serde(default = "default_true")]
     pub image: bool,
+    #[serde(default = "default_true")]
     pub video: bool,
+    #[serde(default = "default_true")]
     pub audio: bool,
+    #[serde(default = "default_true")]
     pub search: bool,
+    #[serde(default = "default_true")]
     pub consult: bool,
+    #[serde(default)]
+    pub web_page: bool,
+    #[serde(default)]
+    pub edgeone_api_token: Option<String>,
+    #[serde(default)]
+    pub edgeone_project_name: Option<String>,
+    #[serde(default)]
     pub output_dir: String,
+    #[serde(default)]
     pub consult_model: String,
 }
 
@@ -210,9 +223,39 @@ impl McpToolsConfig {
             audio: true,
             search: true,
             consult: true,
+            web_page: false,
+            edgeone_api_token: None,
+            edgeone_project_name: None,
             output_dir: paths.default_media_output_dir().to_string_lossy().to_string(),
             consult_model: "gpt-6.2-sol".to_string(),
         }
+    }
+
+    pub fn normalize_optional_field(raw: Option<String>) -> Option<String> {
+        raw.and_then(|s| {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+    }
+
+    pub fn normalize(&mut self) {
+        self.edgeone_api_token = Self::normalize_optional_field(self.edgeone_api_token.take());
+        self.edgeone_project_name =
+            Self::normalize_optional_field(self.edgeone_project_name.take());
+    }
+
+    pub fn normalized_edgeone_api_token(&self) -> Option<&str> {
+        self.edgeone_api_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn normalized_edgeone_project_name(&self) -> Option<&str> {
+        self.edgeone_project_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -224,6 +267,9 @@ impl Default for McpToolsConfig {
             audio: true,
             search: true,
             consult: true,
+            web_page: false,
+            edgeone_api_token: None,
+            edgeone_project_name: None,
             output_dir: "~/Downloads/Tako".to_string(),
             consult_model: "gpt-6.2-sol".to_string(),
         }
@@ -604,11 +650,14 @@ pub fn read_switch_state(paths: &AppPaths) -> SwitchState {
     if state.mcp.consult_model.trim().is_empty() {
         state.mcp.consult_model = default.mcp.consult_model;
     }
+    state.mcp.normalize();
     state
 }
 
 pub fn save_switch_state(paths: &AppPaths, state: &SwitchState) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(state)
+    let mut normalized = state.clone();
+    normalized.mcp.normalize();
+    let bytes = serde_json::to_vec_pretty(&normalized)
         .map_err(|e| format!("序列化 switch state 失败: {e}"))?;
     write_atomic(&paths.state_path(), &bytes, true)
 }
@@ -971,5 +1020,73 @@ mod tests {
         );
         assert_eq!(long_id_name, "abcdefghijklmno-0123456789abcdef");
         assert_eq!(long_id_name.len(), 32);
+    }
+
+    #[test]
+    fn legacy_mcp_config_deserializes_with_edgeone_defaults_and_trims_blank_fields() {
+        let legacy_mcp_json = r#"{
+            "image": true,
+            "video": false,
+            "audio": true,
+            "search": true,
+            "consult": false,
+            "outputDir": "~/Downloads/Tako",
+            "consultModel": "gpt-6.2-sol"
+        }"#;
+        let parsed: McpToolsConfig = serde_json::from_str(legacy_mcp_json).unwrap();
+        assert!(parsed.image);
+        assert!(!parsed.video);
+        assert!(!parsed.consult);
+        assert!(!parsed.web_page);
+        assert_eq!(parsed.edgeone_api_token, None);
+        assert_eq!(parsed.edgeone_project_name, None);
+
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let legacy_state = serde_json::json!({
+            "baseUrl": "https://tako.shiroha.tech",
+            "manifestUrl": DEFAULT_MANIFEST_URL,
+            "fallbackManifestUrl": DEFAULT_FALLBACK_MANIFEST_URL,
+            "autoCheckUpdates": true,
+            "mcp": {
+                "image": true,
+                "video": true,
+                "audio": true,
+                "search": true,
+                "consult": true,
+                "outputDir": "~/Downloads/Tako",
+                "consultModel": "gpt-6.2-sol"
+            }
+        });
+        write_atomic(
+            &paths.state_path(),
+            serde_json::to_string(&legacy_state).unwrap().as_bytes(),
+            false,
+        )
+        .unwrap();
+
+        let loaded = read_switch_state(&paths);
+        assert!(!loaded.mcp.web_page);
+        assert_eq!(loaded.mcp.edgeone_api_token, None);
+        assert_eq!(loaded.mcp.edgeone_project_name, None);
+
+        let mut st = loaded;
+        st.mcp.web_page = true;
+        st.mcp.edgeone_api_token = Some("   \t ".to_string());
+        st.mcp.edgeone_project_name = Some("  my-site  ".to_string());
+        save_switch_state(&paths, &st).unwrap();
+
+        let reloaded = read_switch_state(&paths);
+        assert!(reloaded.mcp.web_page);
+        assert_eq!(reloaded.mcp.edgeone_api_token, None);
+        assert_eq!(
+            reloaded.mcp.edgeone_project_name.as_deref(),
+            Some("my-site")
+        );
+
+        let raw_on_disk = fs::read_to_string(paths.state_path()).unwrap();
+        let val_on_disk: serde_json::Value = serde_json::from_str(&raw_on_disk).unwrap();
+        assert!(val_on_disk["mcp"]["edgeoneApiToken"].is_null());
+        assert_eq!(val_on_disk["mcp"]["edgeoneProjectName"], "my-site");
     }
 }

@@ -490,6 +490,12 @@ impl DesktopAppAdapter for DshTakoAdapter {
         }
 
         notes.push("DSH Tako 原生内置 Tako 模型目录与联网工具，无需占用本地网关端口".to_string());
+        if crate::config::read_switch_state(paths).mcp.web_page {
+            notes.push(
+                "网站上线 MCP (EdgeOne): DSH Tako 当前不读取外部 mcpServers JSON，已保持配置文件无改动"
+                    .to_string(),
+            );
+        }
 
         DiagnosticResult {
             ok: issues.is_empty(),
@@ -738,5 +744,27 @@ refs:
         assert_eq!(adapter.read_mode(&paths), AppMode::Official);
         let restored = fs::read_to_string(&cred_path).unwrap();
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn dsh_tako_edgeone_web_page_enabled_does_not_create_unsupported_mcp_files() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        save_switch_auth(&paths, Some("cr_switch_main_key"), Some("9"), Some("oauth")).unwrap();
+
+        let mut st = crate::config::read_switch_state(&paths);
+        st.mcp.web_page = true;
+        crate::config::save_switch_state(&paths, &st).unwrap();
+
+        let adapter = DshTakoAdapter;
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        let diag = adapter.diagnose(&paths);
+        assert!(diag.ok);
+        assert!(diag
+            .notes
+            .iter()
+            .any(|n| n.contains("EdgeOne") && n.contains("无改动")));
+        assert!(!paths.dsh_tako_dir.join("mcp.json").exists());
+        assert!(!paths.dsh_tako_dir.join("config.yaml").exists());
     }
 }

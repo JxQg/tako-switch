@@ -81,7 +81,7 @@ pub struct DashboardPayload {
     pub ui_patch_prompts: Vec<adapters::UiPatchPermissionPrompt>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsPatch {
     pub base_url: Option<String>,
@@ -612,16 +612,25 @@ fn open_url(url: String) -> Result<(), String> {
     open_external_url(&url)
 }
 
-#[tauri::command]
-async fn save_settings(app: AppHandle, input: SettingsPatch) -> Result<SwitchState, String> {
-    let paths = AppPaths::detect()?;
-    let mut state = read_switch_state(&paths);
+pub fn apply_settings_patch_for_paths(
+    paths: &AppPaths,
+    input: SettingsPatch,
+) -> Result<SwitchState, String> {
+    let mut state = read_switch_state(paths);
     let prev_base = state.normalized_base_url();
     let prev_agy_key = state.agy_api_key.clone();
     let prev_codex_preserve = state.codex_preserve_official_auth;
     let prev_name = state.normalized_gateway_name();
     let prev_subtitle = state.normalized_gateway_subtitle();
     let prev_zh = state.prefer_chinese_ui;
+    let prev_edgeone = (
+        state.mcp.web_page,
+        state.mcp.normalized_edgeone_api_token().map(str::to_string),
+        state
+            .mcp
+            .normalized_edgeone_project_name()
+            .map(str::to_string),
+    );
 
     if let Some(url) = input.base_url {
         let trimmed = url.trim().trim_end_matches('/').to_string();
@@ -669,17 +678,28 @@ async fn save_settings(app: AppHandle, input: SettingsPatch) -> Result<SwitchSta
     if let Some(bypass_proxy) = input.bypass_system_proxy {
         state.bypass_system_proxy = bypass_proxy;
     }
-    if let Some(mcp) = input.mcp {
+    if let Some(mut mcp) = input.mcp {
+        mcp.normalize();
         state.mcp = mcp;
     }
 
-    save_switch_state(&paths, &state)?;
+    save_switch_state(paths, &state)?;
 
+    let next_edgeone = (
+        state.mcp.web_page,
+        state.mcp.normalized_edgeone_api_token().map(str::to_string),
+        state
+            .mcp
+            .normalized_edgeone_project_name()
+            .map(str::to_string),
+    );
+    let edgeone_mcp_changed = prev_edgeone != next_edgeone;
     let endpoint_or_profile_changed = prev_base != state.normalized_base_url()
         || prev_agy_key != state.agy_api_key
         || prev_name != state.normalized_gateway_name()
         || prev_subtitle != state.normalized_gateway_subtitle()
-        || prev_zh != state.prefer_chinese_ui;
+        || prev_zh != state.prefer_chinese_ui
+        || edgeone_mcp_changed;
     let codex_auth_mode_changed = prev_codex_preserve != state.codex_preserve_official_auth;
     if endpoint_or_profile_changed || codex_auth_mode_changed {
         for &app_id in AppId::all() {
@@ -690,17 +710,31 @@ async fn save_settings(app: AppHandle, input: SettingsPatch) -> Result<SwitchSta
                 continue;
             }
             let adapter = get_adapter(app_id);
-            if adapter.read_mode(&paths) == AppMode::Tako {
-                let _ = adapter.apply_mode(&paths, AppMode::Tako);
+            if adapter.read_mode(paths) == AppMode::Tako {
+                let _ = adapter.apply_mode(paths, AppMode::Tako);
             }
         }
     }
     if prev_zh != state.prefer_chinese_ui {
-        sync_standalone_chinese_for_installed(&paths, state.prefer_chinese_ui);
+        sync_standalone_chinese_for_installed(paths, state.prefer_chinese_ui);
     }
 
+    Ok(state)
+}
+
+#[tauri::command]
+async fn save_settings(app: AppHandle, input: SettingsPatch) -> Result<SwitchState, String> {
+    let paths = AppPaths::detect()?;
+    let state = apply_settings_patch_for_paths(&paths, input)?;
     refresh_tray(&app, &paths);
     Ok(state)
+}
+
+#[tauri::command]
+async fn check_node_runtime() -> Result<adapters::NodeRuntimeInfo, String> {
+    Ok(tokio::task::spawn_blocking(adapters::detect_node_runtime)
+        .await
+        .unwrap_or_else(|_| adapters::NodeRuntimeInfo::unavailable()))
 }
 
 fn should_sync_standalone_locale(paths: &AppPaths, app_id: AppId, enable: bool) -> bool {
@@ -1531,6 +1565,7 @@ pub fn run() {
             check_self_update_smart,
             install_self_update,
             run_mcp_live_demo,
+            check_node_runtime,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tako Switch");
@@ -1561,5 +1596,92 @@ mod tests {
         let (src_gh_only, urls_gh_only) = choose_self_update_endpoints(None, Some((2, 0, 3)));
         assert_eq!(src_gh_only, "github");
         assert_eq!(urls_gh_only[0], SELF_UPDATE_GITHUB_ENDPOINT);
+    }
+
+    #[test]
+    fn save_settings_syncs_edgeone_mcp_to_tako_clients_only_and_normalizes_blank_fields() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        config::save_switch_auth(&paths, Some("cr_main_key"), Some("1"), Some("oauth")).unwrap();
+
+        // Put Claude & Codex in Tako mode; leave Antigravity in Official mode
+        get_adapter(AppId::Claude)
+            .apply_mode(&paths, AppMode::Tako)
+            .unwrap();
+        get_adapter(AppId::Codex)
+            .apply_mode(&paths, AppMode::Tako)
+            .unwrap();
+
+        let mut next_mcp = read_switch_state(&paths).mcp;
+        next_mcp.web_page = true;
+        next_mcp.edgeone_api_token = Some("   ".to_string());
+        next_mcp.edgeone_project_name = Some("  demo-site  ".to_string());
+
+        let saved = apply_settings_patch_for_paths(
+            &paths,
+            SettingsPatch {
+                mcp: Some(next_mcp),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(saved.mcp.web_page);
+        assert_eq!(saved.mcp.edgeone_api_token, None);
+        assert_eq!(saved.mcp.edgeone_project_name.as_deref(), Some("demo-site"));
+
+        // Claude & Codex synced automatically
+        assert!(adapters::has_edgeone_mcp_server(
+            &paths.claude_1p_dir.join("claude_desktop_config.json")
+        ));
+        assert!(adapters::has_edgeone_mcp_server(
+            &paths.claude_3p_dir.join("claude_desktop_config.json")
+        ));
+        let codex_toml = std::fs::read_to_string(paths.codex_dir.join("config.toml")).unwrap();
+        assert!(codex_toml.contains(adapters::EDGEONE_MCP_SERVER_KEY));
+        assert!(codex_toml.contains("EDGEONE_PAGES_PROJECT_NAME = \"demo-site\""));
+        assert!(!codex_toml.contains("EDGEONE_PAGES_API_TOKEN"));
+
+        // Antigravity (Official) was NOT touched
+        assert!(!adapters::has_edgeone_mcp_server(
+            &paths.agy_gemini_config_dir.join("mcp_config.json")
+        ));
+
+        // Update token -> synced automatically
+        let mut with_token = saved.mcp.clone();
+        with_token.edgeone_api_token = Some("  eo_live_tok  ".to_string());
+        let saved_tok = apply_settings_patch_for_paths(
+            &paths,
+            SettingsPatch {
+                mcp: Some(with_token),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            saved_tok.mcp.edgeone_api_token.as_deref(),
+            Some("eo_live_tok")
+        );
+        let codex_toml_tok = std::fs::read_to_string(paths.codex_dir.join("config.toml")).unwrap();
+        assert!(codex_toml_tok.contains("EDGEONE_PAGES_API_TOKEN = \"eo_live_tok\""));
+
+        // Disable web_page -> cleaned up automatically
+        let mut disabled = saved_tok.mcp.clone();
+        disabled.web_page = false;
+        apply_settings_patch_for_paths(
+            &paths,
+            SettingsPatch {
+                mcp: Some(disabled),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!adapters::has_edgeone_mcp_server(
+            &paths.claude_1p_dir.join("claude_desktop_config.json")
+        ));
+        assert!(!adapters::has_edgeone_mcp_server(
+            &paths.claude_3p_dir.join("claude_desktop_config.json")
+        ));
+        let codex_toml_off = std::fs::read_to_string(paths.codex_dir.join("config.toml")).unwrap();
+        assert!(!codex_toml_off.contains(adapters::EDGEONE_MCP_SERVER_KEY));
     }
 }
