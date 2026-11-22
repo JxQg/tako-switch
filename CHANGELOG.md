@@ -2,6 +2,10 @@
 
 所有 Tako Switch 的重要版本更新说明都会记录在这里。每次发版时，CI 会自动提取对应版本段落，同步写入 `latest.json`（供客户端自更新与官网下载页展示）及 GitHub Release 正文。
 
+## v2.1.1 (2026-11-22)
+
+- 修复 Windows 构建 clippy 告警：装箱 Claude 适配器 `ResolvedClaudeTarget` 返回值，并为 v209 黑盒测试中的 Unix 专属辅助函数补充平台门禁；无用户可见行为变化
+
 ## v2.1.0 (2026-11-22)
 
 - 新增 Claude Desktop 全量简体中文界面汉化补丁器（纯 Rust 双 ASAR 架构）：同步修补 `app.asar` 与 `ion-dist.asar`，完整覆盖 Chat、Cowork 与 Claude Code Desktop 工作台界面及 51 个动态模型/思考强度词条，内置 ICU 占位符与富文本标签兼容性校验，并支持 macOS 双 `Info.plist` 完整性哈希更新与字节级原厂签名无损还原
