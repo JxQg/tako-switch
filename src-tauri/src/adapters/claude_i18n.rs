@@ -4,6 +4,11 @@ use crate::adapters::antigravity_i18n::{
 };
 #[cfg(target_os = "macos")]
 use crate::adapters::antigravity_i18n::resign_macos_outer_bundle_for;
+#[cfg(target_os = "macos")]
+use crate::adapters::asar_patch::{
+    compute_electron_asar_integrity_digest_from_plist_file,
+    patch_electron_integrity_digest_slots_in_file, scan_active_electron_integrity_digest_slots,
+};
 use crate::adapters::asar_patch::{
     format_ui_patch_block_error, inspect_electron_asar_integrity_fuse, make_msix_readonly_prompt,
     patch_windows_pe_asar_integrity, probe_bundle_write_access, read_bundle_file_checked,
@@ -1115,6 +1120,201 @@ fn update_claude_info_plist_integrity(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn electron_framework_paths(bundle_root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let fw_bundle = bundle_root
+        .join("Contents")
+        .join("Frameworks")
+        .join("Electron Framework.framework");
+    let fw_bin = fw_bundle.join("Versions").join("A").join("Electron Framework");
+    let fw_cr = fw_bundle
+        .join("Versions")
+        .join("A")
+        .join("_CodeSignature")
+        .join("CodeResources");
+    (fw_bundle, fw_bin, fw_cr)
+}
+
+#[cfg(target_os = "macos")]
+fn list_claude_helper_apps(bundle_root: &Path) -> Vec<(String, PathBuf)> {
+    let frameworks_dir = bundle_root.join("Contents").join("Frameworks");
+    let Ok(entries) = fs::read_dir(&frameworks_dir) else {
+        return Vec::new();
+    };
+    let mut helpers = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(stem) = name.strip_suffix(".app") {
+            helpers.push((stem.to_string(), path));
+        }
+    }
+    helpers.sort_by(|a, b| a.0.cmp(&b.0));
+    helpers
+}
+
+#[cfg(target_os = "macos")]
+fn copy_file_cow_or_regular(src: &Path, dst: &Path) -> Result<(), String> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("创建目录 {} 失败: {e}", parent.display()))?;
+    }
+    let tmp = dst.with_file_name(format!(
+        ".{}.tako-tmp.{}",
+        dst.file_name().and_then(|n| n.to_str()).unwrap_or("orig"),
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&tmp);
+    let cow_ok = std::process::Command::new("/bin/cp")
+        .args(["-c", "-p"])
+        .arg(src)
+        .arg(&tmp)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !cow_ok {
+        fs::copy(src, &tmp)
+            .map_err(|e| format!("复制 {} -> {} 失败: {e}", src.display(), dst.display()))?;
+    }
+    fs::rename(&tmp, dst).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("原子保存 {} 失败: {e}", dst.display())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_electron_framework_digest_matches_plist(bundle_root: &Path, plist_path: &Path) -> bool {
+    let (_, fw_bin, _) = electron_framework_paths(bundle_root);
+    if !fw_bin.is_file() {
+        return true;
+    }
+    let Ok(slots) = scan_active_electron_integrity_digest_slots(&fw_bin) else {
+        return true;
+    };
+    if slots.is_empty() {
+        return true;
+    }
+    let Ok(Some(expected)) = compute_electron_asar_integrity_digest_from_plist_file(plist_path) else {
+        return false;
+    };
+    slots.iter().all(|(_, current)| current == &expected)
+}
+
+#[cfg(target_os = "macos")]
+fn sync_macos_electron_framework_and_resign(
+    bundle_root: &Path,
+    plist_path: &Path,
+    backup_dir: &Path,
+    need_refresh_backups: bool,
+) -> Result<(), String> {
+    let (fw_bundle, fw_bin, fw_cr) = electron_framework_paths(bundle_root);
+    let mut patched_framework = false;
+
+    if fw_bin.is_file() {
+        let slots = scan_active_electron_integrity_digest_slots(&fw_bin)?;
+        if !slots.is_empty() {
+            let expected_digest = compute_electron_asar_integrity_digest_from_plist_file(plist_path)?
+                .ok_or_else(|| {
+                    "无法从 Claude.app Info.plist 解析 ElectronAsarIntegrity 摘要".to_string()
+                })?;
+
+            let needs_digest_patch = slots.iter().any(|(_, cur)| cur != &expected_digest);
+            if needs_digest_patch {
+                probe_bundle_write_access(AppId::Claude, "patch", &fw_bin)?;
+
+                let fw_backup = backup_dir.join("Electron_Framework.orig");
+                let fw_cr_backup = backup_dir.join("Electron_Framework_CodeResources.orig");
+                if need_refresh_backups || !fw_backup.is_file() {
+                    copy_file_cow_or_regular(&fw_bin, &fw_backup)?;
+                }
+                if fw_cr.is_file() && (need_refresh_backups || !fw_cr_backup.is_file()) {
+                    copy_file_cow_or_regular(&fw_cr, &fw_cr_backup)?;
+                }
+
+                let helpers = list_claude_helper_apps(bundle_root);
+                for (stem, helper_app) in &helpers {
+                    let h_bin = helper_app.join("Contents").join("MacOS").join(stem);
+                    let h_cr = helper_app
+                        .join("Contents")
+                        .join("_CodeSignature")
+                        .join("CodeResources");
+                    let h_dir = backup_dir.join("helpers").join(stem);
+                    let h_bin_bak = h_dir.join("binary.orig");
+                    let h_cr_bak = h_dir.join("CodeResources.orig");
+                    if h_bin.is_file() && (need_refresh_backups || !h_bin_bak.is_file()) {
+                        copy_file_cow_or_regular(&h_bin, &h_bin_bak)?;
+                    }
+                    if h_cr.is_file() && (need_refresh_backups || !h_cr_bak.is_file()) {
+                        copy_file_cow_or_regular(&h_cr, &h_cr_bak)?;
+                    }
+                }
+
+                let offsets: Vec<u64> = slots.iter().map(|(off, _)| *off).collect();
+                patch_electron_integrity_digest_slots_in_file(
+                    AppId::Claude,
+                    "patch",
+                    &fw_bin,
+                    &offsets,
+                    &expected_digest,
+                )?;
+                patched_framework = true;
+            }
+        }
+    }
+
+    if patched_framework {
+        resign_macos_outer_bundle_for(AppId::Claude, "patch", &fw_bundle, backup_dir)?;
+        for (_, helper_app) in list_claude_helper_apps(bundle_root) {
+            resign_macos_outer_bundle_for(AppId::Claude, "patch", &helper_app, backup_dir)?;
+        }
+    }
+
+    resign_macos_outer_bundle_for(AppId::Claude, "patch", bundle_root, backup_dir)
+}
+
+#[cfg(target_os = "macos")]
+fn restore_macos_electron_framework_and_helpers(
+    bundle_root: &Path,
+    backup_dir: &Path,
+) -> Result<(), String> {
+    let (_, fw_bin, fw_cr) = electron_framework_paths(bundle_root);
+    let fw_backup = backup_dir.join("Electron_Framework.orig");
+    if fw_backup.is_file() && fw_bin.is_file() {
+        probe_bundle_write_access(AppId::Claude, "restore", &fw_bin)?;
+        copy_file_cow_or_regular(&fw_backup, &fw_bin)?;
+    }
+    let fw_cr_backup = backup_dir.join("Electron_Framework_CodeResources.orig");
+    if fw_cr_backup.is_file() && fw_cr.is_file() {
+        let bytes = fs::read(&fw_cr_backup)
+            .map_err(|e| format!("读取 {} 失败: {e}", fw_cr_backup.display()))?;
+        write_bundle_file_checked(AppId::Claude, "restore", &fw_cr, &bytes, false)?;
+    }
+
+    for (stem, helper_app) in list_claude_helper_apps(bundle_root) {
+        let h_dir = backup_dir.join("helpers").join(&stem);
+        let h_bin_bak = h_dir.join("binary.orig");
+        let h_cr_bak = h_dir.join("CodeResources.orig");
+        let h_bin = helper_app.join("Contents").join("MacOS").join(&stem);
+        let h_cr = helper_app
+            .join("Contents")
+            .join("_CodeSignature")
+            .join("CodeResources");
+        if h_bin_bak.is_file() && h_bin.is_file() {
+            let bytes = fs::read(&h_bin_bak)
+                .map_err(|e| format!("读取 {} 失败: {e}", h_bin_bak.display()))?;
+            write_bundle_file_checked(AppId::Claude, "restore", &h_bin, &bytes, true)?;
+        }
+        if h_cr_bak.is_file() && h_cr.is_file() {
+            let bytes = fs::read(&h_cr_bak)
+                .map_err(|e| format!("读取 {} 失败: {e}", h_cr_bak.display()))?;
+            write_bundle_file_checked(AppId::Claude, "restore", &h_cr, &bytes, false)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
     let target = match resolve_claude_target(paths) {
         ClaudeTargetResolution::NotInstalled => {
@@ -1303,7 +1503,22 @@ pub fn patch_claude_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, String
             && verify_clean_backup_file(paths, "app.asar.orig", expected_app_sha).is_ok()
             && verify_clean_backup_file(paths, "ion-dist.asar.orig", expected_ion_sha).is_ok()
         {
-            return Ok(inspect_claude_ui_patch(paths));
+            #[cfg(target_os = "macos")]
+            let framework_ok = if paths.is_test {
+                true
+            } else if let (Some(ref bundle_root), Some(ref plist_path)) =
+                (&target.bundle_root, &target.info_plist_path)
+            {
+                macos_electron_framework_digest_matches_plist(bundle_root, plist_path)
+            } else {
+                true
+            };
+            #[cfg(not(target_os = "macos"))]
+            let framework_ok = true;
+
+            if framework_ok {
+                return Ok(inspect_claude_ui_patch(paths));
+            }
         }
     }
 
@@ -1574,7 +1789,16 @@ pub fn patch_claude_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, String
     #[cfg(target_os = "macos")]
     if !paths.is_test {
         if let Some(ref bundle_root) = target.bundle_root {
-            resign_macos_outer_bundle_for(AppId::Claude, "patch", bundle_root, &backup_dir)?;
+            if let Some(ref plist_path) = target.info_plist_path {
+                sync_macos_electron_framework_and_resign(
+                    bundle_root,
+                    plist_path,
+                    &backup_dir,
+                    need_refresh_backups,
+                )?;
+            } else {
+                resign_macos_outer_bundle_for(AppId::Claude, "patch", bundle_root, &backup_dir)?;
+            }
         }
     }
 
@@ -1709,6 +1933,13 @@ pub fn restore_claude_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, Stri
                     .map_err(|e| format!("读取 {} 失败: {e}", orig_cr.display()))?;
                 write_bundle_file_checked(AppId::Claude, "restore", dst_cr, &bytes, false)?;
                 restored_cr = true;
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        if !paths.is_test {
+            if let Some(ref bundle_root) = target.bundle_root {
+                restore_macos_electron_framework_and_helpers(bundle_root, &backup_dir)?;
             }
         }
 

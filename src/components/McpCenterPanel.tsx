@@ -75,6 +75,9 @@ interface McpCenterPanelProps {
   savingMcp: boolean;
   loggedIn: boolean;
   loggingIn: boolean;
+  initialDrawerTab?: McpToolKey | null;
+  onConsumeInitialTab?: () => void;
+  onGoHome: () => void;
   onToggleCoreTool: (key: McpToolKey) => void;
   onToggleWebPage: (next: boolean) => Promise<void>;
   onSaveEdgeOneConfig: (token: string, projectName: string) => Promise<void>;
@@ -87,6 +90,9 @@ export function McpCenterPanel({
   savingMcp,
   loggedIn,
   loggingIn,
+  initialDrawerTab,
+  onConsumeInitialTab,
+  onGoHome,
   onToggleCoreTool,
   onToggleWebPage,
   onSaveEdgeOneConfig,
@@ -95,6 +101,14 @@ export function McpCenterPanel({
 }: McpCenterPanelProps) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerTab, setDrawerTab] = useState<McpToolKey>("image");
+
+  useEffect(() => {
+    if (initialDrawerTab) {
+      setDrawerTab(initialDrawerTab);
+      setDrawerOpen(true);
+      onConsumeInitialTab?.();
+    }
+  }, [initialDrawerTab, onConsumeInitialTab]);
   const [authGuideOpen, setAuthGuideOpen] = useState(false);
 
   const [tokenOpen, setTokenOpen] = useState(false);
@@ -130,16 +144,21 @@ export function McpCenterPanel({
   }, [mcp?.webPage, checkNode]);
 
   useEffect(() => {
-    if (!drawerOpen && !authGuideOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        if (authGuideOpen) setAuthGuideOpen(false);
-        else setDrawerOpen(false);
+      if (e.key !== "Escape") return;
+      const activeTag = document.activeElement?.tagName?.toLowerCase();
+      if (activeTag === "input" || activeTag === "textarea") return;
+      if (authGuideOpen) {
+        setAuthGuideOpen(false);
+      } else if (drawerOpen) {
+        setDrawerOpen(false);
+      } else {
+        onGoHome();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [drawerOpen, authGuideOpen]);
+  }, [drawerOpen, authGuideOpen, onGoHome]);
 
   const webPageEnabled = Boolean(mcp?.webPage);
   const enabledCount = mcp
@@ -169,14 +188,14 @@ export function McpCenterPanel({
   const nodeReady = nodeInfo !== null && nodeInfo.available && nodeInfo.meetsMinVersion;
 
   return (
-    <div className="max-w-[760px] mx-auto px-6 py-6 flex flex-col gap-5">
+    <div className="w-full px-4 sm:px-5 py-4 flex flex-col gap-5">
       {/* Page Intro */}
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div className="min-w-0">
-          <div className="text-[10.5px] font-bold tracking-[0.08em] uppercase text-[var(--accent)] mb-1">
+          <div className="text-[11px] font-bold tracking-[0.08em] uppercase text-[var(--accent)] mb-1">
             Tako 超级 MCP · 按需启用
           </div>
-          <h1 className="text-[22px] font-semibold tracking-[-0.025em] text-[var(--text-primary)] leading-tight">
+          <h1 className="text-[20px] font-semibold tracking-[-0.025em] text-[var(--text-primary)] leading-tight">
             MCP 能力中心
           </h1>
           <p className="text-[12.5px] text-[var(--text-secondary)] mt-1">

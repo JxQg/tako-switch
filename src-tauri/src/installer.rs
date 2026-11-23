@@ -563,15 +563,66 @@ pub async fn install_or_upgrade_app(
         } else {
             "正在无损重放 Tako 配置"
         };
-        emit_progress(app, app_id, "configuring", 96, msg);
+        emit_progress(app, app_id, "configuring", 95, msg);
         if let Err(err) = adapter.apply_mode(paths, target_mode) {
             emit_progress(app, app_id, "error", 0, &err);
             return Err(err);
         }
     }
+    drop(adapter);
+
+    // If user enabled Chinese UI preference, automatically refresh standalone Chinese locale
+    // and re-apply UI Chinese patch for the freshly upgraded Claude / Antigravity bundle before relaunch.
+    let switch_state = crate::config::read_switch_state(paths);
+    if switch_state.prefer_chinese_ui
+        && matches!(app_id, AppId::Codex | AppId::Claude | AppId::Antigravity)
+    {
+        match app_id {
+            AppId::Codex => {
+                let _ = crate::adapters::codex::CodexAdapter::sync_standalone_chinese_locale(
+                    paths, true,
+                );
+            }
+            AppId::Claude => {
+                let _ = crate::adapters::claude::ClaudeAdapter::sync_standalone_chinese_locale(
+                    paths, true,
+                );
+            }
+            AppId::Antigravity => {
+                let _ =
+                    crate::adapters::antigravity::AntigravityAdapter::sync_standalone_chinese_locale(
+                        paths, true,
+                    );
+            }
+            AppId::DshTako => {}
+        }
+
+        if matches!(app_id, AppId::Claude | AppId::Antigravity) {
+            emit_progress(
+                app,
+                app_id,
+                "configuring",
+                98,
+                "正在为新版本自动应用简体中文界面",
+            );
+            let paths_clone = paths.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || match app_id {
+                AppId::Claude => {
+                    crate::adapters::claude_i18n::patch_claude_ui_for_paths(&paths_clone)
+                        .map(|_| ())
+                }
+                AppId::Antigravity => {
+                    crate::adapters::antigravity_i18n::patch_antigravity_ui_for_paths(&paths_clone)
+                        .map(|_| ())
+                }
+                _ => Ok(()),
+            })
+            .await;
+        }
+    }
 
     if was_running {
-        let _ = adapter.launch_app(paths);
+        let _ = get_adapter(app_id).launch_app(paths);
     }
 
     let snapshot = snapshot_app(paths, app_id);

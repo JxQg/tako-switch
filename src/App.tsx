@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { AlertCircle, ExternalLink, FileText, X } from "lucide-react";
+import { AlertCircle, ExternalLink, FileText, MessageSquare, X } from "lucide-react";
 import {
   api,
   parseUiPatchBlockError,
+  TAKO_FEEDBACK_URL,
   TAKO_RELEASES_URL,
   type AccountStatus,
   type AppId,
@@ -17,6 +18,7 @@ import {
   type SelfUpdateProgressEvent,
   type SettingsPatch,
   type UiPatchPermissionPrompt,
+  type UiPatchProgressEvent,
 } from "./lib/api";
 import { CHANGELOG_RELEASES, parseReleaseNotesLines } from "./lib/changelog";
 import { ClientSettingsPanel } from "./components/ClientSettingsPanel";
@@ -25,7 +27,6 @@ import { McpCenterPanel } from "./components/McpCenterPanel";
 import type { McpToolKey } from "./components/McpInlineTheater";
 import { ModelPickerModal } from "./components/ModelPickerModal";
 import { OverviewPanel } from "./components/OverviewPanel";
-import { SidebarNav } from "./components/SidebarNav";
 import { TopHeaderBar } from "./components/TopHeaderBar";
 import { UiPatchPermissionModal } from "./components/UiPatchPermissionModal";
 import {
@@ -91,6 +92,9 @@ export default function App() {
   const [loggingIn, setLoggingIn] = useState(false);
 
   const [togglingChineseUi, setTogglingChineseUi] = useState(false);
+  const [uiPatchProgress, setUiPatchProgress] = useState<UiPatchProgressEvent | null>(null);
+  const uiPatchClearTimerRef = useRef<number | null>(null);
+  const uiPatchFloorRef = useRef<number>(0);
   const [permissionPrompts, setPermissionPrompts] = useState<UiPatchPermissionPrompt[]>([]);
   const [retryingPermission, setRetryingPermission] = useState(false);
   const permissionRetryRef = useRef<(() => Promise<void>) | null>(null);
@@ -108,10 +112,51 @@ export default function App() {
   const [showKeyModal, setShowKeyModal] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [showChangelogModal, setShowChangelogModal] = useState(false);
+  const [mcpInitialTab, setMcpInitialTab] = useState<McpToolKey | null>(null);
 
   const [themePref, setThemePref] = useState<ThemePref>(loadInitialTheme);
+  const [systemDark, setSystemDark] = useState<boolean>(() =>
+    typeof window !== "undefined" &&
+    window.matchMedia?.("(prefers-color-scheme: dark)").matches,
+  );
   const initialAutoCheckDone = useRef(false);
   const runningSyncInFlight = useRef(false);
+
+  const isDark = themePref === "dark" || (themePref === "system" && systemDark);
+
+  useEffect(() => {
+    const mq = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!mq) return;
+    const onChange = (e: MediaQueryListEvent) => setSystemDark(e.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+
+  const toggleThemeQuick = useCallback(() => {
+    setThemePref(isDark ? "light" : "dark");
+  }, [isDark]);
+
+  useEffect(() => {
+    if (activeRoute === "overview") return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (
+        showKeyModal ||
+        showChangelogModal ||
+        modelModalApp !== null ||
+        permissionPrompts.length > 0
+      ) {
+        return;
+      }
+      // Let inputs or subpage drawers consume Escape first when focused
+      const activeTag = document.activeElement?.tagName?.toLowerCase();
+      if (activeTag === "input" || activeTag === "textarea") return;
+      if (activeRoute === "mcp") return;
+      setActiveRoute("overview");
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activeRoute, showKeyModal, showChangelogModal, modelModalApp, permissionPrompts.length]);
 
   const selfUpdateNoteLines = useMemo(
     () => parseReleaseNotesLines(selfUpdate?.notes),
@@ -319,16 +364,74 @@ export default function App() {
       setDashboard((prev) => (prev ? { ...prev, account: nextAccount } : prev));
     });
 
+    const unlistenUiPatchProgressPromise = listen<UiPatchProgressEvent>(
+      "ui-patch-progress",
+      (event) => {
+        const payload = event.payload;
+        if (uiPatchClearTimerRef.current !== null) {
+          window.clearTimeout(uiPatchClearTimerRef.current);
+          uiPatchClearTimerRef.current = null;
+        }
+        uiPatchFloorRef.current = payload.percent;
+        setUiPatchProgress((prev) => {
+          const sameRun =
+            prev && prev.scope === payload.scope && prev.action === payload.action;
+          const nextPercent =
+            payload.stage === "done" || payload.stage === "error"
+              ? 100
+              : sameRun
+                ? Math.max(prev.percent, payload.percent)
+                : payload.percent;
+          return { ...payload, percent: nextPercent };
+        });
+        if (payload.stage === "done" || payload.stage === "error") {
+          uiPatchClearTimerRef.current = window.setTimeout(
+            () => {
+              setUiPatchProgress(null);
+              uiPatchClearTimerRef.current = null;
+            },
+            payload.stage === "done" ? 1500 : 800,
+          );
+        }
+      },
+    );
+
     return () => {
       disposed = true;
+      if (uiPatchClearTimerRef.current !== null) {
+        window.clearTimeout(uiPatchClearTimerRef.current);
+        uiPatchClearTimerRef.current = null;
+      }
       void unlistenProgressPromise.then((fn) => fn());
       void unlistenSelfProgressPromise.then((fn) => fn());
       void unlistenSelfStatusPromise.then((fn) => fn());
       void unlistenStatePromise.then((fn) => fn());
       void unlistenUpdatesPromise.then((fn) => fn());
       void unlistenAccountPromise.then((fn) => fn());
+      void unlistenUiPatchProgressPromise.then((fn) => fn());
     };
   }, [applySelfUpdateCheckResult, loadDashboard, runUpdateChecks]);
+
+  // Smoothly advance visual progress between Rust milestones so ASAR repack & codesign never feel frozen
+  useEffect(() => {
+    if (
+      !uiPatchProgress ||
+      uiPatchProgress.stage === "done" ||
+      uiPatchProgress.stage === "error"
+    ) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setUiPatchProgress((prev) => {
+        if (!prev || prev.stage === "done" || prev.stage === "error") return prev;
+        const ceiling = Math.min(94, uiPatchFloorRef.current + 22);
+        if (prev.percent >= ceiling) return prev;
+        const step = prev.percent < ceiling - 8 ? 2 : 1;
+        return { ...prev, percent: Math.min(ceiling, prev.percent + step) };
+      });
+    }, 380);
+    return () => window.clearInterval(timer);
+  }, [uiPatchProgress?.scope, uiPatchProgress?.action, uiPatchProgress?.stage]);
 
   const syncRunningStates = useCallback(async () => {
     if (runningSyncInFlight.current) return;
@@ -647,6 +750,19 @@ export default function App() {
   const runSetPreferChineseUi = async (nextEnable: boolean) => {
     setTogglingChineseUi(true);
     setErrorMsg(null);
+    if (uiPatchClearTimerRef.current !== null) {
+      window.clearTimeout(uiPatchClearTimerRef.current);
+      uiPatchClearTimerRef.current = null;
+    }
+    uiPatchFloorRef.current = 8;
+    setUiPatchProgress({
+      scope: "all",
+      action: nextEnable ? "patch" : "restore",
+      stage: "preparing",
+      percent: 8,
+      message: nextEnable ? "正在准备三端简体中文汉化..." : "正在准备恢复三端原版界面...",
+      currentApp: null,
+    });
     try {
       const nextDashboard = await api.setPreferChineseUi(nextEnable, true, false);
       setDashboard(nextDashboard);
@@ -719,6 +835,19 @@ export default function App() {
     const label = APP_DISPLAY_NAMES[app.id] ?? app.name;
     setBusyApp(app.id);
     setErrorMsg(null);
+    if (uiPatchClearTimerRef.current !== null) {
+      window.clearTimeout(uiPatchClearTimerRef.current);
+      uiPatchClearTimerRef.current = null;
+    }
+    uiPatchFloorRef.current = 10;
+    setUiPatchProgress({
+      scope: app.id,
+      action: "patch",
+      stage: "preparing",
+      percent: 10,
+      message: `正在准备 ${label} 简体中文界面补丁...`,
+      currentApp: app.id,
+    });
     try {
       const updated = await api.patchAppUi(app.id, false);
       setPermissionPrompts([]);
@@ -755,6 +884,19 @@ export default function App() {
     const label = APP_DISPLAY_NAMES[app.id] ?? app.name;
     setBusyApp(app.id);
     setErrorMsg(null);
+    if (uiPatchClearTimerRef.current !== null) {
+      window.clearTimeout(uiPatchClearTimerRef.current);
+      uiPatchClearTimerRef.current = null;
+    }
+    uiPatchFloorRef.current = 10;
+    setUiPatchProgress({
+      scope: app.id,
+      action: "restore",
+      stage: "preparing",
+      percent: 10,
+      message: `正在准备还原 ${label} 原版界面...`,
+      currentApp: app.id,
+    });
     try {
       const updated = await api.restoreAppUi(app.id, false);
       setPermissionPrompts([]);
@@ -973,20 +1115,24 @@ export default function App() {
     return dashboard.apps.find((a) => a.id === activeRoute) ?? null;
   }, [dashboard, activeRoute]);
 
+  const hasPendingUpdates =
+    selfUpdateStatus === "available" || updatableApps.length > 0;
+
   return (
     <div className="h-screen w-full flex flex-col app-surface overflow-hidden">
-      {/* Top Minimal Header Bar (48px, macOS overlay-safe) */}
+      {/* Classic Unified Header Bar (52px, macOS overlay-safe) */}
       <TopHeaderBar
         isMac={isMac}
+        appVersion={dashboard?.appVersion ?? "2.2.2"}
         activeRoute={activeRoute}
         account={dashboard?.account}
-        anyTakoMode={anyTakoMode}
-        localGatewayHealthy={Boolean(dashboard?.localGatewayHealthy)}
-        fixingGateway={fixingGateway}
+        isDark={isDark}
+        hasPendingUpdates={hasPendingUpdates}
         refreshing={refreshing}
         checkingUpdates={checkingUpdates}
         loggingIn={loggingIn}
-        onEnsureGateway={() => void handleEnsureGateway()}
+        onGoHome={() => setActiveRoute("overview")}
+        onToggleTheme={toggleThemeQuick}
         onRefresh={() => void handleRefresh()}
         onOAuthLogin={() => void handleOAuthLogin()}
         onOpenKeyModal={() => setShowKeyModal(true)}
@@ -994,160 +1140,237 @@ export default function App() {
         onOpenGeneralSettings={() => setActiveRoute("general")}
       />
 
-      {/* Body Split: Fixed 220px Sidebar + Single-Domain Main Panel */}
-      <div className="flex-1 min-h-0 flex overflow-hidden">
-        <SidebarNav
-          activeRoute={activeRoute}
-          onSelectRoute={setActiveRoute}
-          appVersion={dashboard?.appVersion ?? "2.2.1"}
-          apps={dashboard?.apps ?? []}
-          updatesMap={updatesMap}
-          mcpEnabledCount={mcpEnabledCount}
-          mcpTotalCount={6}
-          hasSelfUpdate={selfUpdateStatus === "available"}
-          anyTakoMode={anyTakoMode}
-          localGatewayHealthy={Boolean(dashboard?.localGatewayHealthy)}
-        />
-
-        <main className="flex-1 min-w-0 overflow-y-auto subtle-scroll relative">
-          {/* Inline Error Strip (dismissible) */}
-          {errorMsg && (
-            <div className="max-w-[760px] mx-auto px-6 pt-4">
-              <div
-                className="rounded-[10px] border px-3.5 py-2.5 text-[12px] flex items-center justify-between gap-2"
-                style={{
-                  backgroundColor: "var(--danger-soft)",
-                  borderColor: "rgba(201, 76, 76, 0.25)",
-                  color: "var(--danger)",
-                }}
-              >
-                <div className="flex items-center gap-2 min-w-0">
-                  <AlertCircle className="h-4 w-4 shrink-0" />
-                  <span className="break-words">{errorMsg}</span>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setErrorMsg(null)}
-                  className="p-0.5 rounded hover:bg-black/5 cursor-pointer shrink-0"
-                  aria-label="关闭错误提示"
-                >
-                  <X className="h-3.5 w-3.5" />
-                </button>
+      {/* Single-Column Main Scroll Viewport (Home or Secondary Page) */}
+      <main className="flex-1 min-h-0 overflow-y-auto subtle-scroll relative">
+        {/* Inline Error Strip (dismissible) */}
+        {errorMsg && (
+          <div className="w-full px-4 pt-3.5">
+            <div
+              className="rounded-[10px] border px-3.5 py-2 text-[12px] flex items-center justify-between gap-2"
+              style={{
+                backgroundColor: "var(--danger-soft)",
+                borderColor: "rgba(201, 76, 76, 0.25)",
+                color: "var(--danger)",
+              }}
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <AlertCircle className="h-4 w-4 shrink-0" />
+                <span className="break-words">{errorMsg}</span>
               </div>
+              <button
+                type="button"
+                onClick={() => setErrorMsg(null)}
+                className="p-0.5 rounded hover:bg-black/5 cursor-pointer shrink-0"
+                aria-label="关闭错误提示"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {activeRoute === "overview" && (
+          <OverviewPanel
+            dashboard={dashboard}
+            loading={loading}
+            updatesMap={updatesMap}
+            installProgress={installProgress}
+            needsRestart={needsRestart}
+            updatableApps={updatableApps}
+            batchUpdatingApps={batchUpdatingApps}
+            busyApp={busyApp}
+            cancellingApp={cancellingApp}
+            togglingChineseUi={togglingChineseUi}
+            uiPatchProgress={uiPatchProgress}
+            savingMcp={savingMcp}
+            mcpEnabledCount={mcpEnabledCount}
+            mcpTotalCount={6}
+            selfUpdateSummary={{
+              status: selfUpdateStatus,
+              version: selfUpdate?.version,
+              source: selfUpdate?.source,
+              percent: selfUpdateProgress?.percent,
+            }}
+            onNavigate={setActiveRoute}
+            onOpenMcpDetail={(tab) => {
+              setMcpInitialTab(tab ?? null);
+              setActiveRoute("mcp");
+            }}
+            onSetMode={(app, mode) => void handleSetMode(app, mode)}
+            onLaunchApp={(id) => void handleLaunchApp(id)}
+            onRestartApp={(id) => void handleRestartApp(id)}
+            onCloseApp={(id) => void handleCloseApp(id)}
+            onInstallOrUpgrade={(id) => void handleInstallOrUpgrade(id)}
+            onCancelInstall={(id) => void handleCancelAppInstall(id)}
+            onToggleMainChineseUi={() => void handleToggleMainChineseUi()}
+            onToggleCoreMcp={(key) => void handleToggleMcpTool(key)}
+            onToggleWebPageMcp={(next) => void handleToggleWebPage(next)}
+            onOpenModelSquare={() => setModelModalApp("dsh-tako")}
+            onBatchUpgradeApps={() => void handleBatchUpgradeApps()}
+            onInstallSelfUpdate={() => void handleInstallSelfUpdate()}
+            onOpenChangelog={() => setShowChangelogModal(true)}
+          />
+        )}
+
+        {activeRoute === "general" && (
+          <GeneralSettingsPanel
+            dashboard={dashboard}
+            themePref={themePref}
+            onChangeTheme={setThemePref}
+            anyTakoMode={anyTakoMode}
+            fixingGateway={fixingGateway}
+            loggingIn={loggingIn}
+            savingSettings={savingSettings}
+            checkingUpdates={checkingUpdates}
+            lastCheckedAt={lastCheckedAt}
+            updatableApps={updatableApps}
+            batchUpdatingApps={batchUpdatingApps}
+            busyApp={busyApp}
+            selfUpdateView={{
+              status: selfUpdateStatus,
+              version: selfUpdate?.version,
+              source: selfUpdate?.source,
+              percent: selfUpdateProgress?.percent,
+              error: selfUpdateError,
+            }}
+            mcpEnabledCount={mcpEnabledCount}
+            mcpTotalCount={6}
+            onEnsureGateway={() => void handleEnsureGateway()}
+            onOAuthLogin={() => void handleOAuthLogin()}
+            onOpenKeyModal={() => setShowKeyModal(true)}
+            onLogout={() => void handleLogout()}
+            onRefreshAccount={() => void loadDashboard(true)}
+            onSavePatch={handleSaveSettingsPatch}
+            onCheckUpdates={() => void runUpdateChecks(false)}
+            onInstallSelfUpdate={() => void handleInstallSelfUpdate()}
+            onBatchUpgradeApps={() => void handleBatchUpgradeApps()}
+            onOpenChangelog={() => setShowChangelogModal(true)}
+            onNavigate={setActiveRoute}
+          />
+        )}
+
+        {activeRoute === "mcp" && (
+          <McpCenterPanel
+            mcp={dashboard?.state.mcp ?? null}
+            savingMcp={savingMcp}
+            loggedIn={Boolean(dashboard?.account.loggedIn)}
+            loggingIn={loggingIn}
+            initialDrawerTab={mcpInitialTab}
+            onConsumeInitialTab={() => setMcpInitialTab(null)}
+            onGoHome={() => setActiveRoute("overview")}
+            onToggleCoreTool={(key) => void handleToggleMcpTool(key)}
+            onToggleWebPage={handleToggleWebPage}
+            onSaveEdgeOneConfig={handleSaveEdgeOneConfig}
+            onSelectConsultModel={(model) => void handleSelectConsultModel(model)}
+            onRequestLogin={() => void handleOAuthLogin()}
+          />
+        )}
+
+        {selectedClientApp && dashboard && (
+          <ClientSettingsPanel
+            app={selectedClientApp}
+            dashboard={dashboard}
+            update={updatesMap[selectedClientApp.id]}
+            progress={installProgress[selectedClientApp.id]}
+            uiPatchProgress={
+              uiPatchProgress &&
+              (uiPatchProgress.scope === selectedClientApp.id ||
+                uiPatchProgress.currentApp === selectedClientApp.id)
+                ? uiPatchProgress
+                : null
+            }
+            isBusy={busyApp === selectedClientApp.id}
+            cancelling={cancellingApp === selectedClientApp.id}
+            needsRestart={Boolean(needsRestart[selectedClientApp.id])}
+            savingInlineSetting={savingSettings}
+            onSetMode={(app, mode) => void handleSetMode(app, mode)}
+            onLaunchApp={(id) => void handleLaunchApp(id)}
+            onRestartApp={(id) => void handleRestartApp(id)}
+            onCloseApp={(id) => void handleCloseApp(id)}
+            onInstallOrUpgrade={(id) => void handleInstallOrUpgrade(id)}
+            onCancelInstall={(id) => void handleCancelAppInstall(id)}
+            onRediagnose={(id) => void handleRediagnose(id)}
+            onPatchAppUi={(app) => void handlePatchAppUi(app)}
+            onRestoreAppUi={(app) => void handleRestoreAppUi(app)}
+            onOpenModelPicker={(id) => setModelModalApp(id)}
+            onSaveInlineSettings={handleSaveSettingsPatch}
+          />
+        )}
+
+        {activeRoute !== "overview" &&
+          activeRoute !== "general" &&
+          activeRoute !== "mcp" &&
+          !selectedClientApp && (
+            <div className="w-full px-5 py-12 text-center text-[13px] text-[var(--text-muted)]">
+              {loading ? "正在读取客户端状态..." : "未找到该客户端配置"}
             </div>
           )}
+      </main>
 
-          {activeRoute === "overview" && (
-            <OverviewPanel
-              dashboard={dashboard}
-              loading={loading}
-              updatesMap={updatesMap}
-              updatableApps={updatableApps}
-              batchUpdatingApps={batchUpdatingApps}
-              busyApp={busyApp}
-              togglingChineseUi={togglingChineseUi}
-              mcpEnabledCount={mcpEnabledCount}
-              mcpTotalCount={6}
-              selfUpdateSummary={{
-                status: selfUpdateStatus,
-                version: selfUpdate?.version,
-                source: selfUpdate?.source,
-                percent: selfUpdateProgress?.percent,
-              }}
-              onNavigate={setActiveRoute}
-              onToggleMainChineseUi={() => void handleToggleMainChineseUi()}
-              onOpenModelSquare={() => setModelModalApp("dsh-tako")}
-              onBatchUpgradeApps={() => void handleBatchUpgradeApps()}
-              onInstallSelfUpdate={() => void handleInstallSelfUpdate()}
-              onOpenChangelog={() => setShowChangelogModal(true)}
-            />
+      {/* Slim Bottom Status Bar */}
+      <footer className="h-8 shrink-0 px-4 border-t border-[var(--border)] bg-[var(--bg-card)]/80 flex items-center justify-between gap-3 text-[11.5px] text-[var(--text-secondary)] select-none">
+        <div className="flex items-center gap-2 min-w-0">
+          {!anyTakoMode ? (
+            <span className="inline-flex items-center gap-1.5 text-[var(--text-muted)] truncate">
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--text-muted)] shrink-0" />
+              <span className="truncate">本地网关待机</span>
+            </span>
+          ) : dashboard?.localGatewayHealthy ? (
+            <span className="inline-flex items-center gap-1.5 text-[var(--text-secondary)] tabular-nums min-w-0">
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--success)] shrink-0" />
+              <span className="truncate">本地网关 127.0.0.1:18419</span>
+              <span className="text-[var(--success)] font-medium shrink-0">· 运行中</span>
+            </span>
+          ) : (
+            <button
+              type="button"
+              disabled={fixingGateway}
+              onClick={() => void handleEnsureGateway()}
+              className="inline-flex items-center gap-1.5 text-[var(--warning)] hover:underline cursor-pointer disabled:opacity-60 min-w-0"
+            >
+              <span className="h-1.5 w-1.5 rounded-full bg-[var(--warning)] shrink-0" />
+              <span className="truncate">
+                {fixingGateway ? "正在修复网关..." : "本地网关未运行 · 点击修复"}
+              </span>
+            </button>
           )}
+        </div>
 
-          {activeRoute === "general" && (
-            <GeneralSettingsPanel
-              dashboard={dashboard}
-              themePref={themePref}
-              onChangeTheme={setThemePref}
-              anyTakoMode={anyTakoMode}
-              fixingGateway={fixingGateway}
-              loggingIn={loggingIn}
-              savingSettings={savingSettings}
-              checkingUpdates={checkingUpdates}
-              lastCheckedAt={lastCheckedAt}
-              updatableApps={updatableApps}
-              batchUpdatingApps={batchUpdatingApps}
-              busyApp={busyApp}
-              selfUpdateView={{
-                status: selfUpdateStatus,
-                version: selfUpdate?.version,
-                source: selfUpdate?.source,
-                percent: selfUpdateProgress?.percent,
-                error: selfUpdateError,
-              }}
-              mcpEnabledCount={mcpEnabledCount}
-              mcpTotalCount={6}
-              onEnsureGateway={() => void handleEnsureGateway()}
-              onOAuthLogin={() => void handleOAuthLogin()}
-              onOpenKeyModal={() => setShowKeyModal(true)}
-              onLogout={() => void handleLogout()}
-              onRefreshAccount={() => void loadDashboard(true)}
-              onSavePatch={handleSaveSettingsPatch}
-              onCheckUpdates={() => void runUpdateChecks(false)}
-              onInstallSelfUpdate={() => void handleInstallSelfUpdate()}
-              onBatchUpgradeApps={() => void handleBatchUpgradeApps()}
-              onOpenChangelog={() => setShowChangelogModal(true)}
-              onNavigate={setActiveRoute}
-            />
-          )}
-
-          {activeRoute === "mcp" && (
-            <McpCenterPanel
-              mcp={dashboard?.state.mcp ?? null}
-              savingMcp={savingMcp}
-              loggedIn={Boolean(dashboard?.account.loggedIn)}
-              loggingIn={loggingIn}
-              onToggleCoreTool={(key) => void handleToggleMcpTool(key)}
-              onToggleWebPage={handleToggleWebPage}
-              onSaveEdgeOneConfig={handleSaveEdgeOneConfig}
-              onSelectConsultModel={(model) => void handleSelectConsultModel(model)}
-              onRequestLogin={() => void handleOAuthLogin()}
-            />
-          )}
-
-          {selectedClientApp && dashboard && (
-            <ClientSettingsPanel
-              app={selectedClientApp}
-              dashboard={dashboard}
-              update={updatesMap[selectedClientApp.id]}
-              progress={installProgress[selectedClientApp.id]}
-              isBusy={busyApp === selectedClientApp.id}
-              cancelling={cancellingApp === selectedClientApp.id}
-              needsRestart={Boolean(needsRestart[selectedClientApp.id])}
-              savingInlineSetting={savingSettings}
-              onSetMode={(app, mode) => void handleSetMode(app, mode)}
-              onLaunchApp={(id) => void handleLaunchApp(id)}
-              onRestartApp={(id) => void handleRestartApp(id)}
-              onCloseApp={(id) => void handleCloseApp(id)}
-              onInstallOrUpgrade={(id) => void handleInstallOrUpgrade(id)}
-              onCancelInstall={(id) => void handleCancelAppInstall(id)}
-              onRediagnose={(id) => void handleRediagnose(id)}
-              onPatchAppUi={(app) => void handlePatchAppUi(app)}
-              onRestoreAppUi={(app) => void handleRestoreAppUi(app)}
-              onOpenModelPicker={(id) => setModelModalApp(id)}
-              onSaveInlineSettings={handleSaveSettingsPatch}
-            />
-          )}
-
-          {activeRoute !== "overview" &&
-            activeRoute !== "general" &&
-            activeRoute !== "mcp" &&
-            !selectedClientApp && (
-              <div className="max-w-[760px] mx-auto px-6 py-12 text-center text-[13px] text-[var(--text-muted)]">
-                {loading ? "正在读取客户端状态..." : "未找到该客户端配置"}
-              </div>
-            )}
-        </main>
-      </div>
+        <div className="flex items-center gap-2.5 shrink-0">
+          <button
+            type="button"
+            onClick={() => setActiveRoute("general")}
+            className="text-[var(--text-muted)] hover:text-[var(--text-primary)] tabular-nums transition cursor-pointer"
+          >
+            {checkingUpdates
+              ? "检查更新中..."
+              : selfUpdateStatus === "available" && selfUpdate
+                ? `Tako Switch v${selfUpdate.version} 可更新`
+                : updatableApps.length > 0
+                  ? `${updatableApps.length} 款客户端可更新`
+                  : lastCheckedAt
+                    ? `${lastCheckedAt} 已检查更新`
+                    : "检查更新"}
+          </button>
+          <span className="h-3 w-px bg-[var(--border)]" />
+          <button
+            type="button"
+            onClick={() => setShowChangelogModal(true)}
+            className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition cursor-pointer"
+          >
+            更新日志
+          </button>
+          <span className="h-3 w-px bg-[var(--border)]" />
+          <button
+            type="button"
+            onClick={() => void api.openUrl(TAKO_FEEDBACK_URL)}
+            className="inline-flex items-center gap-1 text-[var(--text-muted)] hover:text-[var(--text-primary)] transition cursor-pointer"
+          >
+            <MessageSquare className="h-3 w-3" />
+            <span>问题反馈</span>
+          </button>
+        </div>
+      </footer>
 
       {/* Transient Floating Toast */}
       {statusNote && (

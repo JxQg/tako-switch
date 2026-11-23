@@ -1,7 +1,9 @@
 use crate::adapters::AppId;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 #[cfg(unix)]
@@ -9,6 +11,9 @@ use std::os::unix::fs::PermissionsExt;
 
 pub const UI_PATCH_BLOCK_PREFIX: &str = "[TAKO_UI_PATCH_BLOCK]";
 const ELECTRON_FUSE_V1_SENTINEL: &[u8; 32] = b"dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX";
+/// Electron 37+/45+ macOS `__DATA_CONST,__asar_integrity` dictionary digest slot sentinel.
+/// Layout: `[sentinel: 32][used: 1][version: 1][sha256_digest: 32]` (66 bytes total).
+pub const ELECTRON_INTEGRITY_DIGEST_SENTINEL: &[u8; 32] = b"AGbevlPCksUGKNL8TSn7wGmJEuJsXb2A";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -556,6 +561,236 @@ pub fn update_info_plist_asar_key_hash(
     Some(updated)
 }
 
+fn find_matching_dict_body(xml: &str, open_dict_pos: usize) -> Option<(&str, usize)> {
+    let open_end_rel = xml[open_dict_pos..].find('>')?;
+    let body_start = open_dict_pos + open_end_rel + 1;
+    let mut depth = 1usize;
+    let mut cursor = body_start;
+    while cursor < xml.len() {
+        let next_lt = xml[cursor..].find('<')? + cursor;
+        if xml[next_lt..].starts_with("</dict>") {
+            depth -= 1;
+            if depth == 0 {
+                return Some((&xml[body_start..next_lt], next_lt + "</dict>".len()));
+            }
+            cursor = next_lt + "</dict>".len();
+        } else if xml[next_lt..].starts_with("<dict") {
+            let after = next_lt + "<dict".len();
+            let boundary = xml
+                .as_bytes()
+                .get(after)
+                .is_some_and(|&b| b == b'>' || b == b'/' || b.is_ascii_whitespace());
+            if boundary {
+                let close_gt = xml[next_lt..].find('>')? + next_lt;
+                if !xml[next_lt + 1..close_gt].trim().ends_with('/') {
+                    depth += 1;
+                }
+                cursor = close_gt + 1;
+            } else {
+                cursor = next_lt + 1;
+            }
+        } else {
+            cursor = next_lt + 1;
+        }
+    }
+    None
+}
+
+fn extract_plist_string_for_key(dict_body: &str, key: &str) -> Option<String> {
+    let needle = format!("<key>{key}</key>");
+    let pos = dict_body.find(&needle)?;
+    let rest = &dict_body[pos + needle.len()..];
+    let open = rest.find("<string>")?;
+    let after_open = &rest[open + "<string>".len()..];
+    let close = after_open.find("</string>")?;
+    Some(after_open[..close].trim().to_string())
+}
+
+/// Compute Electron macOS `kIntegrityDictionaryDigest` (SHA-256 over sorted
+/// `ElectronAsarIntegrity` entries: `key + algorithm + hash`), matching
+/// Electron's `shell/common/asar/integrity_digest.mm::IsIntegrityDictionaryValid`.
+pub fn compute_electron_asar_integrity_digest_from_plist_xml(plist_xml: &str) -> Option<[u8; 32]> {
+    let root_key = "<key>ElectronAsarIntegrity</key>";
+    let root_key_pos = plist_xml.find(root_key)?;
+    let after_root_key = root_key_pos + root_key.len();
+    let outer_dict_rel = plist_xml[after_root_key..].find("<dict>")?;
+    let outer_dict_pos = after_root_key + outer_dict_rel;
+    let (outer_body, _) = find_matching_dict_body(plist_xml, outer_dict_pos)?;
+
+    let mut entries: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut cursor = 0usize;
+    while cursor < outer_body.len() {
+        let Some(k_rel) = outer_body[cursor..].find("<key>") else {
+            break;
+        };
+        let k_start = cursor + k_rel + "<key>".len();
+        let Some(k_end_rel) = outer_body[k_start..].find("</key>") else {
+            break;
+        };
+        let rel_path_key = outer_body[k_start..k_start + k_end_rel].trim().to_string();
+        let after_k = k_start + k_end_rel + "</key>".len();
+        let Some(d_rel) = outer_body[after_k..].find("<dict>") else {
+            break;
+        };
+        let d_pos = after_k + d_rel;
+        let Some((entry_body, entry_after)) = find_matching_dict_body(outer_body, d_pos) else {
+            break;
+        };
+        if let (Some(alg), Some(hash)) = (
+            extract_plist_string_for_key(entry_body, "algorithm"),
+            extract_plist_string_for_key(entry_body, "hash"),
+        ) {
+            entries.insert(rel_path_key, (alg, hash));
+        }
+        cursor = entry_after;
+    }
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    for (k, (alg, hash)) in entries {
+        hasher.update(k.as_bytes());
+        hasher.update(alg.as_bytes());
+        hasher.update(hash.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Some(out)
+}
+
+pub fn compute_electron_asar_integrity_digest_from_plist_file(
+    plist_path: &Path,
+) -> Result<Option<[u8; 32]>, String> {
+    if !plist_path.is_file() {
+        return Ok(None);
+    }
+    let raw = fs::read(plist_path)
+        .map_err(|e| format!("读取 {} 失败: {e}", plist_path.display()))?;
+    if let Ok(xml) = std::str::from_utf8(&raw) {
+        return Ok(compute_electron_asar_integrity_digest_from_plist_xml(xml));
+    }
+    #[cfg(target_os = "macos")]
+    if raw.starts_with(b"bplist00") {
+        let out = std::process::Command::new("/usr/bin/plutil")
+            .args(["-convert", "xml1", "-o", "-"])
+            .arg(plist_path)
+            .output()
+            .map_err(|e| format!("转换二进制 Info.plist 失败: {e}"))?;
+        if out.status.success() {
+            if let Ok(xml) = std::str::from_utf8(&out.stdout) {
+                return Ok(compute_electron_asar_integrity_digest_from_plist_xml(xml));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Find active (`used == 1 && version == 1`) Electron `__asar_integrity` digest slots in a byte slice.
+pub fn find_active_electron_integrity_digest_slots_in_slice(
+    data: &[u8],
+) -> Vec<(usize, [u8; 32])> {
+    const SLOT_LEN: usize = 66;
+    if data.len() < SLOT_LEN {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + SLOT_LEN <= data.len() {
+        if let Some(rel) = data[pos..].windows(32).position(|w| w == ELECTRON_INTEGRITY_DIGEST_SENTINEL) {
+            let idx = pos + rel;
+            if idx + SLOT_LEN <= data.len() && data[idx + 32] == 1 && data[idx + 33] == 1 {
+                let mut digest = [0u8; 32];
+                digest.copy_from_slice(&data[idx + 34..idx + 66]);
+                out.push((idx, digest));
+            }
+            pos = idx + 1;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Stream-scan a large Electron Framework Mach-O binary (e.g. 430 MB Universal binary)
+/// using a 4 MiB sliding window with 66-byte overlap so memory stays tiny while finding all slices.
+pub fn scan_active_electron_integrity_digest_slots(
+    file_path: &Path,
+) -> Result<Vec<(u64, [u8; 32])>, String> {
+    const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+    const OVERLAP: usize = 66;
+    let mut f = fs::File::open(file_path)
+        .map_err(|e| format!("打开 {} 失败: {e}", file_path.display()))?;
+    let mut buf = vec![0u8; CHUNK_SIZE + OVERLAP];
+    let mut carry = 0usize;
+    let mut file_offset: u64 = 0;
+    let mut results: Vec<(u64, [u8; 32])> = Vec::new();
+
+    loop {
+        let mut read_total = 0usize;
+        while read_total < CHUNK_SIZE {
+            let n = f
+                .read(&mut buf[carry + read_total..carry + CHUNK_SIZE])
+                .map_err(|e| format!("读取 {} 失败: {e}", file_path.display()))?;
+            if n == 0 {
+                break;
+            }
+            read_total += n;
+        }
+        let valid_len = carry + read_total;
+        if valid_len < OVERLAP {
+            break;
+        }
+
+        let base_off = file_offset.saturating_sub(carry as u64);
+        for (rel_off, digest) in find_active_electron_integrity_digest_slots_in_slice(&buf[..valid_len]) {
+            let abs_off = base_off + rel_off as u64;
+            if !results.iter().any(|(prev, _)| *prev == abs_off) {
+                results.push((abs_off, digest));
+            }
+        }
+
+        file_offset += read_total as u64;
+        if read_total < CHUNK_SIZE {
+            break;
+        }
+        buf.copy_within(valid_len - OVERLAP..valid_len, 0);
+        carry = OVERLAP;
+    }
+
+    Ok(results)
+}
+
+/// Patch the 32-byte digest at each active sentinel offset in-place (APFS copy-on-write friendly).
+pub fn patch_electron_integrity_digest_slots_in_file(
+    app_id: AppId,
+    action: &str,
+    file_path: &Path,
+    sentinel_offsets: &[u64],
+    new_digest: &[u8; 32],
+) -> Result<(), String> {
+    if sentinel_offsets.is_empty() {
+        return Ok(());
+    }
+    let mut f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(file_path)
+        .map_err(|e| map_bundle_io_err(app_id, action, file_path, "打开框架二进制", e))?;
+
+    for &off in sentinel_offsets {
+        f.seek(SeekFrom::Start(off + 34))
+            .map_err(|e| map_bundle_io_err(app_id, action, file_path, "定位完整性槽位", e))?;
+        f.write_all(new_digest)
+            .map_err(|e| map_bundle_io_err(app_id, action, file_path, "写入完整性摘要", e))?;
+    }
+    f.sync_all()
+        .map_err(|e| map_bundle_io_err(app_id, action, file_path, "同步框架二进制", e))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,5 +918,100 @@ mod tests {
             assert!(patched_str.contains(h_new_2));
             assert!(!patched_str.contains(h_old_1));
         }
+    }
+
+    #[test]
+    fn electron_45_macos_integrity_digest_matches_and_patches_dual_slice_binary() {
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+  <dict>
+    <key>CFBundleName</key>
+    <string>Claude</string>
+    <key>ElectronAsarIntegrity</key>
+    <dict>
+      <key>Resources/ion-dist.asar</key>
+      <dict>
+        <key>algorithm</key>
+        <string>SHA256</string>
+        <key>hash</key>
+        <string>d5979d6a0132864aeb35885e3713d97152635b7f01cd722785c7541fd6f3b53c</string>
+      </dict>
+      <key>Resources/app.asar</key>
+      <dict>
+        <key>algorithm</key>
+        <string>SHA256</string>
+        <key>hash</key>
+        <string>9648266b57e9b91c57074d9bd95e0f906c83e6ed93d0e026b61058c313ca8c3d</string>
+      </dict>
+    </dict>
+  </dict>
+</plist>"#;
+
+        let digest = compute_electron_asar_integrity_digest_from_plist_xml(plist)
+            .expect("must compute digest");
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        // Exact SHA-256 verified against Claude Desktop v6.28899.6 Electron 45.3.3 binary
+        assert_eq!(
+            hex,
+            "24c28216c8b8102cd7442e679aaeb0e4d8b717da4de41efbfefa0c6e4c809ff7"
+        );
+
+        let updated_plist = update_info_plist_asar_key_hash(
+            &update_info_plist_asar_key_hash(
+                plist,
+                "Resources/app.asar",
+                "1afff34b688aea7421a514bfd4753f5c39e22fb6faa945c987de8ee87bd38527",
+            )
+            .unwrap(),
+            "Resources/ion-dist.asar",
+            "f3f36783816ee1e56b3d85c2d9ff4840ce782b246bb1712f9b861f59b7d535c2",
+        )
+        .unwrap();
+        let new_digest = compute_electron_asar_integrity_digest_from_plist_xml(&updated_plist)
+            .expect("must compute updated digest");
+        let new_hex: String = new_digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            new_hex,
+            "ac2cfe3d0ecf1ddb97c49274bf2e108dd2634aea3943cf8504e9a83816c444e7"
+        );
+
+        // Synthetic universal binary with 2 active slots + 1 unused slot
+        let mut fake_fw = vec![0xAAu8; 1024];
+        for off in [100usize, 700usize] {
+            fake_fw[off..off + 32].copy_from_slice(ELECTRON_INTEGRITY_DIGEST_SENTINEL);
+            fake_fw[off + 32] = 1;
+            fake_fw[off + 33] = 1;
+            fake_fw[off + 34..off + 66].copy_from_slice(&digest);
+        }
+        // Inactive slot (used == 0) must be ignored
+        fake_fw[400..432].copy_from_slice(ELECTRON_INTEGRITY_DIGEST_SENTINEL);
+        fake_fw[432] = 0;
+        fake_fw[433] = 1;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "tako_test_electron_fw_digest_{}.bin",
+            std::process::id()
+        ));
+        fs::write(&tmp, &fake_fw).unwrap();
+        let slots = scan_active_electron_integrity_digest_slots(&tmp).unwrap();
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0], (100, digest));
+        assert_eq!(slots[1], (700, digest));
+
+        let offsets: Vec<u64> = slots.iter().map(|(o, _)| *o).collect();
+        patch_electron_integrity_digest_slots_in_file(
+            AppId::Claude,
+            "patch",
+            &tmp,
+            &offsets,
+            &new_digest,
+        )
+        .unwrap();
+
+        let after_slots = scan_active_electron_integrity_digest_slots(&tmp).unwrap();
+        assert_eq!(after_slots.len(), 2);
+        assert_eq!(after_slots[0], (100, new_digest));
+        assert_eq!(after_slots[1], (700, new_digest));
+        let _ = fs::remove_file(&tmp);
     }
 }

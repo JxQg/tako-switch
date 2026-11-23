@@ -60,6 +60,26 @@ pub struct SelfUpdateCheckResult {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UiPatchProgressEvent {
+    pub scope: String,
+    pub action: String,
+    pub stage: String,
+    pub percent: u8,
+    pub message: String,
+    pub current_app: Option<AppId>,
+}
+
+fn ui_patch_app_label(app_id: AppId) -> &'static str {
+    match app_id {
+        AppId::Claude => "Claude Desktop",
+        AppId::Codex => "Codex",
+        AppId::Antigravity => "Antigravity",
+        AppId::DshTako => "DSH Tako",
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SelfUpdateProgressEvent {
     stage: String,
     downloaded: u64,
@@ -901,6 +921,33 @@ pub fn apply_prefer_chinese_ui_for_paths(
     patch_ui: bool,
     auto_restart: bool,
 ) -> Result<Vec<adapters::UiPatchPermissionPrompt>, String> {
+    apply_prefer_chinese_ui_for_paths_with_progress(paths, enable, patch_ui, auto_restart, |_| {})
+}
+
+pub fn apply_prefer_chinese_ui_for_paths_with_progress<F>(
+    paths: &AppPaths,
+    enable: bool,
+    patch_ui: bool,
+    auto_restart: bool,
+    mut on_progress: F,
+) -> Result<Vec<adapters::UiPatchPermissionPrompt>, String>
+where
+    F: FnMut(UiPatchProgressEvent),
+{
+    let action = if enable { "patch" } else { "restore" };
+    on_progress(UiPatchProgressEvent {
+        scope: "all".into(),
+        action: action.into(),
+        stage: "config".into(),
+        percent: 12,
+        message: if enable {
+            "正在同步 Codex / Claude / Antigravity 简体中文配置...".into()
+        } else {
+            "正在恢复 Codex / Claude / Antigravity 原版语言配置...".into()
+        },
+        current_app: None,
+    });
+
     let mut state = read_switch_state(paths);
     state.prefer_chinese_ui = enable;
     save_switch_state(paths, &state)?;
@@ -917,6 +964,7 @@ pub fn apply_prefer_chinese_ui_for_paths(
     let mut handled_restarts: std::collections::HashSet<AppId> = std::collections::HashSet::new();
 
     if patch_ui {
+        let mut targets: Vec<AppId> = Vec::new();
         for &app_id in &[AppId::Claude, AppId::Antigravity] {
             let info = inspect_ui_patch_for_app(paths, app_id);
             if enable {
@@ -928,25 +976,75 @@ pub fn apply_prefer_chinese_ui_for_paths(
                     && info.patch_version.as_deref()
                         != Some(adapters::antigravity_i18n::CURRENT_UI_PATCH_VERSION));
                 if needs_patch {
-                    match execute_ui_patch_action_for_paths(paths, app_id, "patch", auto_restart) {
-                        Ok(_) => {
-                            handled_restarts.insert(app_id);
-                        }
-                        Err(err) => {
-                            if let Some(prompt) = adapters::parse_ui_patch_block_error(&err) {
-                                prompts.push(prompt);
-                            }
-                        }
-                    }
+                    targets.push(app_id);
                 }
             } else if info.status == adapters::UiPatchStatus::Patched {
-                match execute_ui_patch_action_for_paths(paths, app_id, "restore", auto_restart) {
+                targets.push(app_id);
+            }
+        }
+
+        let total = targets.len();
+        if total == 0 {
+            on_progress(UiPatchProgressEvent {
+                scope: "all".into(),
+                action: action.into(),
+                stage: "finalizing".into(),
+                percent: 88,
+                message: "配置已同步，正在刷新客户端状态...".into(),
+                current_app: None,
+            });
+        } else {
+            for (idx, &app_id) in targets.iter().enumerate() {
+                let label = ui_patch_app_label(app_id);
+                let start_pct = 24u8
+                    .saturating_add((idx * 64).checked_div(total).unwrap_or(0) as u8);
+                let done_pct = 24u8
+                    .saturating_add(((idx + 1) * 64).checked_div(total).unwrap_or(64) as u8);
+                let step_tag = if total > 1 {
+                    format!("（{}/{}）", idx + 1, total)
+                } else {
+                    String::new()
+                };
+                on_progress(UiPatchProgressEvent {
+                    scope: "all".into(),
+                    action: action.into(),
+                    stage: if enable { "patching" } else { "restoring" }.into(),
+                    percent: start_pct,
+                    message: if enable {
+                        format!("正在注入 {label} 简体中文词典并更新签名{step_tag}...")
+                    } else {
+                        format!("正在无损还原 {label} 原版界面与签名{step_tag}...")
+                    },
+                    current_app: Some(app_id),
+                });
+
+                match execute_ui_patch_action_for_paths(paths, app_id, action, auto_restart) {
                     Ok(_) => {
                         handled_restarts.insert(app_id);
+                        on_progress(UiPatchProgressEvent {
+                            scope: "all".into(),
+                            action: action.into(),
+                            stage: if enable { "patching" } else { "restoring" }.into(),
+                            percent: done_pct,
+                            message: if enable {
+                                format!("{label} 简体中文注入完成{step_tag}")
+                            } else {
+                                format!("{label} 原版界面还原完成{step_tag}")
+                            },
+                            current_app: Some(app_id),
+                        });
                     }
                     Err(err) => {
                         if let Some(prompt) = adapters::parse_ui_patch_block_error(&err) {
                             prompts.push(prompt);
+                            on_progress(UiPatchProgressEvent {
+                                scope: "all".into(),
+                                action: action.into(),
+                                stage: "finalizing".into(),
+                                percent: done_pct,
+                                message: format!("{label} 需要系统授权后继续"),
+                                current_app: Some(app_id),
+                            });
                         }
                     }
                 }
@@ -955,6 +1053,14 @@ pub fn apply_prefer_chinese_ui_for_paths(
     }
 
     if auto_restart && !paths.is_test {
+        on_progress(UiPatchProgressEvent {
+            scope: "all".into(),
+            action: action.into(),
+            stage: "finalizing".into(),
+            percent: 94,
+            message: "正在重启运行中的客户端...".into(),
+            current_app: None,
+        });
         for &app_id in &[AppId::Codex, AppId::Claude, AppId::Antigravity] {
             if handled_restarts.contains(&app_id) {
                 continue;
@@ -968,6 +1074,21 @@ pub fn apply_prefer_chinese_ui_for_paths(
         }
     }
 
+    on_progress(UiPatchProgressEvent {
+        scope: "all".into(),
+        action: action.into(),
+        stage: "done".into(),
+        percent: 100,
+        message: if !prompts.is_empty() {
+            "配置已同步，部分客户端需系统授权后完成界面处理".into()
+        } else if enable {
+            "三端简体中文汉化已完成".into()
+        } else {
+            "三端原版配置与界面已恢复".into()
+        },
+        current_app: None,
+    });
+
     Ok(prompts)
 }
 
@@ -979,11 +1100,38 @@ async fn set_prefer_chinese_ui(
     auto_restart: bool,
 ) -> Result<DashboardPayload, String> {
     let paths_for_sync = AppPaths::detect()?;
-    let prompts = tauri::async_runtime::spawn_blocking(move || {
-        apply_prefer_chinese_ui_for_paths(&paths_for_sync, enable, patch_antigravity, auto_restart)
+    let app_for_emit = app.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        apply_prefer_chinese_ui_for_paths_with_progress(
+            &paths_for_sync,
+            enable,
+            patch_antigravity,
+            auto_restart,
+            |ev| {
+                let _ = app_for_emit.emit("ui-patch-progress", &ev);
+            },
+        )
     })
     .await
-    .map_err(|err| format!("同步中文设置失败: {err}"))??;
+    .map_err(|err| format!("同步中文设置失败: {err}"))?;
+
+    let prompts = match res {
+        Ok(p) => p,
+        Err(err) => {
+            let _ = app.emit(
+                "ui-patch-progress",
+                UiPatchProgressEvent {
+                    scope: "all".into(),
+                    action: if enable { "patch" } else { "restore" }.into(),
+                    stage: "error".into(),
+                    percent: 100,
+                    message: err.clone(),
+                    current_app: None,
+                },
+            );
+            return Err(err);
+        }
+    };
 
     if let Ok(paths) = AppPaths::detect() {
         refresh_tray(&app, &paths);
@@ -1001,8 +1149,47 @@ async fn patch_app_ui(
 ) -> Result<AppSnapshot, String> {
     let paths = AppPaths::detect()?;
     let paths_clone = paths.clone();
-    let snapshot = tauri::async_runtime::spawn_blocking(move || -> Result<AppSnapshot, String> {
+    let app_for_emit = app.clone();
+    let scope = app_id.as_str().to_string();
+    let label = ui_patch_app_label(app_id);
+
+    let _ = app.emit(
+        "ui-patch-progress",
+        UiPatchProgressEvent {
+            scope: scope.clone(),
+            action: "patch".into(),
+            stage: "preparing".into(),
+            percent: 14,
+            message: format!("正在校验 {label} 安装包与原始备份..."),
+            current_app: Some(app_id),
+        },
+    );
+
+    let scope_worker = scope.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || -> Result<AppSnapshot, String> {
+        let _ = app_for_emit.emit(
+            "ui-patch-progress",
+            UiPatchProgressEvent {
+                scope: scope_worker.clone(),
+                action: "patch".into(),
+                stage: "patching".into(),
+                percent: 38,
+                message: format!("正在解包并注入 {label} 简体中文词典与签名..."),
+                current_app: Some(app_id),
+            },
+        );
         execute_ui_patch_action_for_paths(&paths_clone, app_id, "patch", auto_restart)?;
+        let _ = app_for_emit.emit(
+            "ui-patch-progress",
+            UiPatchProgressEvent {
+                scope: scope_worker.clone(),
+                action: "patch".into(),
+                stage: "finalizing".into(),
+                percent: 88,
+                message: format!("正在同步 {label} 语言配置并验证状态..."),
+                current_app: Some(app_id),
+            },
+        );
         if read_switch_state(&paths_clone).prefer_chinese_ui {
             match app_id {
                 AppId::Antigravity => {
@@ -1023,7 +1210,38 @@ async fn patch_app_ui(
         Ok(snapshot_app(&paths_clone, app_id))
     })
     .await
-    .map_err(|err| format!("执行界面汉化失败: {err}"))??;
+    .map_err(|err| format!("执行界面汉化失败: {err}"))?;
+
+    let snapshot = match res {
+        Ok(snap) => {
+            let _ = app.emit(
+                "ui-patch-progress",
+                UiPatchProgressEvent {
+                    scope,
+                    action: "patch".into(),
+                    stage: "done".into(),
+                    percent: 100,
+                    message: format!("{label} 完整简体中文已就绪"),
+                    current_app: Some(app_id),
+                },
+            );
+            snap
+        }
+        Err(err) => {
+            let _ = app.emit(
+                "ui-patch-progress",
+                UiPatchProgressEvent {
+                    scope,
+                    action: "patch".into(),
+                    stage: "error".into(),
+                    percent: 100,
+                    message: format!("{label} 汉化未完成"),
+                    current_app: Some(app_id),
+                },
+            );
+            return Err(err);
+        }
+    };
 
     refresh_tray(&app, &paths);
     Ok(snapshot)
@@ -1037,12 +1255,82 @@ async fn restore_app_ui(
 ) -> Result<AppSnapshot, String> {
     let paths = AppPaths::detect()?;
     let paths_clone = paths.clone();
-    let snapshot = tauri::async_runtime::spawn_blocking(move || -> Result<AppSnapshot, String> {
+    let app_for_emit = app.clone();
+    let scope = app_id.as_str().to_string();
+    let label = ui_patch_app_label(app_id);
+
+    let _ = app.emit(
+        "ui-patch-progress",
+        UiPatchProgressEvent {
+            scope: scope.clone(),
+            action: "restore".into(),
+            stage: "preparing".into(),
+            percent: 16,
+            message: format!("正在校验 {label} 无损备份..."),
+            current_app: Some(app_id),
+        },
+    );
+
+    let scope_worker = scope.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || -> Result<AppSnapshot, String> {
+        let _ = app_for_emit.emit(
+            "ui-patch-progress",
+            UiPatchProgressEvent {
+                scope: scope_worker.clone(),
+                action: "restore".into(),
+                stage: "restoring".into(),
+                percent: 45,
+                message: format!("正在无损还原 {label} 原版文件与签名..."),
+                current_app: Some(app_id),
+            },
+        );
         execute_ui_patch_action_for_paths(&paths_clone, app_id, "restore", auto_restart)?;
+        let _ = app_for_emit.emit(
+            "ui-patch-progress",
+            UiPatchProgressEvent {
+                scope: scope_worker.clone(),
+                action: "restore".into(),
+                stage: "finalizing".into(),
+                percent: 90,
+                message: format!("正在校验 {label} 还原结果..."),
+                current_app: Some(app_id),
+            },
+        );
         Ok(snapshot_app(&paths_clone, app_id))
     })
     .await
-    .map_err(|err| format!("还原原版界面失败: {err}"))??;
+    .map_err(|err| format!("还原原版界面失败: {err}"))?;
+
+    let snapshot = match res {
+        Ok(snap) => {
+            let _ = app.emit(
+                "ui-patch-progress",
+                UiPatchProgressEvent {
+                    scope,
+                    action: "restore".into(),
+                    stage: "done".into(),
+                    percent: 100,
+                    message: format!("{label} 已无损还原原版"),
+                    current_app: Some(app_id),
+                },
+            );
+            snap
+        }
+        Err(err) => {
+            let _ = app.emit(
+                "ui-patch-progress",
+                UiPatchProgressEvent {
+                    scope,
+                    action: "restore".into(),
+                    stage: "error".into(),
+                    percent: 100,
+                    message: format!("{label} 还原未完成"),
+                    current_app: Some(app_id),
+                },
+            );
+            return Err(err);
+        }
+    };
 
     refresh_tray(&app, &paths);
     Ok(snapshot)

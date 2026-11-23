@@ -1,6 +1,15 @@
 import { useEffect, useRef, useState } from "react";
-import { KeyRound, LogOut, RefreshCw, Settings } from "lucide-react";
+import {
+  ArrowLeft,
+  KeyRound,
+  LogOut,
+  Moon,
+  RefreshCw,
+  Settings,
+  Sun,
+} from "lucide-react";
 import type { AccountStatus } from "../lib/api";
+import { TakoBrandMark } from "./BrandIcons";
 import {
   APP_DISPLAY_NAMES,
   calcPercent,
@@ -9,15 +18,16 @@ import {
 
 interface TopHeaderBarProps {
   isMac: boolean;
+  appVersion: string;
   activeRoute: NavRoute;
   account?: AccountStatus;
-  anyTakoMode: boolean;
-  localGatewayHealthy: boolean;
-  fixingGateway: boolean;
+  isDark: boolean;
+  hasPendingUpdates: boolean;
   refreshing: boolean;
   checkingUpdates: boolean;
   loggingIn: boolean;
-  onEnsureGateway: () => void;
+  onGoHome: () => void;
+  onToggleTheme: () => void;
   onRefresh: () => void;
   onOAuthLogin: () => void;
   onOpenKeyModal: () => void;
@@ -25,24 +35,25 @@ interface TopHeaderBarProps {
   onOpenGeneralSettings: () => void;
 }
 
-function routeBreadcrumb(route: NavRoute): { parent?: string; current: string } {
-  if (route === "overview") return { current: "总览" };
-  if (route === "general") return { current: "通用设置" };
-  if (route === "mcp") return { current: "MCP 能力中心" };
-  return { parent: "软件独立设置", current: APP_DISPLAY_NAMES[route] };
+function subpageTitle(route: NavRoute): string {
+  if (route === "general") return "通用设置";
+  if (route === "mcp") return "MCP 能力中心";
+  if (route === "overview") return "首页";
+  return `${APP_DISPLAY_NAMES[route]} 设置`;
 }
 
 export function TopHeaderBar({
   isMac,
+  appVersion,
   activeRoute,
   account,
-  anyTakoMode,
-  localGatewayHealthy,
-  fixingGateway,
+  isDark,
+  hasPendingUpdates,
   refreshing,
   checkingUpdates,
   loggingIn,
-  onEnsureGateway,
+  onGoHome,
+  onToggleTheme,
   onRefresh,
   onOAuthLogin,
   onOpenKeyModal,
@@ -70,7 +81,6 @@ export function TopHeaderBar({
     };
   }, [accountOpen]);
 
-  const crumb = routeBreadcrumb(activeRoute);
   const remainUsd = account?.walletRemainUsd;
   const usedUsd = account?.walletUsedUsd;
   const pct5h = calcPercent(account?.quota?.windowUsed, account?.quota?.windowCostLimit);
@@ -80,107 +90,108 @@ export function TopHeaderBar({
       (account.quota.windowCostLimit > 0 || account.quota.weeklyCostLimit > 0),
   );
   const avatarChar = (account?.userName?.trim()?.[0] ?? "T").toUpperCase();
+  const balanceColor =
+    remainUsd !== null && remainUsd !== undefined
+      ? remainUsd < 0.5
+        ? "var(--danger)"
+        : remainUsd < 2.0
+          ? "var(--warning)"
+          : "var(--success)"
+      : "var(--text-primary)";
+
+  const isSubpage = activeRoute !== "overview";
 
   return (
     <header
       data-tauri-drag-region
-      className={`h-[48px] shrink-0 border-b border-[var(--border)] bg-[var(--bg-titlebar)] flex items-center justify-between gap-3 pr-3.5 select-none ${
+      className={`h-[52px] shrink-0 border-b border-[var(--border)] bg-[var(--bg-titlebar)] flex items-center justify-between gap-2.5 pr-3.5 select-none ${
         isMac ? "pl-[82px]" : "pl-4"
       }`}
     >
-      {/* Left Breadcrumb */}
+      {/* Left: Brand on Home, Prominent Back + Title on Subpages */}
       <div
         data-tauri-drag-region
-        className="flex items-center gap-1.5 min-w-0 text-[12.5px] truncate"
+        className="flex items-center gap-2.5 min-w-0 shrink-0 max-w-[56%]"
       >
-        {crumb.parent && (
+        {isSubpage ? (
           <>
-            <span data-tauri-drag-region className="text-[var(--text-muted)] shrink-0">
-              {crumb.parent}
-            </span>
+            <button
+              type="button"
+              data-testid="topbar-back-home"
+              onClick={onGoHome}
+              title="返回首页 (Esc)"
+              className="h-9 px-3.5 -ml-1 rounded-[9px] border border-[var(--border-strong)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] text-[13px] font-semibold inline-flex items-center gap-1.5 transition cursor-pointer shrink-0 shadow-[var(--shadow-card)]"
+            >
+              <ArrowLeft className="h-4 w-4 text-[var(--text-primary)]" />
+              <span>返回首页</span>
+            </button>
             <span data-tauri-drag-region className="text-[var(--border-strong)] shrink-0">
               /
             </span>
+            <span
+              data-tauri-drag-region
+              className="text-[14px] font-semibold tracking-[-0.015em] text-[var(--text-primary)] truncate"
+            >
+              {subpageTitle(activeRoute)}
+            </span>
+          </>
+        ) : (
+          <>
+            <div data-tauri-drag-region className="pointer-events-none shrink-0">
+              <TakoBrandMark className="h-[26px] w-[26px]" />
+            </div>
+            <span
+              data-tauri-drag-region
+              className="text-[14px] font-semibold tracking-[-0.015em] text-[var(--text-primary)] truncate"
+            >
+              Tako Switch
+            </span>
+            <span
+              data-tauri-drag-region
+              className="tabular-nums text-[11.5px] font-medium text-[var(--text-muted)] bg-[var(--bg-subtle)] border border-[var(--border)] rounded-full px-2 py-0.5 shrink-0"
+            >
+              v{appVersion}
+            </span>
           </>
         )}
-        <span
-          data-tauri-drag-region
-          className="font-semibold text-[var(--text-primary)] truncate"
-        >
-          {crumb.current}
-        </span>
       </div>
 
-      {/* Drag Spacer */}
-      <div data-tauri-drag-region className="flex-1 h-full min-w-[16px]" />
+      {/* Flexible Drag Spacer */}
+      <div data-tauri-drag-region className="flex-1 h-full min-w-[12px]" />
 
-      {/* Right Status & Account */}
-      <div className="flex items-center gap-2 shrink-0">
-        {/* Gateway status indicator */}
-        {!anyTakoMode ? (
-          <span
-            className="inline-flex items-center gap-1.5 text-[11.5px] text-[var(--text-muted)] px-2 h-7 rounded-full"
-            title="当前暂无客户端处于 Tako 模式，网关处于待机状态"
-          >
-            <span className="h-[7px] w-[7px] rounded-full bg-[var(--text-muted)]/60 shrink-0" />
-            <span className="hidden sm:inline">网关待机</span>
-          </span>
-        ) : localGatewayHealthy ? (
-          <span
-            className="inline-flex items-center gap-1.5 text-[11.5px] text-[var(--text-secondary)] px-2 h-7 rounded-full"
-            title="本地统一网关 127.0.0.1:18419 运行正常"
-          >
-            <span className="tako-live-dot" />
-            <span className="hidden sm:inline">网关运行中</span>
-          </span>
-        ) : (
-          <button
-            type="button"
-            disabled={fixingGateway}
-            onClick={onEnsureGateway}
-            className="inline-flex items-center gap-1.5 h-7 px-2.5 rounded-full bg-[var(--warning-soft)] text-[var(--warning)] text-[11.5px] font-medium cursor-pointer disabled:opacity-60"
-            title="点击立即重启本地统一网关"
-          >
-            <span className="h-[7px] w-[7px] rounded-full bg-[var(--warning)] shrink-0" />
-            <span>{fixingGateway ? "修复中..." : "网关未启动 · 修复"}</span>
-          </button>
-        )}
-
-        {/* Quiet Refresh */}
-        <button
-          type="button"
-          onClick={onRefresh}
-          disabled={refreshing || checkingUpdates}
-          title="刷新状态与版本"
-          aria-label="刷新状态与版本"
-          className="h-7 w-7 rounded-[8px] border border-transparent hover:border-[var(--border)] hover:bg-[var(--bg-subtle)] text-[var(--text-muted)] hover:text-[var(--text-primary)] inline-flex items-center justify-center transition cursor-pointer disabled:opacity-50"
-        >
-          <RefreshCw
-            className={`h-3.5 w-3.5 ${refreshing || checkingUpdates ? "animate-spin" : ""}`}
-          />
-        </button>
-
-        {/* Account Area */}
+      {/* Right Controls */}
+      <div className="flex items-center gap-1.5 shrink-0">
         {account?.loggedIn ? (
           <div className="relative" ref={popoverRef}>
             <button
               type="button"
               onClick={() => setAccountOpen((prev) => !prev)}
-              className="h-7 pl-2 pr-1 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] inline-flex items-center gap-2 transition cursor-pointer"
-              title="查看账号、余额与配额"
+              title="点击查看账号、余额与配额详情"
+              className="h-8 px-2.5 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] shadow-[var(--shadow-card)] inline-flex items-center gap-2 transition cursor-pointer"
             >
-              {remainUsd !== null && remainUsd !== undefined && (
-                <span className="text-[12px] font-semibold tabular-nums text-[var(--text-primary)]">
-                  ${remainUsd.toFixed(2)}
+              <span className="text-[12px] font-medium text-[var(--text-primary)] max-w-[82px] truncate">
+                {account.userName ?? "Tako 用户"}
+              </span>
+              {account.planName && (
+                <span className="hidden sm:inline text-[11.5px] font-medium text-[var(--accent)] shrink-0">
+                  {account.planName}
                 </span>
               )}
-              <span className="h-[22px] w-[22px] rounded-[6px] bg-gradient-to-br from-[#6a61eb] to-[#4539ca] text-white text-[10.5px] font-bold inline-flex items-center justify-center shrink-0">
-                {avatarChar}
-              </span>
+              {remainUsd !== null && remainUsd !== undefined && (
+                <>
+                  <span className="h-3.5 w-px bg-[var(--border)]" />
+                  <span
+                    className="tabular-nums text-[12px] font-semibold shrink-0"
+                    style={{ color: balanceColor }}
+                  >
+                    ${remainUsd.toFixed(2)}
+                  </span>
+                </>
+              )}
             </button>
 
             {accountOpen && (
-              <div className="absolute right-0 mt-1.5 w-[264px] rounded-[13px] border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-modal)] p-3.5 z-40 flex flex-col gap-3">
+              <div className="absolute right-0 mt-1.5 w-[268px] rounded-[13px] border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-modal)] p-3.5 z-40 flex flex-col gap-3">
                 <div className="flex items-center gap-2.5 min-w-0">
                   <span className="h-9 w-9 rounded-[10px] bg-gradient-to-br from-[#6a61eb] to-[#4539ca] text-white text-[13px] font-bold inline-flex items-center justify-center shrink-0">
                     {avatarChar}
@@ -208,7 +219,10 @@ export function TopHeaderBar({
                   <div className="rounded-[9px] bg-[var(--bg-subtle)] px-3 py-2 flex items-center justify-between">
                     <span className="text-[11.5px] text-[var(--text-secondary)]">钱包余额</span>
                     <div className="text-right tabular-nums">
-                      <div className="text-[13.5px] font-semibold text-[var(--text-primary)]">
+                      <div
+                        className="text-[13.5px] font-semibold"
+                        style={{ color: balanceColor }}
+                      >
                         ${remainUsd.toFixed(2)}
                       </div>
                       {usedUsd !== null && usedUsd !== undefined && (
@@ -278,21 +292,62 @@ export function TopHeaderBar({
               type="button"
               onClick={onOpenKeyModal}
               title="手动输入 API Key 登录"
-              className="h-7 px-2 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[11.5px] font-medium text-[var(--text-secondary)] inline-flex items-center gap-1 transition cursor-pointer"
+              className="h-8 px-2.5 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)] inline-flex items-center gap-1.5 transition cursor-pointer"
             >
-              <KeyRound className="h-3 w-3" />
-              <span className="hidden sm:inline">Key</span>
+              <KeyRound className="h-3.5 w-3.5" />
+              <span>Key 登录</span>
             </button>
             <button
               type="button"
               onClick={onOAuthLogin}
               disabled={loggingIn}
-              className="h-7 px-3 rounded-[8px] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12px] font-medium transition cursor-pointer disabled:opacity-60"
+              className="h-8 px-3 rounded-[8px] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12px] font-medium transition cursor-pointer disabled:opacity-60"
             >
               {loggingIn ? "登录中..." : "登录 Tako"}
             </button>
           </div>
         )}
+
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={refreshing || checkingUpdates}
+          title="刷新状态与版本"
+          aria-label="刷新状态与版本"
+          className="h-8 w-8 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] inline-flex items-center justify-center transition cursor-pointer disabled:opacity-50"
+        >
+          <RefreshCw
+            className={`h-3.5 w-3.5 ${refreshing || checkingUpdates ? "animate-spin" : ""}`}
+          />
+        </button>
+
+        <button
+          type="button"
+          onClick={onToggleTheme}
+          title={isDark ? "切换浅色模式" : "切换深色模式"}
+          aria-label={isDark ? "切换浅色模式" : "切换深色模式"}
+          className="h-8 w-8 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] inline-flex items-center justify-center transition cursor-pointer"
+        >
+          {isDark ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
+        </button>
+
+        <button
+          type="button"
+          data-testid="topbar-general-settings"
+          onClick={() => (activeRoute === "general" ? onGoHome() : onOpenGeneralSettings())}
+          title={activeRoute === "general" ? "返回首页" : "通用设置与更新"}
+          aria-label="通用设置与更新"
+          className={`relative h-8 w-8 rounded-[8px] border inline-flex items-center justify-center transition cursor-pointer ${
+            activeRoute === "general"
+              ? "border-[var(--accent-border)] bg-[var(--accent-soft)] text-[var(--accent)]"
+              : "border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+          }`}
+        >
+          <Settings className="h-3.5 w-3.5" />
+          {hasPendingUpdates && (
+            <span className="absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full bg-[var(--accent)] ring-2 ring-[var(--bg-titlebar)]" />
+          )}
+        </button>
       </div>
     </header>
   );

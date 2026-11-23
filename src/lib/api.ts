@@ -309,6 +309,15 @@ export interface InstallProgressEvent {
   message: string;
 }
 
+export interface UiPatchProgressEvent {
+  scope: "all" | AppId;
+  action: "patch" | "restore";
+  stage: "preparing" | "config" | "patching" | "restoring" | "finalizing" | "done" | "error";
+  percent: number;
+  message: string;
+  currentApp?: AppId | null;
+}
+
 export interface InstallOutcome {
   appId: AppId;
   modeReapplied: AppMode;

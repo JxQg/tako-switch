@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import {
+  CheckCircle2,
   ChevronDown,
   Download,
   ExternalLink,
+  Loader2,
   Power,
   RefreshCw,
   RotateCw,
@@ -16,6 +18,7 @@ import type {
   DashboardPayload,
   InstallProgressEvent,
   SettingsPatch,
+  UiPatchProgressEvent,
 } from "../lib/api";
 import { AppBrandIcon } from "./BrandIcons";
 import {
@@ -36,6 +39,7 @@ interface ClientSettingsPanelProps {
   dashboard: DashboardPayload;
   update?: AppUpdateStatus;
   progress?: InstallProgressEvent;
+  uiPatchProgress?: UiPatchProgressEvent | null;
   isBusy: boolean;
   cancelling: boolean;
   needsRestart: boolean;
@@ -114,6 +118,7 @@ export function ClientSettingsPanel({
   dashboard,
   update,
   progress,
+  uiPatchProgress,
   isBusy,
   cancelling,
   needsRestart,
@@ -188,16 +193,16 @@ export function ClientSettingsPanel({
     (dashboard.state.gatewayDisplaySubtitle ?? "Tako AI Gateway").trim();
 
   return (
-    <div className="max-w-[760px] mx-auto px-6 py-6 flex flex-col gap-5">
+    <div className="w-full px-4 sm:px-5 py-4 flex flex-col gap-5">
       {/* Page Header */}
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0 flex-1">
-          <div className="text-[10.5px] font-bold tracking-[0.08em] uppercase text-[var(--accent)] mb-1">
+          <div className="text-[11px] font-bold tracking-[0.08em] uppercase text-[var(--accent)] mb-1">
             软件独立设置
           </div>
           <div className="flex items-center gap-2.5">
             <AppBrandIcon appId={app.id} className="h-7 w-7" />
-            <h1 className="text-[22px] font-semibold tracking-[-0.025em] text-[var(--text-primary)] leading-tight truncate">
+            <h1 className="text-[20px] font-semibold tracking-[-0.025em] text-[var(--text-primary)] leading-tight truncate">
               {APP_DISPLAY_NAMES[app.id]}
             </h1>
           </div>
@@ -311,9 +316,10 @@ export function ClientSettingsPanel({
       {/* Dedicated Full Simplified Chinese UI Banner (Claude Desktop & Antigravity) */}
       {(app.id === "claude" || app.id === "antigravity") && (
         <div
-          className="rounded-[12px] border border-[var(--accent-border)] px-4 py-3.5 flex flex-wrap items-center justify-between gap-3"
+          className="rounded-[12px] border border-[var(--accent-border)] px-4 py-3.5 flex flex-col gap-3"
           style={{ background: "var(--language-grad)" }}
         >
+          <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0 flex-1">
             <div className="h-[34px] w-[34px] rounded-[10px] bg-[var(--bg-card)] text-[var(--accent)] font-bold text-[14px] inline-flex items-center justify-center shrink-0 shadow-[var(--shadow-nav)]">
               中
@@ -345,7 +351,11 @@ export function ClientSettingsPanel({
                     : "bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white"
                 }`}
               >
-                {isBusy ? "处理中..." : patchInfo.actionLabel}
+                {isBusy
+                  ? uiPatchProgress
+                    ? `处理中 ${Math.round(uiPatchProgress.percent)}%`
+                    : "处理中..."
+                  : patchInfo.actionLabel}
               </button>
               {patchInfo.canRestore && (
                 <button
@@ -372,7 +382,11 @@ export function ClientSettingsPanel({
                     : "bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white"
                 }`}
               >
-                {isBusy ? "处理中..." : patchInfo.actionLabel}
+                {isBusy
+                  ? uiPatchProgress
+                    ? `处理中 ${Math.round(uiPatchProgress.percent)}%`
+                    : "处理中..."
+                  : patchInfo.actionLabel}
               </button>
               {patchInfo.canRestore && (
                 <button
@@ -385,6 +399,49 @@ export function ClientSettingsPanel({
                   还原原版
                 </button>
               )}
+            </div>
+          )}
+          </div>
+
+          {uiPatchProgress && (
+            <div className="pt-2 border-t border-[var(--accent-border)]/70 flex flex-col gap-1.5">
+              <div className="flex items-center justify-between gap-2 text-[11.5px]">
+                <span className="inline-flex items-center gap-1.5 text-[var(--text-primary)] font-medium truncate">
+                  {uiPatchProgress.stage === "done" ? (
+                    <CheckCircle2 className="h-3.5 w-3.5 text-[var(--success)] shrink-0" />
+                  ) : (
+                    <Loader2 className="h-3.5 w-3.5 text-[var(--accent)] animate-spin shrink-0" />
+                  )}
+                  <span className="truncate">{uiPatchProgress.message}</span>
+                </span>
+                <span
+                  className="tabular-nums font-semibold shrink-0"
+                  style={{
+                    color:
+                      uiPatchProgress.stage === "done"
+                        ? "var(--success)"
+                        : uiPatchProgress.stage === "error"
+                          ? "var(--danger)"
+                          : "var(--accent)",
+                  }}
+                >
+                  {Math.round(uiPatchProgress.percent)}%
+                </span>
+              </div>
+              <div className="h-1.5 w-full rounded-full bg-[var(--bg-card)]/80 overflow-hidden">
+                <div
+                  className="h-full rounded-full transition-all duration-300 ease-out"
+                  style={{
+                    width: `${Math.max(4, Math.min(100, uiPatchProgress.percent))}%`,
+                    backgroundColor:
+                      uiPatchProgress.stage === "done"
+                        ? "var(--success)"
+                        : uiPatchProgress.stage === "error"
+                          ? "var(--danger)"
+                          : "var(--accent)",
+                  }}
+                />
+              </div>
             </div>
           )}
         </div>

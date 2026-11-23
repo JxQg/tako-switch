@@ -140,13 +140,13 @@ export function GeneralSettingsPanel({
       fallbackManifestUrl.trim() !== dashboard.state.fallbackManifestUrl.trim());
 
   return (
-    <div className="max-w-[760px] mx-auto px-6 py-6 flex flex-col gap-5">
+    <div className="w-full px-4 sm:px-5 py-4 flex flex-col gap-5">
       {/* Page Head */}
       <div>
-        <div className="text-[10.5px] font-bold tracking-[0.08em] uppercase text-[var(--accent)] mb-1">
+        <div className="text-[11px] font-bold tracking-[0.08em] uppercase text-[var(--accent)] mb-1">
           全局配置
         </div>
-        <h1 className="text-[22px] font-semibold tracking-[-0.025em] text-[var(--text-primary)] leading-tight">
+        <h1 className="text-[20px] font-semibold tracking-[-0.025em] text-[var(--text-primary)] leading-tight">
           通用设置
         </h1>
         <p className="text-[12.5px] text-[var(--text-secondary)] mt-1">
@@ -402,7 +402,7 @@ export function GeneralSettingsPanel({
                 <div className="min-w-0">
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <span className="text-[12.5px] font-medium text-[var(--text-primary)]">
-                      Tako Switch v{dashboard?.appVersion ?? "2.2.1"}
+                      Tako Switch v{dashboard?.appVersion ?? "2.2.2"}
                     </span>
                     <button
                       type="button"
