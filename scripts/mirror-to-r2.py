@@ -545,13 +545,36 @@ def main(argv: list[str] | None = None) -> int:
             encoding="utf-8",
         )
         if args.upload_manifest_key:
+            manifest_key = args.upload_manifest_key.lstrip("/")
             s3.upload_file(
                 manifest_path,
-                args.upload_manifest_key.lstrip("/"),
+                manifest_key,
                 cache_control="public, max-age=300",
                 content_type="application/json; charset=utf-8",
             )
-            print(f"[upload] s3://{s3.bucket}/{args.upload_manifest_key.lstrip('/')}")
+            print(f"[upload] s3://{s3.bucket}/{manifest_key}")
+            # Also overwrite the tiny mutable manifest.json directly into DogeCloud Shanghai OSS
+            # so mirror-storage never serves a stale cached manifest after a new upstream release.
+            if not use_doge and doge_ak and doge_sk and doge_bucket:
+                try:
+                    d_bucket, d_ep, d_reg, d_env = fetch_dogecloud_s3_credentials(
+                        doge_ak, doge_sk, doge_bucket
+                    )
+                    doge_s3 = S3Client(
+                        bucket=d_bucket,
+                        endpoint_url=d_ep,
+                        region=d_reg,
+                        env_overrides=d_env,
+                    )
+                    doge_s3.upload_file(
+                        manifest_path,
+                        manifest_key,
+                        cache_control="public, max-age=120",
+                        content_type="application/json; charset=utf-8",
+                    )
+                    print(f"[upload] synced manifest directly to DogeCloud OSS s3://{d_bucket}/{manifest_key}")
+                except Exception as exc:
+                    print(f"[warn] direct DogeCloud manifest sync skipped: {exc}", file=sys.stderr)
 
     return 0
 

@@ -12,7 +12,7 @@ pub const DEFAULT_TAKO_BASE_URL: &str = "https://tako.shiroha.tech";
 pub const DEFAULT_GATEWAY_DISPLAY_NAME: &str = "Tako";
 pub const DEFAULT_GATEWAY_DISPLAY_SUBTITLE: &str = "Tako AI Gateway";
 pub const DEFAULT_MANIFEST_URL: &str =
-    "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/tako-switch/manifest.json";
+    "https://dl.lven.asia/tako-switch/manifest.json";
 pub const DEFAULT_FALLBACK_MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/tako-dev/tako-switch/main/manifest/manifest.json";
 

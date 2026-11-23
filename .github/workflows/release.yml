@@ -257,6 +257,8 @@ jobs:
           repo = os.environ["GITHUB_REPOSITORY"]
           gh_base = f"https://github.com/{repo}/releases/download/{tag}"
           platforms_gh = {}
+          platforms_cn = {}
+          cn_base = f"https://dl.lven.asia/tako-switch/releases/{tag}"
 
           for meta_path in sorted(glob.glob("collected/*/platform-meta.json")):
               folder = os.path.dirname(meta_path)
@@ -271,12 +273,22 @@ jobs:
                   "signature": sig,
                   "url": f"{gh_base}/{asset}",
               }
+              platforms_cn[meta["updaterKey"]] = {
+                  "signature": sig,
+                  "url": f"{cn_base}/{asset}",
+              }
 
           notes = open("release-notes.md", encoding="utf-8").read().strip() or f"Tako Switch {tag}"
           now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
           json.dump(
               {"version": version, "notes": notes, "pub_date": now, "platforms": platforms_gh},
               open("release-files/latest.json", "w", encoding="utf-8"),
+              ensure_ascii=False,
+              indent=2,
+          )
+          json.dump(
+              {"version": version, "notes": notes, "pub_date": now, "platforms": platforms_cn},
+              open("latest-cn.json", "w", encoding="utf-8"),
               ensure_ascii=False,
               indent=2,
           )
@@ -307,3 +319,56 @@ jobs:
                 ;;
             esac
           done
+
+      - name: Sync Tako Switch release binaries & latest.json to China CDN origin (R2 -> dl.lven.asia)
+        if: env.R2_BUCKET != '' && env.R2_ENDPOINT_URL != ''
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          DOGE_ACCESS_KEY: ${{ secrets.DOGE_ACCESS_KEY }}
+          DOGE_SECRET_KEY: ${{ secrets.DOGE_SECRET_KEY }}
+          DOGE_OSS_BUCKET: ${{ secrets.DOGE_OSS_BUCKET }}
+        run: |
+          tag="${TAG_INPUT:-$GITHUB_REF_NAME}"
+          echo "=== Uploading release-files/* to R2 tako-switch/releases/${tag}/ ==="
+          for f in release-files/*; do
+            fname="$(basename "$f")"
+            [ "$fname" = "latest.json" ] && continue
+            aws --endpoint-url "$R2_ENDPOINT_URL" --region auto s3 cp "$f" \
+              "s3://${R2_BUCKET}/tako-switch/releases/${tag}/${fname}" \
+              --cache-control "public, max-age=31536000, immutable"
+          done
+          echo "=== Uploading China CDN latest.json to R2 tako-switch/latest.json ==="
+          aws --endpoint-url "$R2_ENDPOINT_URL" --region auto s3 cp latest-cn.json \
+            "s3://${R2_BUCKET}/tako-switch/latest.json" \
+            --cache-control "public, max-age=120" \
+            --content-type "application/json; charset=utf-8"
+          echo "=== Overwriting tiny latest.json directly in DogeCloud Shanghai OSS ==="
+          python3 - <<'PY'
+          import importlib.util, os
+          from pathlib import Path
+          ak = os.environ.get("DOGE_ACCESS_KEY", "").strip()
+          sk = os.environ.get("DOGE_SECRET_KEY", "").strip()
+          bucket = os.environ.get("DOGE_OSS_BUCKET", "").strip()
+          if ak and sk and bucket:
+              spec = importlib.util.spec_from_file_location("mirror", "scripts/mirror-to-r2.py")
+              mod = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(mod)
+              sb, ep, reg, env = mod.fetch_dogecloud_s3_credentials(ak, sk, bucket)
+              s3 = mod.S3Client(sb, ep, reg, env)
+              s3.upload_file(
+                  Path("latest-cn.json"),
+                  "tako-switch/latest.json",
+                  cache_control="public, max-age=120",
+                  content_type="application/json; charset=utf-8",
+              )
+              print(f"Synced latest.json directly to DogeCloud OSS s3://{sb}/tako-switch/latest.json")
+          PY
+          echo "=== Warming dl.lven.asia China CDN ==="
+          curl -fsSL --max-time 20 "https://dl.lven.asia/tako-switch/latest.json" -o /dev/null || true

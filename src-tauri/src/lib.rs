@@ -32,7 +32,7 @@ use tokio::sync::Mutex;
 
 const TRAY_ID: &str = "main-tray";
 const SELF_UPDATE_OSS_ENDPOINT: &str =
-    "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/tako-switch/latest.json";
+    "https://dl.lven.asia/tako-switch/latest.json";
 const SELF_UPDATE_GITHUB_ENDPOINT: &str =
     "https://github.com/tako-dev/tako-switch/releases/latest/download/latest.json";
 const SELF_UPDATE_BG_INTERVAL_SECS: u64 = 1800;
