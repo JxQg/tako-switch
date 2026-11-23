@@ -3788,7 +3788,7 @@ dependencies = [
 
 [[package]]
 name = "tako-switch"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "base64 0.22.1",
  "bytes",

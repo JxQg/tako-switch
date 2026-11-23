@@ -1123,7 +1123,7 @@ export default function App() {
       {/* Classic Unified Header Bar (52px, macOS overlay-safe) */}
       <TopHeaderBar
         isMac={isMac}
-        appVersion={dashboard?.appVersion ?? "2.2.2"}
+        appVersion={dashboard?.appVersion ?? "2.2.3"}
         activeRoute={activeRoute}
         account={dashboard?.account}
         isDark={isDark}
