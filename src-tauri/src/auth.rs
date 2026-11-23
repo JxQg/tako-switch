@@ -248,20 +248,80 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-pub fn open_external_url(url: &str) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    let status = std::process::Command::new("open").arg(url).status();
-    #[cfg(target_os = "windows")]
-    let status = std::process::Command::new("rundll32")
-        .args(["url.dll,FileProtocolHandler", url])
-        .status();
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let status = std::process::Command::new("xdg-open").arg(url).status();
+#[cfg(target_os = "windows")]
+fn open_external_url_windows(url: &str) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::process::CommandExt;
 
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut std::ffi::c_void,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> isize;
+    }
+
+    const SW_SHOWNORMAL: i32 = 1;
+    let op: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = OsStr::new(url).encode_wide().chain(Some(0)).collect();
+    let ret = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if ret > 32 {
+        return Ok(());
+    }
+
+    // Fallback: PowerShell Start-Process with single-quoted literal URL (never parses '&' or '%')
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let escaped = url.replace('\'', "''");
+    let ps_cmd = format!("Start-Process -FilePath '{escaped}'");
+    let status = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &ps_cmd,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status();
     match status {
         Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(format!("打开浏览器失败，退出码: {s}")),
-        Err(e) => Err(format!("拉起浏览器失败: {e}")),
+        Ok(s) => Err(format!("打开浏览器失败（ShellExecuteW={ret}, PowerShell={s}）")),
+        Err(e) => Err(format!("拉起浏览器失败（ShellExecuteW={ret}）: {e}")),
+    }
+}
+
+pub fn open_external_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        open_external_url_windows(url)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        #[cfg(target_os = "macos")]
+        let status = std::process::Command::new("open").arg(url).status();
+        #[cfg(not(target_os = "macos"))]
+        let status = std::process::Command::new("xdg-open").arg(url).status();
+
+        match status {
+            Ok(s) if s.success() => Ok(()),
+            Ok(s) => Err(format!("打开浏览器失败，退出码: {s}")),
+            Err(e) => Err(format!("拉起浏览器失败: {e}")),
+        }
     }
 }
 
@@ -355,6 +415,8 @@ pub async fn start_oauth_login(paths: &AppPaths) -> Result<AccountStatus, String
                     html.len()
                 );
                 let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+                let _ = stream.shutdown().await;
                 return Ok(code.clone());
             }
         }

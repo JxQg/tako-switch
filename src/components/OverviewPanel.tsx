@@ -350,7 +350,7 @@ export function OverviewPanel({
         </div>
 
         {/* Live Chinese Localization Progress Card */}
-        {uiPatchProgress && (
+        {uiPatchProgress ? (
           <div
             data-testid="ui-patch-progress-card"
             className="rounded-[12px] border px-3.5 py-2.5 flex flex-col gap-1.5 transition-all"
@@ -407,7 +407,38 @@ export function OverviewPanel({
               />
             </div>
           </div>
-        )}
+        ) : preferZh && anyUpdatableUiPatch ? (
+          <div
+            data-testid="ui-patch-update-banner"
+            className="rounded-[12px] border border-[var(--accent-border)] bg-[var(--accent-soft)]/75 px-3.5 py-2 flex flex-wrap items-center justify-between gap-2"
+          >
+            <div className="flex items-center gap-2 min-w-0 text-[12px] text-[var(--text-primary)]">
+              <Globe className="h-3.5 w-3.5 text-[var(--accent)] shrink-0" />
+              <span className="truncate">
+                检测到新版简体中文汉化（
+                {orderedApps
+                  .filter(
+                    (a) =>
+                      (a.id === "antigravity" || a.id === "claude") &&
+                      a.install.installed &&
+                      (a.uiPatch.status === "outdated_after_upgrade" ||
+                        Boolean(a.uiPatch.updateAvailable)),
+                  )
+                  .map((a) => APP_DISPLAY_NAMES[a.id] ?? a.name)
+                  .join("、")}
+                ），关闭应用后将自动更新
+              </span>
+            </div>
+            <button
+              type="button"
+              disabled={togglingChineseUi || busyApp !== null}
+              onClick={onToggleMainChineseUi}
+              className="h-7 px-2.5 rounded-[7px] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[11.5px] font-medium cursor-pointer disabled:opacity-60 shrink-0"
+            >
+              立即更新汉化
+            </button>
+          </div>
+        ) : null}
 
         {loading ? (
           <div className="rounded-[13px] border border-[var(--border)] bg-[var(--bg-card)] p-6 text-center text-[13px] text-[var(--text-secondary)]">

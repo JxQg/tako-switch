@@ -941,6 +941,17 @@ pub fn auto_sync_pending_ui_patches_for_paths(
     paths: &AppPaths,
     include_unpatched_for: Option<AppId>,
 ) -> AutoUiSyncReport {
+    auto_sync_pending_ui_patches_for_paths_with_progress(paths, include_unpatched_for, |_| {})
+}
+
+pub fn auto_sync_pending_ui_patches_for_paths_with_progress<F>(
+    paths: &AppPaths,
+    include_unpatched_for: Option<AppId>,
+    mut on_progress: F,
+) -> AutoUiSyncReport
+where
+    F: FnMut(UiPatchProgressEvent),
+{
     let mut report = AutoUiSyncReport::default();
     if !read_switch_state(paths).prefer_chinese_ui {
         return report;
@@ -949,6 +960,7 @@ pub fn auto_sync_pending_ui_patches_for_paths(
         return report;
     };
 
+    let mut pending_targets: Vec<AppId> = Vec::new();
     for &app_id in &[AppId::Claude, AppId::Antigravity] {
         let info = inspect_ui_patch_for_app(paths, app_id);
         let needs_sync = info.status == adapters::UiPatchStatus::OutdatedAfterUpgrade
@@ -962,6 +974,23 @@ pub fn auto_sync_pending_ui_patches_for_paths(
             report.deferred_running.push(app_id);
             continue;
         }
+        pending_targets.push(app_id);
+    }
+
+    let total = pending_targets.len();
+    for (idx, app_id) in pending_targets.into_iter().enumerate() {
+        let label = ui_patch_app_label(app_id);
+        let start_pct = 18u8
+            .saturating_add(((idx as u16) * 72 / (total.max(1) as u16)) as u8)
+            .min(86);
+        on_progress(UiPatchProgressEvent {
+            scope: "auto".into(),
+            action: "patch".into(),
+            stage: "patching".into(),
+            percent: start_pct,
+            message: format!("检测到汉化版本更新，正在自动为 {label} 汉化中..."),
+            current_app: Some(app_id),
+        });
         if run_raw_ui_patch_action(paths, app_id, "patch").is_ok() {
             match app_id {
                 AppId::Claude => {
@@ -981,6 +1010,23 @@ pub fn auto_sync_pending_ui_patches_for_paths(
         }
     }
 
+    if !report.updated.is_empty() {
+        let names = report
+            .updated
+            .iter()
+            .map(|id| ui_patch_app_label(*id))
+            .collect::<Vec<_>>()
+            .join("、");
+        on_progress(UiPatchProgressEvent {
+            scope: "auto".into(),
+            action: "patch".into(),
+            stage: "done".into(),
+            percent: 100,
+            message: format!("汉化版本已自动更新完成（{names}）"),
+            current_app: None,
+        });
+    }
+
     report
 }
 
@@ -998,8 +1044,11 @@ async fn run_background_ui_patch_auto_sync(app: &AppHandle, fetch_remote_packs: 
     };
 
     let paths_for_sync = paths.clone();
+    let app_for_progress = app.clone();
     let report = tauri::async_runtime::spawn_blocking(move || {
-        auto_sync_pending_ui_patches_for_paths(&paths_for_sync, None)
+        auto_sync_pending_ui_patches_for_paths_with_progress(&paths_for_sync, None, |evt| {
+            let _ = app_for_progress.emit("ui-patch-progress", &evt);
+        })
     })
     .await
     .unwrap_or_default();
@@ -1008,7 +1057,7 @@ async fn run_background_ui_patch_auto_sync(app: &AppHandle, fetch_remote_packs: 
         refresh_tray(app, &paths);
         let _ = app.emit("state-changed", ());
     }
-    if !report.updated.is_empty() {
+    if !report.updated.is_empty() || !report.deferred_running.is_empty() {
         let _ = app.emit(
             "ui-patch-auto-synced",
             &UiPatchAutoSyncEvent {

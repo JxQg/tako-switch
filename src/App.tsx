@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { AlertCircle, ExternalLink, FileText, MessageSquare, X } from "lucide-react";
+import { AlertCircle, ExternalLink, FileText, Globe, MessageSquare, X } from "lucide-react";
 import {
   api,
   parseUiPatchBlockError,
@@ -93,6 +93,8 @@ export default function App() {
 
   const [togglingChineseUi, setTogglingChineseUi] = useState(false);
   const [uiPatchProgress, setUiPatchProgress] = useState<UiPatchProgressEvent | null>(null);
+  const [unpatchedPromptApps, setUnpatchedPromptApps] = useState<AppId[]>([]);
+  const initialChinesePromptCheckedRef = useRef(false);
   const uiPatchClearTimerRef = useRef<number | null>(null);
   const uiPatchFloorRef = useRef<number>(0);
   const [permissionPrompts, setPermissionPrompts] = useState<UiPatchPermissionPrompt[]>([]);
@@ -293,6 +295,21 @@ export default function App() {
 
     void loadDashboard(true).then((data) => {
       if (disposed || !data) return;
+      if (!initialChinesePromptCheckedRef.current) {
+        initialChinesePromptCheckedRef.current = true;
+        const unpatchedIds = data.apps
+          .filter((a) => {
+            if (!a.install.installed || a.id === "dsh-tako") return false;
+            if (a.id === "claude" || a.id === "antigravity") {
+              return a.uiPatch.status === "unpatched";
+            }
+            return a.id === "codex" && !a.chineseConfigured;
+          })
+          .map((a) => a.id);
+        if (unpatchedIds.length > 0) {
+          setUnpatchedPromptApps(unpatchedIds);
+        }
+      }
       if (data.state.autoCheckUpdates && !initialAutoCheckDone.current) {
         initialAutoCheckDone.current = true;
         void runUpdateChecks(true);
@@ -402,9 +419,14 @@ export default function App() {
       deferredRunningApps: AppId[];
     }>("ui-patch-auto-synced", (event) => {
       const updated = event.payload.updatedApps ?? [];
+      const deferred = event.payload.deferredRunningApps ?? [];
       if (updated.length > 0) {
         const names = updated.map((id) => APP_DISPLAY_NAMES[id] ?? id).join("、");
-        showTransientNote(`已自动同步最新简体中文汉化（${names}）`);
+        showTransientNote(`已自动更新至最新简体中文汉化（${names}）`);
+        void loadDashboard(false);
+      } else if (deferred.length > 0) {
+        const names = deferred.map((id) => APP_DISPLAY_NAMES[id] ?? id).join("、");
+        showTransientNote(`检测到 ${names} 有新版汉化，关闭应用后将自动更新，也可在首页立即更新`);
         void loadDashboard(false);
       }
     });
@@ -1612,6 +1634,74 @@ export default function App() {
                 className="h-8 px-3.5 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-primary)] cursor-pointer"
               >
                 关闭
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Startup Unpatched Chinese Localization Prompt Modal */}
+      {unpatchedPromptApps.length > 0 && !uiPatchProgress && (
+        <div
+          className="fixed inset-0 z-50 bg-black/40 backdrop-blur-[2px] flex items-center justify-center p-4"
+          onClick={() => setUnpatchedPromptApps([])}
+        >
+          <div
+            data-testid="startup-chinese-prompt-modal"
+            className="w-full max-w-[420px] rounded-[16px] border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-md)] p-5 flex flex-col gap-3.5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="w-9 h-9 rounded-[10px] bg-[var(--accent-soft)] border border-[var(--accent-border)] text-[var(--accent)] flex items-center justify-center shrink-0">
+                  <Globe className="h-4.5 w-4.5" />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-[14.5px] font-semibold text-[var(--text-primary)]">
+                    检测到应用尚未汉化
+                  </div>
+                  <div className="text-[11.5px] text-[var(--text-muted)]">
+                    可一键开启简体中文，支持随时无损还原
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                aria-label="关闭"
+                onClick={() => setUnpatchedPromptApps([])}
+                className="w-7 h-7 rounded-[8px] flex items-center justify-center text-[var(--text-muted)] hover:bg-[var(--bg-subtle)] cursor-pointer shrink-0"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="text-[12.5px] text-[var(--text-secondary)] leading-relaxed">
+              检测到当前已安装的{" "}
+              <span className="font-semibold text-[var(--text-primary)]">
+                {unpatchedPromptApps.map((id) => APP_DISPLAY_NAMES[id] ?? id).join("、")}
+              </span>{" "}
+              还没有汉化，是否要直接一键汉化？后续汉化词典更新时，Tako Switch 也会自动帮你同步更新。
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setUnpatchedPromptApps([])}
+                className="h-8.5 px-3.5 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12.5px] font-medium text-[var(--text-secondary)] cursor-pointer"
+              >
+                暂不汉化
+              </button>
+              <button
+                type="button"
+                data-testid="startup-chinese-prompt-confirm"
+                disabled={togglingChineseUi || busyApp !== null}
+                onClick={() => {
+                  setUnpatchedPromptApps([]);
+                  void runSetPreferChineseUi(true);
+                }}
+                className="h-8.5 px-4 rounded-[9px] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12.5px] font-medium cursor-pointer disabled:opacity-60"
+              >
+                立即汉化
               </button>
             </div>
           </div>
