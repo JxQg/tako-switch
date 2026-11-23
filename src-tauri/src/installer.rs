@@ -88,6 +88,98 @@ fn format_eta(secs: u64) -> String {
     }
 }
 
+fn route_display_label(url: &str) -> &'static str {
+    let lower = url.to_ascii_lowercase();
+    if lower.contains("dl.lven.asia") || lower.contains("dogedns") {
+        "国内加速"
+    } else if lower.contains("oss-cn-") || lower.contains("aliyuncs.com") {
+        "国内 OSS"
+    } else if lower.contains("github.com") || lower.contains("githubusercontent.com") {
+        "GitHub"
+    } else {
+        "官方源"
+    }
+}
+
+/// Probe a single candidate URL by fetching up to 256 KiB (via `Range: bytes=0-262143`)
+/// so we measure real connection + TLS + TTFB + actual download throughput instead of just HEAD.
+async fn probe_download_speed(client: &Client, url: &str) -> Option<f64> {
+    const PROBE_CAP_BYTES: usize = 256 * 1024;
+    let started = Instant::now();
+    let resp = client
+        .get(url)
+        .header(reqwest::header::RANGE, "bytes=0-262143")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut received: usize = 0;
+    while received < PROBE_CAP_BYTES {
+        match tokio::time::timeout(Duration::from_millis(1800), stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                received = received.saturating_add(chunk.len());
+            }
+            Ok(None) => break,
+            _ => break,
+        }
+    }
+    if received == 0 {
+        return None;
+    }
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    Some(received as f64 / elapsed)
+}
+
+/// Concurrently probe multiple candidate download URLs and return them ordered fastest-first.
+/// Healthy routes are ranked by measured throughput (bytes/sec); unreachable or timed-out routes
+/// are placed at the end in their original order as last-resort fallbacks.
+pub(crate) async fn rank_fastest_download_urls(urls: Vec<String>) -> Vec<(String, Option<f64>)> {
+    if urls.len() <= 1 {
+        return urls.into_iter().map(|u| (u, None)).collect();
+    }
+
+    let Ok(probe_client) = Client::builder()
+        .connect_timeout(Duration::from_millis(2500))
+        .timeout(Duration::from_millis(3800))
+        .build()
+    else {
+        return urls.into_iter().map(|u| (u, None)).collect();
+    };
+
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, url) in urls.iter().enumerate() {
+        let client = probe_client.clone();
+        let url_owned = url.clone();
+        set.spawn(async move {
+            let speed = probe_download_speed(&client, &url_owned).await;
+            (idx, url_owned, speed)
+        });
+    }
+
+    let mut probed: Vec<(usize, String, Option<f64>)> = Vec::with_capacity(urls.len());
+    while let Some(res) = set.join_next().await {
+        if let Ok(item) = res {
+            probed.push(item);
+        }
+    }
+
+    probed.sort_by(|a, b| match (a.2, b.2) {
+        (Some(sa), Some(sb)) => sb
+            .partial_cmp(&sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.0.cmp(&b.0),
+    });
+
+    probed.into_iter().map(|(_, u, s)| (u, s)).collect()
+}
+
 async fn download_artifact(
     app: Option<&AppHandle>,
     app_id: AppId,
@@ -107,33 +199,52 @@ async fn download_artifact(
     };
 
     let client = Client::builder()
-        .connect_timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(12))
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| format!("创建下载客户端失败: {e}"))?;
 
-    let mut urls = vec![artifact.url.clone()];
-    if let Some(fb) = artifact.fallback_url.as_ref().filter(|u| !u.is_empty() && *u != &artifact.url) {
-        urls.push(fb.clone());
+    let mut raw_urls = vec![artifact.url.clone()];
+    if let Some(fb) = artifact
+        .fallback_url
+        .as_ref()
+        .filter(|u| !u.is_empty() && *u != &artifact.url)
+    {
+        raw_urls.push(fb.clone());
     }
 
+    let ranked_urls = if raw_urls.len() > 1 {
+        emit_progress(app, app_id, "downloading", 1, "正在自动测速，选择最快下载线路...");
+        rank_fastest_download_urls(raw_urls).await
+    } else {
+        raw_urls.into_iter().map(|u| (u, None)).collect()
+    };
+
     let mut last_err = String::new();
-    for url in urls {
+    for (route_idx, (url, probed_bps)) in ranked_urls.into_iter().enumerate() {
         if is_cancelled() {
             let _ = fs::remove_file(dest_path);
             emit_progress(app, app_id, "cancelled", 0, "已取消下载");
             return Err("已取消下载".to_string());
         }
 
-        emit_progress(app, app_id, "downloading", 1, "正在连接下载源...");
+        let route_label = route_display_label(&url);
+        let connect_msg = if route_idx > 0 {
+            format!("正在切换备用线路（{route_label}）...")
+        } else if probed_bps.is_some() {
+            format!("已自动选定最快线路（{route_label}），正在开始下载...")
+        } else {
+            format!("正在连接下载源（{route_label}）...")
+        };
+        emit_progress(app, app_id, "downloading", 1, connect_msg);
         let resp = match client.get(&url).send().await {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                last_err = format!("{url}: HTTP {}", r.status().as_u16());
+                last_err = format!("{route_label} ({url}): HTTP {}", r.status().as_u16());
                 continue;
             }
             Err(e) => {
-                last_err = format!("{url}: {e}");
+                last_err = format!("{route_label} ({url}): {e}");
                 continue;
             }
         };
@@ -148,7 +259,16 @@ async fn download_artifact(
         let mut last_pct: u8 = 1;
         let mut stream_err: Option<String> = None;
 
-        while let Some(chunk_res) = stream.next().await {
+        loop {
+            let chunk_res = match tokio::time::timeout(Duration::from_secs(20), stream.next()).await
+            {
+                Ok(Some(item)) => item,
+                Ok(None) => break,
+                Err(_) => {
+                    stream_err = Some(format!("{route_label} 下载停滞超时，正在切换备用线路"));
+                    break;
+                }
+            };
             if is_cancelled() {
                 drop(out);
                 let _ = fs::remove_file(dest_path);
@@ -182,7 +302,7 @@ async fn download_artifact(
                             let bytes_per_sec = (downloaded as f64 / elapsed).max(1.0);
                             let eta_secs = (rem_bytes / bytes_per_sec).round() as u64;
                             format!(
-                                "已下载 {:.1} / {:.1} MB · {:.1} MB/s · {}",
+                                "{route_label} · 已下载 {:.1} / {:.1} MB · {:.1} MB/s · {}",
                                 downloaded as f64 / 1_048_576.0,
                                 tot as f64 / 1_048_576.0,
                                 speed_mb,
@@ -190,7 +310,7 @@ async fn download_artifact(
                             )
                         } else {
                             format!(
-                                "已下载 {:.1} MB · {:.1} MB/s",
+                                "{route_label} · 已下载 {:.1} MB · {:.1} MB/s",
                                 downloaded as f64 / 1_048_576.0,
                                 speed_mb
                             )
@@ -666,5 +786,78 @@ mod tests {
         let mut bad = good.clone();
         bad.sha256 = Some("0".repeat(64));
         assert!(verify_digests(&pkg, &bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn rank_fastest_download_urls_prefers_fast_healthy_route_over_slow_or_broken() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Fast server: responds immediately with 64 KiB
+        let fast_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fast_addr = fast_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = fast_listener.accept().await {
+                let mut req = [0u8; 512];
+                let _ = sock.read(&mut req).await;
+                let payload = vec![b'A'; 64 * 1024];
+                let hdr = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = sock.write_all(hdr.as_bytes()).await;
+                let _ = sock.write_all(&payload).await;
+            }
+        });
+
+        // Slow server: sleeps 350ms before sending 8 KiB
+        let slow_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_addr = slow_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = slow_listener.accept().await {
+                let mut req = [0u8; 512];
+                let _ = sock.read(&mut req).await;
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                let payload = vec![b'B'; 8 * 1024];
+                let hdr = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = sock.write_all(hdr.as_bytes()).await;
+                let _ = sock.write_all(&payload).await;
+            }
+        });
+
+        // Broken server: returns 503
+        let broken_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let broken_addr = broken_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = broken_listener.accept().await {
+                let mut req = [0u8; 512];
+                let _ = sock.read(&mut req).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let broken_url = format!("http://{broken_addr}/pkg.zip");
+        let slow_url = format!("http://{slow_addr}/pkg.zip");
+        let fast_url = format!("http://{fast_addr}/pkg.zip");
+
+        let ranked = rank_fastest_download_urls(vec![
+            broken_url.clone(),
+            slow_url.clone(),
+            fast_url.clone(),
+        ])
+        .await;
+
+        assert_eq!(ranked.len(), 3);
+        assert_eq!(ranked[0].0, fast_url);
+        assert!(ranked[0].1.is_some());
+        assert_eq!(ranked[1].0, slow_url);
+        assert!(ranked[1].1.is_some());
+        assert_eq!(ranked[2].0, broken_url);
+        assert!(ranked[2].1.is_none());
     }
 }
