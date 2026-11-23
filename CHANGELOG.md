@@ -2,6 +2,13 @@
 
 所有 Tako Switch 的重要版本更新说明都会记录在这里。每次发版时，CI 会自动提取对应版本段落，同步写入 `latest.json`（供客户端自更新与官网下载页展示）及 GitHub Release 正文。
 
+## v2.2.2 (2026-11-23)
+
+- 彻底修复新版 Claude Desktop（Electron 45+）在 macOS 汉化后启动崩溃（`SIGTRAP` / `Failed to get integrity for validatable asar archive`）的问题：支持流式扫描并同步更新 `Electron Framework` 双架构段内的 `__DATA_CONST,__asar_integrity` 字典摘要槽位，按由内向外顺序（`Electron Framework` → 全部 `Claude Helper*.app` → 外层 `Claude.app`）保留安全权限做本地重签，并通过 APFS CoW 备份实现 100% 字节级原厂签名无损还原
+- 简化交互框架回归清爽单栏主页 + 清晰二级页面：移除常驻左侧边栏并全宽自适应对齐，首页直接保留四端一键「官方 / Tako 切换」「打开 / 关闭 / 安装」与 6 项超级 MCP 快捷开关，各软件独立设置、MCP 能力中心与通用设置收拢为带顶部大号「← 返回首页」按钮（支持 `Esc`）的独立二级页
+- 新增汉化与还原实时进度条：前后端打通 `ui-patch-progress` 分阶段事件，首页一键三端汉化与软件独立设置页均实时展示步骤文案与进度百分比
+- 客户端通过 Tako Switch 升级或新装完成后，若已开启简体中文偏好将自动为新版本续打简体中文语言配置与界面补丁后再启动
+
 ## v2.2.1 (2026-11-23)
 
 - 修复 macOS 端 Claude Desktop 启用简体中文汉化补丁后无法启动的问题：本地 ad-hoc 重签前自动剥离绑定原厂签名证书的受限 entitlements（`com.apple.application-identifier`、`com.apple.developer.team-identifier`、`keychain-access-groups` 等），避免触发 AMFI 拦截（SIGKILL），并保留 JIT、音视频、AppleEvents 与虚拟化等合法权限；同时优化大体积 ASAR 重打包哈希计算性能，减少等待时间

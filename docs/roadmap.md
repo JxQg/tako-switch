@@ -15,7 +15,8 @@
 | `v2.0.9` – `v2.0.10` | 代理直连流式优化与更新日志体系 | 新增默认绕过系统代理直连 Tako 网关、大请求体流式透传与下游断连即时中止；建立以 `CHANGELOG.md` 为单一真相源的自动提取发版流水线与客户端内更新日志弹窗。 |
 | `v2.1.0` – `v2.1.1` | Claude Desktop 全量界面汉化 + 跨平台权限引导解耦 | 新增纯 Rust 双 ASAR（`app.asar` + `ion-dist.asar`）Claude Desktop 全量简体中文补丁与字节级无损还原，覆盖 Chat / Cowork / Claude Code 工作台与 ICU 占位符安全校验；解耦配置文件级汉化与 ASAR 写入，新增 macOS「App 管理」权限弹窗直达、Windows Squirrel 数值排序、PE32+ 完整性修补与临时 UAC 提权工作进程。 |
 | `v2.2.0` | 极简界面重设计 + EdgeOne 网站上线 MCP + Antigravity 全量汉化 | 左侧栏「全局 / 软件独立设置」单域分栏架构与 MCP 抽屉剧场降噪重设计；新增 `Tako Web Page`（腾讯云 EdgeOne Pages）免密钥浏览器授权网站上线 MCP 全客户端同步与 Node.js 运行时检测；Antigravity 独立简体中文词典扩充至 3,041 条并升级动态模板/Shadow DOM/同源本地 iframe 零误伤翻译引擎。 |
-| **`v2.2.1`（当前）** | **Claude 汉化启动修复 + Antigravity 词典扩充与防拆词误翻 + 3p MCP 去重** | 修复 macOS ad-hoc 重签携带受限 entitlements 导致 Claude Desktop 汉化后 AMFI SIGKILL 无法启动的问题并优化 ASAR 重打包性能；Antigravity 词典扩充至 3,630 条并引入 React 安全相邻文本节点合并翻译与短词守卫；修复 Claude 3p `tako-web-page` 重复写入触发组织同名告警的问题。 |
+| `v2.2.1` | Claude 汉化启动修复 + Antigravity 词典扩充与防拆词误翻 + 3p MCP 去重 | 修复 macOS ad-hoc 重签携带受限 entitlements 导致 Claude Desktop 汉化后 AMFI SIGKILL 无法启动的问题并优化 ASAR 重打包性能；Antigravity 词典扩充至 3,630 条并引入 React 安全相邻文本节点合并翻译与短词守卫；修复 Claude 3p `tako-web-page` 重复写入触发组织同名告警的问题。 |
+| **`v2.2.2`（当前）** | **Electron 45+ 汉化完整性摘要修复 + 单栏主页二级页架构 + 汉化进度条与升级自动续打** | 修复新版 Claude Desktop（Electron 45+）macOS `__asar_integrity` 摘要槽位校验失败与 Helper 重签问题并实现 APFS CoW 字节级原厂签名无损还原；回归经典单栏全宽主页（直接一键切换/开关客户端与 6 项超级 MCP）搭配清晰二级设置页；新增汉化实时进度条及客户端升级后自动续打简体中文界面补丁。 |
 
 ---
 
