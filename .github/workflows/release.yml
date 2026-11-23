@@ -15,6 +15,10 @@ on:
         type: boolean
         required: false
         default: false
+      resync_tag:
+        description: "CDN repair mode: skip builds, re-download binaries from this GitHub Release tag and re-push to R2 + DogeCloud origins behind dl.lven.asia"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -43,6 +47,7 @@ jobs:
             updater_key: windows-x86_64
             asset_prefix: windows-x64
     runs-on: ${{ matrix.os }}
+    if: ${{ inputs.resync_tag == '' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -227,17 +232,49 @@ jobs:
     name: Publish Release, Checksums & Latest-Only Prune
     needs: build
     runs-on: ubuntu-latest
+    if: ${{ always() && (inputs.resync_tag != '' || needs.build.result == 'success') }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - uses: actions/download-artifact@v4
+        if: ${{ inputs.resync_tag == '' }}
         with:
           path: collected
           pattern: assets-*
 
+      - name: Download binaries from existing GitHub Release (CDN resync repair)
+        if: ${{ inputs.resync_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESYNC_TAG: ${{ inputs.resync_tag }}
+        run: |
+          set -euo pipefail
+          tag="$RESYNC_TAG"
+          mkdir -p release-files
+          gh release download "$tag" -R "$GITHUB_REPOSITORY" --dir release-files --clobber
+          python3 - <<'PY'
+          import json, os
+          tag = os.environ["RESYNC_TAG"]
+          gh_base = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases/download/{tag}"
+          cn_base = f"https://dl.lven.asia/tako-switch/releases/{tag}"
+          data = json.load(open("release-files/latest.json", encoding="utf-8"))
+          if data.get("version") != tag.lstrip("v"):
+              raise SystemExit(f"latest.json version {data.get('version')} does not match tag {tag}; refusing to resync")
+          for plat in (data.get("platforms") or {}).values():
+              url = str(plat.get("url") or "")
+              if not url.startswith(gh_base + "/"):
+                  raise SystemExit(f"unexpected upstream platform url {url}; refusing to rewrite")
+              plat["url"] = cn_base + url[len(gh_base):]
+          json.dump(data, open("latest-cn.json", "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+          PY
+          echo "=== resync payload ==="
+          ls -la release-files
+          cat latest-cn.json
+
       - name: Generate latest.json, SHA256SUMS.txt, publish Release & prune old v2 releases
+        if: ${{ inputs.resync_tag == '' }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_INPUT: ${{ inputs.tag }}
@@ -320,10 +357,10 @@ jobs:
             esac
           done
 
-      - name: Sync Tako Switch release binaries & latest.json to China CDN origin (R2 -> dl.lven.asia)
-        if: env.R2_BUCKET != '' && env.R2_ENDPOINT_URL != ''
+      - name: Sync release binaries & latest.json to China CDN origins (R2 + DogeCloud OSS -> dl.lven.asia)
         env:
           TAG_INPUT: ${{ inputs.tag }}
+          RESYNC_TAG: ${{ inputs.resync_tag }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -335,40 +372,10 @@ jobs:
           DOGE_SECRET_KEY: ${{ secrets.DOGE_SECRET_KEY }}
           DOGE_OSS_BUCKET: ${{ secrets.DOGE_OSS_BUCKET }}
         run: |
-          tag="${TAG_INPUT:-$GITHUB_REF_NAME}"
-          echo "=== Uploading release-files/* to R2 tako-switch/releases/${tag}/ ==="
-          for f in release-files/*; do
-            fname="$(basename "$f")"
-            [ "$fname" = "latest.json" ] && continue
-            aws --endpoint-url "$R2_ENDPOINT_URL" --region auto s3 cp "$f" \
-              "s3://${R2_BUCKET}/tako-switch/releases/${tag}/${fname}" \
-              --cache-control "public, max-age=31536000, immutable"
-          done
-          echo "=== Uploading China CDN latest.json to R2 tako-switch/latest.json ==="
-          aws --endpoint-url "$R2_ENDPOINT_URL" --region auto s3 cp latest-cn.json \
-            "s3://${R2_BUCKET}/tako-switch/latest.json" \
-            --cache-control "public, max-age=120" \
-            --content-type "application/json; charset=utf-8"
-          echo "=== Overwriting tiny latest.json directly in DogeCloud Shanghai OSS ==="
-          python3 - <<'PY'
-          import importlib.util, os
-          from pathlib import Path
-          ak = os.environ.get("DOGE_ACCESS_KEY", "").strip()
-          sk = os.environ.get("DOGE_SECRET_KEY", "").strip()
-          bucket = os.environ.get("DOGE_OSS_BUCKET", "").strip()
-          if ak and sk and bucket:
-              spec = importlib.util.spec_from_file_location("mirror", "scripts/mirror-to-r2.py")
-              mod = importlib.util.module_from_spec(spec)
-              spec.loader.exec_module(mod)
-              sb, ep, reg, env = mod.fetch_dogecloud_s3_credentials(ak, sk, bucket)
-              s3 = mod.S3Client(sb, ep, reg, env)
-              s3.upload_file(
-                  Path("latest-cn.json"),
-                  "tako-switch/latest.json",
-                  cache_control="public, max-age=120",
-                  content_type="application/json; charset=utf-8",
-              )
-              print(f"Synced latest.json directly to DogeCloud OSS s3://{sb}/tako-switch/latest.json")
-          PY
-          echo "=== Warming dl.lven.asia China CDN ==="
-          curl -fsSL --max-time 20 "https://dl.lven.asia/tako-switch/latest.json" -o /dev/null || true
+          set -euo pipefail
+          tag="${RESYNC_TAG:-${TAG_INPUT:-$GITHUB_REF_NAME}}"
+          extra=(--verify)
+          if [ -n "$RESYNC_TAG" ]; then
+            extra+=(--require r2 --require doge)
+          fi
+          python3 scripts/sync-release-cdn.py --tag "$tag" "${extra[@]}"

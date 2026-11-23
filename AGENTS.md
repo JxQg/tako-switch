@@ -48,10 +48,12 @@
 | `src-tauri/src/adapters/antigravity_i18n.rs` | 纯 Rust Electron ASAR v1 界面汉化补丁器、`.orig` 备份、SHA-256 完整性校验、升级检测与原厂签名级无损还原 |
 | `docs/roadmap.md` / `docs/dispatch/v2.0.8.md` | `v2.0.x` 产品演进路线图与双工作树研发/测试隔离契约 |
 | `scripts/sync-manifest.py` / `test_sync_manifest.py` | 抓取 DSH Tako 与三端官方无墙源并更新 `manifest/manifest.json` 的同步脚本与单测 |
+| `scripts/mirror-to-r2.py` / `test_mirror_to_r2.py` | 把 manifest 内三端官方安装包镜像到 R2 / DogeCloud OSS（S3Client、STS 换票、增量跳过与版本清理），并重写 `url`/`fallbackUrl` |
+| `scripts/sync-release-cdn.py` / `test_sync_release_cdn.py` | 把本体 `release-files/*` 与 `latest-cn.json` 同步到 R2 + DogeCloud OSS（`dl.lven.asia` 源站），含平台 URL HEAD 验证 |
 | `scripts/verify_client_mcp_ui.py` | V2 超级 MCP 内联剧场二进制媒体（WebP/MP4/MP3）、`data-testid`、CSP 与受控汉化备份安全门禁校验脚本 |
 | `manifest/manifest.json` | 托管桌面端官方安装源清单（由 `.github/workflows/sync-manifest.yml` 每 6 小时自动刷新） |
 | `.github/workflows/ci.yml` | PR 与 `main` push 验证流水线：前端构建 + 清单脚本单测 + Linux/macOS/Windows 三平台 `cargo test` & `clippy` |
-| `.github/workflows/release.yml` | `v*` tag 发布流水线：macOS 双架构签名公证 + Windows NSIS + `latest.json` / `SHA256SUMS.txt` + 旧 `v2.*` Release 自动清理 |
+| `.github/workflows/release.yml` | `v*` tag 发布流水线：macOS 双架构签名公证 + Windows NSIS + `latest.json` / `SHA256SUMS.txt` + 旧 `v2.*` Release 自动清理；`workflow_dispatch` 的 `resync_tag` 修复模式跳过构建、直接重推已有 Release 产物到 R2 + DogeCloud |
 
 ---
 
@@ -98,6 +100,8 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
 # 3. 清单同步脚本、更新日志提取测试与结构校验
 python3 -m unittest -v scripts/test_sync_manifest.py
+python3 -m unittest -v scripts/test_mirror_to_r2.py
+python3 -m unittest -v scripts/test_sync_release_cdn.py
 python3 -m unittest -v scripts/test_extract_release_notes.py
 python3 scripts/extract_release_notes.py --changelog CHANGELOG.md --check-package-json package.json
 python3 -c 'import json; d=json.load(open("manifest/manifest.json")); assert set(d["apps"])=={"dsh-tako","codex","claude","antigravity"}'

@@ -31,6 +31,7 @@ jobs:
         run: |
           python3 -m unittest -v scripts/test_sync_manifest.py
           python3 -m unittest -v scripts/test_mirror_to_r2.py
+          python3 -m unittest -v scripts/test_sync_release_cdn.py
           python3 -m unittest -v scripts/test_extract_release_notes.py
           python3 scripts/extract_release_notes.py --changelog CHANGELOG.md --check-package-json package.json
 
