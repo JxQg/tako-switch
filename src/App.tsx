@@ -999,7 +999,7 @@ export default function App() {
         <SidebarNav
           activeRoute={activeRoute}
           onSelectRoute={setActiveRoute}
-          appVersion={dashboard?.appVersion ?? "2.2.0"}
+          appVersion={dashboard?.appVersion ?? "2.2.1"}
           apps={dashboard?.apps ?? []}
           updatesMap={updatesMap}
           mcpEnabledCount={mcpEnabledCount}

@@ -2,6 +2,12 @@
 
 所有 Tako Switch 的重要版本更新说明都会记录在这里。每次发版时，CI 会自动提取对应版本段落，同步写入 `latest.json`（供客户端自更新与官网下载页展示）及 GitHub Release 正文。
 
+## v2.2.1 (2026-11-23)
+
+- 修复 macOS 端 Claude Desktop 启用简体中文汉化补丁后无法启动的问题：本地 ad-hoc 重签前自动剥离绑定原厂签名证书的受限 entitlements（`com.apple.application-identifier`、`com.apple.developer.team-identifier`、`keychain-access-groups` 等），避免触发 AMFI 拦截（SIGKILL），并保留 JIT、音视频、AppleEvents 与虚拟化等合法权限；同时优化大体积 ASAR 重打包哈希计算性能，减少等待时间
+- 升级 Antigravity 简体中文汉化词典与 DOM 翻译引擎：从最新版内嵌前端资源增补 589 条漏翻界面文案（总词条扩充至 3,630 条，覆盖自动化页、通知/通用/外观/快捷键/模型/浏览器/Cookie/反馈等设置页）；新增 React 安全的相邻文本节点合并翻译与短词误翻守卫，彻底修复 `No automations yet` 被拆词误翻为「否 automations yet」及长说明文案跳过翻译的问题
+- 修复 Claude Desktop 3p（Tako）模式下 `tako-web-page` 提示 `Replaced by organization's server` 的同名冲突告警：3p 模式统一仅通过 `managedMcpServers` 下发，不再向 `Claude-3p/claude_desktop_config.json` 重复写入并自动清理残留重复项
+
 ## v2.2.0 (2026-11-22)
 
 - 全新极简单域界面设计：左侧栏清晰划分「全局（总览 / 通用设置 / MCP 能力）」与「软件独立设置（Claude Desktop / Codex / Antigravity / DSH Tako）」，收拢各客户端专属配置与低频诊断，统一图标层级，MCP 实景剧场升级为按需滑出抽屉
