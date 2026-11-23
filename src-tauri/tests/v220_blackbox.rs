@@ -568,7 +568,8 @@ fn tc_eo_04_claude_1p_and_3p_edgeone_mcp_sync_and_cleanup() {
         &cfg_3p,
         serde_json::to_string_pretty(&json!({
             "mcpServers": {
-                "user-3p-db": { "command": "uvx", "args": ["mcp-server-sqlite"] }
+                "user-3p-db": { "command": "uvx", "args": ["mcp-server-sqlite"] },
+                "tako-web-page": { "command": "npx", "args": ["-y", "@edgeone/makers-mcp@latest", "--region", "china"] }
             },
             "userPreference": "keep-3p"
         }))
@@ -587,29 +588,68 @@ fn tc_eo_04_claude_1p_and_3p_edgeone_mcp_sync_and_cleanup() {
         .apply_mode(&paths, AppMode::Tako)
         .expect("Claude apply_mode(Tako) with web_page=true");
 
-    for (label, path, preserved_key, preserved_pref) in [
-        ("claude-1p", &cfg_1p, "user-1p-fs", "keep-1p"),
-        ("claude-3p", &cfg_3p, "user-3p-db", "keep-3p"),
-    ] {
-        let doc: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(
-            doc.get("userPreference").and_then(Value::as_str),
-            Some(preserved_pref),
-            "{label}: unrelated top-level key must be preserved"
-        );
-        let servers = doc
-            .get("mcpServers")
-            .and_then(Value::as_object)
-            .unwrap_or_else(|| panic!("{label}: missing mcpServers object"));
-        assert!(
-            servers.contains_key(preserved_key),
-            "{label}: user server '{preserved_key}' must be preserved"
-        );
-        let edgeone = servers
-            .get(EDGEONE_MCP_SERVER_KEY)
-            .unwrap_or_else(|| panic!("{label}: missing '{EDGEONE_MCP_SERVER_KEY}' in Tako+web_page=true"));
-        assert_json_edgeone_entry(edgeone, Some("eo-claude-tok"), Some("claude-site"), label);
-    }
+    // 1p user config gets tako-web-page directly
+    let doc_1p: Value = serde_json::from_str(&fs::read_to_string(&cfg_1p).unwrap()).unwrap();
+    assert_eq!(
+        doc_1p.get("userPreference").and_then(Value::as_str),
+        Some("keep-1p"),
+        "claude-1p: unrelated top-level key must be preserved"
+    );
+    let servers_1p = doc_1p
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .expect("claude-1p: missing mcpServers object");
+    assert!(servers_1p.contains_key("user-1p-fs"));
+    let edgeone_1p = servers_1p
+        .get(EDGEONE_MCP_SERVER_KEY)
+        .expect("claude-1p: missing tako-web-page in Tako+web_page=true");
+    assert_json_edgeone_entry(edgeone_1p, Some("eo-claude-tok"), Some("claude-site"), "claude-1p");
+
+    // 3p user config must NOT duplicate tako-web-page (which is delivered via managedMcpServers),
+    // otherwise Claude Desktop flags "Replaced by organization's server".
+    let doc_3p: Value = serde_json::from_str(&fs::read_to_string(&cfg_3p).unwrap()).unwrap();
+    assert_eq!(
+        doc_3p.get("userPreference").and_then(Value::as_str),
+        Some("keep-3p"),
+        "claude-3p: unrelated top-level key must be preserved"
+    );
+    let servers_3p = doc_3p
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .expect("claude-3p: missing mcpServers object");
+    assert!(servers_3p.contains_key("user-3p-db"));
+    assert!(
+        !servers_3p.contains_key(EDGEONE_MCP_SERVER_KEY),
+        "claude-3p user config must remove duplicate tako-web-page because 3p profile delivers it via managedMcpServers"
+    );
+
+    // Verify 3p profile's managedMcpServers carries tako-web-page with credentials & allow policy
+    let profile_3p_path = paths
+        .claude_3p_dir
+        .join("configLibrary")
+        .join("7a405017-c100-4a80-9000-7a4050170001.json");
+    let profile_3p: Value = serde_json::from_str(&fs::read_to_string(&profile_3p_path).unwrap()).unwrap();
+    let managed = profile_3p
+        .get("managedMcpServers")
+        .and_then(Value::as_array)
+        .expect("claude-3p profile missing managedMcpServers");
+    let managed_edgeone = managed
+        .iter()
+        .find(|e| e.get("name").and_then(Value::as_str) == Some(EDGEONE_MCP_SERVER_KEY))
+        .expect("claude-3p managedMcpServers must contain tako-web-page");
+    assert_json_edgeone_entry(
+        managed_edgeone,
+        Some("eo-claude-tok"),
+        Some("claude-site"),
+        "claude-3p-managed",
+    );
+    assert_eq!(
+        managed_edgeone
+            .get("toolPolicy")
+            .and_then(|v| v.get("*"))
+            .and_then(Value::as_str),
+        Some("allow")
+    );
 
     // Disable web_page while staying in Tako -> must remove tako-web-page and preserve user servers
     state.mcp.web_page = false;

@@ -444,7 +444,7 @@ impl AsarArchive {
                 .ok_or_else(|| format!("ASAR 文件节点 {rel} 非对象"))?;
             obj.insert("size".to_string(), json!(bytes.len() as u64));
             obj.insert("offset".to_string(), json!(current_offset.to_string()));
-            if modified_files.contains(&rel) || obj.contains_key("integrity") {
+            if modified_files.contains(&rel) {
                 obj.insert("integrity".to_string(), compute_asar_integrity(bytes));
             }
             *current_offset += bytes.len() as u64;
@@ -456,7 +456,7 @@ impl AsarArchive {
 
 fn compute_asar_integrity(data: &[u8]) -> Value {
     let full_hash = sha256_hex(data);
-    let blocks: Vec<String> = if data.is_empty() {
+    let blocks: Vec<String> = if data.len() <= ASAR_INTEGRITY_BLOCK_SIZE {
         vec![full_hash.clone()]
     } else {
         data.chunks(ASAR_INTEGRITY_BLOCK_SIZE)
@@ -826,8 +826,38 @@ fn build_preload_iife() -> String {
     var CHAT_BODY_SELECTOR =
       '.markdown-body, .prose, [data-message-role], [data-testid*="message-content"], [data-testid*="markdown"], .message-content, .chat-markdown';
     var ATTRS = ["placeholder", "title", "aria-label"];
-    var MAX_RAW_LEN = 240;
-    var MAX_TRIMMED_LEN = 220;
+    var MAX_RAW_LEN = 560;
+    var MAX_TRIMMED_LEN = 520;
+    // Ultra-short single words that frequently collide with split React text nodes
+    // (e.g. `<p>{"No "}{plural}{" yet"}</p>` -> "否 automations yet") when translated in isolation.
+    var AMBIGUOUS_SINGLE_WORDS = {
+      No: 1,
+      Yes: 1,
+      On: 1,
+      Off: 1,
+      All: 1,
+      Any: 1,
+      To: 1,
+      New: 1,
+      Add: 1,
+      Run: 1,
+      Key: 1,
+      Tag: 1,
+      Low: 1,
+      Max: 1,
+      Raw: 1,
+      Now: 1,
+      Pin: 1,
+      Top: 1,
+      Cut: 1,
+      Ask: 1,
+      Pro: 1,
+      End: 1,
+      Use: 1,
+      See: 1,
+      Hold: 1,
+      This: 1
+    };
 
     function hasCjk(str) {
       return /[\u4e00-\u9fff]/.test(str);
@@ -970,6 +1000,23 @@ fn build_preload_iife() -> String {
       [/^Forked from\s+([^\n]{1,48})$/, function (m) {
         if (looksLikeCodeOrPath(m[1])) return null;
         return "分支自 " + m[1].trim();
+      }],
+      [/^No\s+([a-zA-Z][a-zA-Z0-9\s-]{1,36})\s+yet$/i, function (m) {
+        if (looksLikeCodeOrPath(m[1])) return null;
+        var noun = translateShortNoun(m[1]);
+        return noun === m[1].trim() ? "暂无 " + noun : "暂无" + noun;
+      }],
+      [/^No\s+sites\s+match\s+[“"]([^”"\n]{1,80})[”"]$/i, function (m) {
+        return "没有站点匹配“" + m[1] + "”";
+      }],
+      [/^Couldn't\s+delete\s+cookies\s+for\s+([^\n]{1,80})$/i, function (m) {
+        return "无法删除 " + m[1].trim() + " 的 Cookie";
+      }],
+      [/^Site\s+data\s+cleared\s+for\s+([^\n]{1,80})$/i, function (m) {
+        return "已清除 " + m[1].trim() + " 的站点数据";
+      }],
+      [/^Could\s+not\s+clear\s+site\s+data\s+for\s+([^\n]{1,80})$/i, function (m) {
+        return "无法清除 " + m[1].trim() + " 的站点数据";
       }]
     ];
 
@@ -1014,14 +1061,75 @@ fn build_preload_iife() -> String {
       return false;
     }
 
+    function hasNonEmptySibling(node, parent) {
+      var children = parent.childNodes;
+      if (!children || children.length <= 1) return false;
+      for (var i = 0; i < children.length; i++) {
+        var sib = children[i];
+        if (sib === node) continue;
+        if (sib.nodeType === 3) {
+          if (sib.nodeValue && sib.nodeValue.trim().length > 0) return true;
+        } else if (sib.nodeType === 1) {
+          var tag = sib.tagName;
+          if (tag !== "SVG" && tag !== "IMG" && tag !== "BR") {
+            if ((sib.textContent || "").trim().length > 0) return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    // React often splits interpolated strings like `<p>{"No "}{plural}{" yet"}</p>` into multiple
+    // adjacent Text nodes. Translate the combined sentence while keeping every Text node attached
+    // so React Fiber reconciliation never throws NotFoundError on future updates.
+    function translateCombinedTextNodes(el) {
+      if (!el || el.nodeType !== 1 || isSkippedForText(el)) return false;
+      var children = el.childNodes;
+      if (!children || children.length < 2) return false;
+      var combined = "";
+      var firstNonEmpty = null;
+      for (var i = 0; i < children.length; i++) {
+        var c = children[i];
+        if (c.nodeType !== 3) return false;
+        var val = c.nodeValue || "";
+        combined += val;
+        if (!firstNonEmpty && val.trim().length > 0) {
+          firstNonEmpty = c;
+        }
+      }
+      if (!firstNonEmpty || combined.length > MAX_RAW_LEN) return false;
+      var trimmed = combined.trim();
+      if (!trimmed || trimmed.length > MAX_TRIMMED_LEN) return false;
+      var zh = translateText(trimmed);
+      if (!zh) return false;
+      var idx = combined.indexOf(trimmed);
+      if (idx < 0) return false;
+      var fullNext = combined.slice(0, idx) + zh + combined.slice(idx + trimmed.length);
+      if (fullNext === combined) return true;
+      for (var j = 0; j < children.length; j++) {
+        var tn = children[j];
+        var targetVal = tn === firstNonEmpty ? fullNext : "";
+        if (tn.nodeValue !== targetVal) {
+          tn.nodeValue = targetVal;
+        }
+      }
+      return true;
+    }
+
     function translateTextNode(node) {
       if (!node || node.nodeType !== 3) return;
       var parent = node.parentElement;
       if (!parent || isSkippedForText(parent)) return;
+      if (parent.childNodes && parent.childNodes.length >= 2 && translateCombinedTextNodes(parent)) {
+        return;
+      }
       var raw = node.nodeValue;
       if (!raw || raw.length > MAX_RAW_LEN) return;
       var trimmed = raw.trim();
       if (!trimmed || trimmed.length > MAX_TRIMMED_LEN) return;
+      if (AMBIGUOUS_SINGLE_WORDS[trimmed] && hasNonEmptySibling(node, parent)) {
+        return;
+      }
       var zh = translateText(trimmed);
       if (!zh) return;
       var idx = raw.indexOf(trimmed);
@@ -1294,6 +1402,133 @@ fn update_target_info_plist_integrity(
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn is_restricted_adhoc_entitlement_key(key: &str) -> bool {
+    matches!(
+        key,
+        "com.apple.application-identifier"
+            | "com.apple.developer.team-identifier"
+            | "keychain-access-groups"
+            | "com.apple.security.application-groups"
+            | "aps-environment"
+            | "com.apple.security.associated-domains"
+    ) || key.starts_with("com.apple.developer.")
+        || key.starts_with("com.apple.private.")
+        || key.starts_with("com.apple.security.icloud")
+}
+
+/// Skip one XML plist value element starting at `start` (after optional whitespace).
+/// Returns the byte offset immediately after the value element, or `None` if malformed.
+#[cfg(any(target_os = "macos", test))]
+fn find_plist_value_end(xml: &str, start: usize) -> Option<usize> {
+    let bytes = xml.as_bytes();
+    let mut i = start;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'<' {
+        return None;
+    }
+    let tag_close_rel = xml[i..].find('>')?;
+    let tag_close = i + tag_close_rel;
+    let open_tag = xml[i + 1..tag_close].trim();
+    if open_tag.ends_with('/') {
+        // Self-closing tag such as <true/>, <false/>, <string/>, <array/>, <dict/>
+        return Some(tag_close + 1);
+    }
+    let tag_name = open_tag.split_whitespace().next()?;
+    let open_prefix = format!("<{tag_name}");
+    let close_tag = format!("</{tag_name}>");
+
+    let mut depth = 1usize;
+    let mut cursor = tag_close + 1;
+    while cursor < xml.len() {
+        let next_lt = xml[cursor..].find('<')? + cursor;
+        if xml[next_lt..].starts_with(&close_tag) {
+            depth -= 1;
+            cursor = next_lt + close_tag.len();
+            if depth == 0 {
+                return Some(cursor);
+            }
+            continue;
+        }
+        if xml[next_lt..].starts_with(&open_prefix) {
+            let after_name = next_lt + open_prefix.len();
+            let boundary_ok = xml
+                .as_bytes()
+                .get(after_name)
+                .is_some_and(|&b| b == b'>' || b == b'/' || b.is_ascii_whitespace());
+            if boundary_ok {
+                let end_gt = xml[next_lt..].find('>')? + next_lt;
+                let inner = xml[next_lt + 1..end_gt].trim();
+                if !inner.ends_with('/') {
+                    depth += 1;
+                }
+                cursor = end_gt + 1;
+                continue;
+            }
+        }
+        cursor = next_lt + 1;
+    }
+    None
+}
+
+/// Strip provisioning-profile-bound / restricted entitlements that cause macOS AMFI
+/// to immediately SIGKILL (exit 137) an ad-hoc (`--sign -`) re-signed application
+/// (notably Claude Desktop's `com.apple.application-identifier`,
+/// `com.apple.developer.team-identifier`, and `keychain-access-groups`), while
+/// preserving safe runtime capabilities such as JIT, audio/camera, AppleEvents, and virtualization.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn sanitize_macos_adhoc_entitlements_plist(xml: &str) -> Option<String> {
+    let dict_open = xml.find("<dict>")?;
+    let dict_body_start = dict_open + "<dict>".len();
+    let dict_close = xml.rfind("</dict>")?;
+    if dict_close < dict_body_start {
+        return None;
+    }
+
+    let body = &xml[dict_body_start..dict_close];
+    let mut kept_entries = String::new();
+    let mut kept_count = 0usize;
+    let mut cursor = 0usize;
+
+    while cursor < body.len() {
+        let rest = &body[cursor..];
+        let trimmed_ws_len = rest.len() - rest.trim_start().len();
+        cursor += trimmed_ws_len;
+        if cursor >= body.len() {
+            break;
+        }
+        if !body[cursor..].starts_with("<key>") {
+            // Unexpected plist structure: fall back to omitting --entitlements rather than
+            // risking writing corrupted XML or retaining restricted entitlements.
+            return None;
+        }
+        let key_start = cursor + "<key>".len();
+        let key_end_rel = body[key_start..].find("</key>")?;
+        let key_end = key_start + key_end_rel;
+        let key_name = body[key_start..key_end].trim();
+        let after_key = key_end + "</key>".len();
+        let val_end = find_plist_value_end(body, after_key)?;
+
+        if !is_restricted_adhoc_entitlement_key(key_name) {
+            kept_entries.push_str(&body[cursor..val_end]);
+            kept_count += 1;
+        }
+        cursor = val_end;
+    }
+
+    if kept_count == 0 {
+        return None;
+    }
+
+    let mut out = String::with_capacity(xml.len());
+    out.push_str(&xml[..dict_body_start]);
+    out.push_str(&kept_entries);
+    out.push_str(&xml[dict_close..]);
+    Some(out)
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn resign_macos_outer_bundle_for(
     app_id: AppId,
@@ -1314,9 +1549,11 @@ pub(crate) fn resign_macos_outer_bundle_for(
         if ent_out.status.success() && !ent_out.stdout.is_empty() {
             let stdout_str = String::from_utf8_lossy(&ent_out.stdout);
             if stdout_str.contains("<plist") {
-                fs::write(&tmp_ent_path, &ent_out.stdout)
-                    .map_err(|e| format!("写入临时 entitlements 失败: {e}"))?;
-                has_entitlements = true;
+                if let Some(sanitized) = sanitize_macos_adhoc_entitlements_plist(&stdout_str) {
+                    fs::write(&tmp_ent_path, sanitized.as_bytes())
+                        .map_err(|e| format!("写入临时 entitlements 失败: {e}"))?;
+                    has_entitlements = true;
+                }
             }
         }
     }
@@ -2060,12 +2297,39 @@ addItemToSubmenu(menu, 'Help', { label: 'Check for Updates...', click: (item) =>
             "Dev Containers",
             "Port Forwarding",
             "Connect to WSL",
+            "Create with Prompt",
+            "No automations yet",
+            "Run a prompt on a schedule, like a morning summary of yesterday's changes. Runs show up here.",
+            "Not in Project",
+            "Give Feedback",
+            "Show system notifications when your action is needed or the agent finishes.",
+            "Play a sound when your action is needed or the agent finishes.",
+            "Set the volume of agent sounds.",
         ] {
             assert!(
                 map.contains_key(required_key),
                 "词典缺少核心词条: {required_key}"
             );
         }
+    }
+
+    #[test]
+    fn sanitize_macos_adhoc_entitlements_strips_restricted_keys_and_preserves_safe_caps() {
+        let claude_entitlements = r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>com.apple.application-identifier</key><string>Q6L2SF6YDW.com.anthropic.claudefordesktop</string><key>com.apple.developer.team-identifier</key><string>Q6L2SF6YDW</string><key>com.apple.security.automation.apple-events</key><true/><key>com.apple.security.cs.allow-jit</key><true/><key>com.apple.security.virtualization</key><true/><key>keychain-access-groups</key><array><string>Q6L2SF6YDW.com.anthropic.claude.webauthn</string><string>Q6L2SF6YDW.com.anthropic.claude.hwkey</string></array></dict></plist>"#;
+
+        let sanitized = sanitize_macos_adhoc_entitlements_plist(claude_entitlements)
+            .expect("must retain safe runtime entitlements");
+        assert!(!sanitized.contains("com.apple.application-identifier"));
+        assert!(!sanitized.contains("com.apple.developer.team-identifier"));
+        assert!(!sanitized.contains("keychain-access-groups"));
+        assert!(!sanitized.contains("Q6L2SF6YDW"));
+        assert!(sanitized.contains("com.apple.security.automation.apple-events"));
+        assert!(sanitized.contains("com.apple.security.cs.allow-jit"));
+        assert!(sanitized.contains("com.apple.security.virtualization"));
+
+        // If all entitlements are restricted, return None so codesign omits --entitlements
+        let only_restricted = r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>com.apple.application-identifier</key><string>TEAM.app</string><key>com.apple.developer.icloud-services</key><array><string>CloudKit</string></array></dict></plist>"#;
+        assert!(sanitize_macos_adhoc_entitlements_plist(only_restricted).is_none());
     }
 
     #[test]
@@ -2076,8 +2340,13 @@ addItemToSubmenu(menu, 'Help', { label: 'Check for Updates...', click: (item) =>
         assert_eq!(once, twice, "preload 注入必须幂等");
         assert_eq!(once.matches(PATCH_GUARD_COMMENT).count(), 1);
 
-        // Dictionary, punctuation normalization, dynamic rules
+        // Dictionary, punctuation normalization, dynamic rules & split-text-node protection
         assert!(once.contains("\"New Conversation\": \"新建对话\""));
+        assert!(once.contains("\"Create with Prompt\": \"用提示词创建\""));
+        assert!(once.contains("\"No automations yet\": \"暂无自动化任务\""));
+        assert!(once.contains("AMBIGUOUS_SINGLE_WORDS"));
+        assert!(once.contains("translateCombinedTextNodes"));
+        assert!(once.contains("hasNonEmptySibling"));
         assert!(once.contains("DYNAMIC_RULES"));
         assert!(once.contains("Thinking for"));
         assert!(once.contains("Thought for"));

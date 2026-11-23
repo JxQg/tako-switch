@@ -1629,13 +1629,22 @@ mod tests {
         assert_eq!(saved.mcp.edgeone_api_token, None);
         assert_eq!(saved.mcp.edgeone_project_name.as_deref(), Some("demo-site"));
 
-        // Claude & Codex synced automatically
+        // Claude & Codex synced automatically (Claude 3p receives tako-web-page via managedMcpServers, not user config)
         assert!(adapters::has_edgeone_mcp_server(
             &paths.claude_1p_dir.join("claude_desktop_config.json")
         ));
-        assert!(adapters::has_edgeone_mcp_server(
+        assert!(!adapters::has_edgeone_mcp_server(
             &paths.claude_3p_dir.join("claude_desktop_config.json")
         ));
+        let claude_3p_profile = std::fs::read_to_string(
+            paths
+                .claude_3p_dir
+                .join("configLibrary")
+                .join("7a405017-c100-4a80-9000-7a4050170001.json"),
+        )
+        .unwrap();
+        assert!(claude_3p_profile.contains(adapters::EDGEONE_MCP_SERVER_KEY));
+        assert!(claude_3p_profile.contains("\"EDGEONE_PAGES_PROJECT_NAME\": \"demo-site\""));
         let codex_toml = std::fs::read_to_string(paths.codex_dir.join("config.toml")).unwrap();
         assert!(codex_toml.contains(adapters::EDGEONE_MCP_SERVER_KEY));
         assert!(codex_toml.contains("EDGEONE_PAGES_PROJECT_NAME = \"demo-site\""));

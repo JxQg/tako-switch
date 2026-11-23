@@ -1050,7 +1050,7 @@ fn tc_209_01_macos_claude_bundle_lifecycle_and_snapshot() {
     assert!(patched.has_valid_backup);
     assert_eq!(
         patched.patch_version.as_deref(),
-        Some(env!("CARGO_PKG_VERSION"))
+        Some(tako_switch_lib::adapters::antigravity_i18n::CURRENT_UI_PATCH_VERSION)
     );
     let target_str = patched
         .target_asar_path
@@ -1098,7 +1098,7 @@ fn tc_209_02_dual_asar_deep_binary_i18n_and_icu_invariants() {
     assert_eq!(app_marker.get("schema").and_then(Value::as_u64), Some(1));
     assert_eq!(
         app_marker.get("patchVersion").and_then(Value::as_str),
-        Some(env!("CARGO_PKG_VERSION"))
+        Some(tako_switch_lib::adapters::antigravity_i18n::CURRENT_UI_PATCH_VERSION)
     );
     assert_eq!(
         app_marker
@@ -1200,7 +1200,7 @@ fn tc_209_02_dual_asar_deep_binary_i18n_and_icu_invariants() {
     assert_eq!(ion_marker.get("schema").and_then(Value::as_u64), Some(1));
     assert_eq!(
         ion_marker.get("patchVersion").and_then(Value::as_str),
-        Some(env!("CARGO_PKG_VERSION"))
+        Some(tako_switch_lib::adapters::antigravity_i18n::CURRENT_UI_PATCH_VERSION)
     );
     assert_eq!(
         ion_marker

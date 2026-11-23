@@ -64,12 +64,20 @@ impl ClaudeAdapter {
     }
 
     fn has_managed_tako_mcp(paths: &AppPaths) -> bool {
+        Self::has_managed_mcp_server(paths, "tako")
+    }
+
+    fn has_managed_edgeone_mcp(paths: &AppPaths) -> bool {
+        Self::has_managed_mcp_server(paths, EDGEONE_MCP_SERVER_KEY)
+    }
+
+    fn has_managed_mcp_server(paths: &AppPaths, server_name: &str) -> bool {
         read_json_object_or_empty(&Self::profile_3p_path(paths))
             .ok()
             .and_then(|m| m.get("managedMcpServers").and_then(Value::as_array).cloned())
             .map(|entries| {
                 entries.iter().any(|e| {
-                    e.get("name").and_then(Value::as_str) == Some("tako")
+                    e.get("name").and_then(Value::as_str) == Some(server_name)
                         && e.get("transport").and_then(Value::as_str) == Some("stdio")
                         && e.get("command").and_then(Value::as_str).is_some_and(|c| !c.is_empty())
                 })
@@ -629,11 +637,13 @@ impl DesktopAppAdapter for ClaudeAdapter {
                 write_atomic(&meta_3p, &meta_bytes, false)?;
 
                 merge_tako_mcp_server(&mcp_1p, paths, false)?;
-                // The 3p slot gets tako from the managed profile entry, not the user config,
-                // so leave the user config alone to avoid starting a second instance.
+                // The 3p slot gets tako and tako-web-page from the managed profile entry
+                // (`managedMcpServers`), not the user config, so keep the 3p user config clean
+                // to avoid starting a duplicate instance or triggering Claude Desktop's
+                // "Replaced by organization's server" error.
                 merge_tako_mcp_server(&mcp_3p, paths, false)?;
                 merge_edgeone_mcp_server(&mcp_1p, &state.mcp, state.mcp.web_page)?;
-                merge_edgeone_mcp_server(&mcp_3p, &state.mcp, state.mcp.web_page)?;
+                merge_edgeone_mcp_server(&mcp_3p, &state.mcp, false)?;
                 Self::set_claude_code_mcp_permissions(paths, true, state.mcp.web_page)?;
                 Self::sync_claude_chinese_locale(paths, state.prefer_chinese_ui)?;
                 Ok(())
@@ -695,7 +705,8 @@ impl DesktopAppAdapter for ClaudeAdapter {
             if !Self::has_managed_tako_mcp(paths) {
                 notes.push("提示: Claude-3p profile 尚未下发 tako MCP".to_string());
             }
-            if has_edgeone_mcp_server(&Self::mcp_3p_path(paths))
+            if Self::has_managed_edgeone_mcp(paths)
+                || has_edgeone_mcp_server(&Self::mcp_3p_path(paths))
                 || has_edgeone_mcp_server(&Self::mcp_1p_path(paths))
             {
                 notes.push("网站上线 MCP (EdgeOne): 已启用 (tako-web-page)".to_string());
@@ -1104,10 +1115,19 @@ mod tests {
         save_switch_state(&paths, &st).unwrap();
 
         let adapter = ClaudeAdapter;
+        // Pre-seed a conflicting local entry in Claude-3p user config to verify it gets removed
+        fs::create_dir_all(&paths.claude_3p_dir).unwrap();
+        fs::write(
+            ClaudeAdapter::mcp_3p_path(&paths),
+            r#"{"mcpServers":{"tako-web-page":{"command":"npx","args":["-y","@edgeone/makers-mcp@latest","--region","china"]}}}"#,
+        )
+        .unwrap();
         adapter.apply_mode(&paths, AppMode::Tako).unwrap();
 
         assert!(has_edgeone_mcp_server(&ClaudeAdapter::mcp_1p_path(&paths)));
-        assert!(has_edgeone_mcp_server(&ClaudeAdapter::mcp_3p_path(&paths)));
+        // 3p user config must NOT duplicate tako-web-page (delivered via managedMcpServers)
+        assert!(!has_edgeone_mcp_server(&ClaudeAdapter::mcp_3p_path(&paths)));
+        assert!(ClaudeAdapter::has_managed_edgeone_mcp(&paths));
         let p1 = read_json_object_or_empty(&ClaudeAdapter::mcp_1p_path(&paths)).unwrap();
         let p1_servers = p1["mcpServers"].as_object().unwrap();
         assert!(p1_servers.contains_key("existing"));
@@ -1130,15 +1150,16 @@ mod tests {
         save_switch_state(&paths, &st).unwrap();
         adapter.apply_mode(&paths, AppMode::Tako).unwrap();
 
-        let p3 = read_json_object_or_empty(&ClaudeAdapter::mcp_3p_path(&paths)).unwrap();
+        let p1_tok = read_json_object_or_empty(&ClaudeAdapter::mcp_1p_path(&paths)).unwrap();
         assert_eq!(
-            p3["mcpServers"][EDGEONE_MCP_SERVER_KEY]["env"]["EDGEONE_PAGES_API_TOKEN"],
+            p1_tok["mcpServers"][EDGEONE_MCP_SERVER_KEY]["env"]["EDGEONE_PAGES_API_TOKEN"],
             "eo_secret_1"
         );
         assert_eq!(
-            p3["mcpServers"][EDGEONE_MCP_SERVER_KEY]["env"]["EDGEONE_PAGES_PROJECT_NAME"],
+            p1_tok["mcpServers"][EDGEONE_MCP_SERVER_KEY]["env"]["EDGEONE_PAGES_PROJECT_NAME"],
             "my-web"
         );
+        assert!(!has_edgeone_mcp_server(&ClaudeAdapter::mcp_3p_path(&paths)));
         let prof_tok = read_json_object_or_empty(&ClaudeAdapter::profile_3p_path(&paths)).unwrap();
         let edgeone_managed_tok = prof_tok["managedMcpServers"]
             .as_array()
@@ -1149,6 +1170,10 @@ mod tests {
         assert_eq!(
             edgeone_managed_tok["env"]["EDGEONE_PAGES_API_TOKEN"],
             "eo_secret_1"
+        );
+        assert_eq!(
+            edgeone_managed_tok["env"]["EDGEONE_PAGES_PROJECT_NAME"],
+            "my-web"
         );
 
         // Disable web_page in Tako mode -> cleans up 1p/3p/managedMcpServers while keeping existing

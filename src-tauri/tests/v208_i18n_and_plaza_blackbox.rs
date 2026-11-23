@@ -371,7 +371,7 @@ fn tc_v208_02_to_05_asar_patch_idempotency_unpacked_plist_and_byte_exact_restore
     );
     assert_eq!(
         patched_info.patch_version.as_deref(),
-        Some(env!("CARGO_PKG_VERSION"))
+        Some(tako_switch_lib::adapters::antigravity_i18n::CURRENT_UI_PATCH_VERSION)
     );
     assert_eq!(
         snapshot_app(&paths, AppId::Antigravity).ui_patch.status,
@@ -406,7 +406,7 @@ fn tc_v208_02_to_05_asar_patch_idempotency_unpacked_plist_and_byte_exact_restore
     assert_eq!(marker_json.get("schema").and_then(Value::as_u64), Some(1));
     assert_eq!(
         marker_json.get("patchVersion").and_then(Value::as_str),
-        Some(env!("CARGO_PKG_VERSION"))
+        Some(tako_switch_lib::adapters::antigravity_i18n::CURRENT_UI_PATCH_VERSION)
     );
     assert_eq!(
         marker_json
