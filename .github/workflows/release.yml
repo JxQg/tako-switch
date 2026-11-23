@@ -34,7 +34,7 @@ jobs:
             target: aarch64-apple-darwin
             updater_key: darwin-aarch64
             asset_prefix: darwin-arm64
-          - os: macos-15
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             updater_key: darwin-x86_64
             asset_prefix: darwin-x64
