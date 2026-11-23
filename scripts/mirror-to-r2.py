@@ -190,6 +190,8 @@ class S3Client:
         endpoint_url: str,
         region: str = "auto",
         env_overrides: dict[str, str] | None = None,
+        multipart_threshold_mb: int = 5,
+        max_concurrency: int = 2,
     ) -> None:
         self.bucket = bucket
         self.endpoint_url = endpoint_url
@@ -203,7 +205,9 @@ class S3Client:
         if "myqcloud.com" in lower_ep or "aliyuncs.com" in lower_ep:
             # Tencent COS (DogeCloud OSS) and Aliyun OSS require virtual-hosted-style addressing.
             # Keep multipart chunk size at the 5MB S3 minimum and concurrency low so cross-border
-            # GitHub runners do not trigger COS UserNetworkTooSlow during peak hours.
+            # GitHub runners do not trigger COS UserNetworkTooSlow during peak hours. Callers may
+            # raise multipart_threshold to force a single PUT for files that are small enough to
+            # survive a slow trans-Pacific link in one request (UploadPart gets aborted by COS).
             cfg_file = tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
@@ -216,8 +220,8 @@ class S3Client:
                 "s3 =\n"
                 "    addressing_style = virtual\n"
                 "    multipart_chunksize = 5MB\n"
-                "    multipart_threshold = 5MB\n"
-                "    max_concurrent_requests = 2\n"
+                f"    multipart_threshold = {multipart_threshold_mb}MB\n"
+                f"    max_concurrent_requests = {max_concurrency}\n"
             )
             cfg_file.close()
             self.env["AWS_CONFIG_FILE"] = cfg_file.name

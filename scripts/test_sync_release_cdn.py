@@ -171,6 +171,20 @@ class SyncReleaseCdnTests(unittest.TestCase):
                 )
             self.assertEqual(rc, 0)
 
+    def test_s3client_writes_multipart_tuning_for_cos(self) -> None:
+        mirror = mod.load_mirror_module()
+        s3 = mirror.S3Client(
+            bucket="b",
+            endpoint_url="https://cos.ap-shanghai.myqcloud.com",
+            region="ap-shanghai",
+            multipart_threshold_mb=64,
+            max_concurrency=1,
+        )
+        cfg = Path(s3.env["AWS_CONFIG_FILE"]).read_text(encoding="utf-8")
+        self.assertIn("multipart_threshold = 64MB", cfg)
+        self.assertIn("max_concurrent_requests = 1", cfg)
+        self.assertIn("multipart_chunksize = 5MB", cfg)
+
 
 if __name__ == "__main__":
     unittest.main()
