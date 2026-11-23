@@ -199,6 +199,21 @@ class S3Client:
         self.env.setdefault("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_required")
         if env_overrides:
             self.env.update({k: v for k, v in env_overrides.items() if v is not None})
+        lower_ep = endpoint_url.lower()
+        if "myqcloud.com" in lower_ep or "aliyuncs.com" in lower_ep:
+            # Tencent COS (DogeCloud OSS) and Aliyun OSS require virtual-hosted-style addressing.
+            cfg_file = tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix="tako-aws-cfg-",
+                suffix=".ini",
+                delete=False,
+            )
+            cfg_file.write(
+                f"[default]\nregion = {region}\ns3 =\n    addressing_style = virtual\n"
+            )
+            cfg_file.close()
+            self.env["AWS_CONFIG_FILE"] = cfg_file.name
 
     def _base_cmd(self) -> list[str]:
         return [
