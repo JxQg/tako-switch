@@ -1,27 +1,27 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-23T07:48:00Z",
+  "generatedAt": "2026-11-23T23:02:06Z",
   "apps": {
     "dsh-tako": {
       "displayName": "DSH Tako",
-      "version": "0.1.58",
+      "version": "0.1.59",
       "platforms": {
         "macos-arm64": {
-          "url": "https://dl.lven.asia/apps/dsh-tako/macos-arm64/0.1.58/DSH-Tako-0.1.58-mac-arm64.dmg",
-          "version": "0.1.58",
+          "url": "https://dl.lven.asia/apps/dsh-tako/macos-arm64/0.1.59/DSH-Tako-0.1.59-mac-arm64.dmg",
+          "version": "0.1.59",
           "installType": "dmg",
-          "fallbackUrl": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.58/DSH-Tako-0.1.58-mac-arm64.dmg",
-          "sha256": "ee9de585a75e16025a30c96286f1334785a0a98fdbbfdebb74336d4aa7352ba6",
-          "size": 285937345,
+          "fallbackUrl": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.59/DSH-Tako-0.1.59-mac-arm64.dmg",
+          "sha256": "4ab43649bc6113b682d4dc5202d64464a6282e9348d358fc23ef928991fe533b",
+          "size": 285926628,
           "appBundleName": "DSH Tako.app"
         },
         "windows-x64": {
-          "url": "https://dl.lven.asia/apps/dsh-tako/windows-x64/0.1.58/DSH-Tako-0.1.58-win-x64.exe",
-          "version": "0.1.58",
+          "url": "https://dl.lven.asia/apps/dsh-tako/windows-x64/0.1.59/DSH-Tako-0.1.59-win-x64.exe",
+          "version": "0.1.59",
           "installType": "exe",
-          "fallbackUrl": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.58/DSH-Tako-0.1.58-win-x64.exe",
-          "sha256": "bb97c492a2a1ecf9fbb8c753d46964fe5c1708a42cd8f127bb4676007bc27b4a",
-          "size": 329547915,
+          "fallbackUrl": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.59/DSH-Tako-0.1.59-win-x64.exe",
+          "sha256": "b446ff9c0e2009fa4acef553731726610db8edbcc6908d2dc1fcc9e3683547f1",
+          "size": 329545599,
           "silentArgs": [
             "/S"
           ]
