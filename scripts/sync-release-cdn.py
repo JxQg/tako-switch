@@ -128,7 +128,16 @@ def build_targets(mod, required: set[str]) -> list[tuple[str, object]]:
         print(f"[auth] exchanging DogeCloud STS token for OSS space '{doge_bucket}'")
         sb, ep, reg, env = mod.fetch_dogecloud_s3_credentials(doge_ak, doge_sk, doge_bucket)
         print(f"[auth] DogeCloud S3 target: s3://{sb} ({ep}, region={reg})")
-        targets.append(("dogecloud", mod.S3Client(bucket=sb, endpoint_url=ep, region=reg, env_overrides=env)))
+        # Cross-border runner -> Shanghai COS aborts multipart UploadPart calls with
+        # UserNetworkTooSlow; release assets are ~10 MB so a single PUT is more reliable.
+        targets.append(("dogecloud", mod.S3Client(
+            bucket=sb,
+            endpoint_url=ep,
+            region=reg,
+            env_overrides=env,
+            multipart_threshold_mb=64,
+            max_concurrency=1,
+        )))
     elif "doge" in required:
         raise RuntimeError(
             "DogeCloud target required but DOGE_ACCESS_KEY/DOGE_SECRET_KEY/DOGE_OSS_BUCKET are not configured"
