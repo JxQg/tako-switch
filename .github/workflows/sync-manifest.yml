@@ -24,8 +24,11 @@ jobs:
           cp manifest/manifest.json /tmp/prev-manifest.json
           python3 scripts/sync-manifest.py --out manifest/manifest.json
 
-      - name: Mirror installers to Cloudflare R2 and rewrite manifest mirror URLs (optional)
+      - name: Mirror installers to China OSS / R2 and rewrite manifest mirror URLs (optional)
         env:
+          DOGE_ACCESS_KEY: ${{ secrets.DOGE_ACCESS_KEY }}
+          DOGE_SECRET_KEY: ${{ secrets.DOGE_SECRET_KEY }}
+          DOGE_OSS_BUCKET: ${{ secrets.DOGE_OSS_BUCKET }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}

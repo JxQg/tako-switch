@@ -14,13 +14,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
 import urllib.parse
+import urllib.request
 
 
 DEFAULT_MIRROR_APPS = ("dsh-tako", "claude", "antigravity")
@@ -116,11 +119,86 @@ def compute_file_hashes(path: Path) -> tuple[int, str, str]:
     return total, sha256.hexdigest(), sha512.hexdigest()
 
 
+def infer_s3_region(endpoint_url: str, explicit_region: str | None = None) -> str:
+    if explicit_region and explicit_region.strip():
+        return explicit_region.strip()
+    m = re.search(r"cos\.([a-z0-9-]+)\.myqcloud\.com", endpoint_url, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.search(r"oss-([a-z0-9-]+)\.aliyuncs\.com", endpoint_url, re.IGNORECASE)
+    if m:
+        return f"oss-{m.group(1)}"
+    return "auto"
+
+
+def fetch_dogecloud_s3_credentials(
+    access_key: str,
+    secret_key: str,
+    bucket_name: str,
+) -> tuple[str, str, str, dict[str, str]]:
+    """Exchange DogeCloud master AK/SK for temporary S3-compatible STS credentials."""
+    api_path = "/auth/tmp_token.json"
+    body = json.dumps(
+        {"channel": "OSS_FULL", "scopes": [f"{bucket_name}:*"]},
+        separators=(",", ":"),
+    )
+    sign_str = f"{api_path}\n{body}"
+    sign = hmac.new(
+        secret_key.encode("utf-8"),
+        sign_str.encode("utf-8"),
+        hashlib.sha1,
+    ).hexdigest()
+    req = urllib.request.Request(
+        f"https://api.dogecloud.com{api_path}",
+        data=body.encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"TOKEN {access_key}:{sign}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    if payload.get("code") != 200:
+        raise RuntimeError(f"DogeCloud tmp_token failed: {payload.get('msg') or payload}")
+    data = payload.get("data") or {}
+    creds = data.get("Credentials") or {}
+    buckets = data.get("Buckets") or []
+    if not creds.get("accessKeyId") or not creds.get("secretAccessKey") or not buckets:
+        raise RuntimeError("DogeCloud tmp_token response missing Credentials or Buckets")
+    target = next((b for b in buckets if b.get("name") == bucket_name), buckets[0])
+    s3_bucket = str(target.get("s3Bucket") or "").strip()
+    s3_endpoint = str(target.get("s3Endpoint") or "").strip()
+    if not s3_bucket or not s3_endpoint:
+        raise RuntimeError(f"DogeCloud bucket metadata incomplete: {target}")
+    region = infer_s3_region(s3_endpoint)
+    env_overrides = {
+        "AWS_ACCESS_KEY_ID": str(creds["accessKeyId"]),
+        "AWS_SECRET_ACCESS_KEY": str(creds["secretAccessKey"]),
+        "AWS_SESSION_TOKEN": str(creds.get("sessionToken") or ""),
+        "AWS_DEFAULT_REGION": region,
+        "AWS_REQUEST_CHECKSUM_CALCULATION": "when_required",
+        "AWS_RESPONSE_CHECKSUM_VALIDATION": "when_required",
+    }
+    return s3_bucket, s3_endpoint, region, env_overrides
+
+
 class S3Client:
-    def __init__(self, bucket: str, endpoint_url: str, region: str = "auto") -> None:
+    def __init__(
+        self,
+        bucket: str,
+        endpoint_url: str,
+        region: str = "auto",
+        env_overrides: dict[str, str] | None = None,
+    ) -> None:
         self.bucket = bucket
         self.endpoint_url = endpoint_url
         self.region = region
+        self.env = os.environ.copy()
+        self.env.setdefault("AWS_REQUEST_CHECKSUM_CALCULATION", "when_required")
+        self.env.setdefault("AWS_RESPONSE_CHECKSUM_VALIDATION", "when_required")
+        if env_overrides:
+            self.env.update({k: v for k, v in env_overrides.items() if v is not None})
 
     def _base_cmd(self) -> list[str]:
         return [
@@ -140,7 +218,7 @@ class S3Client:
             "--key",
             key,
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False, env=self.env)
         if res.returncode != 0:
             return None
         try:
@@ -170,7 +248,7 @@ class S3Client:
         if metadata:
             meta_str = ",".join(f"{k}={v}" for k, v in metadata.items())
             cmd.extend(["--metadata", meta_str])
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, env=self.env)
 
     def list_objects(self, prefix: str) -> list[dict]:
         cmd = self._base_cmd() + [
@@ -181,7 +259,7 @@ class S3Client:
             "--prefix",
             prefix,
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, env=self.env)
         if not res.stdout.strip():
             return []
         data = json.loads(res.stdout)
@@ -196,7 +274,7 @@ class S3Client:
             "--key",
             key,
         ]
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, env=self.env)
 
 
 def download_file(url: str, dest: Path) -> None:
@@ -363,14 +441,38 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Plan actions without uploading/pruning")
     args = parser.parse_args(argv)
 
-    if not args.bucket or not args.endpoint_url:
-        print("R2_BUCKET or R2_ENDPOINT_URL not configured; skipping R2 mirror.", file=sys.stderr)
+    doge_ak = os.environ.get("DOGE_ACCESS_KEY", "").strip()
+    doge_sk = os.environ.get("DOGE_SECRET_KEY", "").strip()
+    doge_bucket = os.environ.get("DOGE_OSS_BUCKET", "").strip()
+
+    s3_bucket = args.bucket.strip()
+    s3_endpoint = args.endpoint_url.strip()
+    s3_region = infer_s3_region(s3_endpoint, os.environ.get("AWS_DEFAULT_REGION"))
+    env_overrides: dict[str, str] | None = None
+
+    if doge_ak and doge_sk and doge_bucket:
+        print(f"[auth] exchanging DogeCloud STS token for OSS space '{doge_bucket}'")
+        s3_bucket, s3_endpoint, s3_region, env_overrides = fetch_dogecloud_s3_credentials(
+            doge_ak, doge_sk, doge_bucket
+        )
+        print(f"[auth] DogeCloud S3 target: s3://{s3_bucket} ({s3_endpoint}, region={s3_region})")
+    elif not s3_bucket or not s3_endpoint:
+        print(
+            "Neither DogeCloud OSS (DOGE_ACCESS_KEY/DOGE_SECRET_KEY/DOGE_OSS_BUCKET) "
+            "nor R2 (R2_BUCKET/R2_ENDPOINT_URL) configured; skipping mirror.",
+            file=sys.stderr,
+        )
         return 0
 
     manifest_path = Path(args.manifest)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    s3 = S3Client(bucket=args.bucket, endpoint_url=args.endpoint_url)
+    s3 = S3Client(
+        bucket=s3_bucket,
+        endpoint_url=s3_endpoint,
+        region=s3_region,
+        env_overrides=env_overrides,
+    )
     apps_to_mirror = parse_app_filter(args.apps)
     mirror_base = args.mirror_base.strip() or None
 
