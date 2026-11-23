@@ -2742,10 +2742,21 @@ fn claude_display_name(id: &str, tier: Option<&str>, major: u32, minor: u32) -> 
         .join(" ")
 }
 
-/// Claude Desktop only offers the effort selector for models whose catalog entry carries
-/// `max_effort_level`. Pricing metadata wins when the upstream publishes reasoning levels;
-/// otherwise fall back to high.
+/// Claude Desktop treats `maxEffort` on `inferenceModels` entries strictly as an upper-bound cap
+/// ("Claude Desktop hides higher levels and never requests them"). For Claude models and reasoning
+/// models, return `"max"` so Desktop exposes all native effort levels supported by the model
+/// (`low / medium / high / xhigh / max`) instead of capping them to `low / medium / high`.
 fn claude_max_effort_level(real_id: &str, pricing: &PricingCache) -> &'static str {
+    let lower = real_id.to_ascii_lowercase();
+    if lower.starts_with("claude-")
+        || lower.starts_with("gpt-6")
+        || lower.starts_with("gpt-5")
+        || lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+    {
+        return "max";
+    }
     if let Some(levels) = effective_effort_levels(real_id, pricing) {
         if let Some(level) = ALLOWED_EFFORTS
             .iter()
@@ -2755,17 +2766,7 @@ fn claude_max_effort_level(real_id: &str, pricing: &PricingCache) -> &'static st
             return level;
         }
     }
-    let lower = real_id.to_ascii_lowercase();
-    if lower.starts_with("gpt-6")
-        || lower.starts_with("gpt-5")
-        || lower.starts_with("o1")
-        || lower.starts_with("o3")
-        || lower.starts_with("o4")
-    {
-        "max"
-    } else {
-        "high"
-    }
+    "high"
 }
 
 /// Converts upstream `/v1/models` + `/api/pricing` into Claude Desktop's Anthropic `/v1/models` format.
@@ -2910,6 +2911,7 @@ pub fn build_claude_inference_models(catalog: &Value, filter: &ClientModelFilter
         .into_iter()
         .filter_map(|m| {
             let name = m.get("id").and_then(Value::as_str)?.to_string();
+            let name_lower = name.to_ascii_lowercase();
             let mut entry = Map::new();
             entry.insert("name".to_string(), Value::String(name));
             if let Some(label) = m.get("display_name").and_then(Value::as_str) {
@@ -2924,7 +2926,18 @@ pub fn build_claude_inference_models(catalog: &Value, filter: &ClientModelFilter
             if m.get("is_family_default").and_then(Value::as_bool) == Some(true) {
                 entry.insert("isFamilyDefault".to_string(), Value::Bool(true));
             }
-            if let Some(effort) = m.get("max_effort_level").and_then(Value::as_str) {
+            let effective_max_effort = if name_lower.starts_with("claude-")
+                || name_lower.starts_with("gpt-6")
+                || name_lower.starts_with("gpt-5")
+                || name_lower.starts_with("o1")
+                || name_lower.starts_with("o3")
+                || name_lower.starts_with("o4")
+            {
+                Some("max")
+            } else {
+                m.get("max_effort_level").and_then(Value::as_str)
+            };
+            if let Some(effort) = effective_max_effort {
                 entry.insert("maxEffort".to_string(), Value::String(effort.to_string()));
             }
             Some(Value::Object(entry))
@@ -5208,7 +5221,7 @@ mod tests {
         assert_eq!(opus["labelOverride"].as_str(), Some("Claude Opus 5.5"));
         assert_eq!(opus["anthropicFamilyTier"].as_str(), Some("opus"));
         assert_eq!(opus["isFamilyDefault"].as_bool(), Some(true));
-        assert_eq!(opus["maxEffort"].as_str(), Some("high"));
+        assert_eq!(opus["maxEffort"].as_str(), Some("max"));
     }
 
     #[test]

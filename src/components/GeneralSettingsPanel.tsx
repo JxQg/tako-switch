@@ -402,7 +402,7 @@ export function GeneralSettingsPanel({
                 <div className="min-w-0">
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <span className="text-[12.5px] font-medium text-[var(--text-primary)]">
-                      Tako Switch v{dashboard?.appVersion ?? "2.2.3"}
+                      Tako Switch v{dashboard?.appVersion ?? "2.2.4"}
                     </span>
                     <button
                       type="button"
