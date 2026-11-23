@@ -202,6 +202,8 @@ class S3Client:
         lower_ep = endpoint_url.lower()
         if "myqcloud.com" in lower_ep or "aliyuncs.com" in lower_ep:
             # Tencent COS (DogeCloud OSS) and Aliyun OSS require virtual-hosted-style addressing.
+            # Keep multipart chunk size at the 5MB S3 minimum and concurrency low so cross-border
+            # GitHub runners do not trigger COS UserNetworkTooSlow during peak hours.
             cfg_file = tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
@@ -210,7 +212,12 @@ class S3Client:
                 delete=False,
             )
             cfg_file.write(
-                f"[default]\nregion = {region}\ns3 =\n    addressing_style = virtual\n"
+                f"[default]\nregion = {region}\nretry_mode = standard\nmax_attempts = 6\n"
+                "s3 =\n"
+                "    addressing_style = virtual\n"
+                "    multipart_chunksize = 5MB\n"
+                "    multipart_threshold = 5MB\n"
+                "    max_concurrent_requests = 2\n"
             )
             cfg_file.close()
             self.env["AWS_CONFIG_FILE"] = cfg_file.name
@@ -263,7 +270,20 @@ class S3Client:
         if metadata:
             meta_str = ",".join(f"{k}={v}" for k, v in metadata.items())
             cmd.extend(["--metadata", meta_str])
-        subprocess.run(cmd, check=True, env=self.env)
+        last_err: subprocess.CalledProcessError | None = None
+        for attempt in range(1, 4):
+            try:
+                subprocess.run(cmd, check=True, env=self.env)
+                return
+            except subprocess.CalledProcessError as exc:
+                last_err = exc
+                if attempt < 3:
+                    print(
+                        f"[retry] upload attempt {attempt}/3 failed for {key}; retrying...",
+                        file=sys.stderr,
+                    )
+        assert last_err is not None
+        raise last_err
 
     def list_objects(self, prefix: str) -> list[dict]:
         cmd = self._base_cmd() + [
