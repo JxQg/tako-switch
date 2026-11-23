@@ -168,17 +168,13 @@ export default function App() {
 
   useEffect(() => {
     const root = document.documentElement;
-    if (themePref === "system") {
-      root.removeAttribute("data-theme");
-    } else {
-      root.setAttribute("data-theme", themePref);
-    }
+    root.setAttribute("data-theme", isDark ? "dark" : "light");
     try {
       localStorage.setItem("tako-switch-theme", themePref);
     } catch {
       // ignore storage errors
     }
-  }, [themePref]);
+  }, [themePref, isDark]);
 
   const showTransientNote = useCallback((msg: string) => {
     setStatusNote(msg);

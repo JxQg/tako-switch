@@ -104,12 +104,12 @@ export function AppBrandIcon({
 
   return (
     <span
-      className={`${className} shrink-0 rounded-[6px] overflow-hidden inline-flex items-center justify-center bg-[#edf3ff] dark:bg-[#1f2940]`}
+      className={`${className} shrink-0 rounded-[6px] overflow-hidden inline-flex items-center justify-center bg-white ring-1 ring-inset ring-black/[0.06] dark:bg-[#f8fafc] dark:ring-white/10`}
     >
       <img
         src={antigravityIcon}
         alt="Google Antigravity"
-        className="h-full w-full object-contain scale-[1.18]"
+        className="h-full w-full object-cover"
         draggable={false}
       />
     </span>
