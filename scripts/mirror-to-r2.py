@@ -473,6 +473,11 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Optional path to previous manifest.json; preserves generatedAt when apps did not change",
     )
+    parser.add_argument(
+        "--prefer-doge",
+        action="store_true",
+        help="Upload directly to DogeCloud OSS instead of R2 (only recommended from China-local runners)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Plan actions without uploading/pruning")
     args = parser.parse_args(argv)
 
@@ -485,7 +490,10 @@ def main(argv: list[str] | None = None) -> int:
     s3_region = infer_s3_region(s3_endpoint, os.environ.get("AWS_DEFAULT_REGION"))
     env_overrides: dict[str, str] | None = None
 
-    if doge_ak and doge_sk and doge_bucket:
+    use_doge = (args.prefer_doge or not (s3_bucket and s3_endpoint)) and bool(
+        doge_ak and doge_sk and doge_bucket
+    )
+    if use_doge:
         print(f"[auth] exchanging DogeCloud STS token for OSS space '{doge_bucket}'")
         s3_bucket, s3_endpoint, s3_region, env_overrides = fetch_dogecloud_s3_credentials(
             doge_ak, doge_sk, doge_bucket
@@ -493,8 +501,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[auth] DogeCloud S3 target: s3://{s3_bucket} ({s3_endpoint}, region={s3_region})")
     elif not s3_bucket or not s3_endpoint:
         print(
-            "Neither DogeCloud OSS (DOGE_ACCESS_KEY/DOGE_SECRET_KEY/DOGE_OSS_BUCKET) "
-            "nor R2 (R2_BUCKET/R2_ENDPOINT_URL) configured; skipping mirror.",
+            "Neither R2 (R2_BUCKET/R2_ENDPOINT_URL) nor DogeCloud OSS "
+            "(DOGE_ACCESS_KEY/DOGE_SECRET_KEY/DOGE_OSS_BUCKET) configured; skipping mirror.",
             file=sys.stderr,
         )
         return 0
