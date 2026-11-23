@@ -75,6 +75,18 @@ function getUiPatchPresentation(app: AppSnapshot): {
 
   switch (app.uiPatch.status) {
     case "patched":
+      if (app.uiPatch.updateAvailable) {
+        return {
+          title: "有新版简体中文词典可更新",
+          desc:
+            app.uiPatch.note ??
+            "检测到新版简体中文词典，客户端关闭时会自动静默同步，也可点击立即更新",
+          pillText: "可更新",
+          pillTone: "warn",
+          actionLabel: "更新汉化",
+          canRestore: true,
+        };
+      }
       return {
         title: "完整简体中文已开启",
         desc: app.uiPatch.note ?? scopeDesc,
@@ -156,6 +168,11 @@ export function ClientSettingsPanel({
   }, [dashboard.state.gatewayDisplaySubtitle]);
 
   const isDsh = app.id === "dsh-tako";
+  const pendingAutoTako =
+    Boolean(dashboard.account.loggedIn) &&
+    app.mode === "official" &&
+    !(dashboard.state.explicitOfficialApps ?? []).includes(app.id);
+  const displayMode: AppMode = pendingAutoTako ? "tako" : app.mode;
   const modelFilter =
     app.id === "claude"
       ? dashboard.state.modelFilters?.claude
@@ -175,8 +192,15 @@ export function ClientSettingsPanel({
         { id: "tako", label: "Tako" },
       ];
 
-  const modeHelp =
-    app.id === "claude"
+  const modeHelp = pendingAutoTako
+    ? isDsh
+      ? app.running
+        ? "默认已设为同步 Tako 账号；当前独立会话不中断，下次重启或重新启动时自动同步。"
+        : "默认已设为同步 Tako 账号，点击启动时自动写入密钥。"
+      : app.running
+        ? "默认已设为 Tako 模式；当前官方会话保持不中断，下次重启或重新启动时自动切换。"
+        : "默认已设为 Tako 模式，点击启动时自动切换并连接本地 Tako 网关。"
+    : app.id === "claude"
       ? "Tako 接管时免 Claude 官方登录，官方对话与个人数据保持隔离。"
       : app.id === "codex"
         ? "Tako 接管时自动配置本地网关；可按需保留官方 ChatGPT 登录。"
@@ -471,7 +495,7 @@ export function ClientSettingsPanel({
             </div>
             <SegmentedControl
               options={modeOptions}
-              value={app.mode}
+              value={displayMode}
               disabled={isBusy}
               onChange={(next) => onSetMode(app, next)}
             />

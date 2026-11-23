@@ -23,7 +23,7 @@ import {
 import { CHANGELOG_RELEASES, parseReleaseNotesLines } from "./lib/changelog";
 import { ClientSettingsPanel } from "./components/ClientSettingsPanel";
 import { GeneralSettingsPanel } from "./components/GeneralSettingsPanel";
-import { McpCenterPanel } from "./components/McpCenterPanel";
+import { McpCenterPanel, type McpCenterSection } from "./components/McpCenterPanel";
 import type { McpToolKey } from "./components/McpInlineTheater";
 import { ModelPickerModal } from "./components/ModelPickerModal";
 import { OverviewPanel } from "./components/OverviewPanel";
@@ -113,6 +113,7 @@ export default function App() {
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [showChangelogModal, setShowChangelogModal] = useState(false);
   const [mcpInitialTab, setMcpInitialTab] = useState<McpToolKey | null>(null);
+  const [mcpInitialSection, setMcpInitialSection] = useState<McpCenterSection | null>(null);
 
   const [themePref, setThemePref] = useState<ThemePref>(loadInitialTheme);
   const [systemDark, setSystemDark] = useState<boolean>(() =>
@@ -396,6 +397,18 @@ export default function App() {
       },
     );
 
+    const unlistenUiPatchAutoSyncedPromise = listen<{
+      updatedApps: AppId[];
+      deferredRunningApps: AppId[];
+    }>("ui-patch-auto-synced", (event) => {
+      const updated = event.payload.updatedApps ?? [];
+      if (updated.length > 0) {
+        const names = updated.map((id) => APP_DISPLAY_NAMES[id] ?? id).join("、");
+        showTransientNote(`已自动同步最新简体中文汉化（${names}）`);
+        void loadDashboard(false);
+      }
+    });
+
     return () => {
       disposed = true;
       if (uiPatchClearTimerRef.current !== null) {
@@ -409,8 +422,9 @@ export default function App() {
       void unlistenUpdatesPromise.then((fn) => fn());
       void unlistenAccountPromise.then((fn) => fn());
       void unlistenUiPatchProgressPromise.then((fn) => fn());
+      void unlistenUiPatchAutoSyncedPromise.then((fn) => fn());
     };
-  }, [applySelfUpdateCheckResult, loadDashboard, runUpdateChecks]);
+  }, [applySelfUpdateCheckResult, loadDashboard, runUpdateChecks, showTransientNote]);
 
   // Smoothly advance visual progress between Rust milestones so ASAR repack & codesign never feel frozen
   useEffect(() => {
@@ -574,7 +588,11 @@ export default function App() {
   };
 
   const handleSetMode = async (app: AppSnapshot, mode: AppMode) => {
-    if (app.mode === mode || busyApp === app.id) return;
+    const pendingAutoTako =
+      Boolean(dashboard?.account.loggedIn) &&
+      app.mode === "official" &&
+      !(dashboard?.state.explicitOfficialApps ?? []).includes(app.id);
+    if ((app.mode === mode && !pendingAutoTako) || busyApp === app.id) return;
     setBusyApp(app.id);
     setErrorMsg(null);
     try {
@@ -583,16 +601,26 @@ export default function App() {
         app.id !== "dsh-tako" && updated.mode === "tako"
           ? await api.ensureLocalGateway().catch(() => true)
           : undefined;
-      setDashboard((prev) =>
-        prev
-          ? {
-              ...prev,
-              localGatewayHealthy: gwOk ?? prev.localGatewayHealthy,
-              apps: prev.apps.map((item) => (item.id === app.id ? updated : item)),
-            }
-          : prev,
-      );
-      if (updated.running) {
+      setDashboard((prev) => {
+        if (!prev) return prev;
+        const prevExplicit = prev.state.explicitOfficialApps ?? [];
+        const nextExplicit =
+          mode === "official"
+            ? Array.from(new Set([...prevExplicit, app.id]))
+            : prevExplicit.filter((id) => id !== app.id);
+        return {
+          ...prev,
+          localGatewayHealthy: gwOk ?? prev.localGatewayHealthy,
+          state: {
+            ...prev.state,
+            explicitOfficialApps: nextExplicit,
+          },
+          apps: prev.apps.map((item) => (item.id === app.id ? updated : item)),
+        };
+      });
+      if (mode === "official" && pendingAutoTako) {
+        showTransientNote(`${APP_DISPLAY_NAMES[app.id]} 已固定为官方模式`);
+      } else if (updated.running) {
         setNeedsRestart((prev) => ({ ...prev, [app.id]: true }));
         showTransientNote(`${APP_DISPLAY_NAMES[app.id]} 已切换模式，重启应用后生效`);
       } else {
@@ -630,6 +658,7 @@ export default function App() {
   const handleRestartApp = async (appId: AppId) => {
     setBusyApp(appId);
     setErrorMsg(null);
+    const prevMode = dashboard?.apps.find((a) => a.id === appId)?.mode;
     try {
       const updated = await api.restartApp(appId);
       setNeedsRestart((prev) => ({ ...prev, [appId]: false }));
@@ -641,7 +670,11 @@ export default function App() {
             }
           : prev,
       );
-      showTransientNote(`${APP_DISPLAY_NAMES[appId]} 已重启`);
+      if (prevMode === "official" && updated.mode === "tako") {
+        showTransientNote(`已自动切至 Tako 模式并重启 ${APP_DISPLAY_NAMES[appId]}`);
+      } else {
+        showTransientNote(`${APP_DISPLAY_NAMES[appId]} 已重启`);
+      }
     } catch (err) {
       setErrorMsg(String(err));
     } finally {
@@ -652,6 +685,7 @@ export default function App() {
   const handleLaunchApp = async (appId: AppId) => {
     setBusyApp(appId);
     setErrorMsg(null);
+    const prevMode = dashboard?.apps.find((a) => a.id === appId)?.mode;
     try {
       const updated = await api.launchApp(appId);
       setNeedsRestart((prev) => ({ ...prev, [appId]: false }));
@@ -663,6 +697,9 @@ export default function App() {
             }
           : prev,
       );
+      if (prevMode === "official" && updated.mode === "tako") {
+        showTransientNote(`已自动切至 Tako 模式并启动 ${APP_DISPLAY_NAMES[appId]}`);
+      }
     } catch (err) {
       setErrorMsg(String(err));
     } finally {
@@ -820,7 +857,8 @@ export default function App() {
         (a.id === "antigravity" || a.id === "claude") &&
         a.install.installed &&
         (a.uiPatch.status === "unpatched" ||
-          a.uiPatch.status === "outdated_after_upgrade"),
+          a.uiPatch.status === "outdated_after_upgrade" ||
+          Boolean(a.uiPatch.updateAvailable)),
     );
     const anyInstalledMissingZh = dashboard.apps.some(
       (a) => a.id !== "dsh-tako" && a.install.installed && !a.chineseConfigured,
@@ -1193,7 +1231,13 @@ export default function App() {
             }}
             onNavigate={setActiveRoute}
             onOpenMcpDetail={(tab) => {
+              setMcpInitialSection("builtin");
               setMcpInitialTab(tab ?? null);
+              setActiveRoute("mcp");
+            }}
+            onOpenMultiSync={(section) => {
+              setMcpInitialTab(null);
+              setMcpInitialSection(section);
               setActiveRoute("mcp");
             }}
             onSetMode={(app, mode) => void handleSetMode(app, mode)}
@@ -1256,7 +1300,10 @@ export default function App() {
             loggedIn={Boolean(dashboard?.account.loggedIn)}
             loggingIn={loggingIn}
             initialDrawerTab={mcpInitialTab}
+            initialSection={mcpInitialSection}
             onConsumeInitialTab={() => setMcpInitialTab(null)}
+            onConsumeInitialSection={() => setMcpInitialSection(null)}
+            onNotify={showTransientNote}
             onGoHome={() => setActiveRoute("overview")}
             onToggleCoreTool={(key) => void handleToggleMcpTool(key)}
             onToggleWebPage={handleToggleWebPage}

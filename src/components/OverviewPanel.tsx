@@ -62,6 +62,7 @@ interface OverviewPanelProps {
   selfUpdateSummary: SelfUpdateSummary;
   onNavigate: (route: NavRoute) => void;
   onOpenMcpDetail: (tab?: McpToolKey) => void;
+  onOpenMultiSync: (section: "mcp-sync" | "skill-sync") => void;
   onSetMode: (app: AppSnapshot, mode: AppMode) => void;
   onLaunchApp: (appId: AppId) => void;
   onRestartApp: (appId: AppId) => void;
@@ -143,10 +144,20 @@ const HOME_MCP_ITEMS: HomeMcpItem[] = [
   },
 ];
 
-function briefClientSummary(app: AppSnapshot, update?: AppUpdateStatus): string {
+function briefClientSummary(
+  app: AppSnapshot,
+  update?: AppUpdateStatus,
+  pendingAutoTako?: boolean,
+): string {
   if (!app.install.installed) return "本机尚未安装 · 点击右侧安装或进设置查看引导";
   const parts: string[] = [];
-  if (app.id === "dsh-tako") {
+  if (pendingAutoTako) {
+    if (app.id === "dsh-tako") {
+      parts.push(app.running ? "独立账号运行中 · 重启时自动同步" : "默认同步账号 · 启动时自动切换");
+    } else {
+      parts.push(app.running ? "官方运行中 · 重启时自动切至 Tako" : "默认 Tako · 启动时自动切换");
+    }
+  } else if (app.id === "dsh-tako") {
     parts.push(app.mode === "tako" ? "已同步当前账号密钥" : "使用独立账号登录");
   } else {
     parts.push(app.mode === "tako" ? "免官方登录直连 Tako" : "官方原版直连");
@@ -184,6 +195,7 @@ export function OverviewPanel({
   selfUpdateSummary,
   onNavigate,
   onOpenMcpDetail,
+  onOpenMultiSync,
   onSetMode,
   onLaunchApp,
   onRestartApp,
@@ -204,11 +216,19 @@ export function OverviewPanel({
   );
 
   const preferZh = dashboard?.state.preferChineseUi ?? true;
+  const anyUpdatableUiPatch = orderedApps.some(
+    (a) =>
+      (a.id === "antigravity" || a.id === "claude") &&
+      a.install.installed &&
+      (a.uiPatch.status === "outdated_after_upgrade" || Boolean(a.uiPatch.updateAvailable)),
+  );
   const anyMissingUiPatch = orderedApps.some(
     (a) =>
       (a.id === "antigravity" || a.id === "claude") &&
       a.install.installed &&
-      (a.uiPatch.status === "unpatched" || a.uiPatch.status === "outdated_after_upgrade"),
+      (a.uiPatch.status === "unpatched" ||
+        a.uiPatch.status === "outdated_after_upgrade" ||
+        Boolean(a.uiPatch.updateAvailable)),
   );
   const anyMissingZhConfig = orderedApps.some(
     (a) => a.id !== "dsh-tako" && a.install.installed && !a.chineseConfigured,
@@ -271,8 +291,10 @@ export function OverviewPanel({
               onClick={onToggleMainChineseUi}
               title={
                 chineseFullyActive
-                  ? "三端简体中文配置与界面汉化已生效 · 点击可一键关闭并恢复"
-                  : "一键同步 Codex / Claude / Antigravity 简体中文配置与界面汉化"
+                  ? "三端简体中文配置与界面汉化已生效（后续词典更新将自动同步）· 点击可一键关闭并恢复"
+                  : preferZh && anyUpdatableUiPatch
+                    ? "检测到新版简体中文词典（客户端关闭时会自动同步，点击也可立即更新）"
+                    : "一键同步 Codex / Claude / Antigravity 简体中文配置与界面汉化"
               }
               className={`h-6 px-2.5 rounded-full border text-[11px] font-medium inline-flex items-center gap-1 transition cursor-pointer disabled:opacity-60 shrink-0 ${
                 chineseFullyActive
@@ -286,7 +308,9 @@ export function OverviewPanel({
                   ? "汉化同步中..."
                   : chineseFullyActive
                     ? "三端汉化：已开启"
-                    : "一键三端汉化"}
+                    : preferZh && anyUpdatableUiPatch
+                      ? "更新三端汉化"
+                      : "一键三端汉化"}
               </span>
             </button>
 
@@ -397,6 +421,11 @@ export function OverviewPanel({
               const isBusy = busyApp === app.id;
               const restartRequired = Boolean(needsRestart[app.id]);
               const hasIssue = app.diagnostic.issues.length > 0;
+              const pendingAutoTako =
+                Boolean(dashboard?.account.loggedIn) &&
+                app.mode === "official" &&
+                !(dashboard?.state.explicitOfficialApps ?? []).includes(app.id);
+              const displayMode: AppMode = pendingAutoTako ? "tako" : app.mode;
 
               return (
                 <div
@@ -439,6 +468,14 @@ export function OverviewPanel({
                               有更新
                             </span>
                           )}
+                          {preferZh && app.uiPatch.updateAvailable && !update?.hasUpdate && (
+                            <span
+                              className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-[var(--accent-soft)] text-[var(--accent)] shrink-0"
+                              title="检测到新版汉化词典，关闭客户端后将自动同步，或点顶部「更新三端汉化」立即应用"
+                            >
+                              汉化可更新
+                            </span>
+                          )}
                           {hasIssue && (
                             <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-[var(--warning-soft)] text-[var(--warning)] shrink-0">
                               需检查
@@ -446,7 +483,7 @@ export function OverviewPanel({
                           )}
                         </div>
                         <div className="text-[11.5px] text-[var(--text-muted)] truncate mt-0.5">
-                          {briefClientSummary(app, update)}
+                          {briefClientSummary(app, update, pendingAutoTako)}
                         </div>
                       </div>
                     </button>
@@ -454,7 +491,7 @@ export function OverviewPanel({
                     {/* Fixed-Width Mode Switcher */}
                     <div className="w-[116px] shrink-0 grid grid-cols-2 p-0.5 rounded-[9px] bg-[var(--bg-pill)] border border-[var(--border)]">
                       {MODE_OPTIONS.map((option) => {
-                        const active = app.mode === option.id;
+                        const active = displayMode === option.id;
                         const label =
                           app.id === "dsh-tako"
                             ? option.id === "tako"
@@ -622,10 +659,19 @@ export function OverviewPanel({
             </span>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 shrink-0">
             <span className="tabular-nums text-[11.5px] font-medium text-[var(--text-secondary)]">
               {mcpEnabledCount}/{mcpTotalCount} 已开启
             </span>
+            <button
+              type="button"
+              data-testid="open-multi-sync"
+              onClick={() => onOpenMultiSync("mcp-sync")}
+              className="h-7 px-2.5 rounded-full border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] text-[11.5px] font-medium inline-flex items-center gap-1 transition cursor-pointer"
+              title="跨平台同步 Claude / Codex / Antigravity 自定义 MCP 与 Skills"
+            >
+              <span>MCP / Skill 同步</span>
+            </button>
             <button
               type="button"
               data-testid="open-mcp-center"

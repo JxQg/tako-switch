@@ -124,6 +124,7 @@ export interface SwitchState {
   bypassSystemProxy?: boolean;
   mcp: McpToolsConfig;
   modelFilters?: ModelFiltersConfig;
+  explicitOfficialApps?: AppId[];
 }
 
 export interface InstallInfo {
@@ -225,9 +226,16 @@ export function parseUiPatchBlockError(err: unknown): UiPatchPermissionPrompt | 
 export interface UiPatchInfo {
   status: UiPatchStatus;
   patchVersion: string | null;
+  targetPatchVersion?: string | null;
+  updateAvailable?: boolean;
   hasValidBackup: boolean;
   targetAsarPath: string | null;
   note: string | null;
+}
+
+export interface UiPatchAutoSyncEvent {
+  updatedApps: AppId[];
+  deferredRunningApps: AppId[];
 }
 
 export interface AppSnapshot {
@@ -382,6 +390,53 @@ export interface LiveDemoResult {
   citations: LiveDemoCitation[];
 }
 
+export type SyncPlatform = "claude" | "codex" | "antigravity";
+
+export interface SyncedMcpSpec {
+  transport: string;
+  command?: string | null;
+  args: string[];
+  env: Record<string, string>;
+  url?: string | null;
+  headers: Record<string, string>;
+  summary: string;
+}
+
+export interface PlatformMcpItem {
+  name: string;
+  managedByTako: boolean;
+  platforms: SyncPlatform[];
+  variants: Partial<Record<SyncPlatform, SyncedMcpSpec>>;
+  hasDiff: boolean;
+}
+
+export interface PlatformSkillItem {
+  name: string;
+  title: string;
+  description: string;
+  platforms: SyncPlatform[];
+  fileCounts: Partial<Record<SyncPlatform, number>>;
+  modifiedMs: Partial<Record<SyncPlatform, number>>;
+  hasDiff: boolean;
+}
+
+export interface PlatformSyncPaths {
+  mcpPath: string;
+  skillsDir: string;
+}
+
+export interface MultiPlatformSyncSnapshot {
+  mcpItems: PlatformMcpItem[];
+  skillItems: PlatformSkillItem[];
+  platformPaths: Partial<Record<SyncPlatform, PlatformSyncPaths>>;
+}
+
+export interface BatchSyncOutcome {
+  syncedItems: number;
+  syncedWrites: number;
+  snapshot: MultiPlatformSyncSnapshot;
+}
+
 export const api = {
   getDashboard: (refreshAccount: boolean) =>
     invoke<DashboardPayload>("get_dashboard", { refreshAccount }),
@@ -437,4 +492,52 @@ export const api = {
   runMcpLiveDemo: (input: LiveDemoRequest) =>
     invoke<LiveDemoResult>("run_mcp_live_demo", { input }),
   checkNodeRuntime: () => invoke<NodeRuntimeInfo>("check_node_runtime"),
+  getMultiPlatformSyncSnapshot: () =>
+    invoke<MultiPlatformSyncSnapshot>("get_multi_platform_sync_snapshot"),
+  syncMcpToPlatforms: (
+    name: string,
+    source: SyncPlatform,
+    targets: SyncPlatform[],
+  ) =>
+    invoke<MultiPlatformSyncSnapshot>("sync_mcp_to_platforms", {
+      name,
+      source,
+      targets,
+    }),
+  syncAllMcps: (
+    targets: SyncPlatform[],
+    preferredSource?: SyncPlatform | null,
+  ) =>
+    invoke<BatchSyncOutcome>("sync_all_mcps", {
+      targets,
+      preferredSource: preferredSource ?? null,
+    }),
+  syncSkillToPlatforms: (
+    name: string,
+    source: SyncPlatform,
+    targets: SyncPlatform[],
+  ) =>
+    invoke<MultiPlatformSyncSnapshot>("sync_skill_to_platforms", {
+      name,
+      source,
+      targets,
+    }),
+  syncAllSkills: (
+    targets: SyncPlatform[],
+    preferredSource?: SyncPlatform | null,
+  ) =>
+    invoke<BatchSyncOutcome>("sync_all_skills", {
+      targets,
+      preferredSource: preferredSource ?? null,
+    }),
+  removeSyncedItem: (
+    kind: "mcp" | "skill",
+    name: string,
+    platform: SyncPlatform,
+  ) =>
+    invoke<MultiPlatformSyncSnapshot>("remove_synced_item", {
+      kind,
+      name,
+      platform,
+    }),
 };

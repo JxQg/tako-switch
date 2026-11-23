@@ -5,6 +5,7 @@ pub mod config;
 pub mod installer;
 pub mod manifest;
 pub mod mcp_server;
+pub mod sync_hub;
 
 use adapters::{
     get_adapter, snapshot_app, AppId, AppMode, AppSnapshot, DesktopAppAdapter, DiagnosticResult,
@@ -35,6 +36,26 @@ const SELF_UPDATE_OSS_ENDPOINT: &str =
 const SELF_UPDATE_GITHUB_ENDPOINT: &str =
     "https://github.com/tako-dev/tako-switch/releases/latest/download/latest.json";
 const SELF_UPDATE_BG_INTERVAL_SECS: u64 = 1800;
+const UI_PATCH_IDLE_SYNC_INTERVAL_SECS: u64 = 20;
+
+static UI_PATCH_OP_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+fn ui_patch_op_lock() -> &'static std::sync::Mutex<()> {
+    UI_PATCH_OP_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutoUiSyncReport {
+    pub updated: Vec<AppId>,
+    pub deferred_running: Vec<AppId>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiPatchAutoSyncEvent {
+    pub updated_apps: Vec<AppId>,
+    pub deferred_running_apps: Vec<AppId>,
+}
 
 pub struct InstallGuard {
     lock: Mutex<()>,
@@ -877,6 +898,7 @@ fn execute_ui_patch_action_for_paths(
     action: &str,
     auto_restart: bool,
 ) -> Result<adapters::UiPatchInfo, String> {
+    let _op_guard = ui_patch_op_lock().lock().unwrap_or_else(|e| e.into_inner());
     let quit_for_patch = quit_app_and_wait_for_ui_patch(paths, app_id, true, auto_restart)?;
 
     let res = {
@@ -910,6 +932,91 @@ fn execute_ui_patch_action_for_paths(
         let _ = get_adapter(app_id).launch_app(paths);
     }
     res
+}
+
+/// Silently upgrades outdated / post-upgrade UI localization patches for installed apps
+/// when `prefer_chinese_ui` is enabled. Never kills a running client; running apps are
+/// recorded in `deferred_running` so they can be synced automatically once closed.
+pub fn auto_sync_pending_ui_patches_for_paths(
+    paths: &AppPaths,
+    include_unpatched_for: Option<AppId>,
+) -> AutoUiSyncReport {
+    let mut report = AutoUiSyncReport::default();
+    if !read_switch_state(paths).prefer_chinese_ui {
+        return report;
+    }
+    let Ok(_guard) = ui_patch_op_lock().try_lock() else {
+        return report;
+    };
+
+    for &app_id in &[AppId::Claude, AppId::Antigravity] {
+        let info = inspect_ui_patch_for_app(paths, app_id);
+        let needs_sync = info.status == adapters::UiPatchStatus::OutdatedAfterUpgrade
+            || (info.status == adapters::UiPatchStatus::Patched && info.update_available)
+            || (include_unpatched_for == Some(app_id)
+                && info.status == adapters::UiPatchStatus::Unpatched);
+        if !needs_sync {
+            continue;
+        }
+        if !paths.is_test && get_adapter(app_id).is_running(paths) {
+            report.deferred_running.push(app_id);
+            continue;
+        }
+        if run_raw_ui_patch_action(paths, app_id, "patch").is_ok() {
+            match app_id {
+                AppId::Claude => {
+                    let _ = adapters::claude::ClaudeAdapter::sync_standalone_chinese_locale(
+                        paths, true,
+                    );
+                }
+                AppId::Antigravity => {
+                    let _ =
+                        adapters::antigravity::AntigravityAdapter::sync_standalone_chinese_locale(
+                            paths, true,
+                        );
+                }
+                _ => {}
+            }
+            report.updated.push(app_id);
+        }
+    }
+
+    report
+}
+
+async fn run_background_ui_patch_auto_sync(app: &AppHandle, fetch_remote_packs: bool) {
+    let Ok(paths) = AppPaths::detect() else {
+        return;
+    };
+    if !read_switch_state(&paths).prefer_chinese_ui {
+        return;
+    }
+    let fetched_packs = if fetch_remote_packs {
+        adapters::refresh_remote_i18n_packs(&paths).await
+    } else {
+        Vec::new()
+    };
+
+    let paths_for_sync = paths.clone();
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        auto_sync_pending_ui_patches_for_paths(&paths_for_sync, None)
+    })
+    .await
+    .unwrap_or_default();
+
+    if !report.updated.is_empty() || !fetched_packs.is_empty() {
+        refresh_tray(app, &paths);
+        let _ = app.emit("state-changed", ());
+    }
+    if !report.updated.is_empty() {
+        let _ = app.emit(
+            "ui-patch-auto-synced",
+            &UiPatchAutoSyncEvent {
+                updated_apps: report.updated,
+                deferred_running_apps: report.deferred_running,
+            },
+        );
+    }
 }
 
 /// Decoupled Chinese UI toggle & ASAR synchronization for tests and runtime commands.
@@ -972,9 +1079,7 @@ where
                     info.status,
                     adapters::UiPatchStatus::Unpatched
                         | adapters::UiPatchStatus::OutdatedAfterUpgrade
-                ) || (info.status == adapters::UiPatchStatus::Patched
-                    && info.patch_version.as_deref()
-                        != Some(adapters::antigravity_i18n::CURRENT_UI_PATCH_VERSION));
+                ) || (info.status == adapters::UiPatchStatus::Patched && info.update_available);
                 if needs_patch {
                     targets.push(app_id);
                 }
@@ -1444,6 +1549,28 @@ async fn get_running_states() -> Result<std::collections::BTreeMap<String, bool>
     .map_err(|err| format!("读取运行状态失败: {err}"))?
 }
 
+async fn ensure_default_tako_mode_before_launch(
+    paths: &AppPaths,
+    app_id: AppId,
+) -> Result<bool, String> {
+    if config::read_main_api_key(paths).is_none() {
+        return Ok(false);
+    }
+    let state = read_switch_state(paths);
+    if state.is_explicit_official(app_id) {
+        return Ok(false);
+    }
+    let is_official = get_adapter(app_id).read_mode(paths) == AppMode::Official;
+    if !is_official {
+        return Ok(false);
+    }
+    if app_id == AppId::Claude {
+        let _ = crate::agy_proxy::refresh_claude_catalog_cache(paths).await;
+    }
+    get_adapter(app_id).apply_mode(paths, AppMode::Tako)?;
+    Ok(true)
+}
+
 #[tauri::command]
 async fn set_app_mode(
     app: AppHandle,
@@ -1452,6 +1579,9 @@ async fn set_app_mode(
     auto_restart: bool,
 ) -> Result<AppSnapshot, String> {
     let paths = AppPaths::detect()?;
+    let mut state = read_switch_state(&paths);
+    state.set_explicit_official(app_id, mode == AppMode::Official);
+    save_switch_state(&paths, &state)?;
     if app_id == AppId::Claude && mode == AppMode::Tako {
         let _ = crate::agy_proxy::refresh_claude_catalog_cache(&paths).await;
     }
@@ -1467,14 +1597,20 @@ async fn set_app_mode(
 }
 
 #[tauri::command]
-fn restart_app(app_id: AppId) -> Result<AppSnapshot, String> {
+async fn restart_app(app: AppHandle, app_id: AppId) -> Result<AppSnapshot, String> {
     let paths = AppPaths::detect()?;
-    let adapter = get_adapter(app_id);
-    if adapter.is_running(&paths) {
-        adapter.quit_app(&paths)?;
-        std::thread::sleep(std::time::Duration::from_millis(450));
+    {
+        let adapter = get_adapter(app_id);
+        if adapter.is_running(&paths) {
+            adapter.quit_app(&paths)?;
+            std::thread::sleep(std::time::Duration::from_millis(450));
+        }
     }
-    adapter.launch_app(&paths)?;
+    let switched = ensure_default_tako_mode_before_launch(&paths, app_id).await?;
+    get_adapter(app_id).launch_app(&paths)?;
+    if switched {
+        refresh_tray(&app, &paths);
+    }
     Ok(snapshot_app(&paths, app_id))
 }
 
@@ -1490,10 +1626,20 @@ fn close_app(app_id: AppId) -> Result<AppSnapshot, String> {
 }
 
 #[tauri::command]
-fn launch_app(app_id: AppId) -> Result<AppSnapshot, String> {
+async fn launch_app(app: AppHandle, app_id: AppId) -> Result<AppSnapshot, String> {
     let paths = AppPaths::detect()?;
-    let adapter = get_adapter(app_id);
-    adapter.launch_app(&paths)?;
+    let was_running = get_adapter(app_id).is_running(&paths);
+    // Only apply lazy default Tako switch when the client is NOT currently running,
+    // so an active official session is never disrupted mid-conversation.
+    let switched = if !was_running {
+        ensure_default_tako_mode_before_launch(&paths, app_id).await?
+    } else {
+        false
+    };
+    get_adapter(app_id).launch_app(&paths)?;
+    if switched {
+        refresh_tray(&app, &paths);
+    }
     Ok(snapshot_app(&paths, app_id))
 }
 
@@ -1535,10 +1681,14 @@ async fn save_client_model_filter(
 }
 
 #[tauri::command]
-async fn check_app_updates() -> Result<ManifestCheckResult, String> {
+async fn check_app_updates(app: AppHandle) -> Result<ManifestCheckResult, String> {
     let paths = AppPaths::detect()?;
     let (source_url, manifest) = fetch_manifest(&paths).await?;
     let updates = compute_updates(&paths, &manifest);
+    let app_for_i18n = app.clone();
+    tauri::async_runtime::spawn(async move {
+        run_background_ui_patch_auto_sync(&app_for_i18n, true).await;
+    });
     Ok(ManifestCheckResult {
         source_url,
         manifest,
@@ -1568,6 +1718,82 @@ async fn run_mcp_live_demo(
 ) -> Result<mcp_server::LiveDemoResult, String> {
     let paths = AppPaths::detect()?;
     mcp_server::execute_live_demo_for_paths(&paths, input).await
+}
+
+#[tauri::command]
+async fn get_multi_platform_sync_snapshot() -> Result<sync_hub::MultiPlatformSyncSnapshot, String> {
+    let paths = AppPaths::detect()?;
+    tauri::async_runtime::spawn_blocking(move || sync_hub::build_multi_platform_sync_snapshot(&paths))
+        .await
+        .map_err(|e| format!("扫描多平台 MCP/Skill 失败: {e}"))
+}
+
+#[tauri::command]
+async fn sync_mcp_to_platforms(
+    name: String,
+    source: sync_hub::SyncPlatform,
+    targets: Vec<sync_hub::SyncPlatform>,
+) -> Result<sync_hub::MultiPlatformSyncSnapshot, String> {
+    let paths = AppPaths::detect()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        sync_hub::sync_mcp_to_platforms_for_paths(&paths, &name, source, &targets)
+    })
+    .await
+    .map_err(|e| format!("同步 MCP 失败: {e}"))?
+}
+
+#[tauri::command]
+async fn sync_all_mcps(
+    targets: Vec<sync_hub::SyncPlatform>,
+    preferred_source: Option<sync_hub::SyncPlatform>,
+) -> Result<sync_hub::BatchSyncOutcome, String> {
+    let paths = AppPaths::detect()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        sync_hub::sync_all_mcps_for_paths(&paths, &targets, preferred_source)
+    })
+    .await
+    .map_err(|e| format!("批量同步 MCP 失败: {e}"))?
+}
+
+#[tauri::command]
+async fn sync_skill_to_platforms(
+    name: String,
+    source: sync_hub::SyncPlatform,
+    targets: Vec<sync_hub::SyncPlatform>,
+) -> Result<sync_hub::MultiPlatformSyncSnapshot, String> {
+    let paths = AppPaths::detect()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        sync_hub::sync_skill_to_platforms_for_paths(&paths, &name, source, &targets)
+    })
+    .await
+    .map_err(|e| format!("同步 Skill 失败: {e}"))?
+}
+
+#[tauri::command]
+async fn sync_all_skills(
+    targets: Vec<sync_hub::SyncPlatform>,
+    preferred_source: Option<sync_hub::SyncPlatform>,
+) -> Result<sync_hub::BatchSyncOutcome, String> {
+    let paths = AppPaths::detect()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        sync_hub::sync_all_skills_for_paths(&paths, &targets, preferred_source)
+    })
+    .await
+    .map_err(|e| format!("批量同步 Skill 失败: {e}"))?
+}
+
+#[tauri::command]
+async fn remove_synced_item(
+    kind: String,
+    name: String,
+    platform: sync_hub::SyncPlatform,
+) -> Result<sync_hub::MultiPlatformSyncSnapshot, String> {
+    let paths = AppPaths::detect()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        sync_hub::remove_synced_item_for_paths(&paths, &kind, &name, platform)
+    })
+    .await
+    .map_err(|e| format!("移除同步项失败: {e}"))?
 }
 
 #[tauri::command]
@@ -1688,6 +1914,16 @@ async fn install_or_upgrade_app(
         let outcome =
             installer::install_or_upgrade_app(Some(&app), &paths, app_id, artifact, Some(cancel_flag))
                 .await?;
+        if read_switch_state(&paths).prefer_chinese_ui {
+            let paths_for_zh = paths.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                sync_standalone_chinese_for_installed(&paths_for_zh, true);
+                if matches!(app_id, AppId::Claude | AppId::Antigravity) {
+                    let _ = auto_sync_pending_ui_patches_for_paths(&paths_for_zh, Some(app_id));
+                }
+            })
+            .await;
+        }
         refresh_tray(&app, &paths);
         Ok(outcome)
     }
@@ -1718,7 +1954,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let paths = AppPaths::detect().map_err(std::io::Error::other)?;
+            #[cfg(target_os = "macos")]
             let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
+            #[cfg(not(target_os = "macos"))]
+            let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/64x64.png"))?;
             let menu = build_tray_menu(app.handle(), &paths).map_err(std::io::Error::other)?;
 
             let builder = TrayIconBuilder::with_id(TRAY_ID)
@@ -1744,6 +1983,9 @@ pub fn run() {
                         app.exit(0);
                     } else if let Some((app_id, mode)) = parse_tray_mode_id(id) {
                         if let Ok(paths) = AppPaths::detect() {
+                            let mut st = read_switch_state(&paths);
+                            st.set_explicit_official(app_id, mode == AppMode::Official);
+                            let _ = save_switch_state(&paths, &st);
                             if get_adapter(app_id).apply_mode(&paths, mode).is_ok() {
                                 refresh_tray(app, &paths);
                                 let _ = app.emit("state-changed", ());
@@ -1802,12 +2044,29 @@ pub fn run() {
                             if let Ok(res) = perform_self_update_check(&upd_handle).await {
                                 let _ = upd_handle.emit("self-update-status", &res);
                             }
+                            run_background_ui_patch_auto_sync(&upd_handle, true).await;
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(
                         SELF_UPDATE_BG_INTERVAL_SECS,
                     ))
                     .await;
+                }
+            });
+
+            // Startup & idle UI localization auto-sync:
+            // 1. After startup, check remote i18n overlay packs and silently upgrade outdated patches.
+            // 2. While running, periodically sync any deferred app once the user closes it.
+            let i18n_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+                run_background_ui_patch_auto_sync(&i18n_handle, true).await;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        UI_PATCH_IDLE_SYNC_INTERVAL_SECS,
+                    ))
+                    .await;
+                    run_background_ui_patch_auto_sync(&i18n_handle, false).await;
                 }
             });
 
@@ -1854,6 +2113,12 @@ pub fn run() {
             install_self_update,
             run_mcp_live_demo,
             check_node_runtime,
+            get_multi_platform_sync_snapshot,
+            sync_mcp_to_platforms,
+            sync_all_mcps,
+            sync_skill_to_platforms,
+            sync_all_skills,
+            remove_synced_item,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tako Switch");
@@ -1980,5 +2245,40 @@ mod tests {
         ));
         let codex_toml_off = std::fs::read_to_string(paths.codex_dir.join("config.toml")).unwrap();
         assert!(!codex_toml_off.contains(adapters::EDGEONE_MCP_SERVER_KEY));
+    }
+
+    #[test]
+    fn lazy_default_tako_switch_respects_explicit_official_opt_out() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+
+        // Without login: must NOT auto-switch
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(!rt
+            .block_on(ensure_default_tako_mode_before_launch(&paths, AppId::Codex))
+            .unwrap());
+        assert_eq!(get_adapter(AppId::Codex).read_mode(&paths), AppMode::Official);
+
+        // After login: Codex defaults to Tako on launch
+        config::save_switch_auth(&paths, Some("cr_lazy_test"), Some("1"), Some("oauth")).unwrap();
+        assert!(rt
+            .block_on(ensure_default_tako_mode_before_launch(&paths, AppId::Codex))
+            .unwrap());
+        assert_eq!(get_adapter(AppId::Codex).read_mode(&paths), AppMode::Tako);
+
+        // If user explicitly chooses Official for Antigravity, launch must NOT override it
+        let mut st = read_switch_state(&paths);
+        st.set_explicit_official(AppId::Antigravity, true);
+        save_switch_state(&paths, &st).unwrap();
+        assert!(!rt
+            .block_on(ensure_default_tako_mode_before_launch(
+                &paths,
+                AppId::Antigravity
+            ))
+            .unwrap());
+        assert_eq!(
+            get_adapter(AppId::Antigravity).read_mode(&paths),
+            AppMode::Official
+        );
     }
 }

@@ -1,7 +1,7 @@
 use crate::adapters::antigravity_i18n::{
-    sha256_hex, AsarArchive, UiPatchInfo, UiPatchStatus, CURRENT_UI_PATCH_VERSION,
-    PATCH_MARKER_FILE,
+    sha256_hex, AsarArchive, UiPatchInfo, UiPatchStatus, PATCH_MARKER_FILE,
 };
+use crate::adapters::i18n_packs::{effective_ui_patch_version, load_i18n_overlay_dict};
 #[cfg(target_os = "macos")]
 use crate::adapters::antigravity_i18n::resign_macos_outer_bundle_for;
 #[cfg(target_os = "macos")]
@@ -18,6 +18,7 @@ use crate::adapters::{AppId, DesktopAppAdapter};
 use crate::config::{write_atomic, AppPaths};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -113,6 +114,17 @@ const STANDARD_ION_LOCALES: &[&str] = &[
 fn claude_zh_dict() -> &'static HashMap<String, String> {
     static DICT: OnceLock<HashMap<String, String>> = OnceLock::new();
     DICT.get_or_init(|| serde_json::from_str(CLAUDE_ZH_DICT_RAW).unwrap_or_default())
+}
+
+fn load_effective_claude_zh_dict(paths: &AppPaths) -> Cow<'static, HashMap<String, String>> {
+    let base = claude_zh_dict();
+    if let Some(overlay) = load_i18n_overlay_dict(paths, AppId::Claude) {
+        let mut merged = base.clone();
+        merged.extend(overlay);
+        Cow::Owned(merged)
+    } else {
+        Cow::Borrowed(base)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -882,8 +894,9 @@ fn patch_app_asar_in_memory(
     archive: &mut AsarArchive,
     orig_sha256: &str,
     app_version: Option<&str>,
+    target_patch_version: &str,
+    dict: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>, String> {
-    let dict = claude_zh_dict();
     let mut shell_en_to_zh: HashMap<String, String> = HashMap::new();
 
     // 1. Merge/fill resources/i18n/zh-Hans.json while preserving existing translations
@@ -956,7 +969,7 @@ fn patch_app_asar_in_memory(
     // 3. Inject patch marker
     let marker = ClaudePatchMarker {
         schema: 1,
-        patch_version: CURRENT_UI_PATCH_VERSION.to_string(),
+        patch_version: target_patch_version.to_string(),
         original_asar_sha256: orig_sha256.to_string(),
         app_version: app_version.map(str::to_string),
     };
@@ -971,9 +984,10 @@ fn patch_ion_asar_in_memory(
     archive: &mut AsarArchive,
     orig_sha256: &str,
     app_version: Option<&str>,
+    target_patch_version: &str,
     shell_en_to_zh: &HashMap<String, String>,
+    dict: &HashMap<String, String>,
 ) -> Result<(), String> {
-    let dict = claude_zh_dict();
 
     // 1. Scan assets/**/*.js for 11-locale whitelist arrays & display name map
     let js_paths: Vec<String> = archive
@@ -1049,7 +1063,7 @@ fn patch_ion_asar_in_memory(
     // 4. Inject patch marker
     let marker = ClaudePatchMarker {
         schema: 1,
-        patch_version: CURRENT_UI_PATCH_VERSION.to_string(),
+        patch_version: target_patch_version.to_string(),
         original_asar_sha256: orig_sha256.to_string(),
         app_version: app_version.map(str::to_string),
     };
@@ -1316,11 +1330,14 @@ fn restore_macos_electron_framework_and_helpers(
 }
 
 pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
+    let target_patch_version = effective_ui_patch_version(paths, AppId::Claude);
     let target = match resolve_claude_target(paths) {
         ClaudeTargetResolution::NotInstalled => {
             return UiPatchInfo {
                 status: UiPatchStatus::NotInstalled,
                 patch_version: None,
+                target_patch_version: Some(target_patch_version),
+                update_available: false,
                 has_valid_backup: false,
                 target_asar_path: None,
                 note: None,
@@ -1331,6 +1348,8 @@ pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
             return UiPatchInfo {
                 status: UiPatchStatus::Unsupported,
                 patch_version: None,
+                target_patch_version: Some(target_patch_version),
+                update_available: false,
                 has_valid_backup: false,
                 target_asar_path: Some(root.to_string_lossy().to_string()),
                 note: Some(prompt.message),
@@ -1340,6 +1359,8 @@ pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
             return UiPatchInfo {
                 status: UiPatchStatus::Unsupported,
                 patch_version: None,
+                target_patch_version: Some(target_patch_version),
+                update_available: false,
                 has_valid_backup: false,
                 target_asar_path: None,
                 note: Some(format!(
@@ -1359,6 +1380,8 @@ pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
         return UiPatchInfo {
             status: UiPatchStatus::Unsupported,
             patch_version: None,
+            target_patch_version: Some(target_patch_version),
+            update_available: false,
             has_valid_backup: false,
             target_asar_path: Some(target_asar_str),
             note: Some("无法读取 Claude Desktop 资源包文件".to_string()),
@@ -1372,6 +1395,8 @@ pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
         return UiPatchInfo {
             status: UiPatchStatus::Unsupported,
             patch_version: None,
+            target_patch_version: Some(target_patch_version),
+            update_available: false,
             has_valid_backup: false,
             target_asar_path: Some(target_asar_str),
             note: Some("解析 Claude Desktop ASAR 资源包失败".to_string()),
@@ -1403,13 +1428,23 @@ pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
         let has_valid_backup =
             verify_clean_backup_file(paths, "app.asar.orig", expected_app_sha).is_ok()
                 && verify_clean_backup_file(paths, "ion-dist.asar.orig", expected_ion_sha).is_ok();
+        let update_available = patch_version.as_deref() != Some(target_patch_version.as_str());
+        let note = if update_available {
+            format!(
+                "检测到新版简体中文词典（v{target_patch_version}），Claude 关闭时将自动同步，也可立即一键更新"
+            )
+        } else {
+            "Claude Desktop 全量简体中文界面补丁已生效（Chat / Cowork / Claude Code）".to_string()
+        };
 
         return UiPatchInfo {
             status: UiPatchStatus::Patched,
             patch_version,
+            target_patch_version: Some(target_patch_version),
+            update_available,
             has_valid_backup,
             target_asar_path: Some(target_asar_str),
-            note: Some("Claude Desktop 全量简体中文界面补丁已生效（Chat / Cowork / Claude Code）".to_string()),
+            note: Some(note),
         };
     }
 
@@ -1417,10 +1452,12 @@ pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
         return UiPatchInfo {
             status: UiPatchStatus::OutdatedAfterUpgrade,
             patch_version: Some(old_meta.patch_version),
+            target_patch_version: Some(target_patch_version),
+            update_available: true,
             has_valid_backup: false,
             target_asar_path: Some(target_asar_str),
             note: Some(
-                "检测到 Claude Desktop 已升级至新版本，点击即可基于新版重新注入简体中文界面补丁"
+                "检测到 Claude Desktop 已升级至新版本，关闭客户端时将自动重打汉化，也可立即重新应用"
                     .to_string(),
             ),
         };
@@ -1430,6 +1467,8 @@ pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
         return UiPatchInfo {
             status: UiPatchStatus::Unsupported,
             patch_version: None,
+            target_patch_version: Some(target_patch_version),
+            update_available: false,
             has_valid_backup: false,
             target_asar_path: Some(target_asar_str),
             note: Some("当前 Claude Desktop 安装包缺少 i18n/en-US.json 语言目录".to_string()),
@@ -1439,6 +1478,8 @@ pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
     UiPatchInfo {
         status: UiPatchStatus::Unpatched,
         patch_version: None,
+        target_patch_version: Some(target_patch_version),
+        update_available: false,
         has_valid_backup: false,
         target_asar_path: Some(target_asar_str),
         note: None,
@@ -1471,6 +1512,7 @@ pub fn patch_claude_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, String
     let current_app_archive = AsarArchive::parse(&current_app_bytes)?;
     let current_ion_archive = AsarArchive::parse(&current_ion_bytes)?;
 
+    let target_patch_version = effective_ui_patch_version(paths, AppId::Claude);
     let backup_dir = ui_patch_backup_dir(paths);
     let existing_meta = read_patch_meta(paths);
 
@@ -1496,10 +1538,10 @@ pub fn patch_claude_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, String
             .unwrap_or("");
         if app_marker
             .as_ref()
-            .is_some_and(|m| m.patch_version == CURRENT_UI_PATCH_VERSION)
+            .is_some_and(|m| m.patch_version == target_patch_version)
             && ion_marker
                 .as_ref()
-                .is_some_and(|m| m.patch_version == CURRENT_UI_PATCH_VERSION)
+                .is_some_and(|m| m.patch_version == target_patch_version)
             && verify_clean_backup_file(paths, "app.asar.orig", expected_app_sha).is_ok()
             && verify_clean_backup_file(paths, "ion-dist.asar.orig", expected_ion_sha).is_ok()
         {
@@ -1665,13 +1707,21 @@ pub fn patch_claude_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, String
         read_archive_app_version(&base_app_archive).or(target.app_version_hint.clone());
 
     // Mutate BOTH archives fully in memory BEFORE writing anything to disk!
-    let shell_en_to_zh =
-        patch_app_asar_in_memory(&mut base_app_archive, &orig_app_sha, app_version.as_deref())?;
+    let effective_dict = load_effective_claude_zh_dict(paths);
+    let shell_en_to_zh = patch_app_asar_in_memory(
+        &mut base_app_archive,
+        &orig_app_sha,
+        app_version.as_deref(),
+        &target_patch_version,
+        effective_dict.as_ref(),
+    )?;
     patch_ion_asar_in_memory(
         &mut base_ion_archive,
         &orig_ion_sha,
         app_version.as_deref(),
+        &target_patch_version,
         &shell_en_to_zh,
+        effective_dict.as_ref(),
     )?;
 
     let (patched_app_bytes, patched_app_header_json) = base_app_archive.pack()?;
@@ -1773,7 +1823,7 @@ pub fn patch_claude_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, String
 
     let meta = ClaudePatchMeta {
         schema: 1,
-        patch_version: CURRENT_UI_PATCH_VERSION.to_string(),
+        patch_version: target_patch_version,
         app_version,
         original_app_asar_sha256: orig_app_sha,
         patched_app_asar_sha256: patched_app_sha,
@@ -1986,6 +2036,7 @@ pub fn restore_claude_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::antigravity_i18n::CURRENT_UI_PATCH_VERSION;
     use crate::adapters::asar_patch::{parse_ui_patch_block_error, UiPatchBlockKind};
     use tempfile::TempDir;
 
@@ -2212,5 +2263,59 @@ mod tests {
         let err = patch_claude_ui_for_paths(&msix_paths).unwrap_err();
         let prompt = parse_ui_patch_block_error(&err).expect("must emit structured MSIX block");
         assert_eq!(prompt.kind, UiPatchBlockKind::WindowsMsixReadOnly);
+    }
+
+    #[test]
+    fn cloud_overlay_pack_triggers_update_available_and_auto_sync() {
+        let tmp = TempDir::new().unwrap();
+        let (paths, app_dir) = setup_fake_macos_claude_bundle(tmp.path(), "1.1.0");
+        let ion_asar_path = app_dir.join("Contents").join("Resources").join("ion-dist.asar");
+
+        let mut st = crate::config::read_switch_state(&paths);
+        st.prefer_chinese_ui = true;
+        crate::config::save_switch_state(&paths, &st).unwrap();
+
+        // 1. Initial patch uses built-in version and has no pending update
+        let first = patch_claude_ui_for_paths(&paths).unwrap();
+        assert_eq!(first.status, UiPatchStatus::Patched);
+        assert!(!first.update_available);
+        assert_eq!(first.patch_version.as_deref(), Some(CURRENT_UI_PATCH_VERSION));
+
+        // 2. Installing a newer cloud dictionary overlay marks update_available = true
+        let overlay = r#"{"New chat":"全新会话（云端词典）"}"#.as_bytes();
+        let sha = sha256_hex(overlay);
+        assert!(crate::adapters::install_i18n_pack_bytes(
+            &paths,
+            AppId::Claude,
+            "20261123.9",
+            overlay,
+            Some(&sha),
+            None,
+        )
+        .unwrap());
+
+        let before_sync = inspect_claude_ui_patch(&paths);
+        assert_eq!(before_sync.status, UiPatchStatus::Patched);
+        assert!(before_sync.update_available);
+
+        // 3. Background auto-sync upgrades the patch seamlessly with the overlay translation
+        let report = crate::auto_sync_pending_ui_patches_for_paths(&paths, None);
+        assert_eq!(report.updated, vec![AppId::Claude]);
+
+        let after_sync = inspect_claude_ui_patch(&paths);
+        assert_eq!(after_sync.status, UiPatchStatus::Patched);
+        assert!(!after_sync.update_available);
+        assert_eq!(
+            after_sync.patch_version.as_deref(),
+            Some(format!("{CURRENT_UI_PATCH_VERSION}+pack.20261123.9").as_str())
+        );
+
+        let ion_arc = AsarArchive::parse(&fs::read(&ion_asar_path).unwrap()).unwrap();
+        let zh_map: Map<String, Value> =
+            serde_json::from_slice(ion_arc.get_file("i18n/zh-Hans.json").unwrap()).unwrap();
+        assert_eq!(
+            zh_map.get("k2").and_then(Value::as_str),
+            Some("全新会话（云端词典）")
+        );
     }
 }

@@ -449,6 +449,11 @@ pub struct SwitchState {
     pub mcp: McpToolsConfig,
     #[serde(default)]
     pub model_filters: ModelFiltersConfig,
+    /// Apps where the user explicitly chose Official / Standalone mode.
+    /// When logged into Tako, apps absent from this list default to Tako intent
+    /// and lazily switch to Tako right before launch/restart so active sessions are never disrupted.
+    #[serde(default)]
+    pub explicit_official_apps: Vec<AppId>,
 }
 
 impl SwitchState {
@@ -467,6 +472,21 @@ impl SwitchState {
             bypass_system_proxy: true,
             mcp: McpToolsConfig::with_default_dir(paths),
             model_filters: ModelFiltersConfig::default(),
+            explicit_official_apps: Vec::new(),
+        }
+    }
+
+    pub fn is_explicit_official(&self, app_id: AppId) -> bool {
+        self.explicit_official_apps.contains(&app_id)
+    }
+
+    pub fn set_explicit_official(&mut self, app_id: AppId, official: bool) {
+        if official {
+            if !self.explicit_official_apps.contains(&app_id) {
+                self.explicit_official_apps.push(app_id);
+            }
+        } else {
+            self.explicit_official_apps.retain(|id| *id != app_id);
         }
     }
 

@@ -7,6 +7,9 @@ pub use crate::adapters::asar_patch::{
     parse_ui_patch_block_error, patch_windows_pe_asar_integrity, UiPatchBlockKind,
     UiPatchPermissionPrompt, UI_PATCH_BLOCK_PREFIX,
 };
+use crate::adapters::i18n_packs::{
+    effective_ui_patch_version, load_i18n_overlay_dict, merge_json_dict_with_overlay,
+};
 use crate::adapters::{AppId, DesktopAppAdapter};
 use crate::config::{write_atomic, AppPaths};
 use serde::{Deserialize, Serialize};
@@ -38,6 +41,10 @@ pub enum UiPatchStatus {
 pub struct UiPatchInfo {
     pub status: UiPatchStatus,
     pub patch_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_patch_version: Option<String>,
+    #[serde(default)]
+    pub update_available: bool,
     pub has_valid_backup: bool,
     pub target_asar_path: Option<String>,
     pub note: Option<String>,
@@ -48,6 +55,8 @@ impl UiPatchInfo {
         Self {
             status: UiPatchStatus::NotApplicable,
             patch_version: None,
+            target_patch_version: None,
+            update_available: false,
             has_valid_backup: false,
             target_asar_path: None,
             note: None,
@@ -769,11 +778,16 @@ fn patch_main_process_js(raw_js: &str, is_updater: bool) -> String {
     format!("{hook}\n{transformed}\n")
 }
 
+#[allow(dead_code)]
 fn patch_preload_js(raw_js: &str) -> String {
+    patch_preload_js_with_dict(raw_js, ANTIGRAVITY_ZH_DICT_JSON)
+}
+
+fn patch_preload_js_with_dict(raw_js: &str, dict_json: &str) -> String {
     if raw_js.contains(PATCH_GUARD_COMMENT) {
         return raw_js.to_string();
     }
-    let iife = build_preload_iife();
+    let iife = build_preload_iife_with_dict(dict_json);
     if raw_js.ends_with('\n') {
         format!("{raw_js}\n{iife}\n")
     } else {
@@ -781,8 +795,8 @@ fn patch_preload_js(raw_js: &str) -> String {
     }
 }
 
-fn build_preload_iife() -> String {
-    let safe_dict_json = ANTIGRAVITY_ZH_DICT_JSON
+fn build_preload_iife_with_dict(dict_json: &str) -> String {
+    let safe_dict_json = dict_json
         .trim()
         .replace('\u{2028}', "\\u2028")
         .replace('\u{2029}', "\\u2029")
@@ -1605,11 +1619,14 @@ fn is_patchable_asar(archive: &AsarArchive) -> bool {
 }
 
 pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
+    let target_patch_version = effective_ui_patch_version(paths, AppId::Antigravity);
     let target = match resolve_antigravity_target(paths) {
         TargetResolution::NotInstalled => {
             return UiPatchInfo {
                 status: UiPatchStatus::NotInstalled,
                 patch_version: None,
+                target_patch_version: Some(target_patch_version),
+                update_available: false,
                 has_valid_backup: false,
                 target_asar_path: None,
                 note: None,
@@ -1619,6 +1636,8 @@ pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
             return UiPatchInfo {
                 status: UiPatchStatus::Unsupported,
                 patch_version: None,
+                target_patch_version: Some(target_patch_version),
+                update_available: false,
                 has_valid_backup: false,
                 target_asar_path: None,
                 note: Some(format!(
@@ -1635,6 +1654,8 @@ pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
         return UiPatchInfo {
             status: UiPatchStatus::Unsupported,
             patch_version: None,
+            target_patch_version: Some(target_patch_version),
+            update_available: false,
             has_valid_backup: false,
             target_asar_path: Some(asar_path_str),
             note: Some("无法读取 app.asar 文件".to_string()),
@@ -1647,6 +1668,8 @@ pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
             return UiPatchInfo {
                 status: UiPatchStatus::Unsupported,
                 patch_version: None,
+                target_patch_version: Some(target_patch_version),
+                update_available: false,
                 has_valid_backup: false,
                 target_asar_path: Some(asar_path_str),
                 note: Some(err),
@@ -1667,13 +1690,23 @@ pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
             .or_else(|| marker.as_ref().map(|m| m.original_asar_sha256.as_str()))
             .unwrap_or("");
         let has_valid_backup = verify_clean_backup_asar(paths, expected_sha).is_ok();
+        let update_available = patch_version.as_deref() != Some(target_patch_version.as_str());
+        let note = if update_available {
+            format!(
+                "检测到新版简体中文词典（v{target_patch_version}），Antigravity 关闭时将自动同步，也可立即一键更新"
+            )
+        } else {
+            "Antigravity 菜单与主界面简体中文补丁已生效".to_string()
+        };
 
         return UiPatchInfo {
             status: UiPatchStatus::Patched,
             patch_version,
+            target_patch_version: Some(target_patch_version),
+            update_available,
             has_valid_backup,
             target_asar_path: Some(asar_path_str),
-            note: Some("Antigravity 菜单与主界面简体中文补丁已生效".to_string()),
+            note: Some(note),
         };
     }
 
@@ -1681,6 +1714,8 @@ pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
         return UiPatchInfo {
             status: UiPatchStatus::Unsupported,
             patch_version: None,
+            target_patch_version: Some(target_patch_version),
+            update_available: false,
             has_valid_backup: false,
             target_asar_path: Some(asar_path_str),
             note: Some("当前 Antigravity 安装包未包含受支持的入口脚本".to_string()),
@@ -1691,15 +1726,19 @@ pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
         return UiPatchInfo {
             status: UiPatchStatus::OutdatedAfterUpgrade,
             patch_version: Some(old_meta.patch_version),
+            target_patch_version: Some(target_patch_version),
+            update_available: true,
             has_valid_backup: false,
             target_asar_path: Some(asar_path_str),
-            note: Some("检测到 Antigravity 已升级至新版本，点击即可基于新版重新注入汉化补丁".to_string()),
+            note: Some("检测到 Antigravity 已升级至新版本，关闭客户端时将自动重打汉化，也可立即重新应用".to_string()),
         };
     }
 
     UiPatchInfo {
         status: UiPatchStatus::Unpatched,
         patch_version: None,
+        target_patch_version: Some(target_patch_version),
+        update_available: false,
         has_valid_backup: false,
         target_asar_path: Some(asar_path_str),
         note: None,
@@ -1737,6 +1776,8 @@ pub fn patch_antigravity_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, S
     let current_archive = AsarArchive::parse(&current_bytes)?;
     let backup_dir = ui_patch_backup_dir(paths);
 
+    let target_patch_version = effective_ui_patch_version(paths, AppId::Antigravity);
+
     // Determine clean base archive & ensure original backup is NEVER overwritten by a patched ASAR.
     let (mut base_archive, orig_sha256) =
         if let Some(marker_bytes) = current_archive.get_file(PATCH_MARKER_FILE) {
@@ -1746,7 +1787,7 @@ pub fn patch_antigravity_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, S
                 .map(|m| m.original_asar_sha256)
                 .unwrap_or_else(|| marker.original_asar_sha256.clone());
 
-            if marker.patch_version == CURRENT_UI_PATCH_VERSION
+            if marker.patch_version == target_patch_version
                 && verify_clean_backup_asar(paths, &expected_orig_sha).is_ok()
             {
                 return Ok(inspect_antigravity_ui_patch(paths));
@@ -1820,13 +1861,17 @@ pub fn patch_antigravity_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, S
     if let Some(preload_bytes) = base_archive.get_file("dist/preload.js") {
         let preload_str = std::str::from_utf8(preload_bytes)
             .map_err(|e| format!("dist/preload.js 非合法 UTF-8: {e}"))?;
-        let patched_preload = patch_preload_js(preload_str);
+        let merged_dict_json = merge_json_dict_with_overlay(
+            ANTIGRAVITY_ZH_DICT_JSON,
+            load_i18n_overlay_dict(paths, AppId::Antigravity),
+        );
+        let patched_preload = patch_preload_js_with_dict(preload_str, &merged_dict_json);
         base_archive.set_file("dist/preload.js", patched_preload.into_bytes())?;
     }
 
     let marker_payload = PatchMarkerPayload {
         schema: 1,
-        patch_version: CURRENT_UI_PATCH_VERSION.to_string(),
+        patch_version: target_patch_version.clone(),
         original_asar_sha256: orig_sha256.clone(),
         app_version: app_version.clone(),
     };
@@ -1852,7 +1897,7 @@ pub fn patch_antigravity_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, S
 
     let meta = PatchMeta {
         schema: 1,
-        patch_version: CURRENT_UI_PATCH_VERSION.to_string(),
+        patch_version: target_patch_version,
         app_version,
         original_asar_sha256: orig_sha256,
         patched_asar_sha256,

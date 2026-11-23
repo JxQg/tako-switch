@@ -5,6 +5,7 @@ pub mod claude;
 pub mod claude_i18n;
 pub mod codex;
 pub mod dsh_tako;
+pub mod i18n_packs;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_process;
 
@@ -20,6 +21,10 @@ pub use asar_patch::{
 pub use claude_i18n::{
     inspect_claude_ui_patch, patch_claude_ui_for_paths, restore_claude_ui_for_paths,
     validate_icu_compatibility, CLAUDE_PATCH_GUARD_COMMENT,
+};
+pub use i18n_packs::{
+    effective_ui_patch_version, install_i18n_pack_bytes, load_i18n_overlay_dict,
+    merge_json_dict_with_overlay, refresh_remote_i18n_packs,
 };
 
 use crate::config::{write_atomic, AppPaths, McpToolsConfig};
