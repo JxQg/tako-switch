@@ -31,8 +31,15 @@ class FakeS3:
     def __init__(self, bucket: str = "bucket-x"):
         self.bucket = bucket
         self.uploaded: list[tuple[str, str, str | None]] = []
+        self.heads: dict[str, dict] = {}
+        self.fail_on: set[str] = set()
+
+    def head_object(self, key: str) -> dict | None:
+        return self.heads.get(key)
 
     def upload_file(self, local_path: Path, key: str, *, cache_control: str, content_type=None, metadata=None) -> None:
+        if key in self.fail_on:
+            raise RuntimeError(f"boom {key}")
         self.uploaded.append((key, cache_control, content_type))
 
 
@@ -77,12 +84,13 @@ class SyncReleaseCdnTests(unittest.TestCase):
             latest = write_latest_cn(tmp, ["https://dl.lven.asia/tako-switch/releases/v9.9.9/app.dmg"])
             fake = FakeS3("mybucket")
             keys = mod.sync_release_to_bucket(fake, tag="v9.9.9", files=files, latest_cn=latest)
+            # Pointer lands before any binary so a dead cross-border PUT can never block it.
             self.assertEqual(
                 keys,
                 [
+                    "tako-switch/latest.json",
                     "tako-switch/releases/v9.9.9/SHA256SUMS.txt",
                     "tako-switch/releases/v9.9.9/app.dmg",
-                    "tako-switch/latest.json",
                 ],
             )
             by_key = {k: (cc, ct) for k, cc, ct in fake.uploaded}
@@ -91,6 +99,46 @@ class SyncReleaseCdnTests(unittest.TestCase):
                 by_key["tako-switch/latest.json"],
                 (mod.LATEST_CACHE_CONTROL, mod.LATEST_CONTENT_TYPE),
             )
+
+    def test_sync_release_to_bucket_skips_existing_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            d = make_release_dir(tmp, ["app.dmg"])
+            files = mod.iter_release_files(d)
+            latest = write_latest_cn(tmp, ["https://dl.lven.asia/tako-switch/releases/v9.9.9/app.dmg"])
+            fake = FakeS3("mybucket")
+            key = "tako-switch/releases/v9.9.9/app.dmg"
+            fake.heads[key] = {"ContentLength": len("blob-app.dmg")}
+            keys = mod.sync_release_to_bucket(fake, tag="v9.9.9", files=files, latest_cn=latest)
+            self.assertEqual(keys, ["tako-switch/latest.json", key])
+            self.assertEqual([k for k, _, _ in fake.uploaded], ["tako-switch/latest.json"])
+
+    def test_sync_release_to_bucket_optional_binary_warns(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            d = make_release_dir(tmp, ["app.dmg", "app2.dmg"])
+            files = mod.iter_release_files(d)
+            latest = write_latest_cn(tmp, ["https://dl.lven.asia/tako-switch/releases/v9.9.9/app.dmg"])
+            fake = FakeS3("mybucket")
+            fake.fail_on.add("tako-switch/releases/v9.9.9/app.dmg")
+            keys = mod.sync_release_to_bucket(
+                fake, tag="v9.9.9", files=files, latest_cn=latest, binary_optional=True
+            )
+            self.assertEqual(
+                keys,
+                ["tako-switch/latest.json", "tako-switch/releases/v9.9.9/app2.dmg"],
+            )
+
+    def test_sync_release_to_bucket_binary_failure_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            d = make_release_dir(tmp, ["app.dmg"])
+            files = mod.iter_release_files(d)
+            latest = write_latest_cn(tmp, ["https://dl.lven.asia/tako-switch/releases/v9.9.9/app.dmg"])
+            fake = FakeS3("mybucket")
+            fake.fail_on.add("tako-switch/releases/v9.9.9/app.dmg")
+            with self.assertRaises(RuntimeError):
+                mod.sync_release_to_bucket(fake, tag="v9.9.9", files=files, latest_cn=latest)
 
     def test_verify_platform_urls_retries_then_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as td:
