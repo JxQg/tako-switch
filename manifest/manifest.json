@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-24T07:31:53Z",
+  "generatedAt": "2026-11-24T19:12:04Z",
   "apps": {
     "dsh-tako": {
       "displayName": "DSH Tako",
@@ -57,67 +57,67 @@
     },
     "claude": {
       "displayName": "Claude Desktop",
-      "version": "6.28899.6",
+      "version": "7.37095.0",
       "platforms": {
         "macos-universal": {
-          "url": "https://dl.lven.asia/apps/claude/macos-universal/6.28899.6/Claude-2f5fc59b2d1c672dd9dced86720c50f48cca0cf9.zip",
-          "version": "6.28899.6",
+          "url": "https://dl.lven.asia/apps/claude/macos-universal/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.zip",
+          "version": "7.37095.0",
           "installType": "zip",
           "appBundleName": "Claude.app",
-          "size": 404693227,
-          "sha256": "ae58c31858b41dd2a3bca78da26433f4f17c044ce3c2486128fb82a82e457f16",
-          "fallbackUrl": "https://downloads.claude.ai/releases/darwin/universal/6.28899.6/Claude-2f5fc59b2d1c672dd9dced86720c50f48cca0cf9.zip"
+          "size": 407313465,
+          "sha256": "800806556cacece6bdacbb9f3aef1849a9ed8d6fc2ee0eb2ed881a098d094eab",
+          "fallbackUrl": "https://downloads.claude.ai/releases/darwin/universal/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.zip"
         },
         "windows-x64": {
-          "url": "https://dl.lven.asia/apps/claude/windows-x64/6.28899.6/Claude-2f5fc59b2d1c672dd9dced86720c50f48cca0cf9.exe",
-          "version": "6.28899.6",
+          "url": "https://dl.lven.asia/apps/claude/windows-x64/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.exe",
+          "version": "7.37095.0",
           "installType": "exe",
           "silentArgs": [
             "--silent"
           ],
-          "size": 279363744,
-          "sha256": "8dc26a3418d84959a831255ebbfb0fbb5ddaf2d908021a9433ae46f1222a6057",
-          "fallbackUrl": "https://downloads.claude.ai/releases/win32/x64/6.28899.6/Claude-2f5fc59b2d1c672dd9dced86720c50f48cca0cf9.exe"
+          "size": 281758368,
+          "sha256": "0c2921ba4c2f5bbe14a10e91770a0833305d475c6cf3eeeaaa08d4b90e5bd768",
+          "fallbackUrl": "https://downloads.claude.ai/releases/win32/x64/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.exe"
         }
       }
     },
     "antigravity": {
       "displayName": "Google Antigravity",
-      "version": "2.34.0",
+      "version": "2.35.0",
       "platforms": {
         "macos-arm64": {
-          "url": "https://dl.lven.asia/apps/antigravity/macos-arm64/2.34.0/Antigravity.zip",
-          "version": "2.34.0",
+          "url": "https://dl.lven.asia/apps/antigravity/macos-arm64/2.35.0/Antigravity.zip",
+          "version": "2.35.0",
           "installType": "zip",
-          "sha512": "e266374246e95b1babbb980fbc9ada6ddaf7b4c1ff9a7403b5a965700e66e9b650ea0dc00a5a94e4dea0af2b747a697b9ab2ed9bb5646fe88841d0d1077c0217",
-          "size": 211599326,
+          "sha512": "4b37b5a93c0bf767c9a016666915749e69c61c5fbfb4453bc01d72cc2dd2a71f8c2a367420aaece816db16dfde44a68677a751a4a5b70582ba0fcafa6bd28f74",
+          "size": 216135553,
           "appBundleName": "Antigravity.app",
-          "sha256": "bb564db95b79761e66a58605ddf4d67020ede8865f902b8b7412f87bd384cc91",
-          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.34.0-5887025308631040/darwin-arm/Antigravity.zip"
+          "sha256": "150a2ba735e2b1f0fcf220b418a772ff42cc36aebf70cd14e738440b2fec6c0e",
+          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.0-6394266482769920/darwin-arm/Antigravity.zip"
         },
         "macos-x64": {
-          "url": "https://dl.lven.asia/apps/antigravity/macos-x64/2.34.0/Antigravity.zip",
-          "version": "2.34.0",
+          "url": "https://dl.lven.asia/apps/antigravity/macos-x64/2.35.0/Antigravity.zip",
+          "version": "2.35.0",
           "installType": "zip",
-          "sha512": "a2fae6eecf1818d511c3a9f8d43acbd8aea42191efc1a955156682495450cb4ae32c5e6e493c908a09b9c387443dbe18eee9c47038be15b978f63f4762b78293",
-          "size": 223410052,
+          "sha512": "bf5ed7ef26e46a3210030f8b6652e4bf0c20eadc5911078f8f19e35630100cd21b1ec06ffa5b6fc56e1964341a68552ca1c98247dad2714260c86c3f094168e5",
+          "size": 224089562,
           "appBundleName": "Antigravity.app",
-          "sha256": "9c0d2d8774038f4318b0dfc824afb72afa4e34c1786659a8e40a3a3fdf2891e5",
-          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.34.0-5887025308631040/darwin-x64/Antigravity.zip"
+          "sha256": "dc33f4a735b4c77c2a63fe0dc437f547f4999cc6b0a78993f56ae72fa97a02d0",
+          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.0-6394266482769920/darwin-x64/Antigravity.zip"
         },
         "windows-x64": {
-          "url": "https://dl.lven.asia/apps/antigravity/windows-x64/2.34.0/Antigravity-x64.exe",
-          "version": "2.34.0",
+          "url": "https://dl.lven.asia/apps/antigravity/windows-x64/2.35.0/Antigravity-x64.exe",
+          "version": "2.35.0",
           "installType": "exe",
-          "sha512": "2a430f97a29643cb1751dbe46d29379c775f5b24983e413d64d6be49b2849cb304e19c30a45f500137f75a5421ad09d82dd7d1d4ed290c1c35be3d7fe13f0a6c",
-          "size": 169817280,
+          "sha512": "5779d1f396b531f1221d66f9b920c980dfb8f5606f8405c8484d7a2c69cce9210688cccd51d2cb4011beba48b38cc310a01d9d0b566fdbdb34fb99f8c081a5a8",
+          "size": 170274552,
           "silentArgs": [
             "/VERYSILENT",
             "/NORESTART",
             "/CLOSEAPPLICATIONS"
           ],
-          "sha256": "7c34f5aecbb269a182b12f63fd8f4f7e3bb4a893f23490d99735b137a7e881bd",
-          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.34.0-5887025308631040/windows-x64/Antigravity-x64.exe"
+          "sha256": "14289414612ae336933a6963880b3996ab34f47d7d6f4951e0eae1871694050e",
+          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.0-6394266482769920/windows-x64/Antigravity-x64.exe"
         }
       }
     }
