@@ -36,6 +36,9 @@
 | `src-tauri/src/main.rs` | 4 角色子命令路由（`mcp-server`、`status-line`、`gateway-proxy` / `agy-proxy`、GUI） |
 | `src-tauri/src/lib.rs` | Tauri 命令注册（含 `sync_window_theme`、`show_window_system_menu`、`set_prefer_chinese_ui`、`patch_antigravity_ui`、`restore_antigravity_ui`、`list_plaza_models`、`run_mcp_live_demo`）、Windows 无框阴影与 DWM 边框色装配、OSS/GitHub 双端点更新策略、网关守护 |
 | `src-tauri/src/config.rs` | `AppPaths`（含沙盒 `agy_app_override_dir`）、备份存取 (`has_backup`)、`SwitchState`（含 `UiDensity` / `ThemePref`）、`ClientModelFilter`、持久化设备指纹、原子写 (`write_atomic`) |
+| `src-tauri/src/extensions/mod.rs` / `skills.rs` | 复用 `SyncPlatform` 的三端扩展平台类型、JSON Store、代理策略与 Skills 主副本、软链回退、ZIP 导入、GitHub 仓库发现和内容哈希更新 |
+| `src/components/ExtensionsHubPanel.tsx` / `extensions/` | 扩展中心入口、公共搜索/菜单/抽屉原语和 Skills 已安装矩阵、仓库发现、导入视图 |
+| `docs/skills-hub.md` / `src-tauri/tests/ext_hub_phase2_blackbox.rs` / `scripts/test_skills_hub_ui.mjs` | Skills 使用与存储契约、隔离后端黑盒和八组窗口/主题/密度 UI 验证 |
 | `src-tauri/src/auth.rs` | 独立于 `tako-cli` 的 OAuth PKCE 登录（`DESKTOP_OAUTH_CLIENT_ID = "takoswitch"`、`build_oauth_authorize_url`、`exchange_desktop_token`）与 `~/.tako/switch/auth.json` 存取、`AccountStatus`、`BalanceCache` |
 | `src-tauri/src/agy_proxy.rs` | 本地网关服务、免登录模型广场 `fetch_plaza_models_for_ui` / `build_plaza_model_options`、`/claude` 与 `/codex` 模型目录生成与过滤、Antigravity 32 槽位展开 |
 | `src-tauri/src/mcp_server.rs` | 6 合 1 `stdio` MCP 工具实现（`tako_web_search`、`tako_generate_image`、`tako_generate_video`、`tako_generate_audio`、`tako_consult`、`tako_account_status`）及现场试跑核心 `execute_live_demo_for_paths` |
@@ -84,6 +87,10 @@
 7. **默认绕过系统代理与本地网关断连中止规则（`config.rs`、`agy_proxy.rs`、`auth.rs`、`mcp_server.rs`）**：
    - `SwitchState.bypass_system_proxy`（JSON 键 `bypassSystemProxy`）默认值为 `true`（直连 Tako 网关 `.no_proxy()`），避免用户开启慢速全局/系统代理时劫持网关上行；在设置中关闭后无需重启守护进程即可动态切回系统代理。
    - 本地网关转发无需改写的超大请求体（> 64 KiB）时采用流式透传，并在下游客户端断开 TCP 连接时立即中止上游请求，防止超时重试堆积僵尸上传。
+8. **Skills 主副本与安全分发（`extensions/skills.rs`）**：
+   - 只纳管 Claude、Codex 和 Antigravity。主副本位于 `paths.switch_dir()/skills/<id>`；全关保留主副本，仅 `uninstall_skill` 清理主副本。
+   - 自动模式先尝试目录软链，失败后复制到临时目录并替换。移除链接或 Junction 时只移除链接本身。覆盖客户端目录前调用 `backup_file_once`，元数据通过 `write_atomic` 落盘。
+   - ZIP 先在内存校验路径、类型、数量、深度和 50 MiB 解压上限。仓库下载逐次读取代理策略，更新不得静默覆盖本地修改；测试只使用 `AppPaths::for_test` 和本地 HTTP 服务。
 
 ---
 

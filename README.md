@@ -61,6 +61,8 @@ Tako Switch 在每次写入前都会自动备份原配置至 `~/.tako/switch/bac
 
 ## 本地目录结构与隐私安全
 
+Skills 主副本、三端同步、本地和 ZIP 导入、GitHub 仓库发现的说明见 [Skills 技能管理](./docs/skills-hub.md)。
+
 Tako Switch 的所有配置均保存在用户主目录的独立子目录下，与 `tako-cli`（`~/.tako/config.json`）**完全隔离，互不覆盖**：
 
 | 路径 | 用途 |

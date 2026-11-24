@@ -23,6 +23,7 @@ import {
 import { CHANGELOG_RELEASES, parseReleaseNotesLines } from "./lib/changelog";
 import { ClientSettingsPanel } from "./components/ClientSettingsPanel";
 import { GeneralSettingsPanel } from "./components/GeneralSettingsPanel";
+import { ExtensionsHubPanel } from "./components/ExtensionsHubPanel";
 import { McpCenterPanel, type McpCenterSection } from "./components/McpCenterPanel";
 import type { McpToolKey } from "./components/McpInlineTheater";
 import { ModelPickerModal } from "./components/ModelPickerModal";
@@ -193,7 +194,7 @@ export default function App() {
       // Let inputs or subpage drawers consume Escape first when focused
       const activeTag = document.activeElement?.tagName?.toLowerCase();
       if (activeTag === "input" || activeTag === "textarea") return;
-      if (activeRoute === "mcp") return;
+      if (activeRoute === "mcp" || document.querySelector('[role="dialog"][aria-modal="true"]')) return;
       setActiveRoute("overview");
     };
     window.addEventListener("keydown", onKeyDown);
@@ -1254,7 +1255,8 @@ export default function App() {
       !dashboard ||
       activeRoute === "overview" ||
       activeRoute === "general" ||
-      activeRoute === "mcp"
+      activeRoute === "mcp" ||
+      activeRoute === "extensions"
     ) {
       return null;
     }
@@ -1369,6 +1371,10 @@ export default function App() {
             }}
             onOpenMultiSync={(section) => {
               setMcpInitialTab(null);
+              if (section === "skill-sync") {
+                setActiveRoute("extensions");
+                return;
+              }
               setMcpInitialSection(section);
               setActiveRoute("mcp");
             }}
@@ -1427,6 +1433,16 @@ export default function App() {
           />
         )}
 
+        {activeRoute === "extensions" && (
+          <ExtensionsHubPanel
+            onNotify={showTransientNote}
+            onOpenMcp={() => {
+              setMcpInitialSection("mcp-sync");
+              setActiveRoute("mcp");
+            }}
+          />
+        )}
+
         {activeRoute === "mcp" && (
           <McpCenterPanel
             mcp={dashboard?.state.mcp ?? null}
@@ -1439,6 +1455,7 @@ export default function App() {
             onConsumeInitialSection={() => setMcpInitialSection(null)}
             onNotify={showTransientNote}
             onGoHome={() => setActiveRoute("overview")}
+            onOpenSkillsHub={() => setActiveRoute("extensions")}
             onToggleCoreTool={(key) => void handleToggleMcpTool(key)}
             onToggleWebPage={handleToggleWebPage}
             onSaveEdgeOneConfig={handleSaveEdgeOneConfig}
@@ -1481,6 +1498,7 @@ export default function App() {
         {activeRoute !== "overview" &&
           activeRoute !== "general" &&
           activeRoute !== "mcp" &&
+          activeRoute !== "extensions" &&
           !selectedClientApp && (
             <div className="w-full px-5 py-12 text-center text-[13px] text-[var(--text-muted)]">
               {loading ? "正在读取客户端状态..." : "未找到该客户端配置"}

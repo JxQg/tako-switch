@@ -47,6 +47,7 @@ interface TopHeaderBarProps {
 function subpageTitle(route: NavRoute): string {
   if (route === "general") return "通用设置";
   if (route === "mcp") return "MCP 能力中心";
+  if (route === "extensions") return "通用扩展中心";
   if (route === "overview") return "首页";
   return `${APP_DISPLAY_NAMES[route]} 设置`;
 }
@@ -209,7 +210,7 @@ export function TopHeaderBar({
                   {account.userName ?? "Tako 用户"}
                 </span>
                 {account.planName && (
-                  <span className="hidden sm:inline text-[11.5px] font-medium text-[var(--accent)] shrink-0">
+                  <span className="hidden min-[900px]:inline text-[11.5px] font-medium text-[var(--accent)] shrink-0">
                     {account.planName}
                   </span>
                 )}

@@ -7,6 +7,7 @@ import {
   ExternalLink,
   FileText,
   Film,
+  FolderGit2,
   Globe,
   Globe2,
   Headphones,
@@ -798,6 +799,19 @@ export function OverviewPanel({
             );
           })}
         </div>
+      </section>
+
+      <section className="min-w-0 border-t border-[var(--border)] pt-3">
+        <button
+          type="button"
+          data-testid="open-ext-hub-skills"
+          onClick={() => onNavigate("extensions")}
+          className="flex w-full min-w-0 cursor-pointer items-center gap-2 rounded-[7px] px-2 py-2 text-left text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+        >
+          <FolderGit2 className="h-4 w-4 shrink-0 text-[var(--success)]" />
+          <span className="min-w-0 flex-1 truncate text-[12px] font-semibold">通用扩展中心 · Skills 技能</span>
+          <ChevronRight className="h-3.5 w-3.5 shrink-0" />
+        </button>
       </section>
     </div>
   );

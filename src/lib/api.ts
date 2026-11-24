@@ -397,6 +397,80 @@ export interface LiveDemoResult {
 }
 
 export type SyncPlatform = "claude" | "codex" | "antigravity";
+export type ExtPlatform = SyncPlatform;
+export type SkillSyncMethod = "auto" | "symlink" | "copy";
+export type SkillLinkMode = "symlink" | "copy";
+export type SkillSource = "local" | "adopted" | "zip" | "github";
+
+export interface SkillRepo {
+  owner: string;
+  name: string;
+  branch: string;
+  enabled: boolean;
+  archiveUrlOverride?: string | null;
+}
+
+export interface SkillRecord {
+  id: string;
+  name: string;
+  description: string;
+  source: SkillSource;
+  repoOwner: string | null;
+  repoName: string | null;
+  repoBranch: string | null;
+  repoSubdir: string | null;
+  installedHash: string;
+  remoteHash: string | null;
+  updateAvailable: boolean;
+  enabledPlatforms: ExtPlatform[];
+}
+
+export interface SkillTargetStatus {
+  path: string;
+  actualMethod: SkillLinkMode | null;
+  hasDiff: boolean;
+}
+
+export interface SkillPlatformStatus {
+  enabled: boolean;
+  actualMethod: SkillLinkMode | null;
+  hasDiff: boolean;
+  targets: SkillTargetStatus[];
+}
+
+export interface ManagedSkill {
+  skill: SkillRecord;
+  masterPath: string;
+  platforms: Record<ExtPlatform, SkillPlatformStatus>;
+  locallyModified: boolean;
+}
+
+export interface SkillsHubSnapshot {
+  syncMethod: SkillSyncMethod;
+  defaultTargets: ExtPlatform[];
+  masterDir: string;
+  skills: ManagedSkill[];
+  repos: SkillRepo[];
+}
+
+export interface DiscoverableSkill {
+  id: string;
+  name: string;
+  description: string;
+  repoOwner: string;
+  repoName: string;
+  repoBranch: string;
+  repoSubdir: string;
+  remoteHash: string;
+  installedId: string | null;
+  updateAvailable: boolean;
+}
+
+export interface ImportLocalSkillRequest {
+  path?: string | null;
+  zipBase64?: string | null;
+  targets?: ExtPlatform[];
+}
 
 export interface SyncedMcpSpec {
   transport: string;
@@ -444,6 +518,33 @@ export interface BatchSyncOutcome {
 }
 
 export const api = {
+  getSkillsHubSnapshot: () => invoke<SkillsHubSnapshot>("get_skills_hub_snapshot"),
+  toggleSkillPlatform: (id: string, platform: ExtPlatform, enabled: boolean) =>
+    invoke<SkillsHubSnapshot>("toggle_skill_platform", { id, platform, enabled }),
+  alignSkillPlatforms: (id: string, targets: ExtPlatform[]) =>
+    invoke<SkillsHubSnapshot>("align_skill_platforms", { id, targets }),
+  uninstallSkill: (id: string) => invoke<SkillsHubSnapshot>("uninstall_skill", { id }),
+  setSkillSyncMethod: (method: SkillSyncMethod) =>
+    invoke<SkillsHubSnapshot>("set_skill_sync_method", { method }),
+  setSkillDefaultTargets: (targets: ExtPlatform[]) =>
+    invoke<SkillsHubSnapshot>("set_skill_default_targets", { targets }),
+  importLocalSkill: (input: ImportLocalSkillRequest) =>
+    invoke<SkillsHubSnapshot>("import_local_skill", { input }),
+  scanAdoptLocalSkills: () => invoke<SkillsHubSnapshot>("scan_adopt_local_skills"),
+  upsertSkillRepo: (repo: SkillRepo) =>
+    invoke<SkillsHubSnapshot>("upsert_skill_repo", { repo }),
+  removeSkillRepo: (owner: string, name: string) =>
+    invoke<SkillsHubSnapshot>("remove_skill_repo", { owner, name }),
+  discoverRepoSkills: (owner: string, name: string) =>
+    invoke<DiscoverableSkill[]>("discover_repo_skills", { owner, name }),
+  installDiscoveredSkill: (
+    owner: string,
+    name: string,
+    subdir: string,
+    targets: ExtPlatform[],
+  ) => invoke<SkillsHubSnapshot>("install_discovered_skill", { owner, name, subdir, targets }),
+  updateInstalledSkill: (id: string) =>
+    invoke<SkillsHubSnapshot>("update_installed_skill", { id }),
   getDashboard: (refreshAccount: boolean) =>
     invoke<DashboardPayload>("get_dashboard", { refreshAccount }),
   getRunningStates: () =>

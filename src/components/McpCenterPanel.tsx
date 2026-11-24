@@ -84,6 +84,7 @@ interface McpCenterPanelProps {
   onConsumeInitialSection?: () => void;
   onNotify?: (msg: string) => void;
   onGoHome: () => void;
+  onOpenSkillsHub: () => void;
   onToggleCoreTool: (key: McpToolKey) => void;
   onToggleWebPage: (next: boolean) => Promise<void>;
   onSaveEdgeOneConfig: (token: string, projectName: string) => Promise<void>;
@@ -102,6 +103,7 @@ export function McpCenterPanel({
   onConsumeInitialSection,
   onNotify,
   onGoHome,
+  onOpenSkillsHub,
   onToggleCoreTool,
   onToggleWebPage,
   onSaveEdgeOneConfig,
@@ -123,10 +125,11 @@ export function McpCenterPanel({
 
   useEffect(() => {
     if (initialSection) {
-      setActiveSection(initialSection);
+      if (initialSection === "skill-sync") onOpenSkillsHub();
+      else setActiveSection(initialSection);
       onConsumeInitialSection?.();
     }
-  }, [initialSection, onConsumeInitialSection]);
+  }, [initialSection, onConsumeInitialSection, onOpenSkillsHub]);
   const [authGuideOpen, setAuthGuideOpen] = useState(false);
 
   const [tokenOpen, setTokenOpen] = useState(false);
@@ -245,7 +248,10 @@ export function McpCenterPanel({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <SegmentedControl<McpCenterSection>
           value={activeSection}
-          onChange={setActiveSection}
+          onChange={(section) => {
+            if (section === "skill-sync") onOpenSkillsHub();
+            else setActiveSection(section);
+          }}
           options={[
             { id: "builtin", label: "Tako 内置工具" },
             { id: "mcp-sync", label: "多平台 MCP 同步" },
@@ -256,10 +262,6 @@ export function McpCenterPanel({
 
       {activeSection === "mcp-sync" && (
         <MultiPlatformSyncPanel mode="mcp" onNotify={onNotify} />
-      )}
-
-      {activeSection === "skill-sync" && (
-        <MultiPlatformSyncPanel mode="skill" onNotify={onNotify} />
       )}
 
       {/* Capabilities Grid: Full-width Tako Web Page + 2-Column 5 Core Abilities */}
