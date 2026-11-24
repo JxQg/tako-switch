@@ -1,7 +1,13 @@
-import type { AppId, AppSnapshot, ClientModelFilter } from "../lib/api";
+import type {
+  AppId,
+  AppSnapshot,
+  ClientModelFilter,
+  ThemePref,
+  UiDensity,
+} from "../lib/api";
 
 export type NavRoute = "overview" | "general" | "mcp" | AppId;
-export type ThemePref = "system" | "light" | "dark";
+export type { ThemePref, UiDensity };
 
 export const CLIENT_ORDER: AppId[] = ["claude", "codex", "antigravity", "dsh-tako"];
 
@@ -172,7 +178,7 @@ export function StatusPill({
 
   return (
     <span
-      className={`inline-flex items-center gap-1.5 h-6 px-2.5 rounded-full text-[11px] font-semibold shrink-0 whitespace-nowrap ${toneClass}`}
+      className={`inline-flex items-center gap-1.5 h-[var(--density-pill-h)] px-2.5 rounded-full text-[11px] font-semibold shrink-0 whitespace-nowrap ${toneClass}`}
     >
       {children}
     </span>
@@ -184,23 +190,29 @@ export function SegmentedControl<T extends string>({
   value,
   onChange,
   disabled = false,
+  testId,
 }: {
   options: { id: T; label: string }[];
   value: T;
   onChange: (next: T) => void;
   disabled?: boolean;
+  testId?: string;
 }) {
   return (
-    <div className="inline-flex p-[3px] rounded-[9px] bg-[var(--bg-pill)] border border-[var(--border)]/70 shrink-0">
+    <div
+      data-testid={testId}
+      className="inline-flex p-[3px] rounded-[9px] bg-[var(--bg-pill)] border border-[var(--border)]/70 shrink-0"
+    >
       {options.map((opt) => {
         const active = value === opt.id;
         return (
           <button
             key={opt.id}
             type="button"
+            data-testid={testId ? `${testId}-${opt.id}` : undefined}
             disabled={disabled}
             onClick={() => onChange(opt.id)}
-            className={`h-[27px] min-w-[64px] px-2.5 rounded-[7px] text-[12px] transition cursor-pointer disabled:opacity-50 whitespace-nowrap ${
+            className={`h-[var(--density-ctrl-sm-h)] min-w-[64px] px-2.5 rounded-[7px] text-[12px] transition cursor-pointer disabled:opacity-50 whitespace-nowrap ${
               active
                 ? "bg-[var(--bg-card)] text-[var(--text-primary)] font-semibold shadow-[var(--shadow-segment)]"
                 : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"

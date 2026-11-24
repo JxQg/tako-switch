@@ -41,6 +41,59 @@
   --backdrop: rgba(15, 23, 42, 0.34);
   --language-grad: linear-gradient(120deg, #f3f2ff 0%, #fff7f4 100%);
   --webpage-grad: linear-gradient(125deg, #ffffff 42%, #f2f0ff 100%);
+
+  /* Dual-Density Design Tokens — Default: Compact ("compact") */
+  --density-font-base: 13px;
+  --density-line-height: 1.48;
+  --density-titlebar-h: 46px;
+  --density-titlebar-mac-h: 48px;
+  --density-statusbar-h: 30px;
+  --density-page-px: 16px;
+  --density-page-py: 12px;
+  --density-subpage-py: 14px;
+  --density-section-gap: 12px;
+  --density-subpage-gap: 16px;
+  --density-list-gap: 8px;
+  --density-card-px: 14px;
+  --density-card-py: 9px;
+  --density-mcp-card-px: 10px;
+  --density-mcp-card-py: 8px;
+  --density-panel-px: 16px;
+  --density-panel-py: 11px;
+  --density-row-py: 11px;
+  --density-ctrl-h: 32px;
+  --density-ctrl-sm-h: 27px;
+  --density-pill-h: 24px;
+  --density-card-radius: 12px;
+  --density-brand-icon: 32px;
+  --density-page-max-w: 100%;
+}
+
+:root[data-density="comfortable"] {
+  --density-font-base: 13.5px;
+  --density-line-height: 1.56;
+  --density-titlebar-h: 54px;
+  --density-titlebar-mac-h: 54px;
+  --density-statusbar-h: 36px;
+  --density-page-px: 24px;
+  --density-page-py: 18px;
+  --density-subpage-py: 22px;
+  --density-section-gap: 18px;
+  --density-subpage-gap: 22px;
+  --density-list-gap: 12px;
+  --density-card-px: 18px;
+  --density-card-py: 14px;
+  --density-mcp-card-px: 14px;
+  --density-mcp-card-py: 12px;
+  --density-panel-px: 20px;
+  --density-panel-py: 15px;
+  --density-row-py: 16px;
+  --density-ctrl-h: 36px;
+  --density-ctrl-sm-h: 31px;
+  --density-pill-h: 26px;
+  --density-card-radius: 14px;
+  --density-brand-icon: 36px;
+  --density-page-max-w: 980px;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -137,13 +190,107 @@ body,
   padding: 0;
   background-color: var(--bg-canvas);
   color: var(--text-primary);
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-  font-size: 13px;
-  line-height: 1.48;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  font-size: var(--density-font-base);
+  line-height: var(--density-line-height);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   user-select: none;
   overflow: hidden;
+}
+
+/* Seamless Integrated Title Bar */
+.tako-titlebar {
+  height: var(--density-titlebar-h);
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease,
+    box-shadow 150ms ease;
+}
+
+.tako-titlebar-mac {
+  height: var(--density-titlebar-mac-h);
+}
+
+.tako-titlebar-merged {
+  background-color: var(--bg-canvas);
+  border-bottom: 1px solid transparent;
+}
+
+.tako-titlebar-scrolled {
+  background-color: var(--bg-titlebar);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+  box-shadow: var(--shadow-nav);
+}
+
+/* Density-Driven Layout Primitives */
+.tako-statusbar {
+  height: var(--density-statusbar-h);
+  padding-inline: var(--density-page-px);
+}
+
+.tako-page-overview {
+  width: 100%;
+  max-width: var(--density-page-max-w);
+  margin-inline: auto;
+  padding: var(--density-page-py) var(--density-page-px);
+  gap: var(--density-section-gap);
+}
+
+.tako-page-sub {
+  width: 100%;
+  max-width: var(--density-page-max-w);
+  margin-inline: auto;
+  padding: var(--density-subpage-py) var(--density-page-px);
+  gap: var(--density-subpage-gap);
+}
+
+.tako-list-stack {
+  gap: var(--density-list-gap);
+}
+
+.tako-card-surface {
+  border-radius: var(--density-card-radius);
+}
+
+.tako-client-row {
+  padding: var(--density-card-py) var(--density-card-px);
+}
+
+.tako-mcp-section {
+  border-radius: var(--density-card-radius);
+  padding: var(--density-panel-py) var(--density-panel-px);
+}
+
+.tako-mcp-cell {
+  padding: var(--density-mcp-card-py) var(--density-mcp-card-px);
+}
+
+.tako-panel-head {
+  padding: var(--density-panel-py) var(--density-panel-px);
+}
+
+.tako-panel-body {
+  padding-inline: var(--density-panel-px);
+}
+
+.tako-panel-pad {
+  padding: var(--density-panel-px);
+}
+
+.tako-setting-row {
+  padding-block: var(--density-row-py);
+}
+
+.tako-brand-size {
+  width: var(--density-brand-icon);
+  height: var(--density-brand-icon);
+}
+
+.tako-ctrl-h {
+  height: var(--density-ctrl-h);
 }
 
 input,

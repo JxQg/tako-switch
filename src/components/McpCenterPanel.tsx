@@ -206,7 +206,7 @@ export function McpCenterPanel({
   const nodeReady = nodeInfo !== null && nodeInfo.available && nodeInfo.meetsMinVersion;
 
   return (
-    <div className="w-full px-4 sm:px-5 py-4 flex flex-col gap-5">
+    <div className="tako-page-sub flex flex-col">
       {/* Page Intro */}
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div className="min-w-0">
@@ -264,10 +264,10 @@ export function McpCenterPanel({
 
       {/* Capabilities Grid: Full-width Tako Web Page + 2-Column 5 Core Abilities */}
       {activeSection === "builtin" && (
-      <div className="grid grid-cols-1 min-[640px]:grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 min-[640px]:grid-cols-2 tako-list-stack">
         {/* Featured Full-Width Card: Tako Web Page (Tencent Cloud EdgeOne) */}
         <article
-          className="min-[640px]:col-span-2 rounded-[13px] border border-[var(--accent-border)] p-4 flex flex-col gap-3"
+          className="min-[640px]:col-span-2 tako-card-surface border border-[var(--accent-border)] tako-panel-pad flex flex-col gap-3"
           style={{ background: "var(--webpage-grad)" }}
         >
           <div className="flex flex-wrap items-start justify-between gap-4">
@@ -435,7 +435,7 @@ export function McpCenterPanel({
             <article
               key={key}
               data-mcp-tool={mcpToolAttr}
-              className="rounded-[13px] border border-[var(--border)] bg-[var(--bg-card)] hover:border-[var(--border-strong)] p-4 min-h-[126px] flex flex-col transition"
+              className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] hover:border-[var(--border-strong)] tako-panel-pad min-h-[126px] flex flex-col transition"
             >
               <div className="flex items-center justify-between gap-2">
                 <span className="h-8 w-8 rounded-[9px] bg-[var(--bg-subtle)] text-[var(--text-secondary)] inline-flex items-center justify-center shrink-0">
