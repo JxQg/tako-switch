@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-23T23:02:06Z",
+  "generatedAt": "2026-11-24T07:31:53Z",
   "apps": {
     "dsh-tako": {
       "displayName": "DSH Tako",
@@ -30,28 +30,28 @@
     },
     "codex": {
       "displayName": "Codex Desktop",
-      "version": "26.1117.41037",
+      "version": "26.1120.41243",
       "platforms": {
         "macos-arm64": {
-          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-arm64-26.1117.41037.zip",
-          "version": "26.1117.41037",
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-arm64-26.1120.41243.zip",
+          "version": "26.1120.41243",
           "installType": "zip",
           "appBundleName": "ChatGPT.app",
-          "size": 724006681
+          "size": 662370483
         },
         "macos-x64": {
-          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-x64-26.1117.41037.zip",
-          "version": "26.1117.41037",
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-x64-26.1120.41243.zip",
+          "version": "26.1120.41243",
           "installType": "zip",
           "appBundleName": "ChatGPT.app",
-          "size": 754302240
+          "size": 690143689
         },
         "windows-x64": {
           "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix",
-          "version": "26.1117.4957.0",
+          "version": "26.1120.5083.0",
           "installType": "msix",
           "packageFamilyName": "OpenAI.Codex_2p2nqsd0c76g0",
-          "size": 796523063
+          "size": 770059628
         }
       }
     },
