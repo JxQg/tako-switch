@@ -27,6 +27,8 @@
 |---|---|
 | `src/App.tsx` | 主界面：无界融合顶栏、双密度（紧凑/舒适）与原生窗口主题联动、账号登录/登出、一键三端汉化开关、模型广场直达入口、四大客户端卡片与更新检查 |
 | `src/components/TopHeaderBar.tsx` / `WindowChrome.tsx` | 融合自定义标题栏、Windows 原生规范控制键（最小化/最大化还原/关闭）、8 方向无死角边缘缩放热区与右键系统窗口菜单 |
+| `src/components/ExtensionsHubPanel.tsx` / `extensions/PluginsHubView.tsx` | 通用扩展中心入口、三端插件已安装/发现/市场源视图，遵循主题与密度 Token |
+| `src/components/extensions/ExtensionPrimitives.tsx` | 三端平台定义、弹性搜索框、探测说明气泡与带焦点约束的侧滑抽屉 |
 | `src/components/McpInlineTheater.tsx` | 主界面下方 5 合 1 超级 MCP 内联实景剧场（「效果演示」零扣费媒体交互 + 「现场试跑」Live Playground） |
 | `src/components/ModelPickerModal.tsx` | 模型广场总览与分客户端模型选择弹窗：人民币/内部额度切换、明细价/均价双视图、官方倍率折扣与 6 场景筛选 |
 | `src/components/BrandIcons.tsx` / `ModelIcons.tsx` | 客户端品牌图标与模型厂商图标（Codex / Claude / Antigravity / DeepSeek 等） |
@@ -36,6 +38,8 @@
 | `src-tauri/src/main.rs` | 4 角色子命令路由（`mcp-server`、`status-line`、`gateway-proxy` / `agy-proxy`、GUI） |
 | `src-tauri/src/lib.rs` | Tauri 命令注册（含 `sync_window_theme`、`show_window_system_menu`、`set_prefer_chinese_ui`、`patch_antigravity_ui`、`restore_antigravity_ui`、`list_plaza_models`、`run_mcp_live_demo`）、Windows 无框阴影与 DWM 边框色装配、OSS/GitHub 双端点更新策略、网关守护 |
 | `src-tauri/src/config.rs` | `AppPaths`（含沙盒 `agy_app_override_dir`）、备份存取 (`has_backup`)、`SwitchState`（含 `UiDensity` / `ThemePref`）、`ClientModelFilter`、持久化设备指纹、原子写 (`write_atomic`) |
+| `src-tauri/src/extensions/mod.rs` / `plugins.rs` | `ExtPlatform` 复用 `SyncPlatform`、扩展 JSON Store、代理策略、内置优先 CLI 探测、插件协议、JSONC 清单与双目录缓存 |
+| `src-tauri/tests/ext_hub_phase3_blackbox.rs` / `scripts/test_ext_hub_phase3_ui.mjs` | 插件沙盒 CLI 与本地 HTTP 黑盒测试、最小窗口/深浅色/双密度浏览器回归 |
 | `src-tauri/src/auth.rs` | 独立于 `tako-cli` 的 OAuth PKCE 登录（`DESKTOP_OAUTH_CLIENT_ID = "takoswitch"`、`build_oauth_authorize_url`、`exchange_desktop_token`）与 `~/.tako/switch/auth.json` 存取、`AccountStatus`、`BalanceCache` |
 | `src-tauri/src/agy_proxy.rs` | 本地网关服务、免登录模型广场 `fetch_plaza_models_for_ui` / `build_plaza_model_options`、`/claude` 与 `/codex` 模型目录生成与过滤、Antigravity 32 槽位展开 |
 | `src-tauri/src/mcp_server.rs` | 6 合 1 `stdio` MCP 工具实现（`tako_web_search`、`tako_generate_image`、`tako_generate_video`、`tako_generate_audio`、`tako_consult`、`tako_account_status`）及现场试跑核心 `execute_live_demo_for_paths` |
@@ -84,6 +88,11 @@
 7. **默认绕过系统代理与本地网关断连中止规则（`config.rs`、`agy_proxy.rs`、`auth.rs`、`mcp_server.rs`）**：
    - `SwitchState.bypass_system_proxy`（JSON 键 `bypassSystemProxy`）默认值为 `true`（直连 Tako 网关 `.no_proxy()`），避免用户开启慢速全局/系统代理时劫持网关上行；在设置中关闭后无需重启守护进程即可动态切回系统代理。
    - 本地网关转发无需改写的超大请求体（> 64 KiB）时采用流式透传，并在下游客户端断开 TCP 连接时立即中止上游请求，防止超时重试堆积僵尸上传。
+8. **插件中心边界（`extensions/plugins.rs`）**：
+   - 仅管理 Claude、Codex、Antigravity。CLI 按桌面内置、用户安装目录、系统 PATH 顺序探测；`paths.is_test` 时禁止读取宿主机 PATH，测试覆盖路径必须位于沙盒内，目录 URL 只能指向本地 HTTP 服务。
+   - CLI 参数先校验再执行。Windows 批处理由无窗口 `cmd.exe` 调用，关闭 stdin；普通操作超时 60 秒，安装、更新和添加市场超时 180 秒。
+   - Codex 插件开关先 `backup_file_once`，再用 `toml_edit` 与 `write_atomic` 无损保存。Claude 项目/管理员 scope 只读；Antigravity 启停和卸载使用已安装目录名，安装和更新使用市场 ID。
+   - Antigravity 目录遵循系统代理开关，分官方和伙伴来源原子缓存至 `extensions/plugin_cache.json`；单源或全部请求失败时保留可用缓存，并在界面说明缓存状态。完整契约见 [`docs/extensions-plugins.md`](./docs/extensions-plugins.md)。
 
 ---
 

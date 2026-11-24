@@ -14,6 +14,7 @@ import {
   LayoutGrid,
   Loader2,
   Power,
+  Puzzle,
   RotateCw,
   SlidersHorizontal,
   Sparkles,
@@ -798,6 +799,19 @@ export function OverviewPanel({
             );
           })}
         </div>
+      </section>
+      <section className="min-w-0 border-t border-[var(--border)] pt-3">
+        <button
+          type="button"
+          data-testid="open-ext-hub-plugins"
+          onClick={() => onNavigate("extensions")}
+          className="flex w-full min-w-0 items-center gap-2.5 rounded-lg px-1 py-1 text-left text-[var(--text-primary)] hover:text-[var(--accent)] cursor-pointer"
+        >
+          <Puzzle className="h-4 w-4 shrink-0 text-[var(--accent)]" />
+          <span className="min-w-0 flex-1 truncate text-[13px] font-semibold">通用扩展中心</span>
+          <span className="shrink-0 whitespace-nowrap text-[12px] text-[var(--text-secondary)]">插件管理</span>
+          <ChevronRight className="h-4 w-4 shrink-0 text-[var(--text-muted)]" />
+        </button>
       </section>
     </div>
   );

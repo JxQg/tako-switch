@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
+    "test:extensions-ui": "node scripts/test_ext_hub_phase3_ui.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -24,6 +25,7 @@
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.8",
     "@vitejs/plugin-react": "^4.5.1",
+    "playwright": "^1.65.1",
     "tailwindcss": "^4.1.8",
     "typescript": "^5.8.3",
     "vite": "^6.3.5"

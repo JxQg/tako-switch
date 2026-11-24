@@ -23,6 +23,7 @@ import {
 import { CHANGELOG_RELEASES, parseReleaseNotesLines } from "./lib/changelog";
 import { ClientSettingsPanel } from "./components/ClientSettingsPanel";
 import { GeneralSettingsPanel } from "./components/GeneralSettingsPanel";
+import { ExtensionsHubPanel } from "./components/ExtensionsHubPanel";
 import { McpCenterPanel, type McpCenterSection } from "./components/McpCenterPanel";
 import type { McpToolKey } from "./components/McpInlineTheater";
 import { ModelPickerModal } from "./components/ModelPickerModal";
@@ -1254,6 +1255,7 @@ export default function App() {
       !dashboard ||
       activeRoute === "overview" ||
       activeRoute === "general" ||
+      activeRoute === "extensions" ||
       activeRoute === "mcp"
     ) {
       return null;
@@ -1447,6 +1449,16 @@ export default function App() {
           />
         )}
 
+        {activeRoute === "extensions" && (
+          <ExtensionsHubPanel
+            onOpenSync={(section) => {
+              setMcpInitialTab(null);
+              setMcpInitialSection(section);
+              setActiveRoute("mcp");
+            }}
+          />
+        )}
+
         {selectedClientApp && dashboard && (
           <ClientSettingsPanel
             app={selectedClientApp}
@@ -1481,6 +1493,7 @@ export default function App() {
         {activeRoute !== "overview" &&
           activeRoute !== "general" &&
           activeRoute !== "mcp" &&
+          activeRoute !== "extensions" &&
           !selectedClientApp && (
             <div className="w-full px-5 py-12 text-center text-[13px] text-[var(--text-muted)]">
               {loading ? "正在读取客户端状态..." : "未找到该客户端配置"}

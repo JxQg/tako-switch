@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod agy_proxy;
 pub mod auth;
 pub mod config;
+pub mod extensions;
 pub mod installer;
 pub mod manifest;
 pub mod mcp_server;
@@ -1976,6 +1977,93 @@ async fn get_multi_platform_sync_snapshot() -> Result<sync_hub::MultiPlatformSyn
 }
 
 #[tauri::command]
+async fn get_plugins_hub_snapshot(
+    platform: extensions::ExtPlatform,
+    include_available: Option<bool>,
+) -> Result<extensions::plugins::PluginsHubSnapshot, extensions::plugins::PluginError> {
+    let paths = AppPaths::detect()?;
+    extensions::plugins::get_plugins_hub_snapshot_for_paths(
+        &paths,
+        platform,
+        include_available.unwrap_or(true),
+    )
+    .await
+}
+
+#[tauri::command]
+async fn toggle_plugin_enabled(
+    platform: extensions::ExtPlatform,
+    id: String,
+    enabled: bool,
+) -> Result<extensions::plugins::PluginActionOutcome, extensions::plugins::PluginError> {
+    let paths = AppPaths::detect()?;
+    extensions::plugins::execute_plugin_action_for_paths(
+        &paths, platform, extensions::plugins::PluginAction::Toggle(enabled), &id,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn install_plugin_entry(
+    platform: extensions::ExtPlatform,
+    id: String,
+) -> Result<extensions::plugins::PluginActionOutcome, extensions::plugins::PluginError> {
+    let paths = AppPaths::detect()?;
+    extensions::plugins::execute_plugin_action_for_paths(
+        &paths, platform, extensions::plugins::PluginAction::Install, &id,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn update_plugin_entry(
+    platform: extensions::ExtPlatform,
+    id: String,
+) -> Result<extensions::plugins::PluginActionOutcome, extensions::plugins::PluginError> {
+    let paths = AppPaths::detect()?;
+    extensions::plugins::execute_plugin_action_for_paths(
+        &paths, platform, extensions::plugins::PluginAction::Update, &id,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn uninstall_plugin_entry(
+    platform: extensions::ExtPlatform,
+    id: String,
+) -> Result<extensions::plugins::PluginActionOutcome, extensions::plugins::PluginError> {
+    let paths = AppPaths::detect()?;
+    extensions::plugins::execute_plugin_action_for_paths(
+        &paths, platform, extensions::plugins::PluginAction::Uninstall, &id,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn add_plugin_marketplace(
+    platform: extensions::ExtPlatform,
+    source: String,
+) -> Result<extensions::plugins::PluginActionOutcome, extensions::plugins::PluginError> {
+    let paths = AppPaths::detect()?;
+    extensions::plugins::execute_plugin_action_for_paths(
+        &paths, platform, extensions::plugins::PluginAction::AddMarketplace, &source,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn remove_plugin_marketplace(
+    platform: extensions::ExtPlatform,
+    name: String,
+) -> Result<extensions::plugins::PluginActionOutcome, extensions::plugins::PluginError> {
+    let paths = AppPaths::detect()?;
+    extensions::plugins::execute_plugin_action_for_paths(
+        &paths, platform, extensions::plugins::PluginAction::RemoveMarketplace, &name,
+    )
+    .await
+}
+
+#[tauri::command]
 async fn sync_mcp_to_platforms(
     name: String,
     source: sync_hub::SyncPlatform,
@@ -2376,6 +2464,13 @@ pub fn run() {
             sync_skill_to_platforms,
             sync_all_skills,
             remove_synced_item,
+            get_plugins_hub_snapshot,
+            toggle_plugin_enabled,
+            install_plugin_entry,
+            update_plugin_entry,
+            uninstall_plugin_entry,
+            add_plugin_marketplace,
+            remove_plugin_marketplace,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tako Switch");
