@@ -6,7 +6,8 @@ import type {
   UiDensity,
 } from "../lib/api";
 
-export type NavRoute = "overview" | "general" | "mcp" | AppId;
+export type NavRoute = "overview" | "general" | "mcp" | "extensions" | AppId;
+export type ExtensionTab = "mcp" | "skills" | "plugins" | "prompts";
 export type { ThemePref, UiDensity };
 
 export const CLIENT_ORDER: AppId[] = ["claude", "codex", "antigravity", "dsh-tako"];

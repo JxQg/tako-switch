@@ -47,6 +47,7 @@ interface TopHeaderBarProps {
 function subpageTitle(route: NavRoute): string {
   if (route === "general") return "通用设置";
   if (route === "mcp") return "MCP 能力中心";
+  if (route === "extensions") return "通用扩展中心";
   if (route === "overview") return "首页";
   return `${APP_DISPLAY_NAMES[route]} 设置`;
 }

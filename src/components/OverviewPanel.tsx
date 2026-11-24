@@ -14,9 +14,12 @@ import {
   LayoutGrid,
   Loader2,
   Power,
+  Plug,
+  Puzzle,
   RotateCw,
   SlidersHorizontal,
   Sparkles,
+  Zap,
 } from "lucide-react";
 import type {
   AppId,
@@ -24,6 +27,7 @@ import type {
   AppSnapshot,
   AppUpdateStatus,
   DashboardPayload,
+  ExtensionsSummary,
   InstallProgressEvent,
   UiPatchProgressEvent,
 } from "../lib/api";
@@ -34,6 +38,7 @@ import {
   CLIENT_ORDER,
   formatVersion,
   installStageLabel,
+  type ExtensionTab,
   type NavRoute,
 } from "./UiPrimitives";
 
@@ -62,7 +67,8 @@ interface OverviewPanelProps {
   selfUpdateSummary: SelfUpdateSummary;
   onNavigate: (route: NavRoute) => void;
   onOpenMcpDetail: (tab?: McpToolKey) => void;
-  onOpenMultiSync: (section: "mcp-sync" | "skill-sync") => void;
+  extensionsSummary: ExtensionsSummary | null;
+  onOpenExtensions: (tab: ExtensionTab) => void;
   onSetMode: (app: AppSnapshot, mode: AppMode) => void;
   onLaunchApp: (appId: AppId) => void;
   onRestartApp: (appId: AppId) => void;
@@ -195,7 +201,8 @@ export function OverviewPanel({
   selfUpdateSummary,
   onNavigate,
   onOpenMcpDetail,
-  onOpenMultiSync,
+  extensionsSummary,
+  onOpenExtensions,
   onSetMode,
   onLaunchApp,
   onRestartApp,
@@ -696,15 +703,6 @@ export function OverviewPanel({
             </span>
             <button
               type="button"
-              data-testid="open-multi-sync"
-              onClick={() => onOpenMultiSync("mcp-sync")}
-              className="h-7 px-2.5 rounded-full border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] text-[11.5px] font-medium inline-flex items-center gap-1 transition cursor-pointer"
-              title="跨平台同步 Claude / Codex / Antigravity 自定义 MCP 与 Skills"
-            >
-              <span>MCP / Skill 同步</span>
-            </button>
-            <button
-              type="button"
               data-testid="open-mcp-center"
               onClick={() => onOpenMcpDetail()}
               className="h-7 px-2.5 rounded-full border border-[var(--accent-border)] bg-[var(--accent-soft)] hover:bg-[var(--accent-border)] text-[var(--accent)] text-[11.5px] font-medium inline-flex items-center gap-1 transition cursor-pointer"
@@ -797,6 +795,25 @@ export function OverviewPanel({
               </div>
             );
           })}
+        </div>
+      </section>
+      <section className="flex min-w-0 flex-col gap-2">
+        <h2 className="px-0.5 text-[12.5px] font-semibold text-[var(--text-secondary)]">通用扩展中心</h2>
+        <div className="grid grid-cols-2 min-[760px]:grid-cols-4 tako-list-stack">
+          {([
+            { id: "mcp", label: "通用 MCP", icon: Plug, count: extensionsSummary?.mcpCount },
+            { id: "skills", label: "Skills 技能", icon: Zap, count: extensionsSummary?.skillsCount },
+            { id: "plugins", label: "插件管理", icon: Puzzle, count: extensionsSummary?.pluginsCount },
+            { id: "prompts", label: "提示词预设", icon: FileText, count: extensionsSummary?.promptsCount },
+          ] satisfies { id: ExtensionTab; label: string; icon: typeof Plug; count: number | undefined }[]).map(({ id, label, icon: Icon, count }) => (
+            <button key={id} type="button" data-testid={`open-ext-hub-${id}`} onClick={() => onOpenExtensions(id)}
+              className="flex min-w-0 items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-3 py-3 text-left text-[var(--text-secondary)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)] cursor-pointer">
+              <Icon className="h-4 w-4 shrink-0 text-[var(--accent)]" strokeWidth={1.8} />
+              <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-[var(--text-primary)]">{label}</span>
+              <span className="shrink-0 text-[11px] text-[var(--text-muted)] tabular-nums">{count ?? 0}</span>
+              <ChevronRight className="h-3 w-3 shrink-0 text-[var(--text-muted)]" />
+            </button>
+          ))}
         </div>
       </section>
     </div>

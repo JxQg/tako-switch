@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod agy_proxy;
 pub mod auth;
 pub mod config;
+pub mod extensions;
 pub mod installer;
 pub mod manifest;
 pub mod mcp_server;
@@ -1975,6 +1976,146 @@ async fn get_multi_platform_sync_snapshot() -> Result<sync_hub::MultiPlatformSyn
         .map_err(|e| format!("扫描多平台 MCP/Skill 失败: {e}"))
 }
 
+async fn with_extension_paths<T: Send + 'static>(
+    operation: impl FnOnce(&AppPaths) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let paths = AppPaths::detect()?;
+    tauri::async_runtime::spawn_blocking(move || operation(&paths))
+        .await
+        .map_err(|err| format!("扩展中心操作失败: {err}"))?
+}
+
+#[tauri::command]
+async fn get_extensions_summary() -> Result<extensions::ExtensionsSummary, String> {
+    with_extension_paths(extensions::get_extensions_summary_for_paths).await
+}
+
+#[tauri::command]
+async fn get_mcp_hub_snapshot() -> Result<extensions::mcp::McpHubSnapshot, String> {
+    with_extension_paths(extensions::mcp::get_mcp_hub_snapshot_for_paths).await
+}
+
+#[tauri::command]
+async fn upsert_mcp_entry(
+    entry: extensions::mcp::McpEntry,
+) -> Result<extensions::mcp::McpHubSnapshot, String> {
+    with_extension_paths(move |paths| extensions::mcp::upsert_mcp_entry_for_paths(paths, entry)).await
+}
+
+#[tauri::command]
+async fn toggle_mcp_platform(
+    id: String,
+    platform: extensions::ExtPlatform,
+    enabled: bool,
+) -> Result<extensions::mcp::McpHubSnapshot, String> {
+    with_extension_paths(move |paths| {
+        extensions::mcp::toggle_mcp_platform_for_paths(paths, &id, platform, enabled)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn delete_mcp_entry(id: String) -> Result<extensions::mcp::McpHubSnapshot, String> {
+    with_extension_paths(move |paths| extensions::mcp::delete_mcp_entry_for_paths(paths, &id)).await
+}
+
+#[tauri::command]
+async fn align_mcp_entry(
+    id: String,
+    source: Option<extensions::ExtPlatform>,
+) -> Result<extensions::mcp::McpHubSnapshot, String> {
+    with_extension_paths(move |paths| {
+        extensions::mcp::align_mcp_entry_for_paths(paths, &id, source)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn align_all_mcp_entries() -> Result<extensions::mcp::McpHubSnapshot, String> {
+    with_extension_paths(extensions::mcp::align_all_mcp_entries_for_paths).await
+}
+
+#[tauri::command]
+fn parse_mcp_snippet(snippet: String) -> Result<Vec<extensions::mcp::McpEntry>, String> {
+    extensions::mcp::parse_mcp_snippet(&snippet)
+}
+
+#[tauri::command]
+async fn export_mcp_backup() -> Result<String, String> {
+    with_extension_paths(extensions::mcp::export_mcp_backup_for_paths).await
+}
+
+#[tauri::command]
+async fn import_mcp_backup(backup: String) -> Result<extensions::mcp::McpHubSnapshot, String> {
+    with_extension_paths(move |paths| extensions::mcp::import_mcp_backup_for_paths(paths, &backup)).await
+}
+
+#[tauri::command]
+async fn get_prompts_hub_snapshot() -> Result<extensions::prompts::PromptsHubSnapshot, String> {
+    with_extension_paths(extensions::prompts::get_prompts_hub_snapshot_for_paths).await
+}
+
+#[tauri::command]
+async fn upsert_prompt_preset(
+    platform: extensions::ExtPlatform,
+    preset: extensions::prompts::PromptPreset,
+) -> Result<extensions::prompts::PromptsHubSnapshot, String> {
+    with_extension_paths(move |paths| {
+        extensions::prompts::upsert_prompt_preset_for_paths(paths, platform, preset)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn activate_prompt_preset(
+    platform: extensions::ExtPlatform,
+    id: Option<String>,
+) -> Result<extensions::prompts::PromptsHubSnapshot, String> {
+    with_extension_paths(move |paths| {
+        extensions::prompts::activate_prompt_preset_for_paths(paths, platform, id.as_deref())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn delete_prompt_preset(
+    platform: extensions::ExtPlatform,
+    id: String,
+) -> Result<extensions::prompts::PromptsHubSnapshot, String> {
+    with_extension_paths(move |paths| {
+        extensions::prompts::delete_prompt_preset_for_paths(paths, platform, &id)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn sync_prompt_to_platforms(
+    source: extensions::ExtPlatform,
+    id: String,
+    targets: Vec<extensions::ExtPlatform>,
+    activate: bool,
+) -> Result<extensions::prompts::PromptsHubSnapshot, String> {
+    with_extension_paths(move |paths| {
+        extensions::prompts::sync_prompt_to_platforms_for_paths(paths, source, &id, &targets, activate)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn export_prompts_backup() -> Result<String, String> {
+    with_extension_paths(extensions::prompts::export_prompts_backup_for_paths).await
+}
+
+#[tauri::command]
+async fn import_prompts_backup(
+    backup: String,
+) -> Result<extensions::prompts::PromptsHubSnapshot, String> {
+    with_extension_paths(move |paths| {
+        extensions::prompts::import_prompts_backup_for_paths(paths, &backup)
+    })
+    .await
+}
+
 #[tauri::command]
 async fn sync_mcp_to_platforms(
     name: String,
@@ -2370,6 +2511,23 @@ pub fn run() {
             install_self_update,
             run_mcp_live_demo,
             check_node_runtime,
+            get_extensions_summary,
+            get_mcp_hub_snapshot,
+            upsert_mcp_entry,
+            toggle_mcp_platform,
+            delete_mcp_entry,
+            align_mcp_entry,
+            align_all_mcp_entries,
+            parse_mcp_snippet,
+            export_mcp_backup,
+            import_mcp_backup,
+            get_prompts_hub_snapshot,
+            upsert_prompt_preset,
+            activate_prompt_preset,
+            delete_prompt_preset,
+            sync_prompt_to_platforms,
+            export_prompts_backup,
+            import_prompts_backup,
             get_multi_platform_sync_snapshot,
             sync_mcp_to_platforms,
             sync_all_mcps,

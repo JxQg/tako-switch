@@ -16,6 +16,7 @@
   --text-secondary: #596174;
   --text-muted: #8a92a3;
   --accent: #5147e5;
+  --on-accent: white;
   --accent-hover: #4338ca;
   --accent-soft: #eeedff;
   --accent-border: #d8d4ff;
@@ -354,6 +355,40 @@ pre,
   background-color: var(--success);
   flex-shrink: 0;
   animation: tako-dot-core 2.8s ease-in-out infinite;
+}
+
+.ext-button {
+  height: var(--density-ctrl-h);
+}
+
+.ext-hub-tab {
+  height: var(--density-ctrl-h);
+  padding-inline: 8px;
+}
+
+.ext-field {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.ext-hub-toolbar,
+.ext-hub-tabs {
+  letter-spacing: 0;
+}
+
+@media (max-width: 759px) {
+  .ext-hub-tab {
+    padding-inline: 5px;
+    gap: 4px;
+  }
+
+  .ext-hub-toolbar > :last-child {
+    gap: 4px;
+  }
 }
 
 /* Drawer slide-in animation */

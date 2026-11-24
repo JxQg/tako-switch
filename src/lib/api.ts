@@ -397,50 +397,56 @@ export interface LiveDemoResult {
 }
 
 export type SyncPlatform = "claude" | "codex" | "antigravity";
+export type ExtPlatform = SyncPlatform;
 
-export interface SyncedMcpSpec {
-  transport: string;
-  command?: string | null;
+export interface ExtensionsSummary {
+  mcpCount: number;
+  skillsCount: number;
+  pluginsCount: number;
+  promptsCount: number;
+}
+
+export interface McpSpec {
+  transport: "stdio" | "http";
+  command: string | null;
   args: string[];
   env: Record<string, string>;
-  url?: string | null;
+  url: string | null;
   headers: Record<string, string>;
-  summary: string;
+  extra: Record<string, unknown>;
 }
 
-export interface PlatformMcpItem {
+export interface McpEntry {
+  id: string;
   name: string;
-  managedByTako: boolean;
-  platforms: SyncPlatform[];
-  variants: Partial<Record<SyncPlatform, SyncedMcpSpec>>;
+  spec: McpSpec;
+  platforms: ExtPlatform[];
+  variants: Partial<Record<ExtPlatform, McpSpec>>;
   hasDiff: boolean;
 }
 
-export interface PlatformSkillItem {
+export interface McpHubSnapshot {
+  entries: McpEntry[];
+  platformPaths: Record<ExtPlatform, string[]>;
+  warnings: string[];
+}
+
+export interface PromptPreset {
+  id: string;
   name: string;
-  title: string;
-  description: string;
-  platforms: SyncPlatform[];
-  fileCounts: Partial<Record<SyncPlatform, number>>;
-  modifiedMs: Partial<Record<SyncPlatform, number>>;
-  hasDiff: boolean;
+  content: string;
 }
 
-export interface PlatformSyncPaths {
-  mcpPath: string;
-  skillsDir: string;
+export interface PromptPlatformSnapshot {
+  presets: PromptPreset[];
+  activeId: string | null;
+  path: string;
+  liveBytes: number;
+  hasChineseBlock: boolean;
 }
 
-export interface MultiPlatformSyncSnapshot {
-  mcpItems: PlatformMcpItem[];
-  skillItems: PlatformSkillItem[];
-  platformPaths: Partial<Record<SyncPlatform, PlatformSyncPaths>>;
-}
-
-export interface BatchSyncOutcome {
-  syncedItems: number;
-  syncedWrites: number;
-  snapshot: MultiPlatformSyncSnapshot;
+export interface PromptsHubSnapshot {
+  platforms: Record<ExtPlatform, PromptPlatformSnapshot>;
 }
 
 export const api = {
@@ -501,52 +507,27 @@ export const api = {
   runMcpLiveDemo: (input: LiveDemoRequest) =>
     invoke<LiveDemoResult>("run_mcp_live_demo", { input }),
   checkNodeRuntime: () => invoke<NodeRuntimeInfo>("check_node_runtime"),
-  getMultiPlatformSyncSnapshot: () =>
-    invoke<MultiPlatformSyncSnapshot>("get_multi_platform_sync_snapshot"),
-  syncMcpToPlatforms: (
-    name: string,
-    source: SyncPlatform,
-    targets: SyncPlatform[],
-  ) =>
-    invoke<MultiPlatformSyncSnapshot>("sync_mcp_to_platforms", {
-      name,
-      source,
-      targets,
-    }),
-  syncAllMcps: (
-    targets: SyncPlatform[],
-    preferredSource?: SyncPlatform | null,
-  ) =>
-    invoke<BatchSyncOutcome>("sync_all_mcps", {
-      targets,
-      preferredSource: preferredSource ?? null,
-    }),
-  syncSkillToPlatforms: (
-    name: string,
-    source: SyncPlatform,
-    targets: SyncPlatform[],
-  ) =>
-    invoke<MultiPlatformSyncSnapshot>("sync_skill_to_platforms", {
-      name,
-      source,
-      targets,
-    }),
-  syncAllSkills: (
-    targets: SyncPlatform[],
-    preferredSource?: SyncPlatform | null,
-  ) =>
-    invoke<BatchSyncOutcome>("sync_all_skills", {
-      targets,
-      preferredSource: preferredSource ?? null,
-    }),
-  removeSyncedItem: (
-    kind: "mcp" | "skill",
-    name: string,
-    platform: SyncPlatform,
-  ) =>
-    invoke<MultiPlatformSyncSnapshot>("remove_synced_item", {
-      kind,
-      name,
-      platform,
-    }),
+  getExtensionsSummary: () => invoke<ExtensionsSummary>("get_extensions_summary"),
+  getMcpHubSnapshot: () => invoke<McpHubSnapshot>("get_mcp_hub_snapshot"),
+  upsertMcpEntry: (entry: McpEntry) => invoke<McpHubSnapshot>("upsert_mcp_entry", { entry }),
+  toggleMcpPlatform: (id: string, platform: ExtPlatform, enabled: boolean) =>
+    invoke<McpHubSnapshot>("toggle_mcp_platform", { id, platform, enabled }),
+  deleteMcpEntry: (id: string) => invoke<McpHubSnapshot>("delete_mcp_entry", { id }),
+  alignMcpEntry: (id: string, source: ExtPlatform | null = null) =>
+    invoke<McpHubSnapshot>("align_mcp_entry", { id, source }),
+  alignAllMcpEntries: () => invoke<McpHubSnapshot>("align_all_mcp_entries"),
+  parseMcpSnippet: (snippet: string) => invoke<McpEntry[]>("parse_mcp_snippet", { snippet }),
+  exportMcpBackup: () => invoke<string>("export_mcp_backup"),
+  importMcpBackup: (backup: string) => invoke<McpHubSnapshot>("import_mcp_backup", { backup }),
+  getPromptsHubSnapshot: () => invoke<PromptsHubSnapshot>("get_prompts_hub_snapshot"),
+  upsertPromptPreset: (platform: ExtPlatform, preset: PromptPreset) =>
+    invoke<PromptsHubSnapshot>("upsert_prompt_preset", { platform, preset }),
+  activatePromptPreset: (platform: ExtPlatform, id: string | null) =>
+    invoke<PromptsHubSnapshot>("activate_prompt_preset", { platform, id }),
+  deletePromptPreset: (platform: ExtPlatform, id: string) =>
+    invoke<PromptsHubSnapshot>("delete_prompt_preset", { platform, id }),
+  syncPromptToPlatforms: (source: ExtPlatform, id: string, targets: ExtPlatform[], activate: boolean) =>
+    invoke<PromptsHubSnapshot>("sync_prompt_to_platforms", { source, id, targets, activate }),
+  exportPromptsBackup: () => invoke<string>("export_prompts_backup"),
+  importPromptsBackup: (backup: string) => invoke<PromptsHubSnapshot>("import_prompts_backup", { backup }),
 };
