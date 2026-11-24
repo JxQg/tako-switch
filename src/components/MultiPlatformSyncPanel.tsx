@@ -211,9 +211,9 @@ export function MultiPlatformSyncPanel({
   const skillItems = snapshot?.skillItems ?? [];
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex flex-col tako-list-stack">
       {/* Summary & Batch Action Bar */}
-      <div className="rounded-[13px] border border-[var(--border)] bg-[var(--bg-card)] px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+      <div className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] tako-panel-head flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             {mode === "mcp" ? (
@@ -289,7 +289,7 @@ export function MultiPlatformSyncPanel({
             </p>
           </div>
         ) : (
-          <div className="flex flex-col gap-2">
+          <div className="flex flex-col tako-list-stack">
             {mcpItems.map((item) => {
               const firstSpec = item.platforms[0]
                 ? item.variants[item.platforms[0]]
@@ -298,7 +298,7 @@ export function MultiPlatformSyncPanel({
               return (
                 <div
                   key={item.name}
-                  className="rounded-[12px] border border-[var(--border)] bg-[var(--bg-card)] px-3.5 py-3 flex flex-wrap items-center justify-between gap-3"
+                  className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] tako-client-row flex flex-wrap items-center justify-between gap-3"
                 >
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2 flex-wrap">
@@ -382,14 +382,14 @@ export function MultiPlatformSyncPanel({
           </p>
         </div>
       ) : (
-        <div className="flex flex-col gap-2">
+        <div className="flex flex-col tako-list-stack">
           {skillItems.map((item) => {
             const allSynced = item.platforms.length === PLATFORMS.length && !item.hasDiff;
             const maxFiles = Math.max(0, ...Object.values(item.fileCounts).map((n) => n ?? 0));
             return (
               <div
                 key={item.name}
-                className="rounded-[12px] border border-[var(--border)] bg-[var(--bg-card)] px-3.5 py-3 flex flex-wrap items-center justify-between gap-3"
+                className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] tako-client-row flex flex-wrap items-center justify-between gap-3"
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2 flex-wrap">

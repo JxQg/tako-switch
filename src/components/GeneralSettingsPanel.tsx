@@ -27,6 +27,7 @@ import {
   calcPercent,
   type NavRoute,
   type ThemePref,
+  type UiDensity,
 } from "./UiPrimitives";
 
 interface SelfUpdateViewState {
@@ -41,6 +42,8 @@ interface GeneralSettingsPanelProps {
   dashboard: DashboardPayload | null;
   themePref: ThemePref;
   onChangeTheme: (pref: ThemePref) => void;
+  uiDensity: UiDensity;
+  onChangeDensity: (density: UiDensity) => void;
   anyTakoMode: boolean;
   fixingGateway: boolean;
   loggingIn: boolean;
@@ -72,10 +75,17 @@ const THEME_OPTIONS: { id: ThemePref; label: string }[] = [
   { id: "dark", label: "深色" },
 ];
 
+const DENSITY_OPTIONS: { id: UiDensity; label: string }[] = [
+  { id: "compact", label: "紧凑" },
+  { id: "comfortable", label: "舒适" },
+];
+
 export function GeneralSettingsPanel({
   dashboard,
   themePref,
   onChangeTheme,
+  uiDensity,
+  onChangeDensity,
   anyTakoMode,
   fixingGateway,
   loggingIn,
@@ -140,7 +150,7 @@ export function GeneralSettingsPanel({
       fallbackManifestUrl.trim() !== dashboard.state.fallbackManifestUrl.trim());
 
   return (
-    <div className="w-full px-4 sm:px-5 py-4 flex flex-col gap-5">
+    <div className="tako-page-sub flex flex-col">
       {/* Page Head */}
       <div>
         <div className="text-[11px] font-bold tracking-[0.08em] uppercase text-[var(--accent)] mb-1">
@@ -155,7 +165,7 @@ export function GeneralSettingsPanel({
       </div>
 
       {/* Account & Balance Card */}
-      <section className="rounded-[13px] border border-[var(--border)] bg-[var(--bg-card)] px-4 py-4">
+      <section className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] tako-panel-pad">
         {account?.loggedIn ? (
           <div className="flex flex-col gap-3.5">
             <div className="flex flex-wrap items-center justify-between gap-4">
@@ -274,16 +284,16 @@ export function GeneralSettingsPanel({
       </section>
 
       {/* Two-Column Global Cards (stacks cleanly on narrow windows) */}
-      <div className="grid grid-cols-1 min-[700px]:grid-cols-2 gap-3.5">
+      <div className="grid grid-cols-1 min-[700px]:grid-cols-2 gap-[var(--density-section-gap)]">
         {/* Card 1: Gateway & Network */}
-        <section className="rounded-[13px] border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden flex flex-col">
-          <div className="px-4 py-3 border-b border-[var(--border)]">
+        <section className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden flex flex-col">
+          <div className="tako-panel-head border-b border-[var(--border)]">
             <h2 className="text-[13.5px] font-semibold text-[var(--text-primary)]">
               网关与网络
             </h2>
           </div>
-          <div className="divide-y divide-[var(--border)] px-4 flex-1">
-            <div className="py-3 flex items-center justify-between gap-3">
+          <div className="divide-y divide-[var(--border)] tako-panel-body flex-1">
+            <div className="tako-setting-row flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
                   本地统一网关
@@ -308,7 +318,7 @@ export function GeneralSettingsPanel({
               )}
             </div>
 
-            <div className="py-3 flex items-center justify-between gap-3">
+            <div className="tako-setting-row flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
                   直连 Tako 网关（绕过系统代理）
@@ -363,8 +373,8 @@ export function GeneralSettingsPanel({
         </section>
 
         {/* Card 2: Update Strategy */}
-        <section className="rounded-[13px] border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden flex flex-col">
-          <div className="px-4 py-3 border-b border-[var(--border)] flex items-center justify-between gap-2">
+        <section className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden flex flex-col">
+          <div className="tako-panel-head border-b border-[var(--border)] flex items-center justify-between gap-2">
             <h2 className="text-[13.5px] font-semibold text-[var(--text-primary)]">
               更新策略
             </h2>
@@ -374,8 +384,8 @@ export function GeneralSettingsPanel({
               </span>
             )}
           </div>
-          <div className="divide-y divide-[var(--border)] px-4 flex-1">
-            <div className="py-3 flex items-center justify-between gap-3">
+          <div className="divide-y divide-[var(--border)] tako-panel-body flex-1">
+            <div className="tako-setting-row flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
                   启动时自动检查更新
@@ -397,12 +407,12 @@ export function GeneralSettingsPanel({
               />
             </div>
 
-            <div className="py-3 flex flex-col gap-2">
+            <div className="tako-setting-row flex flex-col gap-2">
               <div className="flex items-center justify-between gap-2">
                 <div className="min-w-0">
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <span className="text-[12.5px] font-medium text-[var(--text-primary)]">
-                      Tako Switch v{dashboard?.appVersion ?? "2.2.4"}
+                      Tako Switch v{dashboard?.appVersion ?? "2.2.7"}
                     </span>
                     <button
                       type="button"
@@ -463,7 +473,7 @@ export function GeneralSettingsPanel({
               )}
             </div>
 
-            <div className="py-3 flex items-center justify-between gap-2">
+            <div className="tako-setting-row flex items-center justify-between gap-2">
               <div className="min-w-0">
                 <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
                   桌面客户端集中更新
@@ -491,30 +501,48 @@ export function GeneralSettingsPanel({
         </section>
 
         {/* Card 3: Appearance & Behavior */}
-        <section className="rounded-[13px] border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden flex flex-col">
-          <div className="px-4 py-3 border-b border-[var(--border)]">
+        <section className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden flex flex-col">
+          <div className="tako-panel-head border-b border-[var(--border)]">
             <h2 className="text-[13.5px] font-semibold text-[var(--text-primary)]">
               外观与行为
             </h2>
           </div>
-          <div className="divide-y divide-[var(--border)] px-4 flex-1">
-            <div className="py-3 flex flex-wrap items-center justify-between gap-3">
-              <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
+          <div className="divide-y divide-[var(--border)] tako-panel-body flex-1">
+            <div className="tako-setting-row flex items-center justify-between gap-3">
+              <div className="min-w-0 flex-1 text-[12.5px] font-medium text-[var(--text-primary)]">
                 界面主题
               </div>
               <SegmentedControl
+                testId="settings-theme-pref"
                 options={THEME_OPTIONS}
                 value={themePref}
                 onChange={onChangeTheme}
               />
             </div>
 
-            <div className="py-3 flex items-center justify-between gap-3">
-              <div className="min-w-0">
+            <div className="tako-setting-row flex items-center justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
+                  界面密度
+                </div>
+                <div className="text-[11px] text-[var(--text-muted)] mt-0.5 leading-snug">
+                  紧凑适合单屏高效总览，舒适提供更宽裕的阅读留白。
+                </div>
+              </div>
+              <SegmentedControl
+                testId="settings-ui-density"
+                options={DENSITY_OPTIONS}
+                value={uiDensity}
+                onChange={onChangeDensity}
+              />
+            </div>
+
+            <div className="tako-setting-row flex items-center justify-between gap-3">
+              <div className="min-w-0 flex-1">
                 <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
                   菜单栏显示实时余额
                 </div>
-                <div className="text-[11px] text-[var(--text-muted)] mt-0.5">
+                <div className="text-[11px] text-[var(--text-muted)] mt-0.5 leading-snug">
                   在系统状态栏轻量化展示当前余额。
                 </div>
               </div>
@@ -531,8 +559,8 @@ export function GeneralSettingsPanel({
               />
             </div>
 
-            <div className="py-3 flex items-center justify-between gap-3">
-              <div className="min-w-0">
+            <div className="tako-setting-row flex items-center justify-between gap-3">
+              <div className="min-w-0 flex-1">
                 <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
                   客户端优先简体中文
                 </div>
@@ -556,14 +584,14 @@ export function GeneralSettingsPanel({
         </section>
 
         {/* Card 4: MCP & Output */}
-        <section className="rounded-[13px] border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden flex flex-col">
-          <div className="px-4 py-3 border-b border-[var(--border)]">
+        <section className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden flex flex-col">
+          <div className="tako-panel-head border-b border-[var(--border)]">
             <h2 className="text-[13.5px] font-semibold text-[var(--text-primary)]">
               MCP 与输出目录
             </h2>
           </div>
-          <div className="divide-y divide-[var(--border)] px-4 flex-1">
-            <div className="py-3 flex items-center justify-between gap-3">
+          <div className="divide-y divide-[var(--border)] tako-panel-body flex-1">
+            <div className="tako-setting-row flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
                   全局 MCP 能力
@@ -581,7 +609,7 @@ export function GeneralSettingsPanel({
               </button>
             </div>
 
-            <div className="py-3 flex flex-col gap-1.5">
+            <div className="tako-setting-row flex flex-col gap-1.5">
               <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
                 媒体文件输出目录
               </div>

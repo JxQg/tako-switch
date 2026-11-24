@@ -34,7 +34,12 @@ import {
   formatTimeHHMM,
   type NavRoute,
   type ThemePref,
+  type UiDensity,
 } from "./components/UiPrimitives";
+import {
+  useNativeWindowState,
+  WindowResizeHandles,
+} from "./components/WindowChrome";
 
 type SelfUpdateStatus =
   | "idle"
@@ -68,6 +73,16 @@ function loadInitialTheme(): ThemePref {
     // ignore storage errors
   }
   return "system";
+}
+
+function loadInitialDensity(): UiDensity {
+  try {
+    const saved = localStorage.getItem("tako-switch-density");
+    if (saved === "compact" || saved === "comfortable") return saved;
+  } catch {
+    // ignore storage errors
+  }
+  return "compact";
 }
 
 export default function App() {
@@ -118,6 +133,10 @@ export default function App() {
   const [mcpInitialSection, setMcpInitialSection] = useState<McpCenterSection | null>(null);
 
   const [themePref, setThemePref] = useState<ThemePref>(loadInitialTheme);
+  const [uiDensity, setUiDensity] = useState<UiDensity>(loadInitialDensity);
+  const [headerScrolled, setHeaderScrolled] = useState(false);
+  const mainScrollRef = useRef<HTMLElement | null>(null);
+  const appearanceHydratedRef = useRef(false);
   const [systemDark, setSystemDark] = useState<boolean>(() =>
     typeof window !== "undefined" &&
     window.matchMedia?.("(prefers-color-scheme: dark)").matches,
@@ -135,9 +154,29 @@ export default function App() {
     return () => mq.removeEventListener("change", onChange);
   }, []);
 
+  const handleChangeTheme = useCallback((next: ThemePref) => {
+    setThemePref(next);
+    void api
+      .saveSettings({ themePref: next })
+      .then((saved) => {
+        setDashboard((prev) => (prev ? { ...prev, state: saved } : prev));
+      })
+      .catch(() => {});
+  }, []);
+
+  const handleChangeDensity = useCallback((next: UiDensity) => {
+    setUiDensity(next);
+    void api
+      .saveSettings({ uiDensity: next })
+      .then((saved) => {
+        setDashboard((prev) => (prev ? { ...prev, state: saved } : prev));
+      })
+      .catch(() => {});
+  }, []);
+
   const toggleThemeQuick = useCallback(() => {
-    setThemePref(isDark ? "light" : "dark");
-  }, [isDark]);
+    handleChangeTheme(isDark ? "light" : "dark");
+  }, [isDark, handleChangeTheme]);
 
   useEffect(() => {
     if (activeRoute === "overview") return;
@@ -174,7 +213,48 @@ export default function App() {
     } catch {
       // ignore storage errors
     }
+    void api.syncWindowTheme(themePref, isDark).catch(() => {});
   }, [themePref, isDark]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    root.setAttribute("data-density", uiDensity);
+    try {
+      localStorage.setItem("tako-switch-density", uiDensity);
+    } catch {
+      // ignore storage errors
+    }
+  }, [uiDensity]);
+
+  useEffect(() => {
+    if (appearanceHydratedRef.current || !dashboard) return;
+    appearanceHydratedRef.current = true;
+    let storedDensity: string | null = null;
+    let storedTheme: string | null = null;
+    try {
+      storedDensity = localStorage.getItem("tako-switch-density");
+      storedTheme = localStorage.getItem("tako-switch-theme");
+    } catch {
+      // ignore storage errors
+    }
+    if (
+      dashboard.state.uiDensity &&
+      (storedDensity === null || dashboard.state.uiDensity !== "compact")
+    ) {
+      setUiDensity(dashboard.state.uiDensity);
+    }
+    if (
+      dashboard.state.themePref &&
+      (storedTheme === null || dashboard.state.themePref !== "system")
+    ) {
+      setThemePref(dashboard.state.themePref);
+    }
+  }, [dashboard]);
+
+  useEffect(() => {
+    mainScrollRef.current?.scrollTo({ top: 0 });
+    setHeaderScrolled(false);
+  }, [activeRoute]);
 
   const showTransientNote = useCallback((msg: string) => {
     setStatusNote(msg);
@@ -1141,6 +1221,16 @@ export default function App() {
     return typeof navigator !== "undefined" && navigator.platform.toLowerCase().includes("mac");
   }, [dashboard?.os]);
 
+  const isWindows = useMemo(() => {
+    if (dashboard?.os) return dashboard.os === "windows";
+    return (
+      typeof navigator !== "undefined" &&
+      navigator.userAgent.toLowerCase().includes("win")
+    );
+  }, [dashboard?.os]);
+
+  const nativeWindow = useNativeWindowState(isWindows);
+
   const mcpEnabledCount = useMemo(() => {
     if (!dashboard) return 0;
     const mcp = dashboard.state.mcp;
@@ -1176,10 +1266,19 @@ export default function App() {
 
   return (
     <div className="h-screen w-full flex flex-col app-surface overflow-hidden">
-      {/* Classic Unified Header Bar (52px, macOS overlay-safe) */}
+      <WindowResizeHandles
+        enabled={isWindows && !nativeWindow.isMaximized}
+        onStartResize={nativeWindow.startResize}
+      />
+
+      {/* Seamless Integrated Header Bar (Windows undecorated + macOS overlay-safe) */}
       <TopHeaderBar
         isMac={isMac}
-        appVersion={dashboard?.appVersion ?? "2.2.4"}
+        isWindows={isWindows}
+        scrolled={headerScrolled}
+        windowFocused={nativeWindow.isFocused}
+        isMaximized={nativeWindow.isMaximized}
+        appVersion={dashboard?.appVersion ?? "2.2.7"}
         activeRoute={activeRoute}
         account={dashboard?.account}
         isDark={isDark}
@@ -1194,13 +1293,28 @@ export default function App() {
         onOpenKeyModal={() => setShowKeyModal(true)}
         onLogout={() => void handleLogout()}
         onOpenGeneralSettings={() => setActiveRoute("general")}
+        onMinimizeWindow={nativeWindow.minimize}
+        onToggleMaximizeWindow={nativeWindow.toggleMaximize}
+        onCloseWindow={nativeWindow.close}
+        onTitleBarContextMenu={() => {
+          void api.showWindowSystemMenu().catch(() => {});
+        }}
       />
 
       {/* Single-Column Main Scroll Viewport (Home or Secondary Page) */}
-      <main className="flex-1 min-h-0 overflow-y-auto subtle-scroll relative">
+      <main
+        ref={mainScrollRef}
+        onScroll={(e) => {
+          const nextScrolled = e.currentTarget.scrollTop > 4;
+          if (nextScrolled !== headerScrolled) {
+            setHeaderScrolled(nextScrolled);
+          }
+        }}
+        className="flex-1 min-h-0 overflow-y-auto subtle-scroll relative"
+      >
         {/* Inline Error Strip (dismissible) */}
         {errorMsg && (
-          <div className="w-full px-4 pt-3.5">
+          <div className="w-full max-w-[var(--density-page-max-w)] mx-auto px-[var(--density-page-px)] pt-3">
             <div
               className="rounded-[10px] border px-3.5 py-2 text-[12px] flex items-center justify-between gap-2"
               style={{
@@ -1278,7 +1392,9 @@ export default function App() {
           <GeneralSettingsPanel
             dashboard={dashboard}
             themePref={themePref}
-            onChangeTheme={setThemePref}
+            onChangeTheme={handleChangeTheme}
+            uiDensity={uiDensity}
+            onChangeDensity={handleChangeDensity}
             anyTakoMode={anyTakoMode}
             fixingGateway={fixingGateway}
             loggingIn={loggingIn}
@@ -1373,7 +1489,7 @@ export default function App() {
       </main>
 
       {/* Slim Bottom Status Bar */}
-      <footer className="h-8 shrink-0 px-4 border-t border-[var(--border)] bg-[var(--bg-card)]/80 flex items-center justify-between gap-3 text-[11.5px] text-[var(--text-secondary)] select-none">
+      <footer className="tako-statusbar shrink-0 border-t border-[var(--border)] bg-[var(--bg-card)]/80 flex items-center justify-between gap-3 text-[11.5px] text-[var(--text-secondary)] select-none">
         <div className="flex items-center gap-2 min-w-0">
           {!anyTakoMode ? (
             <span className="inline-flex items-center gap-1.5 text-[var(--text-muted)] truncate">

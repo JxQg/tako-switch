@@ -25,16 +25,17 @@
 
 | 路径 | 职责与核心符号 |
 |---|---|
-| `src/App.tsx` | 主界面：账号登录/登出、一键三端汉化开关、模型广场直达入口、四大客户端卡片（含 Antigravity 界面汉化/还原）、设置抽屉与更新检查 |
+| `src/App.tsx` | 主界面：无界融合顶栏、双密度（紧凑/舒适）与原生窗口主题联动、账号登录/登出、一键三端汉化开关、模型广场直达入口、四大客户端卡片与更新检查 |
+| `src/components/TopHeaderBar.tsx` / `WindowChrome.tsx` | 融合自定义标题栏、Windows 原生规范控制键（最小化/最大化还原/关闭）、8 方向无死角边缘缩放热区与右键系统窗口菜单 |
 | `src/components/McpInlineTheater.tsx` | 主界面下方 5 合 1 超级 MCP 内联实景剧场（「效果演示」零扣费媒体交互 + 「现场试跑」Live Playground） |
 | `src/components/ModelPickerModal.tsx` | 模型广场总览与分客户端模型选择弹窗：人民币/内部额度切换、明细价/均价双视图、官方倍率折扣与 6 场景筛选 |
 | `src/components/BrandIcons.tsx` / `ModelIcons.tsx` | 客户端品牌图标与模型厂商图标（Codex / Claude / Antigravity / DeepSeek 等） |
 | `src/lib/plaza-pricing.ts` | 与网关模型广场 PR #296 对齐的纯函数计价库（`CNY = internalUSD / 3`、`/1M`·`/1K`、官方倍率折算与快捷筛选） |
-| `src/lib/api.ts` | Tauri `invoke` Typed IPC 封装与数据类型定义（`AppSnapshot`、`UiPatchInfo`、`SwitchState`、`ClientModelsResponse`、`LiveDemoResult` 等） |
-| `src/index.css` | 全局设计 Token（浅色 + 深色 `[data-theme="dark"]`）与 `.tako-running-row` / `.tako-live-dot` 呼吸指示器样式 |
+| `src/lib/api.ts` | Tauri `invoke` Typed IPC 封装与数据类型定义（`AppSnapshot`、`UiPatchInfo`、`SwitchState`、`UiDensity`、`ThemePref`、`ClientModelsResponse`、`LiveDemoResult` 等） |
+| `src/index.css` | 全局设计 Token（浅色 + 深色 `[data-theme="dark"]`、紧凑默认 + 舒适 `[data-density="comfortable"]`）与 `.tako-live-dot` 呼吸指示器样式 |
 | `src-tauri/src/main.rs` | 4 角色子命令路由（`mcp-server`、`status-line`、`gateway-proxy` / `agy-proxy`、GUI） |
-| `src-tauri/src/lib.rs` | Tauri 命令注册（含 `set_prefer_chinese_ui`、`patch_antigravity_ui`、`restore_antigravity_ui`、`list_plaza_models`、`run_mcp_live_demo`）、OSS/GitHub 双端点更新策略、网关守护 |
-| `src-tauri/src/config.rs` | `AppPaths`（含沙盒 `agy_app_override_dir`）、备份存取 (`has_backup`)、`SwitchState`、`ClientModelFilter`、持久化设备指纹、原子写 (`write_atomic`) |
+| `src-tauri/src/lib.rs` | Tauri 命令注册（含 `sync_window_theme`、`show_window_system_menu`、`set_prefer_chinese_ui`、`patch_antigravity_ui`、`restore_antigravity_ui`、`list_plaza_models`、`run_mcp_live_demo`）、Windows 无框阴影与 DWM 边框色装配、OSS/GitHub 双端点更新策略、网关守护 |
+| `src-tauri/src/config.rs` | `AppPaths`（含沙盒 `agy_app_override_dir`）、备份存取 (`has_backup`)、`SwitchState`（含 `UiDensity` / `ThemePref`）、`ClientModelFilter`、持久化设备指纹、原子写 (`write_atomic`) |
 | `src-tauri/src/auth.rs` | 独立于 `tako-cli` 的 OAuth PKCE 登录（`DESKTOP_OAUTH_CLIENT_ID = "takoswitch"`、`build_oauth_authorize_url`、`exchange_desktop_token`）与 `~/.tako/switch/auth.json` 存取、`AccountStatus`、`BalanceCache` |
 | `src-tauri/src/agy_proxy.rs` | 本地网关服务、免登录模型广场 `fetch_plaza_models_for_ui` / `build_plaza_model_options`、`/claude` 与 `/codex` 模型目录生成与过滤、Antigravity 32 槽位展开 |
 | `src-tauri/src/mcp_server.rs` | 6 合 1 `stdio` MCP 工具实现（`tako_web_search`、`tako_generate_image`、`tako_generate_video`、`tako_generate_audio`、`tako_consult`、`tako_account_status`）及现场试跑核心 `execute_live_demo_for_paths` |

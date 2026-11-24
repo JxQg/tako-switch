@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 
 export type AppId = "dsh-tako" | "codex" | "claude" | "antigravity";
 export type AppMode = "official" | "tako";
+export type UiDensity = "compact" | "comfortable";
+export type ThemePref = "system" | "light" | "dark";
 
 export interface QuotaSummary {
   windowCostLimit: number;
@@ -122,6 +124,8 @@ export interface SwitchState {
   preferChineseUi?: boolean;
   showTrayBalance?: boolean;
   bypassSystemProxy?: boolean;
+  uiDensity?: UiDensity;
+  themePref?: ThemePref;
   mcp: McpToolsConfig;
   modelFilters?: ModelFiltersConfig;
   explicitOfficialApps?: AppId[];
@@ -357,6 +361,8 @@ export interface SettingsPatch {
   preferChineseUi?: boolean;
   showTrayBalance?: boolean;
   bypassSystemProxy?: boolean;
+  uiDensity?: UiDensity;
+  themePref?: ThemePref;
   mcp?: McpToolsConfig;
 }
 
@@ -448,6 +454,9 @@ export const api = {
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   saveSettings: (input: SettingsPatch) =>
     invoke<SwitchState>("save_settings", { input }),
+  syncWindowTheme: (themePref: ThemePref, isDark: boolean) =>
+    invoke<void>("sync_window_theme", { themePref, isDark }),
+  showWindowSystemMenu: () => invoke<void>("show_window_system_menu"),
   setPreferChineseUi: (
     enable: boolean,
     patchAntigravity: boolean,

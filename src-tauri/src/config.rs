@@ -424,6 +424,23 @@ impl ModelFiltersConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum UiDensity {
+    #[default]
+    Compact,
+    Comfortable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePref {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchState {
@@ -445,6 +462,10 @@ pub struct SwitchState {
     pub show_tray_balance: bool,
     #[serde(default = "default_true")]
     pub bypass_system_proxy: bool,
+    #[serde(default)]
+    pub ui_density: UiDensity,
+    #[serde(default)]
+    pub theme_pref: ThemePref,
     #[serde(default)]
     pub mcp: McpToolsConfig,
     #[serde(default)]
@@ -470,6 +491,8 @@ impl SwitchState {
             prefer_chinese_ui: true,
             show_tray_balance: true,
             bypass_system_proxy: true,
+            ui_density: UiDensity::Compact,
+            theme_pref: ThemePref::System,
             mcp: McpToolsConfig::with_default_dir(paths),
             model_filters: ModelFiltersConfig::default(),
             explicit_official_apps: Vec::new(),
@@ -1108,5 +1131,31 @@ mod tests {
         let val_on_disk: serde_json::Value = serde_json::from_str(&raw_on_disk).unwrap();
         assert!(val_on_disk["mcp"]["edgeoneApiToken"].is_null());
         assert_eq!(val_on_disk["mcp"]["edgeoneProjectName"], "my-site");
+        assert_eq!(val_on_disk["uiDensity"], "compact");
+        assert_eq!(val_on_disk["themePref"], "system");
+    }
+
+    #[test]
+    fn ui_density_and_theme_pref_default_to_compact_system_and_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+
+        let default_state = read_switch_state(&paths);
+        assert_eq!(default_state.ui_density, UiDensity::Compact);
+        assert_eq!(default_state.theme_pref, ThemePref::System);
+
+        let mut updated = default_state;
+        updated.ui_density = UiDensity::Comfortable;
+        updated.theme_pref = ThemePref::Dark;
+        save_switch_state(&paths, &updated).unwrap();
+
+        let reloaded = read_switch_state(&paths);
+        assert_eq!(reloaded.ui_density, UiDensity::Comfortable);
+        assert_eq!(reloaded.theme_pref, ThemePref::Dark);
+
+        let val: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(paths.state_path()).unwrap()).unwrap();
+        assert_eq!(val["uiDensity"], "comfortable");
+        assert_eq!(val["themePref"], "dark");
     }
 }

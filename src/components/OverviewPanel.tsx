@@ -238,7 +238,7 @@ export function OverviewPanel({
   const mcp = dashboard?.state.mcp ?? null;
 
   return (
-    <div className="w-full px-4 py-3.5 flex flex-col gap-3.5">
+    <div className="tako-page-overview flex flex-col">
       {/* Compact Self-Update Banner */}
       {(selfUpdateSummary.status === "available" ||
         selfUpdateSummary.status === "downloading" ||
@@ -441,11 +441,11 @@ export function OverviewPanel({
         ) : null}
 
         {loading ? (
-          <div className="rounded-[13px] border border-[var(--border)] bg-[var(--bg-card)] p-6 text-center text-[13px] text-[var(--text-secondary)]">
+          <div className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] p-6 text-center text-[13px] text-[var(--text-secondary)]">
             正在读取本机客户端与配置...
           </div>
         ) : (
-          <div className="flex flex-col gap-2">
+          <div className="flex flex-col tako-list-stack">
             {orderedApps.map((app) => {
               const update = updatesMap[app.id];
               const progress = installProgress[app.id];
@@ -461,20 +461,20 @@ export function OverviewPanel({
               return (
                 <div
                   key={app.id}
-                  className={`rounded-[13px] border bg-[var(--bg-card)] shadow-[var(--shadow-card)] transition-colors overflow-hidden ${
+                  className={`tako-card-surface border bg-[var(--bg-card)] shadow-[var(--shadow-card)] transition-colors overflow-hidden ${
                     app.running
                       ? "border-[var(--success-border)]"
                       : "border-[var(--border)] hover:border-[var(--border-strong)]"
                   }`}
                 >
-                  <div className="px-3.5 py-2.5 flex flex-wrap sm:flex-nowrap items-center gap-x-3 gap-y-2">
+                  <div className="tako-client-row flex flex-wrap sm:flex-nowrap items-center gap-x-3 gap-y-2">
                     {/* Brand & Summary (click enters client subpage) */}
                     <button
                       type="button"
                       onClick={() => onNavigate(app.id)}
                       className="w-full sm:w-auto sm:flex-1 min-w-0 flex items-center gap-3 text-left group cursor-pointer"
                     >
-                      <AppBrandIcon appId={app.id} className="h-8 w-8" />
+                      <AppBrandIcon appId={app.id} className="tako-brand-size" />
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-1.5 min-w-0">
                           <span className="text-[13.5px] font-semibold tracking-[-0.01em] text-[var(--text-primary)] group-hover:text-[var(--accent)] transition truncate">
@@ -535,7 +535,7 @@ export function OverviewPanel({
                             type="button"
                             disabled={isBusy}
                             onClick={() => onSetMode(app, option.id)}
-                            className={`h-7 rounded-[7px] text-[12px] transition cursor-pointer disabled:opacity-60 ${
+                            className={`h-[var(--density-ctrl-sm-h)] rounded-[7px] text-[12px] transition cursor-pointer disabled:opacity-60 ${
                               active
                                 ? "bg-[var(--bg-card)] font-semibold shadow-[var(--shadow-segment)]"
                                 : "text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
@@ -579,7 +579,7 @@ export function OverviewPanel({
                         )
                       ) : !app.install.installed ? (
                         update && !update.platformSupported ? (
-                          <span className="w-full h-8 rounded-[9px] bg-[var(--bg-subtle)] text-[var(--text-muted)] text-[12px] font-medium flex items-center justify-center">
+                          <span className="w-full tako-ctrl-h rounded-[9px] bg-[var(--bg-subtle)] text-[var(--text-muted)] text-[12px] font-medium flex items-center justify-center">
                             暂不支持
                           </span>
                         ) : (
@@ -588,7 +588,7 @@ export function OverviewPanel({
                             data-testid={`overview-action-${app.id}`}
                             disabled={isBusy}
                             onClick={() => onInstallOrUpgrade(app.id)}
-                            className="w-full h-8 rounded-[9px] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60"
+                            className="w-full tako-ctrl-h rounded-[9px] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60"
                           >
                             <Download className="h-3.5 w-3.5" />
                             <span>{isBusy ? "安装中" : "安装"}</span>
@@ -601,7 +601,7 @@ export function OverviewPanel({
                           disabled={isBusy}
                           onClick={() => onRestartApp(app.id)}
                           title="重启应用使最新配置生效"
-                          className="w-full h-8 rounded-[9px] text-[12px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60"
+                          className="w-full tako-ctrl-h rounded-[9px] text-[12px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60"
                           style={{
                             backgroundColor: "var(--warning-soft)",
                             color: "var(--warning)",
@@ -617,7 +617,7 @@ export function OverviewPanel({
                           disabled={isBusy}
                           onClick={() => onCloseApp(app.id)}
                           title={`关闭 ${APP_DISPLAY_NAMES[app.id]}`}
-                          className="w-full h-8 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] text-[12px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60"
+                          className="w-full tako-ctrl-h rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-primary)] text-[12px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60"
                         >
                           <Power className="h-3.5 w-3.5 text-[var(--text-secondary)]" />
                           <span>{isBusy ? "关闭中" : "关闭"}</span>
@@ -629,7 +629,7 @@ export function OverviewPanel({
                           disabled={isBusy}
                           onClick={() => onLaunchApp(app.id)}
                           title={`一键打开 ${APP_DISPLAY_NAMES[app.id]}`}
-                          className="w-full h-8 rounded-[9px] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60"
+                          className="w-full tako-ctrl-h rounded-[9px] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12px] font-medium flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-60"
                         >
                           <ExternalLink className="h-3.5 w-3.5" />
                           <span>{isBusy ? "打开中" : "打开"}</span>
@@ -643,7 +643,7 @@ export function OverviewPanel({
                       data-testid={`open-client-settings-${app.id}`}
                       onClick={() => onNavigate(app.id)}
                       title={`进入 ${APP_DISPLAY_NAMES[app.id]} 独立设置（模型、汉化、升级与诊断）`}
-                      className="h-8 px-2.5 rounded-[9px] border border-[var(--border)] bg-[var(--bg-subtle)]/55 hover:bg-[var(--bg-subtle)] hover:border-[var(--border-strong)] text-[12px] font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)] inline-flex items-center gap-1 transition cursor-pointer shrink-0"
+                      className="tako-ctrl-h px-2.5 rounded-[9px] border border-[var(--border)] bg-[var(--bg-subtle)]/55 hover:bg-[var(--bg-subtle)] hover:border-[var(--border-strong)] text-[12px] font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)] inline-flex items-center gap-1 transition cursor-pointer shrink-0"
                     >
                       <SlidersHorizontal className="h-3.5 w-3.5" />
                       <span>设置</span>
@@ -678,8 +678,8 @@ export function OverviewPanel({
       </section>
 
       {/* Section 2: Tako Super MCP Compact Card + Secondary Page Entry */}
-      <section className="rounded-[13px] border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-card)] p-3.5 min-w-0">
-        <div className="flex flex-wrap items-center justify-between gap-2 mb-2.5">
+      <section className="tako-mcp-section border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-card)] min-w-0">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-[var(--density-list-gap)]">
           <div className="flex items-center gap-2 min-w-0">
             <Sparkles className="h-4 w-4 text-[var(--accent)] shrink-0" />
             <span className="text-[13px] font-semibold text-[var(--text-primary)] shrink-0">
@@ -715,7 +715,7 @@ export function OverviewPanel({
           </div>
         </div>
 
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+        <div className="grid grid-cols-2 sm:grid-cols-3 tako-list-stack">
           {HOME_MCP_ITEMS.map((item) => {
             const Icon = item.Icon;
             const enabled =
@@ -738,7 +738,7 @@ export function OverviewPanel({
                     onOpenMcpDetail(item.kind === "core" ? item.key : undefined);
                   }
                 }}
-                className={`rounded-[10px] border px-2.5 py-2 flex flex-col justify-between gap-1.5 transition select-none min-w-0 cursor-pointer ${
+                className={`rounded-[10px] border tako-mcp-cell flex flex-col justify-between gap-1.5 transition select-none min-w-0 cursor-pointer ${
                   enabled
                     ? "bg-[var(--accent-soft)]/50 border-[var(--accent-border)] text-[var(--accent)] hover:bg-[var(--accent-soft)]"
                     : "bg-[var(--bg-subtle)]/55 border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--text-primary)]"

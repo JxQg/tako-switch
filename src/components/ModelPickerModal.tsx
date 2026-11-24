@@ -598,7 +598,7 @@ export function ModelPickerModal({
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-[820px] h-[min(640px,92vh)] rounded-[16px] border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-modal)] flex flex-col overflow-hidden"
+        className="w-full max-w-[860px] h-[min(660px,92vh)] rounded-[16px] border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-modal)] flex flex-col overflow-hidden"
       >
         {/* Top Header: Context-focused client title (or Plaza tabs) + Mode + Actions */}
         <div className="px-4 py-3 border-b border-[var(--border)] flex flex-wrap items-center justify-between gap-2.5 shrink-0 bg-[var(--bg-card)]">
@@ -1072,7 +1072,7 @@ export function ModelPickerModal({
                   )}
                 </div>
               ) : (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                <div className="grid grid-cols-1 md:grid-cols-2 tako-list-stack">
                   {filteredModels.map((model) => {
                     const key = model.id.toLowerCase();
                     const checked = checkedIds.has(key);
@@ -1122,7 +1122,7 @@ export function ModelPickerModal({
                         disabled={saving}
                         onClick={() => handleCardClick(model.id)}
                         title={buildCardTitle(model, currency, tokenUnit, lockedLast)}
-                        className={`group text-left p-2.5 rounded-[11px] border transition flex flex-col gap-1.5 min-w-0 cursor-pointer ${
+                        className={`group text-left tako-mcp-cell rounded-[11px] border transition flex flex-col gap-1.5 min-w-0 cursor-pointer ${
                           !isPlazaOverview && checked
                             ? "border-[var(--accent-border)] bg-[var(--accent-soft)]/35 hover:bg-[var(--accent-soft)]/55"
                             : "border-[var(--border)] bg-[var(--bg-card)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)]/40"

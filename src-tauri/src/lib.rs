@@ -136,6 +136,8 @@ pub struct SettingsPatch {
     pub prefer_chinese_ui: Option<bool>,
     pub show_tray_balance: Option<bool>,
     pub bypass_system_proxy: Option<bool>,
+    pub ui_density: Option<config::UiDensity>,
+    pub theme_pref: Option<config::ThemePref>,
     pub mcp: Option<McpToolsConfig>,
 }
 
@@ -719,6 +721,12 @@ pub fn apply_settings_patch_for_paths(
     if let Some(bypass_proxy) = input.bypass_system_proxy {
         state.bypass_system_proxy = bypass_proxy;
     }
+    if let Some(density) = input.ui_density {
+        state.ui_density = density;
+    }
+    if let Some(theme) = input.theme_pref {
+        state.theme_pref = theme;
+    }
     if let Some(mut mcp) = input.mcp {
         mcp.normalize();
         state.mcp = mcp;
@@ -766,9 +774,199 @@ pub fn apply_settings_patch_for_paths(
 #[tauri::command]
 async fn save_settings(app: AppHandle, input: SettingsPatch) -> Result<SwitchState, String> {
     let paths = AppPaths::detect()?;
+    let theme_changed = input.theme_pref.is_some();
     let state = apply_settings_patch_for_paths(&paths, input)?;
+    if theme_changed {
+        if let Some(win) = app.get_webview_window("main") {
+            apply_native_window_appearance(&win, state.theme_pref, None);
+        }
+    }
     refresh_tray(&app, &paths);
     Ok(state)
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_dwm_frame_attributes(win: &tauri::WebviewWindow, is_dark: bool) {
+    let Ok(hwnd_raw) = win.hwnd() else { return };
+    let hwnd = hwnd_raw.0;
+    if hwnd.is_null() {
+        return;
+    }
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_ROUND: u32 = 2;
+    const DWMWA_BORDER_COLOR: u32 = 34;
+
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: *mut std::ffi::c_void,
+            attribute: u32,
+            pv_attribute: *const std::ffi::c_void,
+            cb_attribute: u32,
+        ) -> i32;
+    }
+
+    let corner_pref: u32 = DWMWCP_ROUND;
+    // COLORREF uses 0x00BBGGRR: light #e1e5ec -> 0x00ECE5E1, dark #242b3d -> 0x003D2B24
+    let border_color: u32 = if is_dark { 0x003D_2B24 } else { 0x00EC_E5E1 };
+
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&corner_pref as *const u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&border_color as *const u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+}
+
+fn apply_native_window_appearance(
+    win: &tauri::WebviewWindow,
+    theme_pref: config::ThemePref,
+    resolved_dark: Option<bool>,
+) {
+    let native_theme = match theme_pref {
+        config::ThemePref::Light => Some(tauri::Theme::Light),
+        config::ThemePref::Dark => Some(tauri::Theme::Dark),
+        config::ThemePref::System => None,
+    };
+    let _ = win.set_theme(native_theme);
+
+    let is_dark = match theme_pref {
+        config::ThemePref::Dark => true,
+        config::ThemePref::Light => false,
+        config::ThemePref::System => {
+            resolved_dark.unwrap_or_else(|| matches!(win.theme(), Ok(tauri::Theme::Dark)))
+        }
+    };
+    let bg_color = if is_dark {
+        tauri::window::Color(15, 18, 25, 255)
+    } else {
+        tauri::window::Color(247, 248, 251, 255)
+    };
+    let _ = win.set_background_color(Some(bg_color));
+
+    #[cfg(target_os = "windows")]
+    apply_windows_dwm_frame_attributes(win, is_dark);
+}
+
+#[tauri::command]
+fn sync_window_theme(app: AppHandle, theme_pref: config::ThemePref, is_dark: bool) {
+    if let Some(win) = app.get_webview_window("main") {
+        apply_native_window_appearance(&win, theme_pref, Some(is_dark));
+    }
+}
+
+#[tauri::command]
+fn show_window_system_menu(window: tauri::WebviewWindow) {
+    #[cfg(target_os = "windows")]
+    {
+        let Ok(hwnd_raw) = window.hwnd() else { return };
+        let hwnd = hwnd_raw.0;
+        if hwnd.is_null() {
+            return;
+        }
+        #[repr(C)]
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+        const TPM_LEFTALIGN: u32 = 0x0000;
+        const TPM_TOPALIGN: u32 = 0x0000;
+        const TPM_RIGHTBUTTON: u32 = 0x0002;
+        const TPM_RETURNCMD: u32 = 0x0100;
+        const WM_SYSCOMMAND: u32 = 0x0112;
+        const MF_BYCOMMAND: u32 = 0x0000;
+        const MF_ENABLED: u32 = 0x0000;
+        const MF_GRAYED: u32 = 0x0001;
+        const SC_RESTORE: u32 = 0xF120;
+        const SC_MOVE: u32 = 0xF010;
+        const SC_SIZE: u32 = 0xF000;
+        const SC_MINIMIZE: u32 = 0xF020;
+        const SC_MAXIMIZE: u32 = 0xF030;
+        const SC_CLOSE: u32 = 0xF060;
+
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetSystemMenu(hwnd: *mut std::ffi::c_void, revert: i32) -> *mut std::ffi::c_void;
+            fn EnableMenuItem(hmenu: *mut std::ffi::c_void, id: u32, enable: u32) -> i32;
+            fn GetCursorPos(point: *mut Point) -> i32;
+            fn SetForegroundWindow(hwnd: *mut std::ffi::c_void) -> i32;
+            fn TrackPopupMenu(
+                hmenu: *mut std::ffi::c_void,
+                flags: u32,
+                x: i32,
+                y: i32,
+                reserved: i32,
+                hwnd: *mut std::ffi::c_void,
+                rect: *const std::ffi::c_void,
+            ) -> i32;
+            fn PostMessageW(
+                hwnd: *mut std::ffi::c_void,
+                msg: u32,
+                wparam: usize,
+                lparam: isize,
+            ) -> i32;
+        }
+
+        let maximized = window.is_maximized().unwrap_or(false);
+        unsafe {
+            let hmenu = GetSystemMenu(hwnd, 0);
+            if hmenu.is_null() {
+                return;
+            }
+            let _ = EnableMenuItem(
+                hmenu,
+                SC_RESTORE,
+                MF_BYCOMMAND | if maximized { MF_ENABLED } else { MF_GRAYED },
+            );
+            let _ = EnableMenuItem(
+                hmenu,
+                SC_MOVE,
+                MF_BYCOMMAND | if maximized { MF_GRAYED } else { MF_ENABLED },
+            );
+            let _ = EnableMenuItem(
+                hmenu,
+                SC_SIZE,
+                MF_BYCOMMAND | if maximized { MF_GRAYED } else { MF_ENABLED },
+            );
+            let _ = EnableMenuItem(hmenu, SC_MINIMIZE, MF_BYCOMMAND | MF_ENABLED);
+            let _ = EnableMenuItem(
+                hmenu,
+                SC_MAXIMIZE,
+                MF_BYCOMMAND | if maximized { MF_GRAYED } else { MF_ENABLED },
+            );
+            let _ = EnableMenuItem(hmenu, SC_CLOSE, MF_BYCOMMAND | MF_ENABLED);
+
+            let mut pt = Point { x: 0, y: 0 };
+            if GetCursorPos(&mut pt) == 0 {
+                return;
+            }
+            let _ = SetForegroundWindow(hwnd);
+            let cmd = TrackPopupMenu(
+                hmenu,
+                TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                pt.x,
+                pt.y,
+                0,
+                hwnd,
+                std::ptr::null(),
+            );
+            if cmd != 0 {
+                let _ = PostMessageW(hwnd, WM_SYSCOMMAND, cmd as usize, 0);
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+    }
 }
 
 #[tauri::command]
@@ -2120,6 +2318,14 @@ pub fn run() {
             });
 
             if let Some(win) = app.get_webview_window("main") {
+                let init_state = read_switch_state(&paths);
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = win.set_decorations(false);
+                    let _ = win.set_shadow(true);
+                }
+                apply_native_window_appearance(&win, init_state.theme_pref, None);
+
                 let win_clone = win.clone();
                 win.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
@@ -2139,6 +2345,8 @@ pub fn run() {
             logout_account,
             open_url,
             save_settings,
+            sync_window_theme,
+            show_window_system_menu,
             set_prefer_chinese_ui,
             patch_app_ui,
             restore_app_ui,
@@ -2329,5 +2537,38 @@ mod tests {
             get_adapter(AppId::Antigravity).read_mode(&paths),
             AppMode::Official
         );
+    }
+
+    #[test]
+    fn ui_appearance_settings_patch_persists_without_touching_client_configs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        config::save_switch_auth(&paths, Some("cr_ui_test"), Some("1"), Some("oauth")).unwrap();
+
+        // Put Codex in Tako mode, then mutate config.toml with a custom comment marker
+        get_adapter(AppId::Codex)
+            .apply_mode(&paths, AppMode::Tako)
+            .unwrap();
+        let codex_cfg_path = paths.codex_dir.join("config.toml");
+        let mut raw_toml = std::fs::read_to_string(&codex_cfg_path).unwrap();
+        raw_toml.push_str("\n# untouched-marker\n");
+        std::fs::write(&codex_cfg_path, &raw_toml).unwrap();
+
+        let saved = apply_settings_patch_for_paths(
+            &paths,
+            SettingsPatch {
+                ui_density: Some(config::UiDensity::Comfortable),
+                theme_pref: Some(config::ThemePref::Dark),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(saved.ui_density, config::UiDensity::Comfortable);
+        assert_eq!(saved.theme_pref, config::ThemePref::Dark);
+
+        // Codex config was not rewritten by pure UI appearance patch
+        let after_toml = std::fs::read_to_string(&codex_cfg_path).unwrap();
+        assert_eq!(after_toml, raw_toml);
     }
 }

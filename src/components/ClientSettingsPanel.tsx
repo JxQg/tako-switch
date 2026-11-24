@@ -217,7 +217,7 @@ export function ClientSettingsPanel({
     (dashboard.state.gatewayDisplaySubtitle ?? "Tako AI Gateway").trim();
 
   return (
-    <div className="w-full px-4 sm:px-5 py-4 flex flex-col gap-5">
+    <div className="tako-page-sub flex flex-col">
       {/* Page Header */}
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0 flex-1">
@@ -287,8 +287,8 @@ export function ClientSettingsPanel({
       </div>
 
       {/* 3-Card Status Strip */}
-      <div className="grid grid-cols-3 gap-2.5">
-        <div className="rounded-[11px] border border-[var(--border)] bg-[var(--bg-card)] px-3.5 py-3">
+      <div className="grid grid-cols-3 tako-list-stack">
+        <div className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] tako-panel-head">
           <div className="text-[11px] text-[var(--text-muted)] flex items-center justify-between gap-1">
             <span>安装状态</span>
             {app.running && (
@@ -307,7 +307,7 @@ export function ClientSettingsPanel({
           </div>
         </div>
 
-        <div className="rounded-[11px] border border-[var(--border)] bg-[var(--bg-card)] px-3.5 py-3">
+        <div className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] tako-panel-head">
           <div className="text-[11px] text-[var(--text-muted)]">运行模式</div>
           <div
             className={`mt-1.5 text-[14px] font-semibold truncate ${
@@ -318,7 +318,7 @@ export function ClientSettingsPanel({
           </div>
         </div>
 
-        <div className="rounded-[11px] border border-[var(--border)] bg-[var(--bg-card)] px-3.5 py-3">
+        <div className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] tako-panel-head">
           <div className="text-[11px] text-[var(--text-muted)]">更新状态</div>
           {update?.hasUpdate && update.remoteVersion ? (
             <button
@@ -340,7 +340,7 @@ export function ClientSettingsPanel({
       {/* Dedicated Full Simplified Chinese UI Banner (Claude Desktop & Antigravity) */}
       {(app.id === "claude" || app.id === "antigravity") && (
         <div
-          className="rounded-[12px] border border-[var(--accent-border)] px-4 py-3.5 flex flex-col gap-3"
+          className="tako-card-surface border border-[var(--accent-border)] tako-panel-pad flex flex-col gap-3"
           style={{ background: "var(--language-grad)" }}
         >
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -472,8 +472,8 @@ export function ClientSettingsPanel({
       )}
 
       {/* Connection & Model Card */}
-      <section className="rounded-[13px] border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden">
-        <div className="px-4 py-3.5 border-b border-[var(--border)]">
+      <section className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden">
+        <div className="tako-panel-head border-b border-[var(--border)]">
           <h2 className="text-[13.5px] font-semibold text-[var(--text-primary)]">
             {isDsh ? "账号同步" : "连接与模型"}
           </h2>
@@ -482,9 +482,9 @@ export function ClientSettingsPanel({
           </p>
         </div>
 
-        <div className="divide-y divide-[var(--border)] px-4">
+        <div className="divide-y divide-[var(--border)] tako-panel-body">
           {/* Mode Row */}
-          <div className="py-3.5 flex flex-wrap items-center justify-between gap-4">
+          <div className="tako-setting-row flex flex-wrap items-center justify-between gap-4">
             <div className="min-w-0 flex-1">
               <div className="text-[13px] font-medium text-[var(--text-primary)]">
                 运行模式
@@ -503,7 +503,7 @@ export function ClientSettingsPanel({
 
           {/* Model Selection Row (non-DSH clients) */}
           {!isDsh && (
-            <div className="py-3.5 flex flex-wrap items-center justify-between gap-4">
+            <div className="tako-setting-row flex flex-wrap items-center justify-between gap-4">
               <div className="min-w-0 flex-1">
                 <div className="text-[13px] font-medium text-[var(--text-primary)]">
                   可用模型列表
@@ -530,7 +530,7 @@ export function ClientSettingsPanel({
           {/* Codex-only: Preserve Official ChatGPT Login + Chinese Reply Status */}
           {app.id === "codex" && (
             <>
-              <div className="py-3.5 flex items-center justify-between gap-4">
+              <div className="tako-setting-row flex items-center justify-between gap-4">
                 <div className="min-w-0 flex-1">
                   <div className="text-[13px] font-medium text-[var(--text-primary)]">
                     保留官方 ChatGPT 登录
@@ -552,7 +552,7 @@ export function ClientSettingsPanel({
                 />
               </div>
 
-              <div className="py-3.5 flex items-center justify-between gap-4">
+              <div className="tako-setting-row flex items-center justify-between gap-4">
                 <div className="min-w-0 flex-1">
                   <div className="text-[13px] font-medium text-[var(--text-primary)]">
                     简体中文回复规则
@@ -570,7 +570,7 @@ export function ClientSettingsPanel({
 
           {/* Antigravity-only: Dedicated Agy Key & 32-slot note */}
           {app.id === "antigravity" && (
-            <div className="py-3.5 flex flex-col gap-2">
+            <div className="tako-setting-row flex flex-col gap-2">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="min-w-0">
                   <div className="text-[13px] font-medium text-[var(--text-primary)]">
@@ -655,16 +655,16 @@ export function ClientSettingsPanel({
       </section>
 
       {/* Install & Maintenance Card */}
-      <section className="rounded-[13px] border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden">
-        <div className="px-4 py-3.5 border-b border-[var(--border)]">
+      <section className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden">
+        <div className="tako-panel-head border-b border-[var(--border)]">
           <h2 className="text-[13.5px] font-semibold text-[var(--text-primary)]">
             安装与维护
           </h2>
         </div>
 
-        <div className="divide-y divide-[var(--border)] px-4">
+        <div className="divide-y divide-[var(--border)] tako-panel-body">
           {/* Install / Update Row */}
-          <div className="py-3.5 flex flex-col gap-2.5">
+          <div className="tako-setting-row flex flex-col gap-2.5">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0 flex-1">
                 <div className="text-[13px] font-medium text-[var(--text-primary)]">
@@ -727,7 +727,7 @@ export function ClientSettingsPanel({
 
           {/* Close Running App */}
           {app.running && (
-            <div className="py-3.5 flex items-center justify-between gap-3">
+            <div className="tako-setting-row flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <div className="text-[13px] font-medium text-[var(--text-primary)]">
                   关闭正在运行的进程
@@ -740,7 +740,7 @@ export function ClientSettingsPanel({
                 type="button"
                 disabled={isBusy}
                 onClick={() => onCloseApp(app.id)}
-                className="h-8 px-3 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--danger-soft)] text-[12px] font-medium text-[var(--danger)] inline-flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50 shrink-0"
+                className="tako-ctrl-h px-3 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--danger-soft)] text-[12px] font-medium text-[var(--danger)] inline-flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50 shrink-0"
               >
                 <Power className="h-3.5 w-3.5" />
                 <span>关闭应用</span>
@@ -749,7 +749,7 @@ export function ClientSettingsPanel({
           )}
 
           {/* Diagnostics (on-demand collapsible) */}
-          <div className="py-3.5 flex flex-col gap-2.5">
+          <div className="tako-setting-row flex flex-col gap-2.5">
             <div className="flex items-center justify-between gap-3">
               <button
                 type="button"
