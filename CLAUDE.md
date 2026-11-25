@@ -39,6 +39,9 @@
 | `src-tauri/src/main.rs` | 4 角色子命令路由（`mcp-server`、`status-line`、`gateway-proxy` / `agy-proxy`、GUI） |
 | `src-tauri/src/lib.rs` | Tauri 命令注册（含 `sync_window_theme`、`show_window_system_menu`、`set_prefer_chinese_ui`、`patch_antigravity_ui`、`restore_antigravity_ui`、`list_plaza_models`、`run_mcp_live_demo`）、Windows 无框阴影与 DWM 边框色装配、OSS/GitHub 双端点更新策略、网关守护 |
 | `src-tauri/src/config.rs` | `AppPaths`（含沙盒 `agy_app_override_dir`）、备份存取 (`has_backup`)、`SwitchState`（含 `UiDensity` / `ThemePref`）、`ClientModelFilter`、持久化设备指纹、原子写 (`write_atomic`) |
+| `src-tauri/src/extensions/mod.rs` / `skills.rs` | 复用 `SyncPlatform` 的三端扩展平台类型、JSON Store、代理策略与 Skills 主副本、软链回退、ZIP 导入、GitHub 仓库发现和内容哈希更新 |
+| `src/components/ExtensionsHubPanel.tsx` / `extensions/` | 扩展中心入口、公共搜索/菜单/抽屉原语和 Skills 已安装矩阵、仓库发现、导入视图 |
+| `docs/skills-hub.md` / `src-tauri/tests/ext_hub_phase2_blackbox.rs` / `scripts/test_skills_hub_ui.mjs` | Skills 使用与存储契约、隔离后端黑盒和八组窗口/主题/密度 UI 验证 |
 | `src-tauri/src/auth.rs` | 独立于 `tako-cli` 的 OAuth PKCE 登录（`DESKTOP_OAUTH_CLIENT_ID = "takoswitch"`、`build_oauth_authorize_url`、`exchange_desktop_token`）与 `~/.tako/switch/auth.json` 存取、`AccountStatus`、`BalanceCache` |
 | `src-tauri/src/agy_proxy.rs` | 本地网关服务、免登录模型广场 `fetch_plaza_models_for_ui` / `build_plaza_model_options`、`/claude` 与 `/codex` 模型目录生成与过滤、Antigravity 32 槽位展开 |
 | `src-tauri/src/mcp_server.rs` | 6 合 1 `stdio` MCP 工具实现（`tako_web_search`、`tako_generate_image`、`tako_generate_video`、`tako_generate_audio`、`tako_consult`、`tako_account_status`）及现场试跑核心 `execute_live_demo_for_paths` |
@@ -88,10 +91,11 @@
    - `SwitchState.bypass_system_proxy`（JSON 键 `bypassSystemProxy`）默认值为 `true`（直连 Tako 网关 `.no_proxy()`），避免用户开启慢速全局/系统代理时劫持网关上行；在设置中关闭后无需重启守护进程即可动态切回系统代理。
    - 本地网关转发无需改写的超大请求体（> 64 KiB）时采用流式透传，并在下游客户端断开 TCP 连接时立即中止上游请求，防止超时重试堆积僵尸上传。
 8. **通用扩展中心（`extensions/`）**：
-   - 只纳管 `Claude`、`Codex` 和 `Antigravity`，复用 `SyncPlatform as ExtPlatform`。全部核心入口接收 `&AppPaths`，测试使用 `TempDir` 和 `AppPaths::for_test`。
-   - 中心库存放于 `switch/extensions/mcp.json` 和 `prompts.json`。快照自动收编历史配置，不改写客户端原文件；首次修改先备份，所有写入经 `write_atomic`。
-   - 通用 MCP 排除 `tako`、`tako-web-page` 和 `node_repl`。Claude 开关联动 1p、已存在的 3p 和 `.claude.json`，保留其他字段；全关仍保留中心记录，备份恢复保留各端参数差异。
-   - 提示词只修改用户正文，原样保留汉化托管块。快照归档手写正文，并回写已启用预设的外部修改；跨端同步仅作用于勾选的平台。
+   - 只纳管 `Claude`、`Codex` 和 `Antigravity`（严禁触碰 `~/.dsh-tako`）。全部核心入口接收 `&AppPaths`，测试强制使用 `TempDir` 和 `AppPaths::for_test`。
+   - 中心库存放于 `switch/extensions/` 与 `switch/skills/`。快照自动收编历史配置，不改写客户端原文件；首次修改先 `backup_file_once` 备份，所有写入经 `write_atomic` 落盘。
+   - 通用 MCP 排除内置 `tako`、`tako-web-page` 和 `node_repl`；Claude 开关联动 `1p`、已存在的 `3p` 和 `~/.claude.json`，全关仍保留中心记录。
+   - 提示词只修改用户正文，原样保留汉化托管块；快照自动归档手写正文并回写外部修改。
+   - Skills 主副本位于 `switch/skills/<id>`，全关保留主副本；自动模式优先目录软链，无权限回退原子复制，移除链接/Junction 时仅删链接本身；ZIP 解压内存预检路径、深度与 50 MiB 上限，仓库拉取遵循 `bypass_system_proxy`。
 
 ---
 

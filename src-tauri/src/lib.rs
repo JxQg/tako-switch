@@ -2534,6 +2534,19 @@ pub fn run() {
             sync_skill_to_platforms,
             sync_all_skills,
             remove_synced_item,
+            extensions::skills::get_skills_hub_snapshot,
+            extensions::skills::toggle_skill_platform,
+            extensions::skills::align_skill_platforms,
+            extensions::skills::uninstall_skill,
+            extensions::skills::set_skill_sync_method,
+            extensions::skills::set_skill_default_targets,
+            extensions::skills::import_local_skill,
+            extensions::skills::scan_adopt_local_skills,
+            extensions::skills::upsert_skill_repo,
+            extensions::skills::remove_skill_repo,
+            extensions::skills::discover_repo_skills,
+            extensions::skills::install_discovered_skill,
+            extensions::skills::update_installed_skill,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tako Switch");

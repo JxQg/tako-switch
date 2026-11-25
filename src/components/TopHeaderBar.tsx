@@ -210,7 +210,7 @@ export function TopHeaderBar({
                   {account.userName ?? "Tako 用户"}
                 </span>
                 {account.planName && (
-                  <span className="hidden sm:inline text-[11.5px] font-medium text-[var(--accent)] shrink-0">
+                  <span className="hidden min-[900px]:inline text-[11.5px] font-medium text-[var(--accent)] shrink-0">
                     {account.planName}
                   </span>
                 )}

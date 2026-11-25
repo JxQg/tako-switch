@@ -61,7 +61,7 @@ Tako Switch 在每次写入前都会自动备份原配置至 `~/.tako/switch/bac
 
 ## 本地目录结构与隐私安全
 
-首页提供独立的[通用扩展中心](./docs/extensions-hub.md)，用于管理 Claude、Codex 和 Antigravity 的第三方 MCP 与提示词预设。扫描会收录历史配置，三端开关全部关闭后仍保留中心记录。提示词与汉化托管块独立保存，Skills 和插件页签当前保留入口。
+首页提供独立的[通用扩展中心](./docs/extensions-hub.md)，用于管理 Claude、Codex 和 Antigravity 的第三方 MCP、[Skills 技能主副本](./docs/skills-hub.md)、插件与提示词预设。扫描会自动收编历史配置，三端开关全部关闭后仍保留中心记录与技能主副本；提示词预设与汉化托管块独立共存。
 
 Tako Switch 的所有配置均保存在用户主目录的独立子目录下，与 `tako-cli`（`~/.tako/config.json`）**完全隔离，互不覆盖**：
 
