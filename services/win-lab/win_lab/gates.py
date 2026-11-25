@@ -512,8 +512,14 @@ def _extract_windows_installer_sandbox(
     installer_path: Path,
     work_dir: Path,
     log: Callable[[str], None] | None = None,
+    allow_execute: bool = True,
 ) -> tuple[Path, str]:
-    """Safely unpack Windows installer into isolated work_dir (never mutates Program Files/AppData)."""
+    """Safely unpack Windows installer into isolated work_dir (never mutates Program Files/AppData).
+
+    With ``allow_execute=False`` the chain stops before running the installer binary itself —
+    even with ``/DIR=`` electron-builder NSIS uninstalls/overwrites the real per-user install
+    at ``%LocalAppData%\\Programs`` before extracting, so smoke tests must rely on bsdtar/7z only.
+    """
     suffix = installer_path.suffix.lower()
     if installer_path.is_dir():
         return installer_path, "directory"
@@ -597,7 +603,7 @@ def _extract_windows_installer_sandbox(
     # On Windows, Inno Setup & NSIS natively support isolated /DIR= or /D= — pick by sniffed type,
     # NOT app_id, because vendors silently switch packaging technology between releases
     # (Antigravity 2.35.x moved Inno Setup -> NSIS, breaking hardcoded Inno args).
-    if platform.system().lower() == "windows":
+    if allow_execute and platform.system().lower() == "windows":
         sandbox_dir = work_dir / "sandbox_install"
         sandbox_dir.mkdir(parents=True, exist_ok=True)
         kind = detect_installer_type(installer_path)
@@ -608,7 +614,7 @@ def _extract_windows_installer_sandbox(
         for try_kind in kinds:
             method, rc = _silent_sandbox_install(installer_path, sandbox_dir, try_kind, log=log)
             # electron-builder NSIS may spawn an async child copy process — poll briefly for artifacts
-            if not any(sandbox_dir.rglob(p) for p in artifact_patterns):
+            if not any(p.is_file() for pat in artifact_patterns for p in sandbox_dir.rglob(pat)):
                 _wait_for_artifacts([sandbox_dir], artifact_patterns, timeout_sec=8.0)
             if any(p.is_file() for pat in artifact_patterns for p in sandbox_dir.rglob(pat)):
                 if log:

@@ -404,25 +404,20 @@ def _smoke_sandbox_exe(
     target_exe: Path | None = None
     try:
         if app_id == "antigravity":
-            log(f"[smoke:antigravity] Inno sandbox install -> {sandbox_dir}")
-            proc = subprocess.run(
-                [
-                    str(artifact_path),
-                    "/VERYSILENT",
-                    "/NORESTART",
-                    "/CURRENTUSER",
-                    "/SUPPRESSMSGBOXES",
-                    "/NOICONS",
-                    f"/DIR={sandbox_dir}",
-                ],
-                capture_output=True,
-                timeout=240,
+            # Antigravity ships electron-builder NSIS since 2.35.x — running it even with /D=
+            # first uninstalls/overwrites the real per-user install, so smoke must unpack with
+            # bsdtar (libarchive NSIS SFX reader) instead of executing the installer at all.
+            from .gates import _extract_windows_installer_sandbox
+
+            log(f"[smoke:antigravity] non-exec bsdtar sandbox unpack -> {sandbox_dir}")
+            unpack_dir, method = _extract_windows_installer_sandbox(
+                app_id, artifact_path, sandbox_dir, log=log, allow_execute=False
             )
-            if proc.returncode != 0:
-                result["install_error"] = f"Inno installer exit {proc.returncode}"
-                return result
-            found = list(sandbox_dir.rglob("Antigravity.exe"))
+            found = list(unpack_dir.rglob("Antigravity.exe"))
             target_exe = found[0] if found else None
+            if target_exe is None:
+                result["install_error"] = f"免执行解包未提取到 Antigravity.exe (method={method})"
+                return result
         elif app_id == "dsh-tako":
             log(f"[smoke:dsh-tako] NSIS sandbox install -> {sandbox_dir}")
             proc = subprocess.run(f'"{artifact_path}" /S /D={sandbox_dir}', shell=True, capture_output=True, timeout=240)
