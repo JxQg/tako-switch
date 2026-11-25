@@ -211,6 +211,9 @@ mod tests {
     #[test]
     fn batch_returns_all_client_keys() {
         let keys: Vec<_> = running_states().unwrap().into_keys().collect();
-        assert_eq!(keys, ["antigravity", "claude", "codex", "dsh-tako"]);
+        assert_eq!(
+            keys,
+            ["antigravity", "claude", "codex", "dsh-tako", "workbuddy"]
+        );
     }
 }

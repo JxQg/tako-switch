@@ -328,6 +328,11 @@ mod tests {
 
         let merged = merge_with_bundled_fallback(remote);
         assert!(merged.apps.contains_key("workbuddy"));
+        let wb_platforms = &merged.apps["workbuddy"].platforms;
+        assert!(wb_platforms.contains_key("macos-arm64"));
+        assert!(wb_platforms.contains_key("macos-x64"));
+        assert!(wb_platforms.contains_key("windows-x64"));
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         assert!(resolve_platform_artifact(&merged, AppId::WorkBuddy).is_some());
         assert_eq!(merged.apps["claude"].version, "9.9.9");
         assert_eq!(
