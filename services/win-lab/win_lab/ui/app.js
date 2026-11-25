@@ -2,10 +2,10 @@
   "use strict";
 
   const TABS = [
-    { key: "overview", path: "/tako/win-lab", label: "门禁矩阵" },
-    { key: "runs", path: "/tako/win-lab/runs", label: "测试记录" },
-    { key: "candidates", path: "/tako/win-lab/candidates", label: "上游版本与日志" },
-    { key: "hq", path: "/tako/win-lab/hq", label: "HQ 事件上报" },
+    { key: "overview", path: "/win-lab", label: "门禁矩阵" },
+    { key: "runs", path: "/win-lab/runs", label: "测试记录" },
+    { key: "candidates", path: "/win-lab/candidates", label: "上游版本与日志" },
+    { key: "hq", path: "/win-lab/hq", label: "HQ 事件上报" },
   ];
 
   let state = {
@@ -643,7 +643,7 @@
         else if (act === "hq-ping") triggerHqPing(false);
         else if (act === "detail") {
           state.tab = "runs";
-          embed.notifyRoute("/tako/win-lab/runs");
+          embed.notifyRoute("/win-lab/runs");
           loadRuns().then(function () {
             openRunDetail(btn.getAttribute("data-id"));
           });

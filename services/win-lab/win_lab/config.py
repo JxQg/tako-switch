@@ -85,7 +85,7 @@ class LabConfig:
             pinned_gate_interval_min=_env_int("WIN_LAB_GATE_INTERVAL_MIN", 1440, minimum=30),
             allow_live_smoke=_env_bool("WIN_LAB_ALLOW_LIVE_SMOKE", True),
             ops_console_url=os.environ.get(
-                "WIN_LAB_OPS_CONSOLE_URL", "http://172.17.66.26:8767/tako/win-lab"
+                "WIN_LAB_OPS_CONSOLE_URL", "http://172.17.66.26:8767/win-lab"
             ).rstrip("/"),
         )
 

@@ -11,7 +11,7 @@
 3. **上游候选与官方 Changelog 巡检**：
    - 定时拉取上游最新版本与更新日志、标注风险关键词，**绝不自动覆写线上 `manifest.json`**。
 4. **运维中枢与 HQ 事件上报**：
-   - 遵循 `PLUGIN-MOUNTING.md` v4 契约挂载至 `.26:8767/tako/win-lab`（仅 EasyTier Mesh / 回环直连，拒绝公网反代透传头）。
+   - 遵循 `PLUGIN-MOUNTING.md` v4 契约挂载至 `.26:8767/win-lab`（仅 EasyTier Mesh / 回环直连，拒绝公网反代透传头）。
    - Prometheus 黑盒探活 `http://172.17.66.6:18795/healthz`。
    - 门禁失败（`winlab.gate_failed`）、实机崩溃（`winlab.smoke_crash`）、发现上游新版（`winlab.upstream_candidate`）脱敏后经冷却去重上报至 HQ（`http://172.17.66.26:8789/v1/events`）建单分诊；通过回执走轻量 SSE（`winlab.gate_passed`）；同时同步至客户端数据台（`http://172.17.66.15:18080/v1/{events,errors}`）。
 

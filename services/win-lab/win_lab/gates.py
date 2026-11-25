@@ -117,42 +117,61 @@ def download_artifact(
             log(f"[cache] hash mismatch on {dest_path.name}, re-downloading")
 
     urls = [u for u in (url, fallback_url) if u]
+    egress_proxy = os.environ.get("WIN_LAB_EGRESS_PROXY", "").strip()
     last_err = ""
     for candidate in urls:
-        tmp = dest_path.with_suffix(dest_path.suffix + ".part")
-        try:
-            if log:
-                log(f"[download] fetching {candidate}")
-            # Prefer curl.exe / curl when available for robust TLS/Cloudflare/resume support.
-            curl_bin = shutil.which("curl.exe") or shutil.which("curl")
-            if curl_bin:
-                proc = subprocess.run(
-                    [curl_bin, "-fSL", "--retry", "2", "--connect-timeout", "20", "--max-time", "600", "-o", str(tmp), candidate],
-                    capture_output=True,
-                    text=True,
-                    timeout=630,
-                )
-                if proc.returncode != 0:
-                    raise RuntimeError(f"curl exit {proc.returncode}: {(proc.stderr or proc.stdout).strip()[:300]}")
-            else:
-                req = urllib.request.Request(candidate, headers={"User-Agent": "tako-win-lab/0.1"})
-                with urllib.request.urlopen(req, timeout=180) as resp, tmp.open("wb") as out:
-                    shutil.copyfileobj(resp, out, length=1024 * 1024)
+        is_china_cdn = any(d in candidate for d in ("dl.lven.asia", "aliyuncs.com", "172.17.66.", "127.0.0.1"))
+        proxy_attempts: list[str | None] = [None] if is_china_cdn else ([None, egress_proxy] if egress_proxy else [None])
+        for proxy in proxy_attempts:
+            tmp = dest_path.with_suffix(dest_path.suffix + ".part")
+            try:
+                if log:
+                    via = f" via {proxy}" if proxy else ""
+                    log(f"[download] fetching {candidate}{via}")
+                curl_bin = shutil.which("curl.exe") or shutil.which("curl")
+                if curl_bin:
+                    cmd = [
+                        curl_bin,
+                        "-fSL",
+                        "--retry",
+                        "2",
+                        "--connect-timeout",
+                        "20",
+                        "--max-time",
+                        "600",
+                    ]
+                    if proxy:
+                        cmd += ["-x", proxy]
+                    else:
+                        cmd += ["--noproxy", "*"]
+                    cmd += ["-o", str(tmp), candidate]
+                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=630)
+                    if proc.returncode != 0:
+                        raise RuntimeError(f"curl exit {proc.returncode}: {(proc.stderr or proc.stdout).strip()[:300]}")
+                else:
+                    req = urllib.request.Request(candidate, headers={"User-Agent": "tako-win-lab/0.1"})
+                    opener = (
+                        urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+                        if proxy
+                        else urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                    )
+                    with opener.open(req, timeout=180) as resp, tmp.open("wb") as out:
+                        shutil.copyfileobj(resp, out, length=1024 * 1024)
 
-            actual = sha256_file(tmp)
-            if expected_sha256 and actual.lower() != expected_sha256.lower():
+                actual = sha256_file(tmp)
+                if expected_sha256 and actual.lower() != expected_sha256.lower():
+                    tmp.unlink(missing_ok=True)
+                    raise RuntimeError(f"SHA256 mismatch: expected {expected_sha256}, got {actual}")
+                tmp.replace(dest_path)
+                sz = dest_path.stat().st_size
+                if log:
+                    log(f"[download] saved {dest_path.name} ({sz} bytes, sha256={actual[:12]})")
+                return {"path": dest_path, "sha256": actual, "size": sz, "cached": False, "url": candidate}
+            except Exception as exc:
+                last_err = str(exc)
                 tmp.unlink(missing_ok=True)
-                raise RuntimeError(f"SHA256 mismatch: expected {expected_sha256}, got {actual}")
-            tmp.replace(dest_path)
-            sz = dest_path.stat().st_size
-            if log:
-                log(f"[download] saved {dest_path.name} ({sz} bytes, sha256={actual[:12]})")
-            return {"path": dest_path, "sha256": actual, "size": sz, "cached": False, "url": candidate}
-        except Exception as exc:
-            last_err = str(exc)
-            tmp.unlink(missing_ok=True)
-            if log:
-                log(f"[download] failed {candidate}: {last_err}")
+                if log:
+                    log(f"[download] failed {candidate} (proxy={proxy or 'direct'}): {last_err}")
     raise RuntimeError(f"下载候选安装包失败: {last_err}")
 
 
@@ -978,8 +997,21 @@ def run_upstream_candidate_check(cfg: LabConfig) -> tuple[dict[str, Any], str]:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    pinned = load_pinned_versions(cfg)
-    sync_mod = mod.load_sync_manifest_module()
-    upstream_manifest = sync_mod.build_manifest(mirror_base=None)
-    changelogs = mod.fetch_changelogs(upstream_manifest.get("apps") or {})
-    return mod.build_check_report(pinned, upstream_manifest, changelogs)
+    egress_proxy = os.environ.get("WIN_LAB_EGRESS_PROXY", "").strip()
+    prev_env = {k: os.environ.get(k) for k in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY")}
+    try:
+        if egress_proxy:
+            os.environ["HTTP_PROXY"] = egress_proxy
+            os.environ["HTTPS_PROXY"] = egress_proxy
+            os.environ["NO_PROXY"] = "127.0.0.1,localhost,172.17.66.0/24,dl.lven.asia"
+        pinned = load_pinned_versions(cfg)
+        sync_mod = mod.load_sync_manifest_module()
+        upstream_manifest = sync_mod.build_manifest(mirror_base=None)
+        changelogs = mod.fetch_changelogs(upstream_manifest.get("apps") or {})
+        return mod.build_check_report(pinned, upstream_manifest, changelogs)
+    finally:
+        for k, v in prev_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v

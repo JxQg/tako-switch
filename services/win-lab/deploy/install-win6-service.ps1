@@ -11,7 +11,8 @@ param(
   [string]$TaskName = "TakoWinLabService",
   [int]$Port = 18795,
   [string]$HqUrl = "http://172.17.66.26:8789",
-  [string]$TelemetryUrl = "http://172.17.66.15:18080"
+  [string]$TelemetryUrl = "http://172.17.66.15:18080",
+  [string]$EgressProxy = "http://172.17.66.4:3128"
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,6 +41,8 @@ set WIN_LAB_REPO_ROOT=$RepoDir
 set WIN_LAB_DATA_DIR=$DataDir
 set WIN_LAB_HQ_URL=$HqUrl
 set WIN_LAB_TELEMETRY_URL=$TelemetryUrl
+set WIN_LAB_EGRESS_PROXY=$EgressProxy
+set WIN_LAB_OPS_CONSOLE_URL=http://172.17.66.26:8767/win-lab
 set WIN_LAB_SCHEDULE_ENABLED=1
 set WIN_LAB_AUTO_REPORT_HQ=1
 set WIN_LAB_AUTO_REPORT_TELEMETRY=1
@@ -66,9 +69,10 @@ if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContin
     -Protocol TCP -LocalPort $Port -RemoteAddress 172.17.66.0/24,127.0.0.1 | Out-Null
 }
 
-# Register Scheduled Task under current interactive user (runs on logon + boot, auto-restarts on failure)
+# Register Scheduled Task under current interactive user (use full DOMAIN\User to avoid hostname collision)
+$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$RunnerBat`"" -WorkingDirectory "$RepoDir\services\win-lab"
-$triggerLogon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$triggerLogon = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
 $settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries `
   -DontStopIfGoingOnBatteries `
@@ -77,7 +81,7 @@ $settings = New-ScheduledTaskSettingsSet `
   -RestartInterval (New-TimeSpan -Minutes 1) `
   -MultipleInstances IgnoreNew
 
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+$principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggerLogon -Settings $settings -Principal $principal -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName

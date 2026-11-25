@@ -69,7 +69,7 @@ Windows 端已接入常驻测试台微服务 [`services/win-lab/`](../services/w
 2. **Gate 4 实机冷启动与 EventLog 崩溃探针**：
    - 在 `.6` 交互桌面会话中真实拉起候选包，持续轮询进程存活与主窗口标题，并抓取 `Application`（Event ID 1000/1001/1026）、`AppxDeploymentServer`、`AppModel-Runtime` 及客户端启动日志尾部，自动脱敏保存并清理现场。
 3. **运维控制台与 HQ 事件上报闭环**：
-   - 以标准 v4 插件挂载至 `.26:8767/tako/win-lab`（`parent_nav: tako`），Prometheus 黑盒探活 `http://172.17.66.6:18795/healthz`。
+   - 以标准 v4 插件挂载至 `.26:8767/win-lab`（`parent_nav: tako`），Prometheus 黑盒探活 `http://172.17.66.6:18795/healthz`。
    - 门禁失败（`winlab.gate_failed`）、实机崩溃（`winlab.smoke_crash`）、上游发现待审新版（`winlab.upstream_candidate`）自动脱敏并按冷却去重上报至 HQ（`http://172.17.66.26:8789/v1/events`）建单分诊，通过回执走轻量 SSE（`winlab.gate_passed`），同时同步异常至客户端数据台（`http://172.17.66.15:18080/v1/{events,errors}`）。
 
 ### 命令行一键调用 `.6` Windows 测试台

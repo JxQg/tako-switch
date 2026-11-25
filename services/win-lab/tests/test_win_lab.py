@@ -269,7 +269,7 @@ class TestWinLabCore(unittest.TestCase):
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/plugin/manifest", timeout=5) as r:
                 m = json.loads(r.read().decode("utf-8"))
                 self.assertEqual(m["id"], "win-lab")
-                self.assertEqual(m["route"], "/tako/win-lab")
+                self.assertEqual(m["route"], "/win-lab")
                 self.assertIn("badge", m)
 
             # 3. Mesh guard rejects X-Forwarded-For
