@@ -7,8 +7,9 @@ import {
   RefreshCw,
   Settings,
   Sun,
+  Wallet,
 } from "lucide-react";
-import type { AccountStatus } from "../lib/api";
+import { api, type AccountStatus } from "../lib/api";
 import { TakoBrandMark } from "./BrandIcons";
 import {
   APP_DISPLAY_NAMES,
@@ -43,6 +44,8 @@ interface TopHeaderBarProps {
   onCloseWindow?: () => void;
   onTitleBarContextMenu?: () => void;
 }
+
+const TAKO_WALLET_URL = "https://tako.shiroha.tech/wallet";
 
 function subpageTitle(route: NavRoute): string {
   if (route === "general") return "通用设置";
@@ -198,7 +201,19 @@ export function TopHeaderBar({
           }`}
         >
           {account?.loggedIn ? (
-            <div className="relative" ref={popoverRef}>
+            <>
+              <button
+                type="button"
+                data-testid="topbar-recharge"
+                onClick={() => void api.openUrl(TAKO_WALLET_URL)}
+                title="前往 Tako 钱包充值"
+                className="h-8 px-2.5 rounded-[9px] border border-[var(--accent)]/30 bg-[var(--accent-soft)] hover:bg-[var(--accent)] hover:text-white text-[var(--accent)] text-[12px] font-medium inline-flex items-center gap-1.5 transition cursor-pointer shrink-0"
+              >
+                <Wallet className="h-3.5 w-3.5" />
+                <span>充值</span>
+              </button>
+
+              <div className="relative" ref={popoverRef}>
               <button
                 type="button"
                 onClick={() => setAccountOpen((prev) => !prev)}
@@ -328,6 +343,7 @@ export function TopHeaderBar({
                 </div>
               )}
             </div>
+            </>
           ) : (
             <div className="flex items-center gap-1.5">
               <button
