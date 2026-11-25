@@ -124,6 +124,7 @@ export interface SwitchState {
   preferChineseUi?: boolean;
   showTrayBalance?: boolean;
   bypassSystemProxy?: boolean;
+  telemetryEnabled?: boolean;
   uiDensity?: UiDensity;
   themePref?: ThemePref;
   mcp: McpToolsConfig;
@@ -334,6 +335,10 @@ export interface InstallOutcome {
   appId: AppId;
   modeReapplied: AppMode;
   snapshot: AppSnapshot;
+  downloadRoute?: string | null;
+  downloadBytes?: number | null;
+  downloadDurationMs?: number | null;
+  downloadSpeedKbps?: number | null;
 }
 
 export interface SelfUpdateCheckResult {
@@ -361,9 +366,41 @@ export interface SettingsPatch {
   preferChineseUi?: boolean;
   showTrayBalance?: boolean;
   bypassSystemProxy?: boolean;
+  telemetryEnabled?: boolean;
   uiDensity?: UiDensity;
   themePref?: ThemePref;
   mcp?: McpToolsConfig;
+}
+
+export interface FrontendErrorInput {
+  source: "frontend_error" | "unhandled_rejection" | "tauri_invoke";
+  category?: string;
+  errorType: string;
+  message: string;
+  location?: string;
+  stack?: string;
+  context?: Record<string, unknown>;
+}
+
+export type FeedbackCategory =
+  | "bug"
+  | "install"
+  | "i18n"
+  | "mcp"
+  | "feature"
+  | "other";
+
+export interface FeedbackSubmission {
+  category: FeedbackCategory;
+  title?: string;
+  description: string;
+  contact?: string;
+  includeDiagnostics: boolean;
+}
+
+export interface FeedbackReceipt {
+  ok: boolean;
+  id: number;
 }
 
 export interface LiveDemoRequest {
@@ -549,4 +586,12 @@ export const api = {
       name,
       platform,
     }),
+  reportFrontendError: (input: FrontendErrorInput) =>
+    invoke<void>("report_frontend_error", { input }).catch(() => {
+      // Telemetry error capture must never disrupt the UI.
+    }),
+  submitUserFeedback: (input: FeedbackSubmission) =>
+    invoke<FeedbackReceipt>("submit_user_feedback", { input }),
+  getSanitizedDiagnosticsPreview: () =>
+    invoke<Record<string, unknown>>("get_sanitized_diagnostics_preview"),
 };

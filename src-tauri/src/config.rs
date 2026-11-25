@@ -15,6 +15,7 @@ pub const DEFAULT_MANIFEST_URL: &str =
     "https://dl.lven.asia/tako-switch/manifest.json";
 pub const DEFAULT_FALLBACK_MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/tako-dev/tako-switch/main/manifest/manifest.json";
+pub const DEFAULT_TELEMETRY_URL: &str = "https://telemetry.lven.asia";
 
 pub const DEFAULT_CLAUDE_RECOMMENDED_MODELS: &[&str] = &[
     "claude-opus-5-5",
@@ -462,6 +463,8 @@ pub struct SwitchState {
     pub show_tray_balance: bool,
     #[serde(default = "default_true")]
     pub bypass_system_proxy: bool,
+    #[serde(default = "default_true")]
+    pub telemetry_enabled: bool,
     #[serde(default)]
     pub ui_density: UiDensity,
     #[serde(default)]
@@ -491,6 +494,7 @@ impl SwitchState {
             prefer_chinese_ui: true,
             show_tray_balance: true,
             bypass_system_proxy: true,
+            telemetry_enabled: true,
             ui_density: UiDensity::Compact,
             theme_pref: ThemePref::System,
             mcp: McpToolsConfig::with_default_dir(paths),

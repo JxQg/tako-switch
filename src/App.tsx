@@ -4,7 +4,6 @@ import { AlertCircle, ExternalLink, FileText, Globe, MessageSquare, X } from "lu
 import {
   api,
   parseUiPatchBlockError,
-  TAKO_FEEDBACK_URL,
   TAKO_RELEASES_URL,
   type AccountStatus,
   type AppId,
@@ -22,6 +21,7 @@ import {
 } from "./lib/api";
 import { CHANGELOG_RELEASES, parseReleaseNotesLines } from "./lib/changelog";
 import { ClientSettingsPanel } from "./components/ClientSettingsPanel";
+import { FeedbackModal } from "./components/FeedbackModal";
 import { GeneralSettingsPanel } from "./components/GeneralSettingsPanel";
 import { McpCenterPanel, type McpCenterSection } from "./components/McpCenterPanel";
 import type { McpToolKey } from "./components/McpInlineTheater";
@@ -129,6 +129,7 @@ export default function App() {
   const [showKeyModal, setShowKeyModal] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [showChangelogModal, setShowChangelogModal] = useState(false);
+  const [showFeedbackModal, setShowFeedbackModal] = useState(false);
   const [mcpInitialTab, setMcpInitialTab] = useState<McpToolKey | null>(null);
   const [mcpInitialSection, setMcpInitialSection] = useState<McpCenterSection | null>(null);
 
@@ -1423,6 +1424,7 @@ export default function App() {
             onInstallSelfUpdate={() => void handleInstallSelfUpdate()}
             onBatchUpgradeApps={() => void handleBatchUpgradeApps()}
             onOpenChangelog={() => setShowChangelogModal(true)}
+            onOpenFeedback={() => setShowFeedbackModal(true)}
             onNavigate={setActiveRoute}
           />
         )}
@@ -1544,7 +1546,7 @@ export default function App() {
           <span className="h-3 w-px bg-[var(--border)]" />
           <button
             type="button"
-            onClick={() => void api.openUrl(TAKO_FEEDBACK_URL)}
+            onClick={() => setShowFeedbackModal(true)}
             className="inline-flex items-center gap-1 text-[var(--text-muted)] hover:text-[var(--text-primary)] transition cursor-pointer"
           >
             <MessageSquare className="h-3 w-3" />
@@ -1870,6 +1872,12 @@ export default function App() {
             showTransientNote(`${APP_DISPLAY_NAMES[savedAppId]} 模型设置已保存`);
           }
         }}
+      />
+
+      {/* In-App Problem Feedback Modal */}
+      <FeedbackModal
+        open={showFeedbackModal}
+        onClose={() => setShowFeedbackModal(false)}
       />
     </div>
   );

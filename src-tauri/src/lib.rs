@@ -6,6 +6,7 @@ pub mod installer;
 pub mod manifest;
 pub mod mcp_server;
 pub mod sync_hub;
+pub mod telemetry;
 
 use adapters::{
     get_adapter, snapshot_app, AppId, AppMode, AppSnapshot, DesktopAppAdapter, DiagnosticResult,
@@ -136,6 +137,7 @@ pub struct SettingsPatch {
     pub prefer_chinese_ui: Option<bool>,
     pub show_tray_balance: Option<bool>,
     pub bypass_system_proxy: Option<bool>,
+    pub telemetry_enabled: Option<bool>,
     pub ui_density: Option<config::UiDensity>,
     pub theme_pref: Option<config::ThemePref>,
     pub mcp: Option<McpToolsConfig>,
@@ -271,6 +273,18 @@ async fn perform_self_update_check(app: &AppHandle) -> Result<SelfUpdateCheckRes
 
     if let Ok(paths) = AppPaths::detect() {
         refresh_tray(app, &paths);
+        telemetry::track_event(
+            &paths,
+            "self_update_check",
+            "tako-switch",
+            true,
+            0,
+            serde_json::json!({
+                "available": result.available,
+                "version": result.version,
+                "source": result.source,
+            }),
+        );
     }
 
     Ok(result)
@@ -666,6 +680,14 @@ pub fn apply_settings_patch_for_paths(
     let prev_name = state.normalized_gateway_name();
     let prev_subtitle = state.normalized_gateway_subtitle();
     let prev_zh = state.prefer_chinese_ui;
+    let prev_mcp_flags = (
+        state.mcp.image,
+        state.mcp.video,
+        state.mcp.audio,
+        state.mcp.search,
+        state.mcp.consult,
+        state.mcp.web_page,
+    );
     let prev_edgeone = (
         state.mcp.web_page,
         state.mcp.normalized_edgeone_api_token().map(str::to_string),
@@ -721,6 +743,9 @@ pub fn apply_settings_patch_for_paths(
     if let Some(bypass_proxy) = input.bypass_system_proxy {
         state.bypass_system_proxy = bypass_proxy;
     }
+    if let Some(telemetry_on) = input.telemetry_enabled {
+        state.telemetry_enabled = telemetry_on;
+    }
     if let Some(density) = input.ui_density {
         state.ui_density = density;
     }
@@ -733,6 +758,28 @@ pub fn apply_settings_patch_for_paths(
     }
 
     save_switch_state(paths, &state)?;
+
+    let next_mcp_flags = (
+        state.mcp.image,
+        state.mcp.video,
+        state.mcp.audio,
+        state.mcp.search,
+        state.mcp.consult,
+        state.mcp.web_page,
+    );
+    if prev_mcp_flags != next_mcp_flags {
+        telemetry::track_event(
+            paths,
+            "mcp_toggle",
+            "tako-switch",
+            true,
+            0,
+            serde_json::json!({
+                "enabled_mcps": telemetry::enabled_mcp_names(&state),
+                "web_page": state.mcp.web_page,
+            }),
+        );
+    }
 
     let next_edgeone = (
         state.mcp.web_page,
@@ -1500,6 +1547,7 @@ async fn patch_app_ui(
     auto_restart: bool,
 ) -> Result<AppSnapshot, String> {
     let paths = AppPaths::detect()?;
+    let started_at = std::time::Instant::now();
     let paths_clone = paths.clone();
     let app_for_emit = app.clone();
     let scope = app_id.as_str().to_string();
@@ -1577,9 +1625,45 @@ async fn patch_app_ui(
                     current_app: Some(app_id),
                 },
             );
+            telemetry::track_event(
+                &paths,
+                "ui_patch_apply",
+                app_id.as_str(),
+                true,
+                started_at.elapsed().as_millis() as u64,
+                serde_json::json!({
+                    "auto_restart": auto_restart,
+                    "patch_version": snap.ui_patch.patch_version,
+                }),
+            );
             snap
         }
         Err(err) => {
+            telemetry::track_event(
+                &paths,
+                "ui_patch_apply",
+                app_id.as_str(),
+                false,
+                started_at.elapsed().as_millis() as u64,
+                serde_json::json!({
+                    "auto_restart": auto_restart,
+                    "permission_block": err.contains("[TAKO_UI_PATCH_BLOCK]"),
+                }),
+            );
+            if !err.contains("[TAKO_UI_PATCH_BLOCK]") {
+                telemetry::report_error(
+                    &paths,
+                    telemetry::ErrorReport {
+                        source: "rust_error",
+                        category: "ui_patch",
+                        error_type: "UiPatchApplyFailed",
+                        message: &err,
+                        location: "lib.rs:patch_app_ui",
+                        stack: "",
+                        context: serde_json::json!({"app_id": app_id.as_str()}),
+                    },
+                );
+            }
             let _ = app.emit(
                 "ui-patch-progress",
                 UiPatchProgressEvent {
@@ -1606,6 +1690,7 @@ async fn restore_app_ui(
     auto_restart: bool,
 ) -> Result<AppSnapshot, String> {
     let paths = AppPaths::detect()?;
+    let started_at = std::time::Instant::now();
     let paths_clone = paths.clone();
     let app_for_emit = app.clone();
     let scope = app_id.as_str().to_string();
@@ -1666,9 +1751,42 @@ async fn restore_app_ui(
                     current_app: Some(app_id),
                 },
             );
+            telemetry::track_event(
+                &paths,
+                "ui_patch_restore",
+                app_id.as_str(),
+                true,
+                started_at.elapsed().as_millis() as u64,
+                serde_json::json!({"auto_restart": auto_restart}),
+            );
             snap
         }
         Err(err) => {
+            telemetry::track_event(
+                &paths,
+                "ui_patch_restore",
+                app_id.as_str(),
+                false,
+                started_at.elapsed().as_millis() as u64,
+                serde_json::json!({
+                    "auto_restart": auto_restart,
+                    "permission_block": err.contains("[TAKO_UI_PATCH_BLOCK]"),
+                }),
+            );
+            if !err.contains("[TAKO_UI_PATCH_BLOCK]") {
+                telemetry::report_error(
+                    &paths,
+                    telemetry::ErrorReport {
+                        source: "rust_error",
+                        category: "ui_patch",
+                        error_type: "UiPatchRestoreFailed",
+                        message: &err,
+                        location: "lib.rs:restore_app_ui",
+                        stack: "",
+                        context: serde_json::json!({"app_id": app_id.as_str()}),
+                    },
+                );
+            }
             let _ = app.emit(
                 "ui-patch-progress",
                 UiPatchProgressEvent {
@@ -1833,7 +1951,50 @@ async fn set_app_mode(
         let _ = crate::agy_proxy::refresh_claude_catalog_cache(&paths).await;
     }
     let adapter = get_adapter(app_id);
-    adapter.apply_mode(&paths, mode)?;
+    let mode_str = match mode {
+        AppMode::Tako => "tako",
+        AppMode::Official => "official",
+    };
+    if let Err(err) = adapter.apply_mode(&paths, mode) {
+        telemetry::track_event(
+            &paths,
+            "client_switch",
+            app_id.as_str(),
+            false,
+            0,
+            serde_json::json!({
+                "mode": mode_str,
+                "auto_restart": auto_restart,
+            }),
+        );
+        telemetry::report_error(
+            &paths,
+            telemetry::ErrorReport {
+                source: "rust_error",
+                category: "switch",
+                error_type: "ClientSwitchFailed",
+                message: &err,
+                location: "lib.rs:set_app_mode",
+                stack: "",
+                context: serde_json::json!({
+                    "app_id": app_id.as_str(),
+                    "mode": mode_str,
+                }),
+            },
+        );
+        return Err(err);
+    }
+    telemetry::track_event(
+        &paths,
+        "client_switch",
+        app_id.as_str(),
+        true,
+        0,
+        serde_json::json!({
+            "mode": mode_str,
+            "auto_restart": auto_restart,
+        }),
+    );
     if auto_restart && adapter.is_running(&paths) {
         adapter.quit_app(&paths)?;
         std::thread::sleep(std::time::Duration::from_millis(450));
@@ -2150,7 +2311,8 @@ async fn install_or_upgrade_app(
     }
 
     let _lk = guard.lock.lock().await;
-    let outcome = async {
+    let started_at = std::time::Instant::now();
+    let outcome: Result<InstallOutcome, String> = async {
         let paths = AppPaths::detect()?;
         let manifest = match fetch_manifest(&paths).await {
             Ok((_, m)) => m,
@@ -2176,14 +2338,85 @@ async fn install_or_upgrade_app(
     }
     .await;
 
+    if let Ok(paths) = AppPaths::detect() {
+        let total_ms = started_at.elapsed().as_millis() as u64;
+        match &outcome {
+            Ok(res) => {
+                telemetry::track_event(
+                    &paths,
+                    "client_install_done",
+                    app_id.as_str(),
+                    true,
+                    res.download_duration_ms.unwrap_or(total_ms),
+                    serde_json::json!({
+                        "route": res.download_route,
+                        "bytes": res.download_bytes,
+                        "speed_kbps": res.download_speed_kbps,
+                        "total_duration_ms": total_ms,
+                    }),
+                );
+            }
+            Err(err) if err != "已取消下载" => {
+                telemetry::track_event(
+                    &paths,
+                    "client_install_done",
+                    app_id.as_str(),
+                    false,
+                    total_ms,
+                    serde_json::json!({
+                        "error": err,
+                    }),
+                );
+                telemetry::report_error(
+                    &paths,
+                    telemetry::ErrorReport {
+                        source: "rust_error",
+                        category: "installer",
+                        error_type: "ClientInstallFailed",
+                        message: err,
+                        location: "lib.rs:install_or_upgrade_app",
+                        stack: "",
+                        context: serde_json::json!({"app_id": app_id.as_str()}),
+                    },
+                );
+            }
+            Err(_) => {}
+        }
+    }
+
     if let Ok(mut map) = guard.cancels.lock() {
         map.remove(&app_id);
     }
     outcome
 }
 
+#[tauri::command]
+fn report_frontend_error(input: telemetry::FrontendErrorInput) -> Result<(), String> {
+    if let Ok(paths) = AppPaths::detect() {
+        telemetry::report_frontend_error(&paths, input);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn submit_user_feedback(
+    input: telemetry::FeedbackSubmission,
+) -> Result<telemetry::FeedbackReceipt, String> {
+    let paths = AppPaths::detect()?;
+    telemetry::submit_feedback(&paths, input).await
+}
+
+#[tauri::command]
+async fn get_sanitized_diagnostics_preview() -> Result<serde_json::Value, String> {
+    let paths = AppPaths::detect()?;
+    tauri::async_runtime::spawn_blocking(move || telemetry::build_sanitized_diagnostics(&paths))
+        .await
+        .map_err(|e| format!("生成脱敏诊断预览失败: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    telemetry::install_panic_hook();
     let initial_cache = AppPaths::detect()
         .ok()
         .and_then(|p| read_balance_cache(&p))
@@ -2234,6 +2467,21 @@ pub fn run() {
                             st.set_explicit_official(app_id, mode == AppMode::Official);
                             let _ = save_switch_state(&paths, &st);
                             if get_adapter(app_id).apply_mode(&paths, mode).is_ok() {
+                                let mode_str = match mode {
+                                    AppMode::Tako => "tako",
+                                    AppMode::Official => "official",
+                                };
+                                telemetry::track_event(
+                                    &paths,
+                                    "client_switch",
+                                    app_id.as_str(),
+                                    true,
+                                    0,
+                                    serde_json::json!({
+                                        "mode": mode_str,
+                                        "via": "tray",
+                                    }),
+                                );
                                 refresh_tray(app, &paths);
                                 let _ = app.emit("state-changed", ());
                             }
@@ -2317,6 +2565,17 @@ pub fn run() {
                 }
             });
 
+            // Startup anonymous launch heartbeat (runs once shortly after boot if telemetry is enabled).
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let _ = tauri::async_runtime::spawn_blocking(|| {
+                    if let Ok(hb_paths) = AppPaths::detect() {
+                        telemetry::track_launch_heartbeat(&hb_paths);
+                    }
+                })
+                .await;
+            });
+
             if let Some(win) = app.get_webview_window("main") {
                 let init_state = read_switch_state(&paths);
                 #[cfg(target_os = "windows")]
@@ -2376,6 +2635,9 @@ pub fn run() {
             sync_skill_to_platforms,
             sync_all_skills,
             remove_synced_item,
+            report_frontend_error,
+            submit_user_feedback,
+            get_sanitized_diagnostics_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tako Switch");

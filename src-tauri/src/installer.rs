@@ -32,6 +32,22 @@ pub struct InstallOutcome {
     pub app_id: AppId,
     pub mode_reapplied: AppMode,
     pub snapshot: AppSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_route: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_speed_kbps: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct DownloadMetrics {
+    route: String,
+    bytes: u64,
+    duration_ms: u64,
+    speed_kbps: u64,
 }
 
 fn emit_progress(
@@ -186,7 +202,7 @@ async fn download_artifact(
     artifact: &PlatformArtifact,
     dest_path: &Path,
     cancel_flag: Option<&Arc<AtomicBool>>,
-) -> Result<(), String> {
+) -> Result<DownloadMetrics, String> {
     if let Some(parent) = dest_path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("创建下载缓存目录失败: {e}"))?;
@@ -330,7 +346,14 @@ async fn download_artifact(
             let _ = fs::remove_file(dest_path);
             continue;
         }
-        return Ok(());
+        let elapsed_ms = started_at.elapsed().as_millis().max(1) as u64;
+        let speed_kbps = (downloaded as f64 / 1024.0 / (elapsed_ms as f64 / 1000.0)).round() as u64;
+        return Ok(DownloadMetrics {
+            route: route_label.to_string(),
+            bytes: downloaded,
+            duration_ms: elapsed_ms,
+            speed_kbps,
+        });
     }
 
     Err(format!("下载安装包失败: {last_err}"))
@@ -619,14 +642,16 @@ pub async fn install_or_upgrade_app(
     fs::create_dir_all(&work_dir).map_err(|e| format!("创建工作目录失败: {e}"))?;
     let pkg_path = work_dir.join(infer_filename(app_id, artifact));
 
-    let download_res = download_artifact(app, app_id, artifact, &pkg_path, cancel_flag.as_ref()).await;
-    if let Err(err) = download_res {
-        let _ = fs::remove_dir_all(&work_dir);
-        if err != "已取消下载" {
-            emit_progress(app, app_id, "error", 0, &err);
+    let download_metrics = match download_artifact(app, app_id, artifact, &pkg_path, cancel_flag.as_ref()).await {
+        Ok(m) => m,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&work_dir);
+            if err != "已取消下载" {
+                emit_progress(app, app_id, "error", 0, &err);
+            }
+            return Err(err);
         }
-        return Err(err);
-    }
+    };
 
     emit_progress(app, app_id, "verifying", 80, "正在校验安装包完整性");
     if let Err(err) = verify_digests(&pkg_path, artifact) {
@@ -752,6 +777,10 @@ pub async fn install_or_upgrade_app(
         app_id,
         mode_reapplied: target_mode,
         snapshot,
+        download_route: Some(download_metrics.route),
+        download_bytes: Some(download_metrics.bytes),
+        download_duration_ms: Some(download_metrics.duration_ms),
+        download_speed_kbps: Some(download_metrics.speed_kbps),
     })
 }
 

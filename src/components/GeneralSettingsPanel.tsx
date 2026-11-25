@@ -66,6 +66,7 @@ interface GeneralSettingsPanelProps {
   onInstallSelfUpdate: () => void;
   onBatchUpgradeApps: () => void;
   onOpenChangelog: () => void;
+  onOpenFeedback: () => void;
   onNavigate: (route: NavRoute) => void;
 }
 
@@ -108,6 +109,7 @@ export function GeneralSettingsPanel({
   onInstallSelfUpdate,
   onBatchUpgradeApps,
   onOpenChangelog,
+  onOpenFeedback,
   onNavigate,
 }: GeneralSettingsPanelProps) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -580,6 +582,28 @@ export function GeneralSettingsPanel({
                 }
               />
             </div>
+
+            <div className="tako-setting-row flex items-center justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
+                  匿名使用诊断与故障上报
+                </div>
+                <div className="text-[11px] text-[var(--text-muted)] mt-0.5 leading-snug">
+                  上报安装成功率、下载线路速度与脱敏崩溃日志，不含对话、API Key 或账号原文。
+                </div>
+              </div>
+              <ToggleSwitch
+                checked={dashboard?.state.telemetryEnabled ?? true}
+                disabled={savingSettings || !dashboard}
+                ariaLabel="匿名使用诊断与故障上报"
+                onChange={(next) =>
+                  void onSavePatch(
+                    { telemetryEnabled: next },
+                    next ? "已开启匿名诊断与故障上报" : "已关闭匿名诊断与故障上报",
+                  )
+                }
+              />
+            </div>
           </div>
         </section>
 
@@ -712,11 +736,19 @@ export function GeneralSettingsPanel({
               <div className="flex items-center gap-4 text-[12px]">
                 <button
                   type="button"
+                  onClick={onOpenFeedback}
+                  className="inline-flex items-center gap-1.5 text-[var(--accent)] hover:underline font-medium cursor-pointer"
+                >
+                  <MessageSquare className="h-3.5 w-3.5" />
+                  <span>应用内问题反馈</span>
+                </button>
+                <button
+                  type="button"
                   onClick={() => void api.openUrl(TAKO_FEEDBACK_URL)}
                   className="inline-flex items-center gap-1.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
                 >
-                  <MessageSquare className="h-3.5 w-3.5" />
-                  <span>GitHub 问题反馈</span>
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  <span>GitHub Issues</span>
                 </button>
                 <button
                   type="button"
