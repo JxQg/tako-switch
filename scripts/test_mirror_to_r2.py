@@ -162,38 +162,6 @@ class MirrorToR2Tests(unittest.TestCase):
             "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.57/DSH-Tako-0.1.57-mac-arm64.dmg",
         )
 
-    def test_s3_client_applies_cli_timeouts_and_retries_upload_timeout(self) -> None:
-        import subprocess
-        from unittest import mock
-
-        client = mod.S3Client(
-            bucket="demo",
-            endpoint_url="https://example.invalid",
-            region="auto",
-            upload_timeout_secs=30,
-            max_upload_attempts=2,
-            cli_connect_timeout=15,
-            cli_read_timeout=45,
-        )
-        base_cmd = client._base_cmd()
-        self.assertIn("--cli-connect-timeout", base_cmd)
-        self.assertIn("15", base_cmd)
-        self.assertIn("--cli-read-timeout", base_cmd)
-        self.assertIn("45", base_cmd)
-
-        calls: list[int | None] = []
-
-        def fake_run(cmd, *, check=False, env=None, timeout=None, **kwargs):
-            calls.append(timeout)
-            if len(calls) == 1:
-                raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout or 0)
-            return subprocess.CompletedProcess(cmd, 0)
-
-        with mock.patch.object(mod.subprocess, "run", side_effect=fake_run):
-            client.upload_file(Path("/tmp/fake.bin"), "k/fake.bin", cache_control="no-cache")
-
-        self.assertEqual(calls, [30, 30])
-
 
 class TimeoutRetryTests(unittest.TestCase):
     def _client(self) -> object:
