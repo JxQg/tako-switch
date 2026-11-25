@@ -4,6 +4,7 @@ use super::AppId;
 use std::{collections::BTreeMap, ffi::c_void, io, mem::size_of};
 
 const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const ERROR_NO_MORE_FILES: i32 = 18;
 const MAX_PATH: usize = 260;
 
@@ -30,6 +31,13 @@ extern "system" {
     fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
     fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry) -> i32;
     fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry) -> i32;
+    fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+    fn QueryFullProcessImageNameW(
+        process: Handle,
+        flags: u32,
+        exe_name: *mut u16,
+        size: *mut u32,
+    ) -> i32;
     fn CloseHandle(handle: Handle) -> i32;
 }
 
@@ -42,7 +50,7 @@ impl Drop for Snapshot {
     }
 }
 
-fn find_process(mut matches: impl FnMut(&[u16]) -> bool) -> io::Result<bool> {
+fn find_process(mut matches: impl FnMut(&[u16], u32) -> bool) -> io::Result<bool> {
     // SAFETY: TH32CS_SNAPPROCESS requires no specific PID and returns an owned handle.
     let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if handle == INVALID_HANDLE_VALUE {
@@ -61,7 +69,7 @@ fn find_process(mut matches: impl FnMut(&[u16]) -> bool) -> io::Result<bool> {
             .iter()
             .position(|&ch| ch == 0)
             .unwrap_or(MAX_PATH);
-        if matches(&entry.exe_file[..len]) {
+        if matches(&entry.exe_file[..len], entry.process_id) {
             return Ok(true);
         }
         // SAFETY: Same live snapshot and writable entry as above.
@@ -92,8 +100,42 @@ fn matches_ascii_name(image: &[u16], expected: &str) -> bool {
             .all(|(&ch, byte)| u8::try_from(ch).is_ok_and(|ch| ch.eq_ignore_ascii_case(&byte)))
 }
 
+fn is_codex_package_image_path(path: &str) -> bool {
+    path.to_ascii_lowercase().contains("openai.codex")
+}
+
+fn is_codex_packaged_chatgpt_process(process_id: u32) -> bool {
+    // SAFETY: Querying process image path with limited access does not mutate target process state.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let proc_handle = Snapshot(handle);
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    // SAFETY: `buf` is writable for `len` u16 elements and `proc_handle` is a valid process handle.
+    let ok = unsafe { QueryFullProcessImageNameW(proc_handle.0, 0, buf.as_mut_ptr(), &mut len) };
+    if ok == 0 {
+        return false;
+    }
+    let used = (len as usize).min(buf.len());
+    let path = String::from_utf16_lossy(&buf[..used]);
+    is_codex_package_image_path(&path)
+}
+
+fn matches_app_process(id: AppId, image: &[u16], process_id: u32) -> bool {
+    if matches_ascii_name(image, exe_name(id)) {
+        return true;
+    }
+    // Newer OpenAI.Codex MSIX packages ship `app/ChatGPT.exe` as the main UI executable;
+    // verify the full image path so standalone ChatGPT Desktop is never misclassified.
+    id == AppId::Codex
+        && matches_ascii_name(image, "ChatGPT.exe")
+        && is_codex_packaged_chatgpt_process(process_id)
+}
+
 pub(super) fn is_running(id: AppId) -> bool {
-    find_process(|image| matches_ascii_name(image, exe_name(id))).unwrap_or(false)
+    find_process(|image, pid| matches_app_process(id, image, pid)).unwrap_or(false)
 }
 
 pub(crate) fn running_states() -> Result<BTreeMap<String, bool>, String> {
@@ -103,9 +145,9 @@ pub(crate) fn running_states() -> Result<BTreeMap<String, bool>, String> {
         .map(|id| (id.as_str().to_string(), false))
         .collect();
     let mut remaining = ids.len();
-    find_process(|image| {
+    find_process(|image, pid| {
         for &id in ids {
-            if matches_ascii_name(image, exe_name(id)) {
+            if matches_app_process(id, image, pid) {
                 if let Some(running) = states.get_mut(id.as_str()) {
                     if !*running {
                         *running = true;
@@ -148,10 +190,20 @@ mod tests {
     }
 
     #[test]
+    fn codex_packaged_chatgpt_path_filter_excludes_standalone_chatgpt() {
+        assert!(is_codex_package_image_path(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.1120.6357.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+        ));
+        assert!(!is_codex_package_image_path(
+            r"C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.2026.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+        ));
+    }
+
+    #[test]
     fn native_snapshot_contains_this_process() {
         let exe = std::env::current_exe().unwrap();
         let name: Vec<u16> = exe.file_name().unwrap().encode_wide().collect();
-        assert!(find_process(|image| image == name.as_slice()).unwrap());
+        assert!(find_process(|image, _pid| image == name.as_slice()).unwrap());
     }
 
     #[test]

@@ -4635,6 +4635,12 @@ pub fn ensure_gateway_service(paths: &AppPaths) -> Result<(), String> {
     {
         if !paths.is_test {
             ensure_in_process_proxy_running();
+            for _ in 0..15 {
+                if is_proxy_healthy(LOCAL_GATEWAY_PORT) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
         Ok(())
     }

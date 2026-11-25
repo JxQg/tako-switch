@@ -662,7 +662,12 @@ fn detect_windows_codex() -> Option<(Option<String>, Option<String>)> {
 
 #[cfg(target_os = "windows")]
 fn quit_windows_process(name: &str) -> Result<(), String> {
-    let script = format!("Stop-Process -Name '{name}' -Force -ErrorAction SilentlyContinue");
+    let script = format!(
+        "Stop-Process -Name '{name}' -Force -ErrorAction SilentlyContinue; \
+         Get-CimInstance Win32_Process -Filter \"Name='ChatGPT.exe'\" -ErrorAction SilentlyContinue | \
+         Where-Object {{ $_.ExecutablePath -like '*OpenAI.Codex*' }} | \
+         ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+    );
     let _ = ps_hidden(&script);
     Ok(())
 }
