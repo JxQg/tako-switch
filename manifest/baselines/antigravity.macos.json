@@ -1,11 +1,11 @@
 {
   "appId": "antigravity",
-  "capturedAt": "2026-11-25T12:58:08Z",
+  "capturedAt": "2026-11-25T23:09:12Z",
   "profile": {
     "bundleName": "Antigravity.app",
     "bundleId": "com.google.antigravity",
-    "shortVersion": "2.35.1",
-    "bundleVersion": "2.35.1",
+    "shortVersion": "2.35.2",
+    "bundleVersion": "2.35.2",
     "minSystemVersion": "13.0",
     "urlSchemes": [
       "antigravity"
@@ -33,6 +33,6 @@
     ]
   },
   "extraAudit": {
-    "asarFileCount": 1168
+    "asarFileCount": 1167
   }
 }
