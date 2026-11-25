@@ -86,30 +86,36 @@
       "version": "2.35.2",
       "platforms": {
         "macos-arm64": {
-          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/darwin-arm/Antigravity.zip",
+          "url": "https://dl.lven.asia/apps/antigravity/macos-arm64/2.35.2/Antigravity.zip",
           "version": "2.35.2",
           "installType": "zip",
           "sha512": "f41bee8916fea818853c8e6d5b8083114ebee908ba6aff7290910ea56c01414adeeda4da76348e00c9fdf96de1b4e8313b349fb50069cc325bf13056a5aacf83",
           "size": 216133032,
-          "appBundleName": "Antigravity.app"
+          "appBundleName": "Antigravity.app",
+          "sha256": "748ce2894e6a2651724606a1b917e9d695a037935f2fac666939abf7fd8c5a8d",
+          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/darwin-arm/Antigravity.zip"
         },
         "macos-x64": {
-          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/darwin-x64/Antigravity.zip",
+          "url": "https://dl.lven.asia/apps/antigravity/macos-x64/2.35.2/Antigravity.zip",
           "version": "2.35.2",
           "installType": "zip",
           "sha512": "caa043007f7c6b620a465fbd1160df6b48eced06ca3ead51fff84fd41896d3d490d6255dd7e556e4a742df87c405325bff51e412a1fa9604f48038a91766e724",
           "size": 224099686,
-          "appBundleName": "Antigravity.app"
+          "appBundleName": "Antigravity.app",
+          "sha256": "0dc4461fa05eb4fd9dde06d51eac6411ae03dd5265424d42946e2fb400e6b94d",
+          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/darwin-x64/Antigravity.zip"
         },
         "windows-x64": {
-          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/windows-x64/Antigravity-x64.exe",
+          "url": "https://dl.lven.asia/apps/antigravity/windows-x64/2.35.2/Antigravity-x64.exe",
           "version": "2.35.2",
           "installType": "exe",
           "sha512": "4c4ad1d13d44db1b0bb8b811d0a568cce96045e1c7ac89790ba7b02abb38d086d181fa7caf258d1479a709033038b51ae66cbe64728cc77803aeba74ff09cffc",
           "size": 170273968,
           "silentArgs": [
             "/S"
-          ]
+          ],
+          "sha256": "1c66f68fa45e9ebc55aec5479617a9eeaa305ba8b16a1bee8327b8bad9d10258",
+          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/windows-x64/Antigravity-x64.exe"
         }
       }
     },
