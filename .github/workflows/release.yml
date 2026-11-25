@@ -232,6 +232,7 @@ jobs:
     name: Publish Release, Checksums & Latest-Only Prune
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     if: ${{ always() && (inputs.resync_tag != '' || needs.build.result == 'success') }}
     steps:
       - uses: actions/checkout@v4

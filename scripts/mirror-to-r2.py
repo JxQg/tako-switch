@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 
@@ -29,6 +30,15 @@ import urllib.request
 DEFAULT_MIRROR_APPS = ("dsh-tako", "claude", "antigravity")
 DEFAULT_KEY_PREFIX = "apps"
 DEFAULT_KEEP_VERSIONS = 2
+
+# Hard per-attempt timeouts for aws CLI subprocess calls. Cross-border half-open TCP
+# connections can otherwise hang for hours with zero error output.
+API_TIMEOUT_SECONDS = 60  # head-object / list-objects-v2 / delete-object
+UPLOAD_TIMEOUT_SECONDS = 300  # baseline for a single PUT attempt
+# Upload timeout scales with file size so large installers do not die spuriously:
+# assume a worst-case sustained throughput floor of ~256 KiB/s across the Pacific.
+UPLOAD_TIMEOUT_FLOOR_BPS = 256 * 1024
+AWS_MAX_ATTEMPTS = 3  # 1 try + up to 2 retries for timed-out operations
 
 
 def parse_app_filter(raw: str | None) -> set[str]:
@@ -235,6 +245,43 @@ class S3Client:
             self.region,
         ]
 
+    def _run_with_timeout(
+        self,
+        cmd: list[str],
+        *,
+        key: str,
+        timeout: float,
+        capture: bool,
+        check: bool,
+        attempts: int = AWS_MAX_ATTEMPTS,
+    ) -> subprocess.CompletedProcess:
+        """Run an aws CLI command with a hard per-attempt timeout. TimeoutExpired alone is
+        retried (up to `attempts` total tries); non-zero exits follow `check` unchanged.
+        Raises RuntimeError naming the object key and elapsed seconds when retries exhaust."""
+        last_timeout: subprocess.TimeoutExpired | None = None
+        start = time.monotonic()
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                if capture:
+                    return subprocess.run(
+                        cmd, capture_output=True, text=True, check=check, env=self.env, timeout=timeout
+                    )
+                return subprocess.run(cmd, check=check, env=self.env, timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                last_timeout = exc
+                if attempt < max(1, attempts):
+                    print(
+                        f"[retry] aws operation timed out after {timeout:.0f}s for {key} "
+                        f"(attempt {attempt}/{attempts}); retrying...",
+                        file=sys.stderr,
+                    )
+        elapsed = time.monotonic() - start
+        assert last_timeout is not None
+        raise RuntimeError(
+            f"aws operation for {key} timed out after {elapsed:.0f}s total "
+            f"({max(1, attempts)} attempts x {timeout:.0f}s cap)"
+        ) from last_timeout
+
     def head_object(self, key: str) -> dict | None:
         cmd = self._base_cmd() + [
             "s3api",
@@ -244,7 +291,7 @@ class S3Client:
             "--key",
             key,
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=False, env=self.env)
+        res = self._run_with_timeout(cmd, key=key, timeout=API_TIMEOUT_SECONDS, capture=True, check=False)
         if res.returncode != 0:
             return None
         try:
@@ -274,20 +321,27 @@ class S3Client:
         if metadata:
             meta_str = ",".join(f"{k}={v}" for k, v in metadata.items())
             cmd.extend(["--metadata", meta_str])
-        last_err: subprocess.CalledProcessError | None = None
-        for attempt in range(1, 4):
+        size = local_path.stat().st_size if local_path.exists() else 0
+        timeout = max(UPLOAD_TIMEOUT_SECONDS, int(size // UPLOAD_TIMEOUT_FLOOR_BPS))
+        last_err: Exception | None = None
+        start = time.monotonic()
+        for attempt in range(1, AWS_MAX_ATTEMPTS + 1):
             try:
-                subprocess.run(cmd, check=True, env=self.env)
+                subprocess.run(cmd, check=True, env=self.env, timeout=timeout)
                 return
-            except subprocess.CalledProcessError as exc:
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
                 last_err = exc
-                if attempt < 3:
+                if attempt < AWS_MAX_ATTEMPTS:
                     print(
-                        f"[retry] upload attempt {attempt}/3 failed for {key}; retrying...",
+                        f"[retry] upload attempt {attempt}/{AWS_MAX_ATTEMPTS} failed for {key}; retrying...",
                         file=sys.stderr,
                     )
+        elapsed = time.monotonic() - start
         assert last_err is not None
-        raise last_err
+        raise RuntimeError(
+            f"upload failed for {key} after {elapsed:.0f}s total "
+            f"({AWS_MAX_ATTEMPTS} attempts x {timeout:.0f}s cap): {last_err}"
+        ) from last_err
 
     def list_objects(self, prefix: str) -> list[dict]:
         cmd = self._base_cmd() + [
@@ -298,7 +352,7 @@ class S3Client:
             "--prefix",
             prefix,
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True, env=self.env)
+        res = self._run_with_timeout(cmd, key=prefix, timeout=API_TIMEOUT_SECONDS, capture=True, check=True)
         if not res.stdout.strip():
             return []
         data = json.loads(res.stdout)
@@ -313,7 +367,7 @@ class S3Client:
             "--key",
             key,
         ]
-        subprocess.run(cmd, check=True, env=self.env)
+        self._run_with_timeout(cmd, key=key, timeout=API_TIMEOUT_SECONDS, capture=False, check=True)
 
 
 def download_file(url: str, dest: Path) -> None:
@@ -333,7 +387,7 @@ def download_file(url: str, dest: Path) -> None:
         str(dest),
         url,
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, timeout=630)  # hard cap slightly above curl --max-time 600
 
 
 def mirror_manifest_to_r2(
