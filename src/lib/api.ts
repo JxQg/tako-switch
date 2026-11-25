@@ -402,6 +402,69 @@ export type SkillSyncMethod = "auto" | "symlink" | "copy";
 export type SkillLinkMode = "symlink" | "copy";
 export type SkillSource = "local" | "adopted" | "zip" | "github";
 
+export type PluginCliSource = "builtin" | "path";
+
+export interface PluginEntry {
+  id: string;
+  name: string;
+  displayName: string;
+  version: string | null;
+  description: string;
+  category: string | null;
+  marketplace: string | null;
+  installPath: string | null;
+  dirName: string | null;
+  scope: string | null;
+  enabled: boolean;
+  manageable: boolean;
+  removable: boolean;
+  needsConfiguration: boolean;
+}
+
+export interface PluginMarketplace {
+  name: string;
+  source: string;
+  installLocation: string | null;
+  manageable: boolean;
+}
+
+export interface PluginsHubSnapshot {
+  platform: ExtPlatform;
+  cliAvailable: boolean;
+  cliPath: string | null;
+  cliSource: PluginCliSource | null;
+  marketplacesSupported: boolean;
+  installed: PluginEntry[];
+  available: PluginEntry[];
+  marketplaces: PluginMarketplace[];
+  catalogFromCache: boolean;
+  warnings: string[];
+}
+
+export interface PluginActionOutcome {
+  platform: ExtPlatform;
+  pluginId: string;
+  needsConfiguration: boolean;
+  message: string;
+}
+
+export interface PluginError {
+  errorCode: string;
+  message: string;
+  detail: string | null;
+}
+
+export function parsePluginError(error: unknown): PluginError {
+  if (typeof error === "object" && error !== null && "errorCode" in error && "message" in error) {
+    return {
+      errorCode: String(error.errorCode),
+      message: String(error.message),
+      detail: "detail" in error && typeof error.detail === "string" ? error.detail : null,
+    };
+  }
+  return { errorCode: "PLUGIN_UNKNOWN_ERROR", message: String(error), detail: null };
+}
+
 export interface SkillRepo {
   owner: string;
   name: string;
@@ -630,4 +693,18 @@ export const api = {
     invoke<PromptsHubSnapshot>("sync_prompt_to_platforms", { source, id, targets, activate }),
   exportPromptsBackup: () => invoke<string>("export_prompts_backup"),
   importPromptsBackup: (backup: string) => invoke<PromptsHubSnapshot>("import_prompts_backup", { backup }),
+  getPluginsHubSnapshot: (platform: ExtPlatform, includeAvailable = true) =>
+    invoke<PluginsHubSnapshot>("get_plugins_hub_snapshot", { platform, includeAvailable }),
+  togglePluginEnabled: (platform: ExtPlatform, id: string, enabled: boolean) =>
+    invoke<PluginActionOutcome>("toggle_plugin_enabled", { platform, id, enabled }),
+  installPluginEntry: (platform: ExtPlatform, id: string) =>
+    invoke<PluginActionOutcome>("install_plugin_entry", { platform, id }),
+  updatePluginEntry: (platform: ExtPlatform, id: string) =>
+    invoke<PluginActionOutcome>("update_plugin_entry", { platform, id }),
+  uninstallPluginEntry: (platform: ExtPlatform, id: string) =>
+    invoke<PluginActionOutcome>("uninstall_plugin_entry", { platform, id }),
+  addPluginMarketplace: (platform: ExtPlatform, source: string) =>
+    invoke<PluginActionOutcome>("add_plugin_marketplace", { platform, source }),
+  removePluginMarketplace: (platform: ExtPlatform, name: string) =>
+    invoke<PluginActionOutcome>("remove_plugin_marketplace", { platform, name }),
 };

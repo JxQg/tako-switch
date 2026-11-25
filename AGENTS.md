@@ -28,9 +28,6 @@
 | `src/App.tsx` | 主界面：无界融合顶栏、双密度（紧凑/舒适）与原生窗口主题联动、账号登录/登出、一键三端汉化开关、模型广场直达入口、四大客户端卡片与更新检查 |
 | `src/components/TopHeaderBar.tsx` / `WindowChrome.tsx` | 融合自定义标题栏、Windows 原生规范控制键（最小化/最大化还原/关闭）、8 方向无死角边缘缩放热区与右键系统窗口菜单 |
 | `src/components/McpInlineTheater.tsx` | 主界面下方 5 合 1 超级 MCP 内联实景剧场（「效果演示」零扣费媒体交互 + 「现场试跑」Live Playground） |
-| `src/components/ExtensionsHubPanel.tsx` / `extensions/` | 通用扩展中心四页签、共享搜索与抽屉、通用 MCP 矩阵、提示词预设双栏编辑器 |
-| `src-tauri/src/extensions/` | 基于 `AppPaths` 的路径与原子存储、第三方 MCP 收编和三端同步、提示词历史归档与汉化块保护 |
-| `src-tauri/tests/ext_hub_phase1_blackbox.rs` / `scripts/test_ext_hub_phase1_ui.mjs` | 临时目录黑盒测试与模拟 IPC 浏览器验收，覆盖双尺寸、深浅色和双密度 |
 | `src/components/ModelPickerModal.tsx` | 模型广场总览与分客户端模型选择弹窗：人民币/内部额度切换、明细价/均价双视图、官方倍率折扣与 6 场景筛选 |
 | `src/components/BrandIcons.tsx` / `ModelIcons.tsx` | 客户端品牌图标与模型厂商图标（Codex / Claude / Antigravity / DeepSeek 等） |
 | `src/lib/plaza-pricing.ts` | 与网关模型广场 PR #296 对齐的纯函数计价库（`CNY = internalUSD / 3`、`/1M`·`/1K`、官方倍率折算与快捷筛选） |
@@ -39,9 +36,9 @@
 | `src-tauri/src/main.rs` | 4 角色子命令路由（`mcp-server`、`status-line`、`gateway-proxy` / `agy-proxy`、GUI） |
 | `src-tauri/src/lib.rs` | Tauri 命令注册（含 `sync_window_theme`、`show_window_system_menu`、`set_prefer_chinese_ui`、`patch_antigravity_ui`、`restore_antigravity_ui`、`list_plaza_models`、`run_mcp_live_demo`）、Windows 无框阴影与 DWM 边框色装配、OSS/GitHub 双端点更新策略、网关守护 |
 | `src-tauri/src/config.rs` | `AppPaths`（含沙盒 `agy_app_override_dir`）、备份存取 (`has_backup`)、`SwitchState`（含 `UiDensity` / `ThemePref`）、`ClientModelFilter`、持久化设备指纹、原子写 (`write_atomic`) |
-| `src-tauri/src/extensions/mod.rs` / `skills.rs` | 复用 `SyncPlatform` 的三端扩展平台类型、JSON Store、代理策略与 Skills 主副本、软链回退、ZIP 导入、GitHub 仓库发现和内容哈希更新 |
-| `src/components/ExtensionsHubPanel.tsx` / `extensions/` | 扩展中心入口、公共搜索/菜单/抽屉原语和 Skills 已安装矩阵、仓库发现、导入视图 |
-| `docs/skills-hub.md` / `src-tauri/tests/ext_hub_phase2_blackbox.rs` / `scripts/test_skills_hub_ui.mjs` | Skills 使用与存储契约、隔离后端黑盒和八组窗口/主题/密度 UI 验证 |
+| `src-tauri/src/extensions/` | 通用扩展中心后端（`mod.rs`、`mcp.rs`、`skills.rs`、`plugins.rs`、`prompts.rs`）：统一三端 `ExtPlatform`、原子 JSON Store、网络代理策略、MCP 收编联动、Skills 主副本/软链回退/ZIP/仓库发现、内置优先 CLI 插件协议与 JSONC/缓存、提示词双区无损合成 |
+| `src/components/ExtensionsHubPanel.tsx` / `extensions/` | 通用扩展中心四页签壳层、共享原语组件（`ExtensionPrimitives.tsx`）及 MCP、Skills、插件、提示词四大管理视图 |
+| `docs/extensions-*.md` / `docs/skills-hub.md` / `src-tauri/tests/ext_hub_phase*_blackbox.rs` | 通用扩展中心维护契约、三阶段隔离沙盒黑盒测试与多尺寸/深浅色/双密度浏览器回归脚本 |
 | `src-tauri/src/auth.rs` | 独立于 `tako-cli` 的 OAuth PKCE 登录（`DESKTOP_OAUTH_CLIENT_ID = "takoswitch"`、`build_oauth_authorize_url`、`exchange_desktop_token`）与 `~/.tako/switch/auth.json` 存取、`AccountStatus`、`BalanceCache` |
 | `src-tauri/src/agy_proxy.rs` | 本地网关服务、免登录模型广场 `fetch_plaza_models_for_ui` / `build_plaza_model_options`、`/claude` 与 `/codex` 模型目录生成与过滤、Antigravity 32 槽位展开 |
 | `src-tauri/src/mcp_server.rs` | 6 合 1 `stdio` MCP 工具实现（`tako_web_search`、`tako_generate_image`、`tako_generate_video`、`tako_generate_audio`、`tako_consult`、`tako_account_status`）及现场试跑核心 `execute_live_demo_for_paths` |
@@ -91,11 +88,12 @@
    - `SwitchState.bypass_system_proxy`（JSON 键 `bypassSystemProxy`）默认值为 `true`（直连 Tako 网关 `.no_proxy()`），避免用户开启慢速全局/系统代理时劫持网关上行；在设置中关闭后无需重启守护进程即可动态切回系统代理。
    - 本地网关转发无需改写的超大请求体（> 64 KiB）时采用流式透传，并在下游客户端断开 TCP 连接时立即中止上游请求，防止超时重试堆积僵尸上传。
 8. **通用扩展中心（`extensions/`）**：
-   - 只纳管 `Claude`、`Codex` 和 `Antigravity`（严禁触碰 `~/.dsh-tako`）。全部核心入口接收 `&AppPaths`，测试强制使用 `TempDir` 和 `AppPaths::for_test`。
-   - 中心库存放于 `switch/extensions/` 与 `switch/skills/`。快照自动收编历史配置，不改写客户端原文件；首次修改先 `backup_file_once` 备份，所有写入经 `write_atomic` 落盘。
+   - 只纳管 `Claude`、`Codex` 和 `Antigravity`（严禁触碰 `~/.dsh-tako`）。全部核心入口接收 `&AppPaths`，测试强制使用 `TempDir` 和 `AppPaths::for_test`（`paths.is_test == true` 时禁止读取宿主机 PATH 或外网）。
+   - 中心库存放于 `switch/extensions/` 与 `switch/skills/`。快照自动收编历史配置，不改写客户端原文件；首次修改先 `backup_file_once` 备份，所有写入经 `write_atomic` 落盘，所有持久化结构体加 `#[serde(default)]` 兼容低版本平滑升级。
    - 通用 MCP 排除内置 `tako`、`tako-web-page` 和 `node_repl`；Claude 开关联动 `1p`、已存在的 `3p` 和 `~/.claude.json`，全关仍保留中心记录。
    - 提示词只修改用户正文，原样保留汉化托管块；快照自动归档手写正文并回写外部修改。
    - Skills 主副本位于 `switch/skills/<id>`，全关保留主副本；自动模式优先目录软链，无权限回退原子复制，移除链接/Junction 时仅删链接本身；ZIP 解压内存预检路径、深度与 50 MiB 上限，仓库拉取遵循 `bypass_system_proxy`。
+   - 插件管理按桌面内置、用户安装目录、系统 PATH 顺序探测 CLI，Windows 无窗口执行并关闭 stdin；Codex 开关经 `toml_edit` 无损保存，Antigravity 目录遵循系统代理开关并缓存至 `extensions/plugin_cache.json`。
 
 ---
 

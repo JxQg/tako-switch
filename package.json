@@ -8,8 +8,9 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
+    "test:phase1-ui": "node scripts/test_ext_hub_phase1_ui.mjs",
     "test:skills-ui": "node scripts/test_skills_hub_ui.mjs",
-    "dev:skills-preview": "node scripts/test_skills_hub_ui.mjs --preview",
+    "test:plugins-ui": "node scripts/test_ext_hub_phase3_ui.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
