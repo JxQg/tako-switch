@@ -18,6 +18,7 @@ from unittest import mock
 import urllib.error
 import urllib.request
 import zipfile
+import shutil
 
 WIN_LAB_ROOT = Path(__file__).resolve().parents[1]
 if str(WIN_LAB_ROOT) not in sys.path:
@@ -343,6 +344,92 @@ class TestWinLabCore(unittest.TestCase):
         self.assertEqual(res["overall"], "pass")
         self.assertEqual(res["extraAudit"]["claudeCodeVersion"], "2.1.331")
         self.assertTrue(res["extraAudit"]["pe_Claude.exe"]["hasElectronFuse"])
+
+    def test_download_artifact_resumes_partial_and_keeps_it_on_stall(self) -> None:
+        body = b"HEAD" + b"x" * 200_000 + b"-TAIL-ok"
+        state = {"calls": 0, "ranges": []}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                state["calls"] += 1
+                rng = self.headers.get("Range")
+                state["ranges"].append(rng)
+                start = 0
+                if rng and rng.startswith("bytes="):
+                    start = int(rng.split("=", 1)[1].split("-", 1)[0] or "0")
+                chunk = body[start:]
+                self.send_response(206 if start else 200)
+                self.send_header("Content-Length", str(len(chunk)))
+                if start:
+                    self.send_header("Content-Range", f"bytes {start}-{len(body) - 1}/{len(body)}")
+                self.end_headers()
+                self.wfile.write(chunk)
+
+            def log_message(self, *_args: object) -> None:
+                return
+
+        class ShortRead(Exception):
+            pass
+
+        real_copy = shutil.copyfileobj
+
+        def copy_then_die(src, dst, length=0):  # noqa: ANN001
+            if state["calls"] == 1:
+                dst.write(src.read(80_000))
+                raise ShortRead("connection dropped mid-body")
+            real_copy(src, dst, length)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        dest = self.tmp / "cache" / "pkg.msix"
+        try:
+            with mock.patch.object(gates.shutil, "which", return_value=None), mock.patch.object(
+                gates.shutil, "copyfileobj", side_effect=copy_then_die
+            ), mock.patch.object(gates, "_DOWNLOAD_MIN_PROGRESS", 1024):
+                res = gates.download_artifact(
+                    f"http://127.0.0.1:{server.server_address[1]}/pkg.msix",
+                    dest,
+                    log=lambda _m: None,
+                )
+        finally:
+            server.shutdown()
+
+        self.assertEqual(dest.read_bytes(), body)
+        self.assertFalse(dest.with_suffix(dest.suffix + ".part").exists())
+        self.assertGreaterEqual(state["calls"], 2)
+        self.assertTrue(any(r and r.startswith("bytes=") for r in state["ranges"]))
+        self.assertEqual(res["size"], len(body))
+        self.assertFalse(res["cached"])
+
+        # A later run reuses the verified file instead of downloading again.
+        calls_after = state["calls"]
+        again = gates.download_artifact(
+            "http://127.0.0.1:1/unused", dest, expected_sha256=res["sha256"], log=lambda _m: None
+        )
+        self.assertTrue(again["cached"])
+        self.assertEqual(state["calls"], calls_after)
+
+    def test_download_artifact_keeps_partial_when_transfer_fails(self) -> None:
+        dest = self.tmp / "cache" / "pkg.msix"
+        partial = b"y" * 80_000
+
+        def boom(curl_bin: str | None, candidate: str, tmp: Path, proxy: str | None) -> None:
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            with tmp.open("ab") as out:
+                out.write(partial)
+            raise TimeoutError("stalled")
+
+        with mock.patch.object(gates, "_download_once", side_effect=boom), mock.patch.object(
+            gates, "_DOWNLOAD_ATTEMPTS", 2
+        ), mock.patch.object(gates, "_DOWNLOAD_MIN_PROGRESS", 1024):
+            with self.assertRaises(RuntimeError) as ctx:
+                gates.download_artifact("https://example.invalid/pkg.msix", dest, log=lambda _m: None)
+        self.assertIn("stalled", str(ctx.exception))
+
+        kept = dest.with_suffix(dest.suffix + ".part")
+        self.assertTrue(kept.is_file())
+        # Both attempts appended; nothing was unlinked between them.
+        self.assertEqual(kept.stat().st_size, len(partial) * 2)
 
     def test_hq_reporter_delivery_and_cooldown_dedupe(self) -> None:
         sent_calls: list[tuple[str, dict]] = []

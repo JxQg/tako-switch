@@ -98,6 +98,80 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+# A ~1 GB MSIX over a jittery cross-border link can sit well under 1 MB/s for
+# long stretches. Bound the transfer by stall (no bytes), not by wall clock:
+# each curl attempt dies only if it stays under 1 KB/s for 120s, and Python
+# resumes the same .part via `curl -C -` until the whole budget is spent.
+_DOWNLOAD_ATTEMPTS = 12
+_DOWNLOAD_STALL_SPEED = "1024"  # bytes/s
+_DOWNLOAD_STALL_TIME = "120"  # seconds below stall speed before curl aborts
+_DOWNLOAD_ATTEMPT_MAX_TIME = "900"  # per-attempt ceiling; resume continues after
+_DOWNLOAD_ATTEMPT_KILL = 960  # subprocess kill, slightly above --max-time
+_DOWNLOAD_TOTAL_BUDGET = 3 * 60 * 60  # seconds across resume attempts
+_DOWNLOAD_MIN_PROGRESS = 64 * 1024  # ignore tiny Range-416 / error-page writes
+
+
+def _download_once(
+    curl_bin: str | None,
+    candidate: str,
+    tmp: Path,
+    proxy: str | None,
+) -> None:
+    """Fetch candidate into tmp, appending via Range when tmp already has bytes."""
+    existing = tmp.stat().st_size if tmp.is_file() else 0
+    if curl_bin:
+        cmd = [
+            curl_bin,
+            "-fSL",
+            "--retry",
+            "5",
+            "--retry-all-errors",
+            "--retry-delay",
+            "3",
+            "--connect-timeout",
+            "20",
+            "--speed-limit",
+            _DOWNLOAD_STALL_SPEED,
+            "--speed-time",
+            _DOWNLOAD_STALL_TIME,
+            "--max-time",
+            _DOWNLOAD_ATTEMPT_MAX_TIME,
+        ]
+        if existing:
+            cmd += ["-C", "-"]
+        if proxy:
+            cmd += ["-x", proxy]
+        else:
+            cmd += ["--noproxy", "*"]
+        cmd += ["-o", str(tmp), candidate]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=_DOWNLOAD_ATTEMPT_KILL)
+        if proc.returncode != 0:
+            raise RuntimeError(f"curl exit {proc.returncode}: {(proc.stderr or proc.stdout).strip()[:300]}")
+        return
+
+    headers = {"User-Agent": "tako-win-lab/0.1"}
+    if existing:
+        headers["Range"] = f"bytes={existing}-"
+    req = urllib.request.Request(candidate, headers=headers)
+    opener = (
+        urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        if proxy
+        else urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    )
+    with opener.open(req, timeout=180) as resp:
+        status = getattr(resp, "status", None) or resp.getcode()
+        # A server that ignores Range answers 200 with the whole body; appending
+        # that would corrupt the partial, so start over.
+        mode = "ab" if existing and status == 206 else "wb"
+        with tmp.open(mode) as out:
+            shutil.copyfileobj(resp, out, length=1024 * 1024)
+        # A 206 that adds nothing means the offset was already past EOF (or the
+        # server sent an empty range). Without this, a truncated-looking success
+        # would be treated as a finished download.
+        if existing and status == 206 and tmp.stat().st_size <= existing:
+            raise RuntimeError(f"range resume made no progress (status={status}, at={existing})")
+
+
 def download_artifact(
     url: str,
     dest_path: Path,
@@ -106,7 +180,12 @@ def download_artifact(
     fallback_url: str = "",
     log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Download artifact into cache with SHA256 verification and reuse."""
+    """Download artifact into cache with SHA256 verification and resume.
+
+    Partial bytes stay in ``<dest>.part`` across curl failures and across
+    later runs, so a 630s cross-border stall no longer throws away a
+    multi-hundred-MB MSIX. Only a completed SHA256 mismatch discards them.
+    """
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     if dest_path.is_file() and dest_path.stat().st_size > 0:
         actual = sha256_file(dest_path)
@@ -126,38 +205,35 @@ def download_artifact(
         for proxy in proxy_attempts:
             tmp = dest_path.with_suffix(dest_path.suffix + ".part")
             try:
-                if log:
-                    via = f" via {proxy}" if proxy else ""
-                    log(f"[download] fetching {candidate}{via}")
                 curl_bin = shutil.which("curl.exe") or shutil.which("curl")
-                if curl_bin:
-                    cmd = [
-                        curl_bin,
-                        "-fSL",
-                        "--retry",
-                        "2",
-                        "--connect-timeout",
-                        "20",
-                        "--max-time",
-                        "600",
-                    ]
-                    if proxy:
-                        cmd += ["-x", proxy]
-                    else:
-                        cmd += ["--noproxy", "*"]
-                    cmd += ["-o", str(tmp), candidate]
-                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=630)
-                    if proc.returncode != 0:
-                        raise RuntimeError(f"curl exit {proc.returncode}: {(proc.stderr or proc.stdout).strip()[:300]}")
+                deadline = time.monotonic() + _DOWNLOAD_TOTAL_BUDGET
+                for attempt in range(1, _DOWNLOAD_ATTEMPTS + 1):
+                    if time.monotonic() > deadline:
+                        raise RuntimeError(f"download exceeded {_DOWNLOAD_TOTAL_BUDGET}s budget")
+                    have = tmp.stat().st_size if tmp.is_file() else 0
+                    if log:
+                        via = f" via {proxy}" if proxy else ""
+                        resume = f" resume_at={have}" if have else ""
+                        log(f"[download] fetching {candidate}{via} attempt={attempt}{resume}")
+                    before = have
+                    try:
+                        _download_once(curl_bin, candidate, tmp, proxy)
+                    except Exception as exc:
+                        # Keep .part: the next attempt (or the next run) continues it,
+                        # but only when this attempt actually moved the file forward.
+                        gained = (tmp.stat().st_size if tmp.is_file() else 0) - before
+                        if gained < _DOWNLOAD_MIN_PROGRESS or attempt == _DOWNLOAD_ATTEMPTS:
+                            raise
+                        if log:
+                            log(f"[download] stalled at {tmp.stat().st_size} bytes ({exc}); resuming")
+                        continue
+                    if tmp.is_file() and tmp.stat().st_size > before:
+                        break
                 else:
-                    req = urllib.request.Request(candidate, headers={"User-Agent": "tako-win-lab/0.1"})
-                    opener = (
-                        urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-                        if proxy
-                        else urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                    raise RuntimeError(
+                        f"download incomplete after {_DOWNLOAD_ATTEMPTS} attempts "
+                        f"({tmp.stat().st_size if tmp.is_file() else 0} bytes)"
                     )
-                    with opener.open(req, timeout=180) as resp, tmp.open("wb") as out:
-                        shutil.copyfileobj(resp, out, length=1024 * 1024)
 
                 actual = sha256_file(tmp)
                 if expected_sha256 and actual.lower() != expected_sha256.lower():
@@ -170,9 +246,9 @@ def download_artifact(
                 return {"path": dest_path, "sha256": actual, "size": sz, "cached": False, "url": candidate}
             except Exception as exc:
                 last_err = str(exc)
-                tmp.unlink(missing_ok=True)
                 if log:
-                    log(f"[download] failed {candidate} (proxy={proxy or 'direct'}): {last_err}")
+                    kept = tmp.stat().st_size if tmp.is_file() else 0
+                    log(f"[download] failed {candidate} (proxy={proxy or 'direct'}, kept={kept}): {last_err}")
     raise RuntimeError(f"下载候选安装包失败: {last_err}")
 
 
