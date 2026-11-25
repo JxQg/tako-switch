@@ -112,9 +112,7 @@
           "sha512": "9ef2324ee671b56f677e7286558eece41e457b19fee3d11b00ccc3fad6d554d5f01fd444b81e879b1fbca321f6fbb8d6f1069152c6e1cad1ef1908b15c0d6130",
           "size": 170272672,
           "silentArgs": [
-            "/VERYSILENT",
-            "/NORESTART",
-            "/CLOSEAPPLICATIONS"
+            "/S"
           ],
           "sha256": "b90d07974759f2f267be4c966ec7e62839b0873b2aa7d2732e74de955a077df0",
           "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.1-4615540875067392/windows-x64/Antigravity-x64.exe"

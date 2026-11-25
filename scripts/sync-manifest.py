@@ -37,7 +37,9 @@ ANTIGRAVITY_FEEDS = {
     "windows-x64": (
         "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-x64-win.yml",
         "exe",
-        ["/VERYSILENT", "/NORESTART", "/CLOSEAPPLICATIONS"],
+        # Antigravity 2.35.x ships NSIS (electron-builder): /S is the only silent switch.
+        # installer.rs additionally sniffs the binary magic and overrides if Inno ever returns.
+        ["/S"],
     ),
 }
 

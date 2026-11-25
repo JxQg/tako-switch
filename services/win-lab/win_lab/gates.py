@@ -23,6 +23,7 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import time
 from typing import Any, Callable
 import urllib.error
 import urllib.parse
@@ -325,6 +326,111 @@ def _extract_embedded_zip_from_exe(exe_path: Path, out_dir: Path, log: Callable[
     return extracted_any
 
 
+def detect_installer_type(installer_path: Path) -> str:
+    """Sniff installer technology from PE stub bytes (works on partial/complete installers).
+
+    Vendors silently switch packaging technology between releases (e.g. Antigravity 2.35.x
+    moved Inno Setup -> NSIS), so never trust app_id heuristics: always sniff the binary.
+    """
+    try:
+        with installer_path.open("rb") as f:
+            head = f.read(1024 * 1024)
+    except OSError:
+        return "unknown"
+    if len(head) < 2 or head[:2] != b"MZ":
+        return "unknown"
+    if b"\xef\xbe\xad\xdeNullsoftInst" in head:
+        return "nsis"
+    if b"Inno Setup" in head or b"JR.Inno.Setup" in head:
+        return "inno"
+    return "unknown"
+
+
+def _wait_for_artifacts(target_dirs: list[Path], patterns: tuple[str, ...], timeout_sec: float) -> bool:
+    """Poll for artifacts appearing in target dirs (NSIS/electron-builder may spawn async child copy)."""
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        for root in target_dirs:
+            if root.is_dir() and any(p.is_file() for pat in patterns for p in root.rglob(pat)):
+                return True
+        time.sleep(2.0)
+    return False
+
+
+def _recursive_7z_extract(seven_z: str, root_dir: Path, log: Callable[[str], None] | None = None, max_rounds: int = 4) -> None:
+    """Recursively extract nested 7z archives inside root_dir (electron-builder NSIS nests app-64.7z)."""
+    for _round in range(max_rounds):
+        nested = sorted(
+            p
+            for p in root_dir.rglob("*.7z")
+            if p.is_file() and not p.parent.name.endswith("_7z")
+        )
+        if not nested:
+            return
+        progress = False
+        for arc in nested:
+            target = arc.parent / (arc.stem + "_7z")
+            if target.is_dir() and any(target.iterdir()):
+                continue
+            target.mkdir(parents=True, exist_ok=True)
+            try:
+                proc = subprocess.run(
+                    [seven_z, "x", "-y", f"-o{target}", str(arc)],
+                    capture_output=True,
+                    timeout=300,
+                )
+                if proc.returncode == 0:
+                    progress = True
+                    if log:
+                        log(f"[unpack] 7z recursively extracted nested {arc.name}")
+                elif log:
+                    log(f"[unpack] 7z nested extraction of {arc.name} exited {proc.returncode}")
+            except Exception as exc:
+                if log:
+                    log(f"[unpack] 7z nested extraction of {arc.name} failed: {exc}")
+        if not progress:
+            return
+
+
+def _silent_sandbox_install(
+    installer_path: Path,
+    sandbox_dir: Path,
+    installer_kind: str,
+    log: Callable[[str], None] | None = None,
+) -> tuple[str, int | None]:
+    """Run vendor installer silently into sandbox_dir; returns (method_tag, exit_code)."""
+    if installer_kind == "inno":
+        args = [
+            str(installer_path),
+            "/VERYSILENT",
+            "/NORESTART",
+            "/CURRENTUSER",
+            "/SUPPRESSMSGBOXES",
+            "/NOICONS",
+            f"/DIR={sandbox_dir}",
+        ]
+        if log:
+            log(f"[unpack] running isolated Inno Setup install -> {sandbox_dir}")
+        try:
+            proc = subprocess.run(args, capture_output=True, timeout=300)
+            return "inno_sandbox", proc.returncode
+        except subprocess.TimeoutExpired:
+            if log:
+                log("[unpack] Inno sandbox install timed out after 300s")
+            return "inno_sandbox", None
+    # NSIS: /S is case-sensitive; /D=<path> must be the LAST argument and unquoted
+    cmd_line = f'"{installer_path}" /S /D={sandbox_dir}'
+    if log:
+        log(f"[unpack] running isolated NSIS install -> {sandbox_dir}")
+    try:
+        proc = subprocess.run(cmd_line, shell=True, capture_output=True, timeout=300)
+        return "nsis_sandbox", proc.returncode
+    except subprocess.TimeoutExpired:
+        if log:
+            log("[unpack] NSIS sandbox install timed out after 300s")
+        return "nsis_sandbox", None
+
+
 def _extract_windows_installer_sandbox(
     app_id: str,
     installer_path: Path,
@@ -352,58 +458,93 @@ def _extract_windows_installer_sandbox(
         if any(out_dir.rglob("*.asar")) or any(out_dir.rglob("*.exe")):
             return out_dir, "embedded_zip"
 
-    # Try 7z if installed on Windows
-    seven_z = shutil.which("7z") or (
+    # bsdtar (Windows System32 tar.exe, libarchive 3.x) natively unpacks NSIS installers —
+    # including electron-builder NSIS flat layouts — without executing any installer code.
+    # Verified empirically on Antigravity 2.35.1 (NSIS): tar -xf yields resources/app.asar directly.
+    tar_bin = shutil.which("tar")
+    if tar_bin:
+        tar_dir = work_dir / "tar_unpacked"
+        tar_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            proc = subprocess.run(
+                [tar_bin, "-xf", str(installer_path), "-C", str(tar_dir)],
+                capture_output=True,
+                timeout=300,
+            )
+            asar_found = any(tar_dir.rglob("*.asar"))
+            exe_found = any(tar_dir.rglob("*.exe"))
+            if proc.returncode == 0 and (asar_found or exe_found):
+                for nupkg in list(tar_dir.rglob("*.nupkg")):
+                    with zipfile.ZipFile(nupkg, "r") as zf:
+                        zf.extractall(nupkg.parent / (nupkg.stem + "_nupkg"))
+                if log:
+                    log(f"[unpack] bsdtar extracted {installer_path.name}")
+                return tar_dir, "bsdtar"
+            if log:
+                stderr_tail = (proc.stderr or b"").decode("utf-8", errors="replace").strip()[-200:]
+                log(f"[unpack] bsdtar exited {proc.returncode} (asar={asar_found}): {stderr_tail}")
+        except subprocess.TimeoutExpired:
+            if log:
+                log("[unpack] bsdtar extraction timed out after 300s")
+        except Exception as exc:
+            if log:
+                log(f"[unpack] bsdtar extraction failed: {exc}")
+        shutil.rmtree(tar_dir, ignore_errors=True)
+
+    # Try 7z if installed (handles Inno Setup + NSIS shells; electron-builder NSIS nests app-64.7z!)
+    seven_z = shutil.which("7z") or shutil.which("7za") or shutil.which("7zz") or (
         r"C:\Program Files\7-Zip\7z.exe" if Path(r"C:\Program Files\7-Zip\7z.exe").is_file() else ""
     )
     if seven_z:
         sz_dir = work_dir / "7z_unpacked"
         sz_dir.mkdir(parents=True, exist_ok=True)
-        proc = subprocess.run(
-            [seven_z, "x", "-y", f"-o{sz_dir}", str(installer_path)],
-            capture_output=True,
-            timeout=180,
-        )
-        if proc.returncode == 0:
+        try:
+            proc = subprocess.run(
+                [seven_z, "x", "-y", f"-o{sz_dir}", str(installer_path)],
+                capture_output=True,
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired:
+            proc = None
+            if log:
+                log("[unpack] 7z extraction timed out after 300s")
+        if proc is not None and proc.returncode == 0:
             for nupkg in list(sz_dir.rglob("*.nupkg")):
                 with zipfile.ZipFile(nupkg, "r") as zf:
                     zf.extractall(nupkg.parent / (nupkg.stem + "_nupkg"))
+            _recursive_7z_extract(seven_z, sz_dir, log=log)
             if any(sz_dir.rglob("*.asar")) or any(sz_dir.rglob("*.exe")):
                 if log:
                     log(f"[unpack] 7z extracted {installer_path.name}")
                 return sz_dir, "7z"
 
-    # On Windows, Inno Setup (antigravity) & NSIS (dsh-tako) natively support isolated /DIR= or /D=
+    # On Windows, Inno Setup & NSIS natively support isolated /DIR= or /D= — pick by sniffed type,
+    # NOT app_id, because vendors silently switch packaging technology between releases
+    # (Antigravity 2.35.x moved Inno Setup -> NSIS, breaking hardcoded Inno args).
     if platform.system().lower() == "windows":
         sandbox_dir = work_dir / "sandbox_install"
         sandbox_dir.mkdir(parents=True, exist_ok=True)
-        if app_id == "antigravity":
-            args = [
-                str(installer_path),
-                "/VERYSILENT",
-                "/NORESTART",
-                "/CURRENTUSER",
-                "/SUPPRESSMSGBOXES",
-                "/NOICONS",
-                f"/DIR={sandbox_dir}",
-            ]
+        kind = detect_installer_type(installer_path)
+        if log:
+            log(f"[unpack] detected installer type: {kind}")
+        kinds = [kind] if kind in ("inno", "nsis") else ["inno", "nsis"]
+        artifact_patterns = ("*.asar", "*.exe")
+        for try_kind in kinds:
+            method, rc = _silent_sandbox_install(installer_path, sandbox_dir, try_kind, log=log)
+            # electron-builder NSIS may spawn an async child copy process — poll briefly for artifacts
+            if not any(sandbox_dir.rglob(p) for p in artifact_patterns):
+                _wait_for_artifacts([sandbox_dir], artifact_patterns, timeout_sec=8.0)
+            if any(p.is_file() for pat in artifact_patterns for p in sandbox_dir.rglob(pat)):
+                if log:
+                    log(f"[unpack] {method} produced artifacts (exit={rc})")
+                return sandbox_dir, method
             if log:
-                log(f"[unpack] running isolated Inno Setup install -> {sandbox_dir}")
-            proc = subprocess.run(args, capture_output=True, timeout=240)
-            if proc.returncode == 0 and any(sandbox_dir.rglob("*.asar")):
-                return sandbox_dir, "inno_sandbox"
-            if log:
-                log(f"[unpack] Inno sandbox install exited {proc.returncode}")
-        elif app_id == "dsh-tako":
-            # NSIS requires /D=<path> as the LAST argument without quotes around /D=
-            cmd_line = f'"{installer_path}" /S /D={sandbox_dir}'
-            if log:
-                log(f"[unpack] running isolated NSIS install -> {sandbox_dir}")
-            proc = subprocess.run(cmd_line, shell=True, capture_output=True, timeout=240)
-            if proc.returncode == 0 and any(sandbox_dir.rglob("*.exe")):
-                return sandbox_dir, "nsis_sandbox"
-            if log:
-                log(f"[unpack] NSIS sandbox install exited {proc.returncode}")
+                log(f"[unpack] {method} exited {rc} but sandbox is empty")
+            for child in list(sandbox_dir.iterdir()):
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
 
     return out_dir, "raw_exe_only"
 

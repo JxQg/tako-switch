@@ -969,6 +969,37 @@ fn install_windows_msix(
 }
 
 #[cfg(target_os = "windows")]
+fn is_nsis_installer(package_path: &Path) -> bool {
+    // NSIS installers carry the `\xef\xbe\xad\xdeNullsoftInst` firstheader magic inside the PE stub.
+    // Antigravity switched Inno Setup -> NSIS (electron-builder) in 2.35.x, so never trust fixed args.
+    use std::io::Read;
+    const NSIS_MAGIC: &[u8] = b"\xef\xbe\xad\xdeNullsoftInst";
+    let Ok(mut f) = std::fs::File::open(package_path) else {
+        return false;
+    };
+    let mut scanned: usize = 0;
+    let mut tail: Vec<u8> = Vec::with_capacity(NSIS_MAGIC.len());
+    while scanned < 1024 * 1024 {
+        let mut buf = [0u8; 65536];
+        let Ok(n) = f.read(&mut buf) else { break };
+        if n == 0 {
+            break;
+        }
+        scanned += n;
+        let mut window = tail.clone();
+        window.extend_from_slice(&buf[..n]);
+        if window
+            .windows(NSIS_MAGIC.len())
+            .any(|w| w == NSIS_MAGIC)
+        {
+            return true;
+        }
+        tail = window[window.len().saturating_sub(NSIS_MAGIC.len())..].to_vec();
+    }
+    false
+}
+
+#[cfg(target_os = "windows")]
 fn install_platform_package(
     paths: &AppPaths,
     app_id: AppId,
@@ -994,7 +1025,11 @@ fn install_platform_package(
                 ],
                 AppId::Codex => vec!["/S".to_string()],
             };
-            let args = artifact.silent_args.as_ref().unwrap_or(&default_args);
+            let mut args: Vec<String> = artifact.silent_args.clone().unwrap_or(default_args);
+            // Manifest silentArgs can lag a packaging-format switch; the sniffed binary is ground truth.
+            if app_id == AppId::Antigravity && is_nsis_installer(package_path) {
+                args = vec!["/S".to_string()];
+            }
             let out = std::process::Command::new(package_path)
                 .args(args)
                 .creation_flags(CREATE_NO_WINDOW)

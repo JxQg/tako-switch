@@ -4,13 +4,17 @@ from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
+import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 import zipfile
@@ -20,9 +24,13 @@ if str(WIN_LAB_ROOT) not in sys.path:
     sys.path.insert(0, str(WIN_LAB_ROOT))
 
 from win_lab.config import LabConfig  # noqa: E402
+from win_lab import gates  # noqa: E402
 from win_lab.gates import (  # noqa: E402
     ELECTRON_FUSE_SENTINEL,
     ELECTRON_INTEGRITY_SLOT,
+    _extract_windows_installer_sandbox,
+    _recursive_7z_extract,
+    detect_installer_type,
     verify_windows_artifact,
 )
 from win_lab.hq_reporter import HqReporter, scrub_text  # noqa: E402
@@ -146,6 +154,156 @@ class TestWinLabCore(unittest.TestCase):
         self.assertTrue(is_private_or_mesh_addr("172.17.66.26"))
         self.assertTrue(is_private_or_mesh_addr("100.64.1.2"))
         self.assertFalse(is_private_or_mesh_addr("8.8.8.8"))
+
+    def test_bsdtar_extraction_is_attempted_before_sandbox_install(self) -> None:
+        # Fabricate a "tar" binary that drops resources/app.asar into the -C target dir;
+        # verifies the bsdtar stage is wired before any installer execution.
+        installer = self.tmp / "Antigravity-x64.exe"
+        installer.write_bytes(b"MZ" + b"\x00" * 90000 + b"\xef\xbe\xad\xdeNullsoftInst" + b"\x00" * 4096)
+
+        fake_tar = self.tmp / "faketar.sh"
+        fake_tar.write_text(
+            "#!/bin/sh\n"
+            "out=\"\"\n"
+            "prev=\"\"\n"
+            "for a in \"$@\"; do\n"
+            "  if [ \"$prev\" = \"-C\" ]; then out=\"$a\"; fi\n"
+            "  prev=\"$a\"\n"
+            "done\n"
+            "mkdir -p \"$out/resources\"\n"
+            "printf fake > \"$out/resources/app.asar\"\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_tar.chmod(fake_tar.stat().st_mode | stat.S_IXUSR)
+
+        def fake_which(name):
+            return str(fake_tar) if name == "tar" else None
+
+        with mock.patch.object(gates.shutil, "which", side_effect=fake_which):
+            work = self.tmp / "work_tar"
+            work.mkdir()
+            unpack_dir, method = _extract_windows_installer_sandbox("antigravity", installer, work)
+            self.assertEqual(method, "bsdtar")
+            self.assertTrue(any(unpack_dir.rglob("app.asar")))
+
+    def test_detect_installer_type_sniffs_pe_stub(self) -> None:
+        nsis_exe = self.tmp / "nsis.exe"
+        nsis_exe.write_bytes(b"MZ" + b"\x00" * 90000 + b"\xef\xbe\xad\xdeNullsoftInst" + b"\x00" * 64)
+        self.assertEqual(detect_installer_type(nsis_exe), "nsis")
+
+        inno_exe = self.tmp / "inno.exe"
+        inno_exe.write_bytes(b"MZ" + b"\x00" * 90000 + b"Inno Setup Setup Data (6.4.3)" + b"\x00" * 64)
+        self.assertEqual(detect_installer_type(inno_exe), "inno")
+
+        plain_exe = self.tmp / "plain.exe"
+        plain_exe.write_bytes(b"MZ" + b"\x00" * 4096)
+        self.assertEqual(detect_installer_type(plain_exe), "unknown")
+
+    def test_recursive_7z_extract_unwraps_nested_archives(self) -> None:
+        # Fake 7z binary: a shell script that copies the archive into a zip-extracted form.
+        # We simulate electron-builder NSIS layout: outer dir contains app-64.7z which itself is
+        # a zip in disguise; the fake extractor "extracts" it as a real zip.
+        inner_zip = self.tmp / "inner_payload.zip"
+        with zipfile.ZipFile(inner_zip, "w") as zf:
+            zf.writestr("resources/app.asar", b"fake-asar")
+
+        outer = self.tmp / "7z_unpacked"
+        plugins = outer / "$PLUGINSDIR"
+        plugins.mkdir(parents=True)
+        (plugins / "app-64.7z").write_bytes(inner_zip.read_bytes())
+
+        fake_7z = self.tmp / "fake7z.sh"
+        fake_7z.write_text(
+            "#!/bin/sh\n"
+            "# fake7z x -y -o<out> <arc> -> python unzip arc into out\n"
+            "out=\"\"\n"
+            "arc=\"\"\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in\n"
+            "    -o*) out=\"${a#-o}\" ;;\n"
+            "    x|-y) ;;\n"
+            "    *) arc=\"$a\" ;;\n"
+            "  esac\n"
+            "done\n"
+            "exec python3 -c \"import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])\" \"$arc\" \"$out\"\n",
+            encoding="utf-8",
+        )
+        fake_7z.chmod(fake_7z.stat().st_mode | stat.S_IXUSR)
+
+        logs: list[str] = []
+        _recursive_7z_extract(str(fake_7z), outer, log=logs.append)
+        extracted = outer / "$PLUGINSDIR" / "app-64_7z" / "resources" / "app.asar"
+        self.assertTrue(extracted.is_file(), f"missing {extracted}; logs={logs}")
+
+    def test_nsis_sandbox_install_routes_by_sniffed_type(self) -> None:
+        # Fake NSIS installer: embedded zip scan must fail, 7z absent, so the flow falls
+        # through to the sandbox install. Mock subprocess.run to emulate a silent NSIS install
+        # that honors /D=<dir> by dropping resources/app.asar into the target dir.
+        installer = self.tmp / "Antigravity-x64.exe"
+        installer.write_bytes(b"MZ" + b"\x00" * 90000 + b"\xef\xbe\xad\xdeNullsoftInst" + b"\x00" * 4096)
+
+        asar_bytes = build_fake_asar({"main.js": b"localization anchor"})
+
+        def fake_run(cmd, capture_output=False, timeout=None, shell=False, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if shell and "/S /D=" in cmd_str:
+                target = cmd_str.split("/D=", 1)[1].strip()
+                dest = Path(target) / "resources"
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / "app.asar").write_bytes(asar_bytes)
+                return subprocess.CompletedProcess(cmd, 0)
+            return subprocess.CompletedProcess(cmd, 1)
+
+        with mock.patch.object(gates.platform, "system", return_value="Windows"), mock.patch.object(
+            gates.shutil, "which", return_value=None
+        ), mock.patch.object(gates.subprocess, "run", side_effect=fake_run):
+            work = self.tmp / "work_nsis"
+            work.mkdir()
+            unpack_dir, method = _extract_windows_installer_sandbox("antigravity", installer, work)
+            self.assertEqual(method, "nsis_sandbox")
+            self.assertTrue(any(unpack_dir.rglob("app.asar")))
+
+    def test_inno_sandbox_still_used_for_inno_installers(self) -> None:
+        installer = self.tmp / "legacy-inno.exe"
+        installer.write_bytes(b"MZ" + b"\x00" * 90000 + b"Inno Setup Setup Data (6.4.3)" + b"\x00" * 4096)
+
+        def fake_run(cmd, capture_output=False, timeout=None, shell=False, **kwargs):
+            if isinstance(cmd, list) and any(str(c).startswith("/DIR=") for c in cmd):
+                target = [str(c) for c in cmd if str(c).startswith("/DIR=")][0].split("=", 1)[1]
+                dest = Path(target) / "resources"
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / "app.asar").write_bytes(build_fake_asar({"main.js": b"x"}))
+                return subprocess.CompletedProcess(cmd, 0)
+            return subprocess.CompletedProcess(cmd, 1)
+
+        with mock.patch.object(gates.platform, "system", return_value="Windows"), mock.patch.object(
+            gates.shutil, "which", return_value=None
+        ), mock.patch.object(gates.subprocess, "run", side_effect=fake_run):
+            work = self.tmp / "work_inno"
+            work.mkdir()
+            unpack_dir, method = _extract_windows_installer_sandbox("antigravity", installer, work)
+            self.assertEqual(method, "inno_sandbox")
+            self.assertTrue(any(unpack_dir.rglob("app.asar")))
+
+    def test_nsis_install_timeout_does_not_raise(self) -> None:
+        installer = self.tmp / "hanging-nsis.exe"
+        installer.write_bytes(b"MZ" + b"\x00" * 90000 + b"\xef\xbe\xad\xdeNullsoftInst" + b"\x00" * 4096)
+
+        def fake_run(cmd, capture_output=False, timeout=None, shell=False, **kwargs):
+            cmd_str = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+            if shell and "/S /D=" in cmd_str:
+                raise subprocess.TimeoutExpired(cmd_str, timeout or 0)
+            return subprocess.CompletedProcess(cmd, 1)
+
+        with mock.patch.object(gates.platform, "system", return_value="Windows"), mock.patch.object(
+            gates.shutil, "which", return_value=None
+        ), mock.patch.object(gates.subprocess, "run", side_effect=fake_run):
+            work = self.tmp / "work_hang"
+            work.mkdir()
+            unpack_dir, method = _extract_windows_installer_sandbox("antigravity", installer, work)
+            # Falls back gracefully instead of raising/crashing the gate run
+            self.assertEqual(method, "raw_exe_only")
 
     def test_verify_codex_msix_3_gates_and_baseline(self) -> None:
         msix = self.tmp / "ChatGPT-x64.msix"
