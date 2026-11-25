@@ -21,12 +21,8 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 New-Item -ItemType Directory -Force -Path $InstallRoot, $DataDir, "$DataDir\logs" | Out-Null
 
-# Resolve real PE binary path (Microsoft Store Python aliases under WindowsApps\python.exe fail under some Scheduled Tasks)
-$PyPrefix = (& python -c "import sys; print(sys.base_prefix)").Trim()
-$PythonExe = Join-Path $PyPrefix "python.exe"
-if (-not (Test-Path $PythonExe)) {
-  $PythonExe = (Get-Command python -ErrorAction Stop).Source
-}
+# Use the AppExecutionAlias or standard Python path from PATH (Windows blocks direct execution inside C:\Program Files\WindowsApps\)
+$PythonExe = (Get-Command python -ErrorAction Stop).Source
 $ServerScript = Join-Path $RepoDir "services\win-lab\server.py"
 if (-not (Test-Path $ServerScript)) {
   throw "Missing server script: $ServerScript"
