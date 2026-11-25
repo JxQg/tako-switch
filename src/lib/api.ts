@@ -130,6 +130,7 @@ export interface SwitchState {
   mcp: McpToolsConfig;
   modelFilters?: ModelFiltersConfig;
   explicitOfficialApps?: AppId[];
+  hiddenApps?: AppId[];
 }
 
 export interface InstallInfo {
@@ -370,6 +371,7 @@ export interface SettingsPatch {
   uiDensity?: UiDensity;
   themePref?: ThemePref;
   mcp?: McpToolsConfig;
+  hiddenApps?: AppId[];
 }
 
 export interface FrontendErrorInput {

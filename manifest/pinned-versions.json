@@ -1,0 +1,189 @@
+{
+  "schemaVersion": 1,
+  "policy": {
+    "autoFollowUpstream": false,
+    "requiredGates": [
+      "localization",
+      "injection",
+      "anomalyAudit"
+    ],
+    "notes": "所有桌面客户端版本由此锁文件统一管控。上线新版前须先拉取官方 changelog 分析，并在 macOS 隔离环境中通过三门禁验收，再由人工 promote 更新此文件并生成 manifest/manifest.json。"
+  },
+  "updatedAt": "2026-11-25T12:45:00Z",
+  "apps": {
+    "dsh-tako": {
+      "displayName": "DSH Tako",
+      "version": "0.1.59",
+      "status": "approved",
+      "approvedAt": "2026-11-25T03:14:43Z",
+      "changelogSummary": "DSH Tako 原生桌面端当前稳定版本。",
+      "gates": {
+        "localization": "pass",
+        "injection": "pass",
+        "anomalyAudit": "pass"
+      },
+      "platforms": {
+        "macos-arm64": {
+          "url": "https://dl.lven.asia/apps/dsh-tako/macos-arm64/0.1.59/DSH-Tako-0.1.59-mac-arm64.dmg",
+          "version": "0.1.59",
+          "installType": "dmg",
+          "fallbackUrl": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.59/DSH-Tako-0.1.59-mac-arm64.dmg",
+          "sha256": "4ab43649bc6113b682d4dc5202d64464a6282e9348d358fc23ef928991fe533b",
+          "size": 285926628,
+          "appBundleName": "DSH Tako.app"
+        },
+        "windows-x64": {
+          "url": "https://dl.lven.asia/apps/dsh-tako/windows-x64/0.1.59/DSH-Tako-0.1.59-win-x64.exe",
+          "version": "0.1.59",
+          "installType": "exe",
+          "fallbackUrl": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.59/DSH-Tako-0.1.59-win-x64.exe",
+          "sha256": "b446ff9c0e2009fa4acef553731726610db8edbcc6908d2dc1fcc9e3683547f1",
+          "size": 329545599,
+          "silentArgs": [
+            "/S"
+          ]
+        }
+      }
+    },
+    "codex": {
+      "displayName": "Codex Desktop",
+      "version": "26.1120.50957",
+      "status": "pinned_review_windows",
+      "approvedAt": "2026-11-25T03:14:43Z",
+      "changelogSummary": "上游 2026-11-25 自动同步版本（macOS 26.1120.50957 / Windows MSIX 26.1120.6357.0）。已冻结不再自动跟进；Windows 26.1120.6357.0 收到 Win10 闪退反馈，待收集 Windows 崩溃日志复核。",
+      "gates": {
+        "localization": "pending_verify",
+        "injection": "pending_verify",
+        "anomalyAudit": "pending_verify"
+      },
+      "platforms": {
+        "macos-arm64": {
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-arm64-26.1120.50957.zip",
+          "version": "26.1120.50957",
+          "installType": "zip",
+          "appBundleName": "ChatGPT.app",
+          "size": 662370089
+        },
+        "macos-x64": {
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-x64-26.1120.50957.zip",
+          "version": "26.1120.50957",
+          "installType": "zip",
+          "appBundleName": "ChatGPT.app",
+          "size": 690152572
+        },
+        "windows-x64": {
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix",
+          "version": "26.1120.6357.0",
+          "installType": "msix",
+          "packageFamilyName": "OpenAI.Codex_2p2nqsd0c76g0",
+          "size": 770050306
+        }
+      }
+    },
+    "claude": {
+      "displayName": "Claude Desktop",
+      "version": "7.37095.0",
+      "status": "approved",
+      "approvedAt": "2026-11-25T03:14:43Z",
+      "changelogSummary": "Claude Desktop 7.37095.0（内嵌 Claude Code CLI 2.1.331）；已配套 Tako 本地网关 /claude-code-releases 镜像加速与 3P 禁自更新配置。",
+      "gates": {
+        "localization": "pass",
+        "injection": "pass",
+        "anomalyAudit": "pass"
+      },
+      "platforms": {
+        "macos-universal": {
+          "url": "https://dl.lven.asia/apps/claude/macos-universal/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.zip",
+          "version": "7.37095.0",
+          "installType": "zip",
+          "appBundleName": "Claude.app",
+          "size": 407313465,
+          "sha256": "800806556cacece6bdacbb9f3aef1849a9ed8d6fc2ee0eb2ed881a098d094eab",
+          "fallbackUrl": "https://downloads.claude.ai/releases/darwin/universal/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.zip"
+        },
+        "windows-x64": {
+          "url": "https://dl.lven.asia/apps/claude/windows-x64/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.exe",
+          "version": "7.37095.0",
+          "installType": "exe",
+          "silentArgs": [
+            "--silent"
+          ],
+          "size": 281758368,
+          "sha256": "0c2921ba4c2f5bbe14a10e91770a0833305d475c6cf3eeeaaa08d4b90e5bd768",
+          "fallbackUrl": "https://downloads.claude.ai/releases/win32/x64/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.exe"
+        }
+      },
+      "companionArtifacts": {
+        "claude-code": {
+          "version": "2.1.331",
+          "notes": "Claude Desktop 7.37095.0 Code 模式内嵌要求的 Claude Code CLI 二进制；镜像至 dl.lven.asia/apps/claude-code/<version>/<platform>/<file> 供国内免翻墙秒下。",
+          "platforms": {
+            "win32-x64": {
+              "url": "https://downloads.claude.ai/claude-code-releases/2.1.331/win32-x64/claude.exe.zst",
+              "sha256": "8ceec14ae60c52df90923a0a8d7ffd93b43ed0b392866920aac8d561d45734c8",
+              "size": 146095455
+            },
+            "darwin-arm64": {
+              "url": "https://downloads.claude.ai/claude-code-releases/2.1.331/darwin-arm64/claude.app.tar.zst",
+              "sha256": "5cdc5c10ac5c5038e87da4cf2511b1ca38b1697cd6298b653f1ae43de57e25d4",
+              "size": 130690599
+            },
+            "darwin-x64": {
+              "url": "https://downloads.claude.ai/claude-code-releases/2.1.331/darwin-x64/claude.app.tar.zst",
+              "sha256": "5864df22ce05cb199764549973927a0a69c2d44a35e0adf349323a1d674d4aef",
+              "size": 138813330
+            }
+          }
+        }
+      }
+    },
+    "antigravity": {
+      "displayName": "Google Antigravity",
+      "version": "2.35.1",
+      "status": "approved",
+      "approvedAt": "2026-11-25T03:14:43Z",
+      "changelogSummary": "Google Antigravity 2.35.1；已适配 v2.3.3 补全词典与 Electron integrity 哈希槽位。",
+      "gates": {
+        "localization": "pass",
+        "injection": "pass",
+        "anomalyAudit": "pass"
+      },
+      "platforms": {
+        "macos-arm64": {
+          "url": "https://dl.lven.asia/apps/antigravity/macos-arm64/2.35.1/Antigravity.zip",
+          "version": "2.35.1",
+          "installType": "zip",
+          "sha512": "bcd4c6e7a18856843f0b3566da99f3335f1b98231b5ec360d15d5ce30ba93565f8f488bb0e0f8c923587086837e1d5ba8f913b7b99c9c3dd67950375d73b18fe",
+          "size": 216134092,
+          "appBundleName": "Antigravity.app",
+          "sha256": "37f78042427b67bd147b8accbf780a9ddc63ba2e116253fc4de556f3ec611d8c",
+          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.1-4615540875067392/darwin-arm/Antigravity.zip"
+        },
+        "macos-x64": {
+          "url": "https://dl.lven.asia/apps/antigravity/macos-x64/2.35.1/Antigravity.zip",
+          "version": "2.35.1",
+          "installType": "zip",
+          "sha512": "e4dd269502448adbfa250ab999692e0d655cc529bf543e01348145f62d6db305114560277f113257eb168e8e41c7c797ef36b846c1496811126ed8c7a8f6c3e6",
+          "size": 224100047,
+          "appBundleName": "Antigravity.app",
+          "sha256": "07a760db2b843fea6257af88518339d3e15935c226c11bfa123901dabce741ad",
+          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.1-4615540875067392/darwin-x64/Antigravity.zip"
+        },
+        "windows-x64": {
+          "url": "https://dl.lven.asia/apps/antigravity/windows-x64/2.35.1/Antigravity-x64.exe",
+          "version": "2.35.1",
+          "installType": "exe",
+          "sha512": "9ef2324ee671b56f677e7286558eece41e457b19fee3d11b00ccc3fad6d554d5f01fd444b81e879b1fbca321f6fbb8d6f1069152c6e1cad1ef1908b15c0d6130",
+          "size": 170272672,
+          "silentArgs": [
+            "/VERYSILENT",
+            "/NORESTART",
+            "/CLOSEAPPLICATIONS"
+          ],
+          "sha256": "b90d07974759f2f267be4c966ec7e62839b0873b2aa7d2732e74de955a077df0",
+          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.1-4615540875067392/windows-x64/Antigravity-x64.exe"
+        }
+      }
+    }
+  }
+}

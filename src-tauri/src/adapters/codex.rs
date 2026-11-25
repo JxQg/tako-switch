@@ -674,8 +674,15 @@ fn quit_windows_process(name: &str) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn launch_windows_codex() -> Result<(), String> {
+    // OpenAI.Codex AppxManifest registers multiple <Application> entries
+    // (`!App`, `!CodexChromeNativeHost`, `!CodexCoreCommandRunner`).
+    // Always prefer the main GUI entrypoint (`*!App`) so we never launch a helper
+    // process that exits immediately.
     let app_id = ps_hidden(
-        "(Get-StartApps | Where-Object { $_.AppID -like 'OpenAI.Codex*' } | Select-Object -First 1).AppID",
+        "$apps = Get-StartApps | Where-Object { $_.AppID -like 'OpenAI.Codex*' }; \
+         $main = $apps | Where-Object { $_.AppID -like '*!App' } | Select-Object -First 1; \
+         if (-not $main) { $main = $apps | Select-Object -First 1 }; \
+         if ($main) { Write-Output $main.AppID }",
     )
     .filter(|s| !s.is_empty())
     .unwrap_or_else(|| "OpenAI.Codex_2p2nqsd0c76g0!App".to_string());

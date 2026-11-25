@@ -41,6 +41,9 @@ pub const LOCAL_GATEWAY_URL: &str = AGY_PROXY_URL;
 pub const CODEX_PROXY_BASE_URL: &str = "http://127.0.0.1:18419/codex/v1";
 pub const CODEX_PROXY_CATALOG_URL: &str = "http://127.0.0.1:18419/codex/models";
 pub const CLAUDE_PROXY_BASE_URL: &str = "http://127.0.0.1:18419/claude";
+pub const CLAUDE_CODE_MIRROR_BASE_URL: &str = "https://dl.lven.asia/apps/claude-code";
+pub const CLAUDE_CODE_UPSTREAM_BASE_URL: &str = "https://downloads.claude.ai/claude-code-releases";
+const CLAUDE_CODE_RELEASES_PREFIX: &str = "/claude-code-releases/";
 
 #[cfg(not(target_os = "windows"))]
 pub const GATEWAY_PLIST_NAME: &str = "tech.shiroha.tako-switch.gateway.plist";
@@ -4464,7 +4467,7 @@ async fn handle_request(
             "ok": true,
             "service": "tako-switch-gateway",
             "version": env!("CARGO_PKG_VERSION"),
-            "routes": ["antigravity", "codex", "claude"]
+            "routes": ["antigravity", "codex", "claude", "claude-code-releases"]
         });
         let bytes = serde_json::to_vec(&payload).unwrap_or_default();
         return Ok(Response::builder()
@@ -4474,6 +4477,18 @@ async fn handle_request(
             .unwrap_or_else(|_| {
                 json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "health error")
             }));
+    }
+
+    if (*req.method() == hyper::Method::GET || *req.method() == hyper::Method::HEAD)
+        && path.starts_with(CLAUDE_CODE_RELEASES_PREFIX)
+    {
+        return Ok(handle_claude_code_releases_proxy(
+            state,
+            req.method().clone(),
+            &path,
+            req.headers(),
+        )
+        .await);
     }
 
     if (*req.method() == hyper::Method::GET || *req.method() == hyper::Method::HEAD)
@@ -4699,6 +4714,126 @@ async fn handle_request(
     Ok(builder.body(body).unwrap_or_else(|_| {
         json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "构建响应失败")
     }))
+}
+
+fn sanitize_claude_code_rel_path(path: &str) -> Option<&str> {
+    let rel = path.strip_prefix(CLAUDE_CODE_RELEASES_PREFIX)?;
+    if rel.is_empty() || rel.len() > 256 || rel.starts_with('/') || rel.ends_with('/') {
+        return None;
+    }
+    for seg in rel.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return None;
+        }
+        if !seg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        {
+            return None;
+        }
+    }
+    Some(rel)
+}
+
+async fn handle_claude_code_releases_proxy(
+    state: Arc<ProxyState>,
+    method: hyper::Method,
+    path: &str,
+    incoming_headers: &hyper::HeaderMap,
+) -> Response<ProxyBody> {
+    let Some(rel) = sanitize_claude_code_rel_path(path) else {
+        return json_error_response(StatusCode::BAD_REQUEST, "无效的 Claude Code 资源路径");
+    };
+    let req_method = if method == hyper::Method::HEAD {
+        Method::HEAD
+    } else {
+        Method::GET
+    };
+    let switch_state = read_switch_state(&state.paths);
+    let mirror_base = std::env::var("TAKO_CLAUDE_CODE_MIRROR_URL")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| CLAUDE_CODE_MIRROR_BASE_URL.to_string());
+    let upstream_base = std::env::var("TAKO_CLAUDE_CODE_UPSTREAM_URL")
+        .ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| CLAUDE_CODE_UPSTREAM_BASE_URL.to_string());
+
+    let mirror_url = format!("{mirror_base}/{rel}");
+    let upstream_url = format!("{upstream_base}/{rel}");
+    let mirror_client = if switch_state.bypass_system_proxy {
+        &state.direct_client
+    } else {
+        &state.system_proxy_client
+    };
+
+    let send_attempt = |client: &Client, url: &str| {
+        let mut req = client.request(req_method.clone(), url);
+        if let Some(range) = incoming_headers.get("range").and_then(|v| v.to_str().ok()) {
+            req = req.header("range", range);
+        }
+        if let Some(inm) = incoming_headers
+            .get("if-none-match")
+            .and_then(|v| v.to_str().ok())
+        {
+            req = req.header("if-none-match", inm);
+        }
+        req.send()
+    };
+
+    let chosen = match send_attempt(mirror_client, &mirror_url).await {
+        Ok(resp)
+            if resp.status().is_success()
+                || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+                || resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE =>
+        {
+            Ok(resp)
+        }
+        _ => send_attempt(&state.system_proxy_client, &upstream_url).await,
+    };
+
+    let resp = match chosen {
+        Ok(r) => r,
+        Err(err) => {
+            return json_error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("拉取 Claude Code 资源失败: {err}"),
+            );
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut builder = Response::builder().status(status);
+    for header_name in [
+        "content-type",
+        "content-length",
+        "content-range",
+        "accept-ranges",
+        "etag",
+        "last-modified",
+        "cache-control",
+    ] {
+        if let Some(val) = resp.headers().get(header_name) {
+            if let Ok(hv) = HeaderValue::from_bytes(val.as_bytes()) {
+                builder = builder.header(header_name, hv);
+            }
+        }
+    }
+    if method == hyper::Method::HEAD {
+        return builder.body(full_body(Bytes::new())).unwrap_or_else(|_| {
+            json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "构建响应失败")
+        });
+    }
+    let stream = resp
+        .bytes_stream()
+        .map(|chunk| chunk.map(Frame::data).map_err(std::io::Error::other));
+    let body: ProxyBody = http_body_util::BodyExt::boxed(StreamBody::new(stream));
+    builder.body(body).unwrap_or_else(|_| {
+        json_error_response(StatusCode::INTERNAL_SERVER_ERROR, "构建响应失败")
+    })
 }
 
 /// Serves the local unified Tako HTTP/SSE gateway on an already-bound `TcpListener`.
@@ -6129,5 +6264,148 @@ mod tests {
         assert!(recovered.parsed.prices.contains_key("gpt-6.2-sol"));
 
         server_task.abort();
+    }
+
+    #[test]
+    fn sanitize_claude_code_rel_path_blocks_traversal() {
+        assert_eq!(
+            sanitize_claude_code_rel_path("/claude-code-releases/2.1.331/win32-x64/claude.exe.zst"),
+            Some("2.1.331/win32-x64/claude.exe.zst")
+        );
+        assert_eq!(
+            sanitize_claude_code_rel_path("/claude-code-releases/2.1.331/darwin-arm64/claude.app.tar.zst"),
+            Some("2.1.331/darwin-arm64/claude.app.tar.zst")
+        );
+        assert_eq!(
+            sanitize_claude_code_rel_path("/claude-code-releases/../secret"),
+            None
+        );
+        assert_eq!(
+            sanitize_claude_code_rel_path("/claude-code-releases//etc/passwd"),
+            None
+        );
+        assert_eq!(
+            sanitize_claude_code_rel_path("/claude-code-releases/"),
+            None
+        );
+        assert_eq!(
+            sanitize_claude_code_rel_path("/claude-code-releases/foo?bar=1"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_code_releases_proxy_prefers_mirror_and_falls_back_to_upstream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = listener.local_addr().unwrap();
+        let backend_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<Incoming>| async move {
+                        let path = req.uri().path().to_string();
+                        let range = req
+                            .headers()
+                            .get("range")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let resp = match path.as_str() {
+                            "/mirror/2.1.331/win32-x64/claude.exe.zst" => {
+                                if range == "bytes=4-" {
+                                    Response::builder()
+                                        .status(StatusCode::PARTIAL_CONTENT)
+                                        .header("content-range", "bytes 4-9/10")
+                                        .header("content-length", "6")
+                                        .body(full_body("MIRROR"))
+                                        .unwrap()
+                                } else {
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header("content-length", "10")
+                                        .body(full_body("0123MIRROR"))
+                                        .unwrap()
+                                }
+                            }
+                            "/upstream/2.1.999/win32-x64/claude.exe.zst" => Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-length", "8")
+                                .body(full_body("UPSTREAM"))
+                                .unwrap(),
+                            _ => Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(full_body("not found"))
+                                .unwrap(),
+                        };
+                        Ok::<_, Infallible>(resp)
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let proxy_task = tokio::spawn(async move {
+            let _ = serve_proxy_on_listener(proxy_listener, paths).await;
+        });
+
+        std::env::set_var(
+            "TAKO_CLAUDE_CODE_MIRROR_URL",
+            format!("http://{backend_addr}/mirror"),
+        );
+        std::env::set_var(
+            "TAKO_CLAUDE_CODE_UPSTREAM_URL",
+            format!("http://{backend_addr}/upstream"),
+        );
+
+        let client = Client::builder().no_proxy().build().unwrap();
+
+        // 1. Mirror hit + Range forwarding
+        let r1 = client
+            .get(format!(
+                "http://{proxy_addr}/claude-code-releases/2.1.331/win32-x64/claude.exe.zst"
+            ))
+            .header("range", "bytes=4-")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            r1.headers().get("content-range").and_then(|v| v.to_str().ok()),
+            Some("bytes 4-9/10")
+        );
+        assert_eq!(r1.text().await.unwrap(), "MIRROR");
+
+        // 2. Mirror 404 falls back cleanly to upstream
+        let r2 = client
+            .get(format!(
+                "http://{proxy_addr}/claude-code-releases/2.1.999/win32-x64/claude.exe.zst"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), reqwest::StatusCode::OK);
+        assert_eq!(r2.text().await.unwrap(), "UPSTREAM");
+
+        // 3. Traversal path rejected with 400
+        let r3 = client
+            .get(format!(
+                "http://{proxy_addr}/claude-code-releases/..%2Fsecret"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r3.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        std::env::remove_var("TAKO_CLAUDE_CODE_MIRROR_URL");
+        std::env::remove_var("TAKO_CLAUDE_CODE_UPSTREAM_URL");
+        proxy_task.abort();
+        backend_task.abort();
     }
 }

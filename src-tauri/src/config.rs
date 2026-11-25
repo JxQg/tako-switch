@@ -478,6 +478,10 @@ pub struct SwitchState {
     /// and lazily switch to Tako right before launch/restart so active sessions are never disrupted.
     #[serde(default)]
     pub explicit_official_apps: Vec<AppId>,
+    /// Apps hidden from the home overview and tray menu by the user.
+    /// Empty by default so all tools are shown unless explicitly hidden in settings.
+    #[serde(default)]
+    pub hidden_apps: Vec<AppId>,
 }
 
 impl SwitchState {
@@ -500,7 +504,26 @@ impl SwitchState {
             mcp: McpToolsConfig::with_default_dir(paths),
             model_filters: ModelFiltersConfig::default(),
             explicit_official_apps: Vec::new(),
+            hidden_apps: Vec::new(),
         }
+    }
+
+    pub fn is_app_hidden(&self, app_id: AppId) -> bool {
+        self.hidden_apps.contains(&app_id)
+    }
+
+    pub fn normalize_hidden_apps(&mut self) {
+        let mut deduped = Vec::with_capacity(self.hidden_apps.len());
+        for &id in &self.hidden_apps {
+            if !deduped.contains(&id) {
+                deduped.push(id);
+            }
+        }
+        // Never allow every desktop client to disappear simultaneously.
+        if AppId::all().iter().all(|id| deduped.contains(id)) {
+            deduped.clear();
+        }
+        self.hidden_apps = deduped;
     }
 
     pub fn is_explicit_official(&self, app_id: AppId) -> bool {
@@ -698,12 +721,14 @@ pub fn read_switch_state(paths: &AppPaths) -> SwitchState {
         state.mcp.consult_model = default.mcp.consult_model;
     }
     state.mcp.normalize();
+    state.normalize_hidden_apps();
     state
 }
 
 pub fn save_switch_state(paths: &AppPaths, state: &SwitchState) -> Result<(), String> {
     let mut normalized = state.clone();
     normalized.mcp.normalize();
+    normalized.normalize_hidden_apps();
     let bytes = serde_json::to_vec_pretty(&normalized)
         .map_err(|e| format!("序列化 switch state 失败: {e}"))?;
     write_atomic(&paths.state_path(), &bytes, true)
@@ -1161,5 +1186,30 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(paths.state_path()).unwrap()).unwrap();
         assert_eq!(val["uiDensity"], "comfortable");
         assert_eq!(val["themePref"], "dark");
+    }
+
+    #[test]
+    fn hidden_apps_defaults_empty_dedupes_and_never_hides_all_tools() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+
+        let default_state = read_switch_state(&paths);
+        assert!(default_state.hidden_apps.is_empty());
+
+        let mut updated = default_state;
+        updated.hidden_apps = vec![AppId::Codex, AppId::Codex, AppId::DshTako];
+        save_switch_state(&paths, &updated).unwrap();
+
+        let reloaded = read_switch_state(&paths);
+        assert_eq!(reloaded.hidden_apps, vec![AppId::Codex, AppId::DshTako]);
+        assert!(reloaded.is_app_hidden(AppId::Codex));
+        assert!(!reloaded.is_app_hidden(AppId::Claude));
+
+        // Manually corrupted state hiding every client resets to all visible on load/save.
+        let mut all_hidden = reloaded;
+        all_hidden.hidden_apps = AppId::all().to_vec();
+        save_switch_state(&paths, &all_hidden).unwrap();
+        let recovered = read_switch_state(&paths);
+        assert!(recovered.hidden_apps.is_empty());
     }
 }

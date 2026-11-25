@@ -99,7 +99,6 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [busyApp, setBusyApp] = useState<AppId | null>(null);
-  const [batchUpdatingApps, setBatchUpdatingApps] = useState(false);
   const [cancellingApp, setCancellingApp] = useState<AppId | null>(null);
   const [fixingGateway, setFixingGateway] = useState(false);
   const [savingMcp, setSavingMcp] = useState(false);
@@ -846,23 +845,32 @@ export default function App() {
     }
   };
 
+  const hiddenAppsSet = useMemo(() => {
+    const raw = dashboard?.state.hiddenApps ?? [];
+    const set = new Set<AppId>(raw);
+    if (dashboard && dashboard.apps.length > 0 && dashboard.apps.every((a) => set.has(a.id))) {
+      return new Set<AppId>();
+    }
+    return set;
+  }, [dashboard]);
+
   const updatableApps = useMemo(() => {
     if (!dashboard) return [];
-    return dashboard.apps.filter((app) => Boolean(updatesMap[app.id]?.hasUpdate));
-  }, [dashboard, updatesMap]);
+    return dashboard.apps.filter(
+      (app) => !hiddenAppsSet.has(app.id) && Boolean(updatesMap[app.id]?.hasUpdate),
+    );
+  }, [dashboard, hiddenAppsSet, updatesMap]);
 
-  const handleBatchUpgradeApps = async () => {
-    if (batchUpdatingApps || busyApp !== null || updatableApps.length === 0) return;
-    setBatchUpdatingApps(true);
-    try {
-      for (const app of updatableApps) {
-        const ok = await handleInstallOrUpgrade(app.id);
-        if (!ok) break;
-      }
-    } finally {
-      setBatchUpdatingApps(false);
+  useEffect(() => {
+    if (
+      activeRoute !== "overview" &&
+      activeRoute !== "general" &&
+      activeRoute !== "mcp" &&
+      hiddenAppsSet.has(activeRoute)
+    ) {
+      setActiveRoute("overview");
     }
-  };
+  }, [activeRoute, hiddenAppsSet]);
 
   const handleRediagnose = async (appId: AppId) => {
     try {
@@ -1347,8 +1355,6 @@ export default function App() {
             updatesMap={updatesMap}
             installProgress={installProgress}
             needsRestart={needsRestart}
-            updatableApps={updatableApps}
-            batchUpdatingApps={batchUpdatingApps}
             busyApp={busyApp}
             cancellingApp={cancellingApp}
             togglingChineseUi={togglingChineseUi}
@@ -1383,7 +1389,6 @@ export default function App() {
             onToggleCoreMcp={(key) => void handleToggleMcpTool(key)}
             onToggleWebPageMcp={(next) => void handleToggleWebPage(next)}
             onOpenModelSquare={() => setModelModalApp("dsh-tako")}
-            onBatchUpgradeApps={() => void handleBatchUpgradeApps()}
             onInstallSelfUpdate={() => void handleInstallSelfUpdate()}
             onOpenChangelog={() => setShowChangelogModal(true)}
           />
@@ -1403,7 +1408,9 @@ export default function App() {
             checkingUpdates={checkingUpdates}
             lastCheckedAt={lastCheckedAt}
             updatableApps={updatableApps}
-            batchUpdatingApps={batchUpdatingApps}
+            updatesMap={updatesMap}
+            installProgress={installProgress}
+            cancellingApp={cancellingApp}
             busyApp={busyApp}
             selfUpdateView={{
               status: selfUpdateStatus,
@@ -1422,7 +1429,8 @@ export default function App() {
             onSavePatch={handleSaveSettingsPatch}
             onCheckUpdates={() => void runUpdateChecks(false)}
             onInstallSelfUpdate={() => void handleInstallSelfUpdate()}
-            onBatchUpgradeApps={() => void handleBatchUpgradeApps()}
+            onInstallOrUpgrade={(id) => void handleInstallOrUpgrade(id)}
+            onCancelInstall={(id) => void handleCancelAppInstall(id)}
             onOpenChangelog={() => setShowChangelogModal(true)}
             onOpenFeedback={() => setShowFeedbackModal(true)}
             onNavigate={setActiveRoute}

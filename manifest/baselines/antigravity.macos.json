@@ -1,0 +1,38 @@
+{
+  "appId": "antigravity",
+  "capturedAt": "2026-11-25T12:58:08Z",
+  "profile": {
+    "bundleName": "Antigravity.app",
+    "bundleId": "com.google.antigravity",
+    "shortVersion": "2.35.1",
+    "bundleVersion": "2.35.1",
+    "minSystemVersion": "13.0",
+    "urlSchemes": [
+      "antigravity"
+    ],
+    "usageDescriptions": [
+      "NSAudioCaptureUsageDescription",
+      "NSBluetoothAlwaysUsageDescription",
+      "NSBluetoothPeripheralUsageDescription",
+      "NSCameraUsageDescription",
+      "NSMicrophoneUsageDescription"
+    ],
+    "executables": [
+      "Antigravity"
+    ],
+    "helpers": [
+      "Antigravity Helper (GPU).app",
+      "Antigravity Helper (Plugin).app",
+      "Antigravity Helper (Renderer).app",
+      "Antigravity Helper.app"
+    ],
+    "loginItems": [],
+    "electronAsarIntegrityKeys": [
+      "Resources/app.asar",
+      "Resources/default_app.asar"
+    ]
+  },
+  "extraAudit": {
+    "asarFileCount": 1168
+  }
+}

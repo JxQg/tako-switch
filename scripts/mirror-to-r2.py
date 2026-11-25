@@ -495,6 +495,111 @@ def mirror_manifest_to_r2(
     return manifest
 
 
+def mirror_companion_artifacts_to_r2(
+    pinned: dict,
+    s3: S3Client,
+    key_prefix: str = DEFAULT_KEY_PREFIX,
+    keep_versions: int = DEFAULT_KEEP_VERSIONS,
+    dry_run: bool = False,
+) -> list[str]:
+    """Mirror companion binaries (e.g. Claude Code CLI `.zst` archives) declared in pinned-versions.json.
+
+    Object layout: `<key_prefix>/<companion_id>/<version>/<platform>/<filename>`, e.g.:
+    `apps/claude-code/2.1.331/win32-x64/claude.exe.zst`
+    so Tako Switch's local `/claude-code-releases/` proxy can serve them at China CDN speed.
+    """
+    mirrored_keys: list[str] = []
+    apps = pinned.get("apps") or {}
+    clean_prefix = key_prefix.strip("/")
+    with tempfile.TemporaryDirectory(prefix="tako-mirror-companion-") as tmpdir:
+        tmp_root = Path(tmpdir)
+        for app_entry in apps.values():
+            companions = app_entry.get("companionArtifacts") or {}
+            for comp_id, comp_entry in companions.items():
+                version = str(comp_entry.get("version") or "").strip()
+                platforms = comp_entry.get("platforms") or {}
+                if not version or not platforms:
+                    continue
+                for plat, art in platforms.items():
+                    official_url = str(art.get("url") or "").strip()
+                    if not official_url:
+                        continue
+                    basename = os.path.basename(urllib.parse.urlparse(official_url).path)
+                    if not basename:
+                        continue
+                    key = (
+                        f"{clean_prefix}/{comp_id}/{version}/{plat}/{basename}"
+                        if clean_prefix
+                        else f"{comp_id}/{version}/{plat}/{basename}"
+                    )
+                    expected_size = art.get("size")
+                    expected_sha256 = str(art.get("sha256") or "").strip().lower()
+                    existing = s3.head_object(key)
+                    existing_size = existing.get("ContentLength") if existing else None
+                    if existing and (not expected_size or existing_size == expected_size):
+                        print(f"[skip] companion {key} already exists in s3://{s3.bucket} ({existing_size} bytes)")
+                        mirrored_keys.append(key)
+                        continue
+                    if dry_run:
+                        print(f"[dry-run] would mirror companion {official_url} -> s3://{s3.bucket}/{key}")
+                        mirrored_keys.append(key)
+                        continue
+                    dest = tmp_root / f"{comp_id}-{plat}-{basename}"
+                    print(f"[download] companion {official_url}")
+                    download_file(official_url, dest)
+                    actual_size, actual_sha256, _ = compute_file_hashes(dest)
+                    if expected_sha256 and actual_sha256 != expected_sha256:
+                        raise RuntimeError(
+                            f"Companion SHA256 mismatch for {key}: expected {expected_sha256}, got {actual_sha256}"
+                        )
+                    if expected_size and actual_size != expected_size:
+                        raise RuntimeError(
+                            f"Companion size mismatch for {key}: expected {expected_size}, got {actual_size}"
+                        )
+                    print(f"[upload] companion s3://{s3.bucket}/{key} ({actual_size} bytes)")
+                    s3.upload_file(dest, key)
+                    mirrored_keys.append(key)
+                    try:
+                        dest.unlink()
+                    except OSError:
+                        pass
+                if not dry_run:
+                    # Prune stale companion versions under `<prefix>/<comp_id>/`
+                    comp_prefix = f"{clean_prefix}/{comp_id}/" if clean_prefix else f"{comp_id}/"
+                    objs = s3.list_objects(comp_prefix)
+                    by_ver: dict[str, tuple[str, list[str]]] = {}
+                    for obj in objs:
+                        okey = str(obj.get("Key") or "")
+                        if not okey.startswith(comp_prefix):
+                            continue
+                        rest = okey[len(comp_prefix) :]
+                        seg = rest.split("/", 1)[0]
+                        if not seg:
+                            continue
+                        lm = str(obj.get("LastModified") or "")
+                        prev_lm, keys = by_ver.get(seg, ("", []))
+                        keys.append(okey)
+                        by_ver[seg] = (max(prev_lm, lm), keys)
+                    keep = max(1, keep_versions)
+                    if len(by_ver) > keep:
+                        retained = {version} if version in by_ver else set()
+                        others = sorted(
+                            ((v, m[0]) for v, m in by_ver.items() if v not in retained),
+                            key=lambda item: (item[1], item[0]),
+                            reverse=True,
+                        )
+                        for v, _ in others:
+                            if len(retained) >= keep:
+                                break
+                            retained.add(v)
+                        for v, (_, keys) in by_ver.items():
+                            if v not in retained:
+                                for stale in sorted(keys):
+                                    print(f"[prune] deleting stale companion s3://{s3.bucket}/{stale}")
+                                    s3.delete_object(stale)
+    return mirrored_keys
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Mirror Tako Switch installers into Cloudflare R2")
     parser.add_argument("--manifest", default="manifest/manifest.json", help="Path to manifest.json")
@@ -530,6 +635,11 @@ def main(argv: list[str] | None = None) -> int:
         "--prev-manifest",
         default="",
         help="Optional path to previous manifest.json; preserves generatedAt when apps did not change",
+    )
+    parser.add_argument(
+        "--pinned",
+        default="",
+        help="Optional path to manifest/pinned-versions.json to also mirror companion binaries (e.g. claude-code)",
     )
     parser.add_argument(
         "--prefer-doge",
@@ -586,6 +696,18 @@ def main(argv: list[str] | None = None) -> int:
         keep_versions=args.keep_versions,
         dry_run=args.dry_run,
     )
+
+    if args.pinned:
+        pinned_path = Path(args.pinned)
+        if pinned_path.exists():
+            pinned_data = json.loads(pinned_path.read_text(encoding="utf-8"))
+            mirror_companion_artifacts_to_r2(
+                pinned=pinned_data,
+                s3=s3,
+                key_prefix=args.key_prefix,
+                keep_versions=args.keep_versions,
+                dry_run=args.dry_run,
+            )
 
     if args.prev_manifest:
         prev_path = Path(args.prev_manifest)

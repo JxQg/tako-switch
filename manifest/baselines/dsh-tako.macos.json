@@ -1,0 +1,36 @@
+{
+  "appId": "dsh-tako",
+  "capturedAt": "2026-11-25T12:58:08Z",
+  "profile": {
+    "bundleName": "DSH Tako.app",
+    "bundleId": "tech.shiroha.dsh-tako",
+    "shortVersion": "0.1.59",
+    "bundleVersion": "0.1.59",
+    "minSystemVersion": "13.0",
+    "urlSchemes": [
+      "dsh-tako"
+    ],
+    "usageDescriptions": [
+      "NSAudioCaptureUsageDescription",
+      "NSBluetoothAlwaysUsageDescription",
+      "NSBluetoothPeripheralUsageDescription",
+      "NSCameraUsageDescription",
+      "NSMicrophoneUsageDescription"
+    ],
+    "executables": [
+      "DSH Tako"
+    ],
+    "helpers": [
+      "DSH Tako Helper (GPU).app",
+      "DSH Tako Helper (Plugin).app",
+      "DSH Tako Helper (Renderer).app",
+      "DSH Tako Helper.app"
+    ],
+    "loginItems": [],
+    "electronAsarIntegrityKeys": [
+      "Resources/app.asar",
+      "Resources/default_app.asar"
+    ]
+  },
+  "extraAudit": {}
+}

@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod agy_proxy;
 pub mod auth;
+pub mod client_monitor;
 pub mod config;
 pub mod installer;
 pub mod manifest;
@@ -141,6 +142,7 @@ pub struct SettingsPatch {
     pub ui_density: Option<config::UiDensity>,
     pub theme_pref: Option<config::ThemePref>,
     pub mcp: Option<McpToolsConfig>,
+    pub hidden_apps: Option<Vec<AppId>>,
 }
 
 fn current_cached_account(app: &AppHandle, paths: &AppPaths) -> Option<AccountStatus> {
@@ -355,8 +357,21 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
     let refresh_bal = MenuItem::with_id(app, "tray:refresh-balance", "刷新余额", true, None::<&str>)
         .map_err(|e| format!("创建刷新余额菜单失败: {e}"))?;
 
+    let switch_state = read_switch_state(paths);
+    let visible_tray_apps: Vec<AppId> = {
+        let filtered: Vec<AppId> = AppId::all()
+            .iter()
+            .copied()
+            .filter(|id| !switch_state.is_app_hidden(*id))
+            .collect();
+        if filtered.is_empty() {
+            AppId::all().to_vec()
+        } else {
+            filtered
+        }
+    };
     let mut submenus = Vec::new();
-    for &app_id in AppId::all() {
+    for app_id in visible_tray_apps {
         let mode = get_adapter(app_id).read_mode(paths);
         let mark = |m: AppMode| if mode == m { "● " } else { "○ " };
         let (off_label, tako_label) = if app_id == AppId::DshTako {
@@ -755,6 +770,18 @@ pub fn apply_settings_patch_for_paths(
     if let Some(mut mcp) = input.mcp {
         mcp.normalize();
         state.mcp = mcp;
+    }
+    if let Some(raw_hidden) = input.hidden_apps {
+        let mut deduped = Vec::with_capacity(raw_hidden.len());
+        for id in raw_hidden {
+            if !deduped.contains(&id) {
+                deduped.push(id);
+            }
+        }
+        if AppId::all().iter().all(|id| deduped.contains(id)) {
+            return Err("至少需要保留一个可见的桌面工具".to_string());
+        }
+        state.hidden_apps = deduped;
     }
 
     save_switch_state(paths, &state)?;
@@ -1174,7 +1201,7 @@ fn execute_ui_patch_action_for_paths(
     };
 
     if quit_for_patch && !paths.is_test {
-        let _ = get_adapter(app_id).launch_app(paths);
+        let _ = client_monitor::launch_and_monitor(paths, app_id, "ui_patch_relaunch");
     }
     res
 }
@@ -1468,7 +1495,7 @@ where
             if adapter.is_running(paths) {
                 let _ = adapter.quit_app(paths);
                 std::thread::sleep(std::time::Duration::from_millis(450));
-                let _ = adapter.launch_app(paths);
+                let _ = client_monitor::launch_and_monitor(paths, app_id, "chinese_toggle_restart");
             }
         }
     }
@@ -1868,7 +1895,11 @@ async fn run_elevated_ui_patch_worker(
             let quit_for_patch = quit_app_and_wait_for_ui_patch(&paths_clone, app_id, true, false)?;
             let elevated_ok = try_windows_elevated_ui_patch(&paths_clone, app_id, normalized_action)?;
             if quit_for_patch && !paths_clone.is_test {
-                let _ = get_adapter(app_id).launch_app(&paths_clone);
+                let _ = client_monitor::launch_and_monitor(
+                    &paths_clone,
+                    app_id,
+                    "elevated_ui_patch_relaunch",
+                );
             }
             if !elevated_ok {
                 return Err("管理员授权被取消或执行失败".to_string());
@@ -2001,7 +2032,7 @@ async fn set_app_mode(
     if auto_restart && adapter.is_running(&paths) {
         adapter.quit_app(&paths)?;
         std::thread::sleep(std::time::Duration::from_millis(450));
-        adapter.launch_app(&paths)?;
+        client_monitor::launch_and_monitor(&paths, app_id, "mode_switch_restart")?;
     }
     refresh_tray(&app, &paths);
     Ok(snapshot_app(&paths, app_id))
@@ -2018,7 +2049,7 @@ async fn restart_app(app: AppHandle, app_id: AppId) -> Result<AppSnapshot, Strin
         }
     }
     let switched = ensure_default_tako_mode_before_launch(&paths, app_id).await?;
-    get_adapter(app_id).launch_app(&paths)?;
+    client_monitor::launch_and_monitor(&paths, app_id, "restart")?;
     if switched {
         refresh_tray(&app, &paths);
     }
@@ -2047,7 +2078,7 @@ async fn launch_app(app: AppHandle, app_id: AppId) -> Result<AppSnapshot, String
     } else {
         false
     };
-    get_adapter(app_id).launch_app(&paths)?;
+    client_monitor::launch_and_monitor(&paths, app_id, "launch")?;
     if switched {
         refresh_tray(&app, &paths);
     }
@@ -2843,5 +2874,45 @@ mod tests {
         // Codex config was not rewritten by pure UI appearance patch
         let after_toml = std::fs::read_to_string(&codex_cfg_path).unwrap();
         assert_eq!(after_toml, raw_toml);
+    }
+
+    #[test]
+    fn hidden_apps_settings_patch_persists_deduped_and_blocks_hiding_all() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+
+        let saved = apply_settings_patch_for_paths(
+            &paths,
+            SettingsPatch {
+                hidden_apps: Some(vec![AppId::Antigravity, AppId::Antigravity, AppId::DshTako]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(saved.hidden_apps, vec![AppId::Antigravity, AppId::DshTako]);
+        assert_eq!(
+            read_switch_state(&paths).hidden_apps,
+            vec![AppId::Antigravity, AppId::DshTako]
+        );
+
+        let err = apply_settings_patch_for_paths(
+            &paths,
+            SettingsPatch {
+                hidden_apps: Some(AppId::all().to_vec()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("至少需要保留一个"));
+
+        let restored = apply_settings_patch_for_paths(
+            &paths,
+            SettingsPatch {
+                hidden_apps: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(restored.hidden_apps.is_empty());
     }
 }

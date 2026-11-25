@@ -1251,7 +1251,7 @@ pub async fn install_or_upgrade_app(
     }
 
     if was_running || auto_launched_by_installer {
-        let _ = get_adapter(app_id).launch_app(paths);
+        let _ = crate::client_monitor::launch_and_monitor(paths, app_id, "post_install");
     }
 
     let snapshot = snapshot_app(paths, app_id);

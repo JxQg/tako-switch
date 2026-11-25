@@ -1,0 +1,48 @@
+{
+  "appId": "claude",
+  "capturedAt": "2026-11-25T12:58:08Z",
+  "profile": {
+    "bundleName": "Claude.app",
+    "bundleId": "com.anthropic.claudefordesktop",
+    "shortVersion": "7.37095.0",
+    "bundleVersion": "7.37095.0",
+    "minSystemVersion": "13.0",
+    "urlSchemes": [
+      "claude",
+      "msauth.com.anthropic.claudefordesktop"
+    ],
+    "usageDescriptions": [
+      "NSAppleEventsUsageDescription",
+      "NSAudioCaptureUsageDescription",
+      "NSBluetoothAlwaysUsageDescription",
+      "NSBluetoothPeripheralUsageDescription",
+      "NSCameraUsageDescription",
+      "NSDesktopFolderUsageDescription",
+      "NSDocumentsFolderUsageDescription",
+      "NSDownloadsFolderUsageDescription",
+      "NSLocalNetworkUsageDescription",
+      "NSLocationUsageDescription",
+      "NSMicrophoneUsageDescription",
+      "NSSpeechRecognitionUsageDescription"
+    ],
+    "executables": [
+      "Claude"
+    ],
+    "helpers": [
+      "Claude Helper (GPU).app",
+      "Claude Helper (Plugin).app",
+      "Claude Helper (Renderer).app",
+      "Claude Helper.app"
+    ],
+    "loginItems": [],
+    "electronAsarIntegrityKeys": [
+      "Resources/app.asar",
+      "Resources/ion-dist.asar"
+    ]
+  },
+  "extraAudit": {
+    "claudeCodeVersion": "2.1.331",
+    "claudeCodeBaseUrl": "https://downloads.claude.ai/claude-code-releases",
+    "hasVmDownloader": true
+  }
+}

@@ -50,8 +50,6 @@ interface OverviewPanelProps {
   updatesMap: Partial<Record<AppId, AppUpdateStatus>>;
   installProgress: Partial<Record<AppId, InstallProgressEvent>>;
   needsRestart: Partial<Record<AppId, boolean>>;
-  updatableApps: AppSnapshot[];
-  batchUpdatingApps: boolean;
   busyApp: AppId | null;
   cancellingApp: AppId | null;
   togglingChineseUi: boolean;
@@ -73,7 +71,6 @@ interface OverviewPanelProps {
   onToggleCoreMcp: (key: McpToolKey) => void;
   onToggleWebPageMcp: (next: boolean) => void;
   onOpenModelSquare: () => void;
-  onBatchUpgradeApps: () => void;
   onInstallSelfUpdate: () => void;
   onOpenChangelog: () => void;
 }
@@ -183,8 +180,6 @@ export function OverviewPanel({
   updatesMap,
   installProgress,
   needsRestart,
-  updatableApps,
-  batchUpdatingApps,
   busyApp,
   cancellingApp,
   togglingChineseUi,
@@ -206,14 +201,17 @@ export function OverviewPanel({
   onToggleCoreMcp,
   onToggleWebPageMcp,
   onOpenModelSquare,
-  onBatchUpgradeApps,
   onInstallSelfUpdate,
   onOpenChangelog,
 }: OverviewPanelProps) {
   const appsById = new Map((dashboard?.apps ?? []).map((app) => [app.id, app]));
-  const orderedApps = CLIENT_ORDER.map((id) => appsById.get(id)).filter(
+  const allOrderedApps = CLIENT_ORDER.map((id) => appsById.get(id)).filter(
     (app): app is AppSnapshot => Boolean(app),
   );
+  const hiddenAppsSet = new Set<AppId>(dashboard?.state.hiddenApps ?? []);
+  const visibleOrderedApps = allOrderedApps.filter((app) => !hiddenAppsSet.has(app.id));
+  const orderedApps = visibleOrderedApps.length > 0 ? visibleOrderedApps : allOrderedApps;
+  const hiddenCount = allOrderedApps.length - orderedApps.length;
 
   const preferZh = dashboard?.state.preferChineseUi ?? true;
   const anyUpdatableUiPatch = orderedApps.some(
@@ -327,19 +325,15 @@ export function OverviewPanel({
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            {updatableApps.length >= 2 ? (
+            {hiddenCount > 0 ? (
               <button
                 type="button"
-                disabled={batchUpdatingApps || busyApp !== null}
-                onClick={onBatchUpgradeApps}
-                className="h-6 px-2.5 rounded-full bg-[var(--accent-soft)] hover:bg-[var(--accent-border)] text-[var(--accent)] border border-[var(--accent-border)] text-[11px] font-medium inline-flex items-center gap-1 transition cursor-pointer disabled:opacity-60 shrink-0"
+                data-testid="overview-manage-hidden-apps"
+                onClick={() => onNavigate("general")}
+                title="前往通用设置管理首页显示的桌面工具"
+                className="h-6 px-2.5 rounded-full border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] hover:border-[var(--border-strong)] text-[11px] font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)] inline-flex items-center gap-1 transition cursor-pointer shrink-0"
               >
-                <ArrowUpCircle className="h-3 w-3" />
-                <span>
-                  {batchUpdatingApps
-                    ? "批量更新中..."
-                    : `全部更新 (${updatableApps.length})`}
-                </span>
+                <span>已隐藏 {hiddenCount} 个工具 · 管理</span>
               </button>
             ) : (
               <span className="hidden sm:inline text-[11.5px] text-[var(--text-muted)]">
@@ -556,6 +550,23 @@ export function OverviewPanel({
                         );
                       })}
                     </div>
+
+                    {/* Standalone Per-App Update Button (never batch-updates other tools) */}
+                    {app.install.installed && update?.hasUpdate && !progress && (
+                      <button
+                        type="button"
+                        data-testid={`overview-upgrade-${app.id}`}
+                        disabled={busyApp !== null}
+                        onClick={() => onInstallOrUpgrade(app.id)}
+                        title={`单独更新 ${APP_DISPLAY_NAMES[app.id]}${
+                          update.remoteVersion ? ` 至 ${formatVersion(update.remoteVersion)}` : ""
+                        }`}
+                        className="tako-ctrl-h px-2.5 rounded-[9px] bg-[var(--accent-soft)] hover:bg-[var(--accent-border)] text-[var(--accent)] border border-[var(--accent-border)] text-[12px] font-medium inline-flex items-center gap-1 transition cursor-pointer disabled:opacity-60 shrink-0"
+                      >
+                        <ArrowUpCircle className="h-3.5 w-3.5 shrink-0" />
+                        <span>更新</span>
+                      </button>
+                    )}
 
                     {/* Fixed-Width Primary Action Slot */}
                     <div className="w-[96px] shrink-0 flex items-center justify-end">

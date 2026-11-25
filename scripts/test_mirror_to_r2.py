@@ -264,6 +264,56 @@ class TimeoutRetryTests(unittest.TestCase):
         self.assertIn("apps/timeout.bin", msg)
         self.assertIn("attempts", msg)
 
+    def test_mirror_companion_artifacts_uploads_verifies_and_prunes(self) -> None:
+        payload = b"fake-zst-claude-code"
+        import hashlib
+        sha = hashlib.sha256(payload).hexdigest()
+        pinned = {
+            "apps": {
+                "claude": {
+                    "companionArtifacts": {
+                        "claude-code": {
+                            "version": "2.1.331",
+                            "platforms": {
+                                "win32-x64": {
+                                    "url": "https://downloads.claude.ai/claude-code-releases/2.1.331/win32-x64/claude.exe.zst",
+                                    "sha256": sha,
+                                    "size": len(payload),
+                                }
+                            },
+                        }
+                    }
+                }
+            }
+        }
+        uploaded: list[str] = []
+        deleted: list[str] = []
+
+        class FakeS3:
+            bucket = "tako-apps-mirror"
+            def head_object(self, key: str):
+                return None
+            def upload_file(self, local_path: Path, key: str, **_kwargs):
+                uploaded.append(key)
+            def list_objects(self, prefix: str):
+                return [
+                    {"Key": "apps/claude-code/2.1.331/win32-x64/claude.exe.zst", "LastModified": "2026-11-25T00:00:00Z"},
+                    {"Key": "apps/claude-code/2.1.300/win32-x64/claude.exe.zst", "LastModified": "2026-11-20T00:00:00Z"},
+                    {"Key": "apps/claude-code/2.1.200/win32-x64/claude.exe.zst", "LastModified": "2026-11-10T00:00:00Z"},
+                ]
+            def delete_object(self, key: str):
+                deleted.append(key)
+
+        def fake_download(url: str, dest: Path):
+            dest.write_bytes(payload)
+
+        with unittest.mock.patch.object(mod, "download_file", side_effect=fake_download):
+            keys = mod.mirror_companion_artifacts_to_r2(pinned, FakeS3(), keep_versions=2)
+
+        self.assertEqual(keys, ["apps/claude-code/2.1.331/win32-x64/claude.exe.zst"])
+        self.assertEqual(uploaded, ["apps/claude-code/2.1.331/win32-x64/claude.exe.zst"])
+        self.assertEqual(deleted, ["apps/claude-code/2.1.200/win32-x64/claude.exe.zst"])
+
 
 if __name__ == "__main__":
     unittest.main()

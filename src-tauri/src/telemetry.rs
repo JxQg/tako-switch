@@ -422,7 +422,7 @@ pub fn build_sanitized_diagnostics(paths: &AppPaths) -> serde_json::Value {
     sanitize_json_value(raw)
 }
 
-fn telemetry_allowed(paths: &AppPaths) -> bool {
+pub(crate) fn telemetry_allowed(paths: &AppPaths) -> bool {
     !paths.is_test && config::read_switch_state(paths).telemetry_enabled
 }
 
