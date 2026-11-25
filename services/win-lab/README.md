@@ -1,6 +1,6 @@
 # tako-win-lab — Tako Switch Windows 发版门禁与实机测试台
 
-运行在河南 `.6` Windows 11 主机（`172.17.66.6:18795`，`D:\fleet\tako-win-lab\`），负责：
+运行在河南 `.6` Windows 11 主机（`172.17.66.6:18795`，`C:\fleet\tako-win-lab\`），负责：
 
 1. **Windows 3 门禁静态解包与注入验收**（不污染宿主配置）：
    - `localization`：检查语言包、ASAR 汉化入口锚点、词典覆盖率、PE Electron fuse/integrity 槽位。
@@ -29,7 +29,7 @@ python3 services/win-lab/server.py --port 18795
 
 ```powershell
 # 安装 / 重启常驻计划任务 \TakoWinLabService
-powershell -NoProfile -ExecutionPolicy Bypass -File D:\fleet\tako-win-lab\repo\services\win-lab\deploy\install-win6-service.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\fleet\tako-win-lab\repo\services\win-lab\deploy\install-win6-service.ps1
 
 # 健康检查
 curl.exe -fsS http://172.17.66.6:18795/healthz

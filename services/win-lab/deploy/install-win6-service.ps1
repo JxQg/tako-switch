@@ -5,9 +5,9 @@
   and registers a persistent Scheduled Task running in shiroha's interactive session.
 #>
 param(
-  [string]$InstallRoot = "D:\fleet\tako-win-lab",
-  [string]$RepoDir = "D:\fleet\tako-win-lab\repo",
-  [string]$DataDir = "D:\fleet\tako-win-lab\data",
+  [string]$InstallRoot = "C:\fleet\tako-win-lab",
+  [string]$RepoDir = "C:\fleet\tako-win-lab\repo",
+  [string]$DataDir = "C:\fleet\tako-win-lab\data",
   [string]$TaskName = "TakoWinLabService",
   [int]$Port = 18795,
   [string]$HqUrl = "http://172.17.66.26:8789",
