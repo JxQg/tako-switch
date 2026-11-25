@@ -976,6 +976,96 @@ def cmd_verify_macos(args: argparse.Namespace) -> int:
     return 1 if overall_failed else 0
 
 
+def cmd_verify_windows(args: argparse.Namespace) -> int:
+    """Dispatch Windows 3-gate (and optional Gate-4 live smoke) verification to .6 tako-win-lab."""
+    import time
+
+    base = args.lab_url.rstrip("/")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def _req(method: str, path: str, body: dict | None = None) -> dict:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(
+            f"{base}{path}",
+            data=data,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method=method,
+        )
+        with opener.open(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    run_ids: list[str] = []
+    if args.smoke:
+        if args.app == "all":
+            raise SystemExit("--smoke must target a single --app (codex/claude/antigravity/dsh-tako)")
+        resp = _req(
+            "POST",
+            "/api/runs/smoke",
+            {
+                "app_id": args.app,
+                "candidate_url": args.candidate_url,
+                "version": args.version,
+                "hold_seconds": args.hold_seconds,
+                "keep_installed": args.keep_installed,
+                "report_hq": not args.no_hq,
+                "trigger": "cli",
+            },
+        )
+        run_ids.append(resp["data"]["run"]["id"])
+    else:
+        resp = _req(
+            "POST",
+            "/api/runs/gate",
+            {
+                "app_id": args.app,
+                "candidate_url": args.candidate_url,
+                "version": args.version,
+                "update_baseline": args.update_baseline,
+                "report_hq": not args.no_hq,
+                "trigger": "cli",
+            },
+        )
+        run_ids.extend(r["id"] for r in resp["data"]["runs"])
+
+    print(f"Dispatched {len(run_ids)} job(s) to {base}: {', '.join(run_ids)}", flush=True)
+    deadline = time.monotonic() + max(60, int(args.timeout))
+    finished: dict[str, dict] = {}
+    while len(finished) < len(run_ids) and time.monotonic() < deadline:
+        for rid in run_ids:
+            if rid in finished:
+                continue
+            detail = _req("GET", f"/api/runs/{rid}")["data"]
+            if detail.get("status") not in ("queued", "running"):
+                finished[rid] = detail
+        if len(finished) < len(run_ids):
+            time.sleep(3)
+
+    if len(finished) < len(run_ids):
+        print(f"ERROR: timed out waiting for Windows lab jobs: {set(run_ids) - set(finished)}", file=sys.stderr)
+        return 2
+
+    overall_failed = False
+    for rid in run_ids:
+        r = finished[rid]
+        st = str(r.get("status") or "error")
+        if st in ("fail", "error"):
+            overall_failed = True
+        print(f"[{st.upper()}] {r.get('app_id')} v{r.get('target_version')} ({r.get('kind')}) - {r.get('summary')}")
+        for gname, gdata in (r.get("gates") or {}).items():
+            if isinstance(gdata, dict):
+                print(f"  - {gname}: {str(gdata.get('status', '')).upper()} | {'; '.join(gdata.get('details') or [])}")
+        if r.get("hq_ticket_id"):
+            print(f"  - HQ Ticket: #{r['hq_ticket_id']}")
+
+    payload = finished[run_ids[0]] if len(run_ids) == 1 else {"runs": [finished[rid] for rid in run_ids]}
+    if args.out_json:
+        out_p = Path(args.out_json)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    return 1 if overall_failed else 0
+
+
 def cmd_render_manifest(args: argparse.Namespace) -> int:
     pinned = json.loads(Path(args.pinned).read_text(encoding="utf-8"))
     out_path = Path(args.out)
@@ -1040,6 +1130,20 @@ def main(argv: list[str] | None = None) -> int:
     p_verify.add_argument("--update-baseline", action="store_true", help="Record current bundle as approved baseline")
     p_verify.add_argument("--out-json", default="")
     p_verify.set_defaults(func=cmd_verify_macos)
+
+    p_verify_win = sub.add_parser("verify-windows", help="Dispatch Windows 3-gate or Gate-4 smoke test to .6 tako-win-lab")
+    p_verify_win.add_argument("--app", choices=(*APP_ORDER, "all"), default="all")
+    p_verify_win.add_argument("--lab-url", default=os.environ.get("TAKO_WIN_LAB_URL", "http://172.17.66.6:18795"))
+    p_verify_win.add_argument("--candidate-url", default="", help="Optional custom Windows installer URL (.msix/.exe)")
+    p_verify_win.add_argument("--version", default="", help="Optional candidate version hint")
+    p_verify_win.add_argument("--smoke", action="store_true", help="Run Gate-4 live install/launch/EventLog smoke test")
+    p_verify_win.add_argument("--hold-seconds", type=int, default=15)
+    p_verify_win.add_argument("--keep-installed", action="store_true")
+    p_verify_win.add_argument("--update-baseline", action="store_true")
+    p_verify_win.add_argument("--no-hq", action="store_true", help="Skip HQ event reporting for this manual run")
+    p_verify_win.add_argument("--timeout", type=int, default=600)
+    p_verify_win.add_argument("--out-json", default="")
+    p_verify_win.set_defaults(func=cmd_verify_windows)
 
     p_render = sub.add_parser("render-manifest", help="Render manifest.json strictly from pinned-versions.json")
     p_render.add_argument("--pinned", default=str(DEFAULT_PINNED_PATH))

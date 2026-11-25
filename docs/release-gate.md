@@ -58,6 +58,29 @@ python3 scripts/manage-releases.py promote \
 
 提交 `manifest/pinned-versions.json`、`manifest/manifest.json`（及更新后的基线文件）到 `main` 后，在 GitHub Actions 手动运行 **Managed Desktop Release Pipeline** 并选择 `mode = mirror-pinned`，自动完成安装包及 `claude-code` 伴随二进制的国内 CDN 镜像与 `manifest.json` 同步。
 
-## Windows 环境演进规划
+## Windows 测试台（河南 `.6` 常驻服务 `tako-win-lab`）
 
-当前先以 macOS 环境跑通三门禁与基线差分；后续接入独立 Windows 测试机 / GitHub `windows-latest` runner 时，沿用同一份 `pinned-versions.json` 与 `baselines/<app>.windows.json` 扩展 `verify-windows`（重点校验 MSIX `AppxManifest.xml` 入口、PE ASAR integrity 校验、杀软/UAC 静默安装与冷启动存活探针）。
+Windows 端已接入常驻测试台微服务 [`services/win-lab/`](../services/win-lab/)，运行在河南 `.6`（`172.17.66.6:18795`），提供：
+
+1. **Windows 3 门禁静态解包与注入验收**（不污染宿主配置）：
+   - `Codex`（`.msix`）：纯解包解析 `AppxManifest.xml`（校验 `OpenAI.Codex` Identity、可见主入口 vs 后台辅助入口、Protocol/Capability/StartupTask）、`app.asar` 锚点（`localeOverride` / `model_catalog_url` / `approval_mode`）、`zh-CN` 语言资源与 `config.toml` 反斜杠路径隔离干跑。
+   - `Claude Desktop`（`.exe`）：免安装提取内嵌 `.nupkg` 校验 `app.asar` + `ion-dist.asar` 汉化覆盖率与 3P 契约字段、`Claude.exe` Electron fuse/integrity 槽位、以及国内 `dl.lven.asia/apps/claude-code/<ver>/win32-x64/claude.exe.zst` 镜像可达性。
+   - `Antigravity`（Inno `.exe`）与 `DSH Tako`（NSIS `.exe`）：隔离目录静默解包，校验 `app.asar` / PE Electron fuse / Authenticode 签名与 Windows 基线差分（`manifest/baselines/<app>.windows.json`）。
+2. **Gate 4 实机冷启动与 EventLog 崩溃探针**：
+   - 在 `.6` 交互桌面会话中真实拉起候选包，持续轮询进程存活与主窗口标题，并抓取 `Application`（Event ID 1000/1001/1026）、`AppxDeploymentServer`、`AppModel-Runtime` 及客户端启动日志尾部，自动脱敏保存并清理现场。
+3. **运维控制台与 HQ 事件上报闭环**：
+   - 以标准 v4 插件挂载至 `.26:8767/tako/win-lab`（`parent_nav: tako`），Prometheus 黑盒探活 `http://172.17.66.6:18795/healthz`。
+   - 门禁失败（`winlab.gate_failed`）、实机崩溃（`winlab.smoke_crash`）、上游发现待审新版（`winlab.upstream_candidate`）自动脱敏并按冷却去重上报至 HQ（`http://172.17.66.26:8789/v1/events`）建单分诊，通过回执走轻量 SSE（`winlab.gate_passed`），同时同步异常至客户端数据台（`http://172.17.66.15:18080/v1/{events,errors}`）。
+
+### 命令行一键调用 `.6` Windows 测试台
+
+```bash
+# 全量跑 Windows 三门禁（或指定单个客户端 --app codex）
+python3 scripts/manage-releases.py verify-windows --app all --out-json /tmp/win-gates.json
+
+# 更新 Windows 基线档案
+python3 scripts/manage-releases.py verify-windows --app codex --update-baseline
+
+# 执行 Gate 4 实机安装 + 冷启动 + EventLog 崩溃复测
+python3 scripts/manage-releases.py verify-windows --app codex --smoke --hold-seconds 15
+```

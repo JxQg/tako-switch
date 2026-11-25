@@ -194,6 +194,77 @@ class ManageReleasesTests(unittest.TestCase):
         self.assertEqual(updated["apps"]["antigravity"]["version"], "2.36.0")
         self.assertEqual(updated["apps"]["antigravity"]["gates"]["localization"], "pass")
 
+    def test_verify_windows_cli_dispatches_and_polls_remote_lab(self) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        calls: list[str] = []
+
+        class MockLab(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):  # noqa: N802
+                calls.append(f"POST {self.path}")
+                raw = json.dumps({"ok": True, "data": {"runs": [{"id": "run_test1"}]}}).encode("utf-8")
+                self.send_response(202)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):  # noqa: N802
+                calls.append(f"GET {self.path}")
+                raw = json.dumps(
+                    {
+                        "ok": True,
+                        "data": {
+                            "id": "run_test1",
+                            "app_id": "codex",
+                            "kind": "gate",
+                            "target_version": "26.1120.6357.0",
+                            "status": "pass",
+                            "summary": "all passed",
+                            "gates": {
+                                "localization": {"status": "pass", "details": ["ok"]},
+                                "injection": {"status": "pass", "details": ["ok"]},
+                                "anomalyAudit": {"status": "pass", "details": ["ok"]},
+                            },
+                        },
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), MockLab)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                out_p = Path(td) / "win-out.json"
+                rc = self.mod.main(
+                    [
+                        "verify-windows",
+                        "--app",
+                        "codex",
+                        "--lab-url",
+                        f"http://127.0.0.1:{port}",
+                        "--out-json",
+                        str(out_p),
+                    ]
+                )
+                self.assertEqual(rc, 0)
+                saved = json.loads(out_p.read_text(encoding="utf-8"))
+                self.assertEqual(saved["id"], "run_test1")
+                self.assertIn("POST /api/runs/gate", calls)
+                self.assertIn("GET /api/runs/run_test1", calls)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
