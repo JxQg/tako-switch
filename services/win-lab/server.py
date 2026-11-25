@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import signal
 import sys
@@ -37,6 +39,25 @@ def main(argv: list[str] | None = None) -> int:
             }
         )
     cfg.ensure_dirs()
+    log_dir = cfg.data_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "win-lab.log"
+    handlers: list[logging.Handler] = [
+        RotatingFileHandler(str(log_file), maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    ]
+    if sys.stderr is not None:
+        try:
+            if sys.stderr.isatty():
+                handlers.append(logging.StreamHandler(sys.stderr))
+        except Exception:
+            pass
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=handlers,
+        force=True,
+    )
+    logger = logging.getLogger("tako_win_lab")
 
     store = LabStore(cfg.db_path)
     reporter = HqReporter(cfg, store)
@@ -53,10 +74,15 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    print(
-        f"[{SERVICE_NAME}] v{SERVICE_VERSION} listening on http://{cfg.host}:{cfg.port} "
-        f"(repo={cfg.repo_root}, data={cfg.data_dir}, hq={cfg.hq_url})",
-        flush=True,
+    logger.info(
+        "[%s] v%s listening on http://%s:%s (repo=%s, data=%s, hq=%s)",
+        SERVICE_NAME,
+        SERVICE_VERSION,
+        cfg.host,
+        cfg.port,
+        cfg.repo_root,
+        cfg.data_dir,
+        cfg.hq_url,
     )
     try:
         httpd.serve_forever()

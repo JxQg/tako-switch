@@ -5,6 +5,7 @@ from __future__ import annotations
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
+import logging
 import os
 from pathlib import Path
 import platform
@@ -193,7 +194,12 @@ class WinLabServer:
             def log_message(self, fmt: str, *args: Any) -> None:
                 if os.environ.get("WIN_LAB_QUIET_LOG", "0") == "1":
                     return
-                super().log_message(fmt, *args)
+                try:
+                    logging.getLogger("tako_win_lab.http").info(
+                        "%s - %s", self.address_string(), fmt % args
+                    )
+                except Exception:
+                    pass
 
             def _send_json(self, status: int, payload: Any) -> None:
                 raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")

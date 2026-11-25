@@ -52,7 +52,7 @@ $Lines = @(
   '$env:WIN_LAB_AUTO_REPORT_TELEMETRY = "1"',
   '$env:WIN_LAB_ALLOW_LIVE_SMOKE = "1"',
   "Set-Location `"$WorkDir`"",
-  "& `"$PythonExe`" `"$ServerScript`" >> `"$LogFile`" 2>&1"
+  "& `"$PythonExe`" `"$ServerScript`""
 )
 Set-Content -Path $RunnerPs1 -Value ($Lines -join "`r`n") -Encoding UTF8
 
