@@ -557,7 +557,11 @@ def mirror_companion_artifacts_to_r2(
                             f"Companion size mismatch for {key}: expected {expected_size}, got {actual_size}"
                         )
                     print(f"[upload] companion s3://{s3.bucket}/{key} ({actual_size} bytes)")
-                    s3.upload_file(dest, key)
+                    s3.upload_file(
+                        dest,
+                        key,
+                        cache_control="public, max-age=31536000, immutable",
+                    )
                     mirrored_keys.append(key)
                     try:
                         dest.unlink()

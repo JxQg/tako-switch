@@ -293,7 +293,8 @@ class TimeoutRetryTests(unittest.TestCase):
             bucket = "tako-apps-mirror"
             def head_object(self, key: str):
                 return None
-            def upload_file(self, local_path: Path, key: str, **_kwargs):
+            def upload_file(self, local_path: Path, key: str, *, cache_control: str, content_type: str | None = None):
+                assert cache_control
                 uploaded.append(key)
             def list_objects(self, prefix: str):
                 return [

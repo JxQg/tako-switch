@@ -149,7 +149,9 @@ fn collect_recent_files_recursive(dir: &Path, max_depth: usize, out: &mut Vec<(S
 }
 
 fn collect_matching_log_files(paths: &AppPaths, app_id: AppId) -> Vec<PathBuf> {
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(unused_mut))]
     let mut fixed: Vec<PathBuf> = Vec::new();
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(unused_mut))]
     let mut scan_dirs: Vec<(PathBuf, usize)> = Vec::new();
 
     #[cfg(target_os = "macos")]
@@ -264,6 +266,7 @@ fn macos_diagnostic_report_prefixes(app_id: AppId) -> &'static [&'static str] {
 }
 
 fn collect_macos_crash_files(paths: &AppPaths, app_id: AppId) -> HashSet<PathBuf> {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut set = HashSet::new();
     #[cfg(target_os = "macos")]
     {
