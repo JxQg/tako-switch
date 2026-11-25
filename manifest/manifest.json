@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-25T03:14:43Z",
+  "generatedAt": "2026-11-25T23:06:56Z",
   "apps": {
     "dsh-tako": {
       "displayName": "DSH Tako",
@@ -83,39 +83,33 @@
     },
     "antigravity": {
       "displayName": "Google Antigravity",
-      "version": "2.35.1",
+      "version": "2.35.2",
       "platforms": {
         "macos-arm64": {
-          "url": "https://dl.lven.asia/apps/antigravity/macos-arm64/2.35.1/Antigravity.zip",
-          "version": "2.35.1",
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/darwin-arm/Antigravity.zip",
+          "version": "2.35.2",
           "installType": "zip",
-          "sha512": "bcd4c6e7a18856843f0b3566da99f3335f1b98231b5ec360d15d5ce30ba93565f8f488bb0e0f8c923587086837e1d5ba8f913b7b99c9c3dd67950375d73b18fe",
-          "size": 216134092,
-          "appBundleName": "Antigravity.app",
-          "sha256": "37f78042427b67bd147b8accbf780a9ddc63ba2e116253fc4de556f3ec611d8c",
-          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.1-4615540875067392/darwin-arm/Antigravity.zip"
+          "sha512": "f41bee8916fea818853c8e6d5b8083114ebee908ba6aff7290910ea56c01414adeeda4da76348e00c9fdf96de1b4e8313b349fb50069cc325bf13056a5aacf83",
+          "size": 216133032,
+          "appBundleName": "Antigravity.app"
         },
         "macos-x64": {
-          "url": "https://dl.lven.asia/apps/antigravity/macos-x64/2.35.1/Antigravity.zip",
-          "version": "2.35.1",
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/darwin-x64/Antigravity.zip",
+          "version": "2.35.2",
           "installType": "zip",
-          "sha512": "e4dd269502448adbfa250ab999692e0d655cc529bf543e01348145f62d6db305114560277f113257eb168e8e41c7c797ef36b846c1496811126ed8c7a8f6c3e6",
-          "size": 224100047,
-          "appBundleName": "Antigravity.app",
-          "sha256": "07a760db2b843fea6257af88518339d3e15935c226c11bfa123901dabce741ad",
-          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.1-4615540875067392/darwin-x64/Antigravity.zip"
+          "sha512": "caa043007f7c6b620a465fbd1160df6b48eced06ca3ead51fff84fd41896d3d490d6255dd7e556e4a742df87c405325bff51e412a1fa9604f48038a91766e724",
+          "size": 224099686,
+          "appBundleName": "Antigravity.app"
         },
         "windows-x64": {
-          "url": "https://dl.lven.asia/apps/antigravity/windows-x64/2.35.1/Antigravity-x64.exe",
-          "version": "2.35.1",
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/windows-x64/Antigravity-x64.exe",
+          "version": "2.35.2",
           "installType": "exe",
-          "sha512": "9ef2324ee671b56f677e7286558eece41e457b19fee3d11b00ccc3fad6d554d5f01fd444b81e879b1fbca321f6fbb8d6f1069152c6e1cad1ef1908b15c0d6130",
-          "size": 170272672,
+          "sha512": "4c4ad1d13d44db1b0bb8b811d0a568cce96045e1c7ac89790ba7b02abb38d086d181fa7caf258d1479a709033038b51ae66cbe64728cc77803aeba74ff09cffc",
+          "size": 170273968,
           "silentArgs": [
             "/S"
-          ],
-          "sha256": "b90d07974759f2f267be4c966ec7e62839b0873b2aa7d2732e74de955a077df0",
-          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.1-4615540875067392/windows-x64/Antigravity-x64.exe"
+          ]
         }
       }
     },
