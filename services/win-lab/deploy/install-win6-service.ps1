@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
   Install or update Tako Switch Windows Release Gate & Test Lab (`tako-win-lab`) on .6 (henan-windows-pc).
-  Creates a persistent Scheduled Task running in shiroha's interactive session so both
-  HTTP API (172.17.66.6:18795) and real GUI cold-launch smoke tests work seamlessly.
+  Uses the real Python binary from sys.base_prefix (avoiding Microsoft Store AppExecutionAlias stubs)
+  and registers a persistent Scheduled Task running in shiroha's interactive session.
 #>
 param(
   [string]$InstallRoot = "D:\fleet\tako-win-lab",
@@ -21,39 +21,43 @@ $OutputEncoding = [System.Text.Encoding]::UTF8
 
 New-Item -ItemType Directory -Force -Path $InstallRoot, $DataDir, "$DataDir\logs" | Out-Null
 
-$PythonExe = (Get-Command python -ErrorAction Stop).Source
+# Resolve real PE binary path (Microsoft Store Python aliases under WindowsApps\python.exe fail under some Scheduled Tasks)
+$PyPrefix = (& python -c "import sys; print(sys.base_prefix)").Trim()
+$PythonExe = Join-Path $PyPrefix "python.exe"
+if (-not (Test-Path $PythonExe)) {
+  $PythonExe = (Get-Command python -ErrorAction Stop).Source
+}
 $ServerScript = Join-Path $RepoDir "services\win-lab\server.py"
 if (-not (Test-Path $ServerScript)) {
   throw "Missing server script: $ServerScript"
 }
 
-$RunnerBat = Join-Path $InstallRoot "run-win-lab.cmd"
+$RunnerPs1 = Join-Path $InstallRoot "run-win-lab.ps1"
 $LogFile = Join-Path $DataDir "logs\win-lab.log"
+$WorkDir = Join-Path $RepoDir "services\win-lab"
 
-$BatContent = @"
-@echo off
-setlocal
-set PYTHONUTF8=1
-set PYTHONUNBUFFERED=1
-set WIN_LAB_HOST=0.0.0.0
-set WIN_LAB_PORT=$Port
-set WIN_LAB_REPO_ROOT=$RepoDir
-set WIN_LAB_DATA_DIR=$DataDir
-set WIN_LAB_HQ_URL=$HqUrl
-set WIN_LAB_TELEMETRY_URL=$TelemetryUrl
-set WIN_LAB_EGRESS_PROXY=$EgressProxy
-set WIN_LAB_OPS_CONSOLE_URL=http://172.17.66.26:8767/win-lab
-set WIN_LAB_SCHEDULE_ENABLED=1
-set WIN_LAB_AUTO_REPORT_HQ=1
-set WIN_LAB_AUTO_REPORT_TELEMETRY=1
-set WIN_LAB_ALLOW_LIVE_SMOKE=1
-cd /d "$RepoDir\services\win-lab"
-"$PythonExe" "$ServerScript" >> "$LogFile" 2>&1
-"@
+$Lines = @(
+  '$env:PYTHONUTF8 = "1"',
+  '$env:PYTHONUNBUFFERED = "1"',
+  '$env:WIN_LAB_HOST = "0.0.0.0"',
+  "`$env:WIN_LAB_PORT = `"$Port`"",
+  "`$env:WIN_LAB_REPO_ROOT = `"$RepoDir`"",
+  "`$env:WIN_LAB_DATA_DIR = `"$DataDir`"",
+  "`$env:WIN_LAB_HQ_URL = `"$HqUrl`"",
+  "`$env:WIN_LAB_TELEMETRY_URL = `"$TelemetryUrl`"",
+  "`$env:WIN_LAB_EGRESS_PROXY = `"$EgressProxy`"",
+  '$env:WIN_LAB_OPS_CONSOLE_URL = "http://172.17.66.26:8767/win-lab"',
+  '$env:WIN_LAB_SCHEDULE_ENABLED = "1"',
+  '$env:WIN_LAB_AUTO_REPORT_HQ = "1"',
+  '$env:WIN_LAB_AUTO_REPORT_TELEMETRY = "1"',
+  '$env:WIN_LAB_ALLOW_LIVE_SMOKE = "1"',
+  "Set-Location `"$WorkDir`"",
+  "& `"$PythonExe`" `"$ServerScript`" >> `"$LogFile`" 2>&1"
+)
+Set-Content -Path $RunnerPs1 -Value ($Lines -join "`r`n") -Encoding UTF8
 
-Set-Content -Path $RunnerBat -Value $BatContent -Encoding ASCII
-
-# Stop any running old instance listening on $Port
+# Stop any running old task or process listening on $Port
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $existingConns = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
 foreach ($c in $existingConns) {
   if ($c.OwningProcess -gt 4) {
@@ -69,9 +73,12 @@ if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContin
     -Protocol TCP -LocalPort $Port -RemoteAddress 172.17.66.0/24,127.0.0.1 | Out-Null
 }
 
-# Register Scheduled Task under current interactive user (use full DOMAIN\User to avoid hostname collision)
+# Register Scheduled Task under full DOMAIN\User in Interactive session (supports GUI Gate-4 smoke tests)
 $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$RunnerBat`"" -WorkingDirectory "$RepoDir\services\win-lab"
+$action = New-ScheduledTaskAction `
+  -Execute "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
+  -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$RunnerPs1`"" `
+  -WorkingDirectory $WorkDir
 $triggerLogon = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
 $settings = New-ScheduledTaskSettingsSet `
   -AllowStartIfOnBatteries `
@@ -80,13 +87,11 @@ $settings = New-ScheduledTaskSettingsSet `
   -RestartCount 999 `
   -RestartInterval (New-TimeSpan -Minutes 1) `
   -MultipleInstances IgnoreNew
-
 $principal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Highest
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggerLogon -Settings $settings -Principal $principal -Force | Out-Null
 Start-ScheduledTask -TaskName $TaskName
 
-# Wait up to 15s for healthz
 $healthy = $false
 for ($i = 0; $i -lt 15; $i++) {
   Start-Sleep -Seconds 1
@@ -101,6 +106,8 @@ for ($i = 0; $i -lt 15; $i++) {
 }
 
 if (-not $healthy) {
+  Write-Output "--- Task Info ---"
+  Get-ScheduledTaskInfo -TaskName $TaskName | Format-List LastRunTime, LastTaskResult
   Write-Output "--- Tail $LogFile ---"
   Get-Content -Path $LogFile -Tail 40 -ErrorAction SilentlyContinue
   throw "tako-win-lab failed health check on port $Port"
