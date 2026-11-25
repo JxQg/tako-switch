@@ -140,7 +140,19 @@ def build_targets(mod, required: set[str]) -> list[tuple[str, object]]:
     r2_endpoint = os.environ.get("R2_ENDPOINT_URL", "").strip()
     if r2_bucket and r2_endpoint:
         region = mod.infer_s3_region(r2_endpoint, os.environ.get("AWS_DEFAULT_REGION"))
-        targets.append(("r2", mod.S3Client(bucket=r2_bucket, endpoint_url=r2_endpoint, region=region)))
+        targets.append(
+            (
+                "r2",
+                mod.S3Client(
+                    bucket=r2_bucket,
+                    endpoint_url=r2_endpoint,
+                    region=region,
+                    upload_timeout_secs=120,
+                    cli_connect_timeout=15,
+                    cli_read_timeout=60,
+                ),
+            )
+        )
     elif "r2" in required:
         raise RuntimeError("R2 target required but R2_BUCKET/R2_ENDPOINT_URL are not configured")
 
@@ -152,7 +164,8 @@ def build_targets(mod, required: set[str]) -> list[tuple[str, object]]:
         sb, ep, reg, env = mod.fetch_dogecloud_s3_credentials(doge_ak, doge_sk, doge_bucket)
         print(f"[auth] DogeCloud S3 target: s3://{sb} ({ep}, region={reg})")
         # Cross-border runner -> Shanghai COS aborts multipart UploadPart calls with
-        # UserNetworkTooSlow; release assets are ~10 MB so a single PUT is more reliable.
+        # UserNetworkTooSlow and can silently stall TCP sockets for hours if unbounded;
+        # cap each PUT cleanly so slow files never hang the Release job.
         targets.append(("dogecloud", mod.S3Client(
             bucket=sb,
             endpoint_url=ep,
@@ -160,6 +173,11 @@ def build_targets(mod, required: set[str]) -> list[tuple[str, object]]:
             env_overrides=env,
             multipart_threshold_mb=64,
             max_concurrency=1,
+            upload_timeout_secs=90,
+            max_upload_attempts=2,
+            aws_max_attempts=2,
+            cli_connect_timeout=15,
+            cli_read_timeout=45,
         )))
     elif "doge" in required:
         raise RuntimeError(

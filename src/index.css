@@ -311,7 +311,6 @@ pre,
 
 .modal-backdrop {
   background-color: var(--backdrop);
-  backdrop-filter: blur(4px);
 }
 
 /* Subtle custom scrollbars */

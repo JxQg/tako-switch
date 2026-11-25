@@ -1889,9 +1889,12 @@ async fn run_elevated_ui_patch_worker(
 }
 
 #[tauri::command]
-async fn list_plaza_models() -> Result<agy_proxy::ClientModelsResponse, String> {
+async fn list_plaza_models(
+    force_refresh: Option<bool>,
+) -> Result<agy_proxy::ClientModelsResponse, String> {
     let paths = AppPaths::detect()?;
-    agy_proxy::fetch_plaza_models_for_ui(&paths).await
+    agy_proxy::fetch_plaza_models_for_ui_with_refresh(&paths, force_refresh.unwrap_or(false))
+        .await
 }
 
 #[tauri::command]
@@ -2058,9 +2061,17 @@ fn diagnose_app(app_id: AppId) -> Result<DiagnosticResult, String> {
 }
 
 #[tauri::command]
-async fn list_client_models(app_id: AppId) -> Result<agy_proxy::ClientModelsResponse, String> {
+async fn list_client_models(
+    app_id: AppId,
+    force_refresh: Option<bool>,
+) -> Result<agy_proxy::ClientModelsResponse, String> {
     let paths = AppPaths::detect()?;
-    agy_proxy::fetch_client_models_for_ui(&paths, app_id).await
+    agy_proxy::fetch_client_models_for_ui_with_refresh(
+        &paths,
+        app_id,
+        force_refresh.unwrap_or(false),
+    )
+    .await
 }
 
 #[tauri::command]

@@ -25,12 +25,12 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream as TokioTcpStream};
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 pub const AGY_PROXY_PORT: u16 = 18419;
 pub const AGY_PROXY_URL: &str = "http://127.0.0.1:18419";
@@ -52,6 +52,11 @@ const GATEWAY_PLIST_LABEL: &str = "tech.shiroha.tako-switch.gateway";
 const LEGACY_AGY_PROXY_PLIST_LABEL: &str = "tech.shiroha.tako-switch.agy-proxy";
 
 const PRICING_CACHE_TTL: Duration = Duration::from_secs(300);
+const PERF_CACHE_TTL: Duration = Duration::from_secs(300);
+const UI_MODELS_CACHE_TTL: Duration = Duration::from_secs(120);
+const PRICING_FETCH_TIMEOUT: Duration = Duration::from_secs(12);
+const PERF_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+const MODELS_FETCH_TIMEOUT: Duration = Duration::from_secs(12);
 const ALLOWED_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const AGY_MAX_CUSTOM_PLACEHOLDERS: usize = 32;
 pub const OFFICIAL_PRICE_RATIO_BASE: f64 = 20.4;
@@ -240,11 +245,365 @@ fn model_family_label(app_id: AppId, id: &str) -> &'static str {
 
 const PASSTHROUGH_STREAM_THRESHOLD_BYTES: u64 = 64 * 1024;
 
+#[derive(Clone)]
+struct CachedPricingSnapshot {
+    base_url: String,
+    fetched_at: Instant,
+    raw_body: Value,
+    parsed: PricingCache,
+}
+
+#[derive(Clone)]
+struct CachedPerfSnapshot {
+    base_url: String,
+    fetched_at: Instant,
+    data: HashMap<String, ModelPerfInfo>,
+}
+
+#[derive(Clone)]
+struct CachedModelsSnapshot {
+    base_url: String,
+    credential_tag: String,
+    fetched_at: Instant,
+    body: Value,
+}
+
+struct SharedCatalogCache {
+    pricing: RwLock<Option<CachedPricingSnapshot>>,
+    pricing_fetch_lock: Mutex<()>,
+    perf: RwLock<Option<CachedPerfSnapshot>>,
+    perf_fetch_lock: Mutex<()>,
+    v1_models: RwLock<Option<CachedModelsSnapshot>>,
+    v1_models_fetch_lock: Mutex<()>,
+    v1beta_models: RwLock<Option<CachedModelsSnapshot>>,
+    v1beta_models_fetch_lock: Mutex<()>,
+}
+
+static SHARED_CATALOG_CACHE: OnceLock<SharedCatalogCache> = OnceLock::new();
+static UI_DIRECT_CLIENT: OnceLock<Client> = OnceLock::new();
+static UI_SYSTEM_PROXY_CLIENT: OnceLock<Client> = OnceLock::new();
+
+fn shared_catalog_cache() -> &'static SharedCatalogCache {
+    SHARED_CATALOG_CACHE.get_or_init(SharedCatalogCache::new)
+}
+
+fn credential_fingerprint(secret: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    secret.hash(&mut hasher);
+    format!("{}:{:016x}", secret.len(), hasher.finish())
+}
+
+fn build_metadata_client(bypass_system_proxy: bool) -> Result<Client, String> {
+    apply_proxy_policy(
+        Client::builder()
+            .gzip(true)
+            .connect_timeout(Duration::from_secs(10))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(6),
+        bypass_system_proxy,
+    )
+    .build()
+    .map_err(|e| format!("创建模型请求客户端失败: {e}"))
+}
+
+fn shared_metadata_client(bypass_system_proxy: bool) -> Result<Client, String> {
+    let slot = if bypass_system_proxy {
+        &UI_DIRECT_CLIENT
+    } else {
+        &UI_SYSTEM_PROXY_CLIENT
+    };
+    if let Some(client) = slot.get() {
+        return Ok(client.clone());
+    }
+    let built = build_metadata_client(bypass_system_proxy)?;
+    Ok(slot.get_or_init(|| built).clone())
+}
+
+impl SharedCatalogCache {
+    fn new() -> Self {
+        Self {
+            pricing: RwLock::new(None),
+            pricing_fetch_lock: Mutex::new(()),
+            perf: RwLock::new(None),
+            perf_fetch_lock: Mutex::new(()),
+            v1_models: RwLock::new(None),
+            v1_models_fetch_lock: Mutex::new(()),
+            v1beta_models: RwLock::new(None),
+            v1beta_models_fetch_lock: Mutex::new(()),
+        }
+    }
+
+    async fn read_fresh_pricing(&self, base_url: &str) -> Option<CachedPricingSnapshot> {
+        let guard = self.pricing.read().await;
+        guard.as_ref().and_then(|snap| {
+            if snap.base_url == base_url
+                && snap.fetched_at.elapsed() < PRICING_CACHE_TTL
+                && !snap.parsed.prices.is_empty()
+            {
+                Some(snap.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn read_stale_pricing(&self, base_url: &str) -> Option<CachedPricingSnapshot> {
+        let guard = self.pricing.read().await;
+        guard.as_ref().and_then(|snap| {
+            if snap.base_url == base_url && !snap.parsed.prices.is_empty() {
+                Some(snap.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn get_or_fetch_pricing(
+        &self,
+        base_url: &str,
+        bypass_system_proxy: bool,
+        force_refresh: bool,
+        allow_stale_fallback: bool,
+    ) -> Result<CachedPricingSnapshot, String> {
+        if !force_refresh {
+            if let Some(cached) = self.read_fresh_pricing(base_url).await {
+                return Ok(cached);
+            }
+        }
+
+        let _fetch_guard = self.pricing_fetch_lock.lock().await;
+        if !force_refresh {
+            if let Some(cached) = self.read_fresh_pricing(base_url).await {
+                return Ok(cached);
+            }
+        }
+
+        let fetch_result: Result<CachedPricingSnapshot, String> = async {
+            let client = shared_metadata_client(bypass_system_proxy)?;
+            let pricing_url = format!("{base_url}/api/pricing");
+            let resp = client
+                .get(&pricing_url)
+                .timeout(PRICING_FETCH_TIMEOUT)
+                .send()
+                .await
+                .map_err(|e| format!("拉取模型广场定价失败: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                let snippet: String = body_text.chars().take(160).collect();
+                return Err(format!(
+                    "模型广场接口返回 HTTP {}: {snippet}",
+                    status.as_u16()
+                ));
+            }
+            let raw_body: Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("解析模型广场定价数据失败: {e}"))?;
+            let parsed = parse_pricing_metadata(&raw_body);
+            Ok(CachedPricingSnapshot {
+                base_url: base_url.to_string(),
+                fetched_at: Instant::now(),
+                raw_body,
+                parsed,
+            })
+        }
+        .await;
+
+        match fetch_result {
+            Ok(snap) => {
+                if !snap.parsed.prices.is_empty() {
+                    let mut guard = self.pricing.write().await;
+                    *guard = Some(snap.clone());
+                    return Ok(snap);
+                }
+                if allow_stale_fallback {
+                    if let Some(stale) = self.read_stale_pricing(base_url).await {
+                        return Ok(stale);
+                    }
+                }
+                Ok(snap)
+            }
+            Err(err) => {
+                if allow_stale_fallback {
+                    if let Some(stale) = self.read_stale_pricing(base_url).await {
+                        return Ok(stale);
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn read_fresh_perf(&self, base_url: &str) -> Option<HashMap<String, ModelPerfInfo>> {
+        let guard = self.perf.read().await;
+        guard.as_ref().and_then(|snap| {
+            if snap.base_url == base_url
+                && snap.fetched_at.elapsed() < PERF_CACHE_TTL
+                && !snap.data.is_empty()
+            {
+                Some(snap.data.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn read_stale_perf(&self, base_url: &str) -> Option<HashMap<String, ModelPerfInfo>> {
+        let guard = self.perf.read().await;
+        guard.as_ref().and_then(|snap| {
+            if snap.base_url == base_url && !snap.data.is_empty() {
+                Some(snap.data.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn get_or_fetch_perf(
+        &self,
+        base_url: &str,
+        bypass_system_proxy: bool,
+        force_refresh: bool,
+    ) -> HashMap<String, ModelPerfInfo> {
+        if !force_refresh {
+            if let Some(cached) = self.read_fresh_perf(base_url).await {
+                return cached;
+            }
+        }
+
+        let _fetch_guard = self.perf_fetch_lock.lock().await;
+        if !force_refresh {
+            if let Some(cached) = self.read_fresh_perf(base_url).await {
+                return cached;
+            }
+        }
+
+        if let Ok(client) = shared_metadata_client(bypass_system_proxy) {
+            let perf_url = format!("{base_url}/api/perf-metrics/summary");
+            if let Ok(resp) = client.get(&perf_url).timeout(PERF_FETCH_TIMEOUT).send().await {
+                if resp.status().is_success() {
+                    if let Ok(v) = resp.json::<Value>().await {
+                        let parsed = parse_perf_metrics_summary(&v);
+                        if !parsed.is_empty() {
+                            let mut guard = self.perf.write().await;
+                            *guard = Some(CachedPerfSnapshot {
+                                base_url: base_url.to_string(),
+                                fetched_at: Instant::now(),
+                                data: parsed.clone(),
+                            });
+                            return parsed;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.read_stale_perf(base_url).await.unwrap_or_default()
+    }
+
+    async fn get_or_fetch_models_list(
+        &self,
+        is_v1beta: bool,
+        base_url: &str,
+        bypass_system_proxy: bool,
+        credential: &str,
+        force_refresh: bool,
+    ) -> Result<Value, String> {
+        let (slot, fetch_lock, path) = if is_v1beta {
+            (
+                &self.v1beta_models,
+                &self.v1beta_models_fetch_lock,
+                "/v1beta/models",
+            )
+        } else {
+            (&self.v1_models, &self.v1_models_fetch_lock, "/v1/models")
+        };
+        let cred_tag = credential_fingerprint(credential);
+
+        if !force_refresh {
+            let guard = slot.read().await;
+            if let Some(ref snap) = *guard {
+                if snap.base_url == base_url
+                    && snap.credential_tag == cred_tag
+                    && snap.fetched_at.elapsed() < UI_MODELS_CACHE_TTL
+                {
+                    return Ok(snap.body.clone());
+                }
+            }
+        }
+
+        let _fetch_guard = fetch_lock.lock().await;
+        if !force_refresh {
+            let guard = slot.read().await;
+            if let Some(ref snap) = *guard {
+                if snap.base_url == base_url
+                    && snap.credential_tag == cred_tag
+                    && snap.fetched_at.elapsed() < UI_MODELS_CACHE_TTL
+                {
+                    return Ok(snap.body.clone());
+                }
+            }
+        }
+
+        let fetch_result: Result<Value, String> = async {
+            let client = shared_metadata_client(bypass_system_proxy)?;
+            let url = format!("{base_url}{path}");
+            let req = if is_v1beta {
+                client.get(&url).header("x-goog-api-key", credential)
+            } else {
+                client.get(&url).bearer_auth(credential)
+            };
+            let resp = req
+                .timeout(MODELS_FETCH_TIMEOUT)
+                .send()
+                .await
+                .map_err(|e| format!("拉取上游模型列表失败: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body_text = resp.text().await.unwrap_or_default();
+                let snippet: String = body_text.chars().take(160).collect();
+                return Err(format!("上游返回 HTTP {}: {snippet}", status.as_u16()));
+            }
+            resp.json::<Value>()
+                .await
+                .map_err(|e| format!("解析上游模型列表失败: {e}"))
+        }
+        .await;
+
+        match fetch_result {
+            Ok(body) => {
+                let mut guard = slot.write().await;
+                *guard = Some(CachedModelsSnapshot {
+                    base_url: base_url.to_string(),
+                    credential_tag: cred_tag,
+                    fetched_at: Instant::now(),
+                    body: body.clone(),
+                });
+                Ok(body)
+            }
+            Err(err) => {
+                if !force_refresh {
+                    let guard = slot.read().await;
+                    if let Some(ref snap) = *guard {
+                        if snap.base_url == base_url && snap.credential_tag == cred_tag {
+                            return Ok(snap.body.clone());
+                        }
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+}
+
 struct ProxyState {
     paths: AppPaths,
     direct_client: Client,
     system_proxy_client: Client,
-    pricing_cache: RwLock<Option<(String, Instant, PricingCache)>>,
     synthetic_routes: RwLock<HashMap<String, SyntheticRoute>>,
     codex_model_messages: RwLock<Option<Value>>,
 }
@@ -2957,40 +3316,21 @@ pub async fn refresh_claude_catalog_cache(paths: &AppPaths) -> Result<(), String
     let base_url = state.normalized_base_url();
     let api_key = read_main_api_key(paths)
         .ok_or_else(|| "未登录 Tako 账号或缺少 API Key".to_string())?;
-    let client = apply_proxy_policy(
-        Client::builder().timeout(Duration::from_secs(12)),
-        state.bypass_system_proxy,
-    )
-    .build()
-    .map_err(|e| format!("创建模型请求客户端失败: {e}"))?;
+    let cache = shared_catalog_cache();
 
     let (models_res, pricing_res) = tokio::join!(
-        client
-            .get(format!("{base_url}/v1/models"))
-            .bearer_auth(api_key)
-            .send(),
-        client
-            .get(format!("{base_url}/api/pricing"))
-            .timeout(Duration::from_secs(5))
-            .send()
+        cache.get_or_fetch_models_list(
+            false,
+            &base_url,
+            state.bypass_system_proxy,
+            &api_key,
+            false
+        ),
+        cache.get_or_fetch_pricing(&base_url, state.bypass_system_proxy, false, true)
     );
 
-    let resp = models_res.map_err(|e| format!("拉取上游模型列表失败: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("上游模型列表返回 HTTP {}", resp.status().as_u16()));
-    }
-    let json_body: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("解析上游模型列表失败: {e}"))?;
-    let pricing = match pricing_res {
-        Ok(r) if r.status().is_success() => r
-            .json::<Value>()
-            .await
-            .map(|v| parse_pricing_metadata(&v))
-            .unwrap_or_default(),
-        _ => PricingCache::default(),
-    };
+    let json_body = models_res?;
+    let pricing = pricing_res.map(|s| s.parsed).unwrap_or_default();
 
     let full = build_claude_models_catalog(&json_body, &pricing);
     let filtered = filter_claude_models_catalog(&full, &state.model_filters.claude);
@@ -3157,39 +3497,14 @@ fn json_error_response(status: StatusCode, message: &str) -> Response<ProxyBody>
 }
 
 async fn get_pricing_cache(
-    state: &ProxyState,
+    _state: &ProxyState,
     base_url: &str,
     bypass_system_proxy: bool,
 ) -> PricingCache {
-    {
-        let guard = state.pricing_cache.read().await;
-        if let Some((ref cached_base, fetched_at, ref cached)) = *guard {
-            if cached_base == base_url && fetched_at.elapsed() < PRICING_CACHE_TTL {
-                return cached.clone();
-            }
-        }
-    }
-
-    let url = format!("{base_url}/api/pricing");
-    let client = state.upstream_client(bypass_system_proxy);
-    let fetched = tokio::time::timeout(Duration::from_secs(5), client.get(&url).send()).await;
-
-    if let Ok(Ok(resp)) = fetched {
-        if resp.status().is_success() {
-            if let Ok(body) = resp.json::<Value>().await {
-                let parsed = parse_pricing_metadata(&body);
-                let mut guard = state.pricing_cache.write().await;
-                *guard = Some((base_url.to_string(), Instant::now(), parsed.clone()));
-                return parsed;
-            }
-        }
-    }
-
-    let guard = state.pricing_cache.read().await;
-    guard
-        .as_ref()
-        .filter(|(cached_base, _, _)| cached_base == base_url)
-        .map(|(_, _, c)| c.clone())
+    shared_catalog_cache()
+        .get_or_fetch_pricing(base_url, bypass_system_proxy, false, true)
+        .await
+        .map(|snap| snap.parsed)
         .unwrap_or_default()
 }
 
@@ -3805,133 +4120,86 @@ pub fn build_plaza_model_options(
 }
 
 pub async fn fetch_plaza_models_for_ui(paths: &AppPaths) -> Result<ClientModelsResponse, String> {
+    fetch_plaza_models_for_ui_with_refresh(paths, false).await
+}
+
+pub async fn fetch_plaza_models_for_ui_with_refresh(
+    paths: &AppPaths,
+    force_refresh: bool,
+) -> Result<ClientModelsResponse, String> {
     let switch_state = read_switch_state(paths);
     let base_url = switch_state.normalized_base_url();
-    let client = apply_proxy_policy(
-        Client::builder().timeout(Duration::from_secs(12)),
-        switch_state.bypass_system_proxy,
-    )
-    .build()
-    .map_err(|e| format!("创建模型广场客户端失败: {e}"))?;
+    let cache = shared_catalog_cache();
 
-    let pricing_url = format!("{base_url}/api/pricing");
-    let perf_url = format!("{base_url}/api/perf-metrics/summary");
-    let (pricing_res, perf_res) = tokio::join!(
-        client.get(&pricing_url).send(),
-        client
-            .get(&perf_url)
-            .timeout(Duration::from_secs(6))
-            .send()
+    let (pricing_res, perf) = tokio::join!(
+        cache.get_or_fetch_pricing(
+            &base_url,
+            switch_state.bypass_system_proxy,
+            force_refresh,
+            !force_refresh,
+        ),
+        cache.get_or_fetch_perf(&base_url, switch_state.bypass_system_proxy, force_refresh)
     );
 
-    let resp = pricing_res.map_err(|e| format!("拉取模型广场定价失败: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body_text = resp.text().await.unwrap_or_default();
-        let snippet: String = body_text.chars().take(160).collect();
-        return Err(format!(
-            "模型广场接口返回 HTTP {}: {snippet}",
-            status.as_u16()
-        ));
-    }
-    let pricing_body: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("解析模型广场定价数据失败: {e}"))?;
-
-    let perf = match perf_res {
-        Ok(r) if r.status().is_success() => r
-            .json::<Value>()
-            .await
-            .map(|v| parse_perf_metrics_summary(&v))
-            .unwrap_or_default(),
-        _ => HashMap::new(),
-    };
-
-    Ok(build_plaza_model_options(&pricing_body, &perf))
+    let pricing_snap = pricing_res?;
+    Ok(build_plaza_model_options(&pricing_snap.raw_body, &perf))
 }
 
 pub async fn fetch_client_models_for_ui(
     paths: &AppPaths,
     app_id: AppId,
 ) -> Result<ClientModelsResponse, String> {
+    fetch_client_models_for_ui_with_refresh(paths, app_id, false).await
+}
+
+pub async fn fetch_client_models_for_ui_with_refresh(
+    paths: &AppPaths,
+    app_id: AppId,
+    force_refresh: bool,
+) -> Result<ClientModelsResponse, String> {
     if app_id == AppId::DshTako {
-        return fetch_plaza_models_for_ui(paths).await;
+        return fetch_plaza_models_for_ui_with_refresh(paths, force_refresh).await;
     }
 
     let switch_state = read_switch_state(paths);
     let base_url = switch_state.normalized_base_url();
-    let client = apply_proxy_policy(
-        Client::builder().timeout(Duration::from_secs(12)),
-        switch_state.bypass_system_proxy,
-    )
-    .build()
-    .map_err(|e| format!("创建模型请求客户端失败: {e}"))?;
+    let cache = shared_catalog_cache();
 
-    let models_req = match app_id {
+    let (is_v1beta, credential) = match app_id {
         AppId::DshTako => unreachable!(),
         AppId::Claude | AppId::Codex => {
             let api_key = read_main_api_key(paths).ok_or_else(|| {
                 "未登录 Tako 账号或缺少 API Key，无法拉取模型列表".to_string()
             })?;
-            client
-                .get(format!("{base_url}/v1/models"))
-                .bearer_auth(api_key)
+            (false, api_key)
         }
         AppId::Antigravity => {
             let agy_key = effective_agy_api_key(paths).ok_or_else(|| {
                 "未登录 Tako 账号或缺少 Antigravity 专用 Key，无法拉取模型列表".to_string()
             })?;
-            client
-                .get(format!("{base_url}/v1beta/models"))
-                .header("x-goog-api-key", agy_key)
+            (true, agy_key)
         }
     };
 
-    let pricing_url = format!("{base_url}/api/pricing");
-    let perf_url = format!("{base_url}/api/perf-metrics/summary");
-    let (models_res, pricing_res, perf_res) = tokio::join!(
-        models_req.send(),
-        client
-            .get(&pricing_url)
-            .timeout(Duration::from_secs(5))
-            .send(),
-        client
-            .get(&perf_url)
-            .timeout(Duration::from_secs(5))
-            .send()
+    let (models_res, pricing_res, perf) = tokio::join!(
+        cache.get_or_fetch_models_list(
+            is_v1beta,
+            &base_url,
+            switch_state.bypass_system_proxy,
+            &credential,
+            force_refresh,
+        ),
+        cache.get_or_fetch_pricing(
+            &base_url,
+            switch_state.bypass_system_proxy,
+            force_refresh,
+            true,
+        ),
+        cache.get_or_fetch_perf(&base_url, switch_state.bypass_system_proxy, force_refresh)
     );
 
-    let pricing = match pricing_res {
-        Ok(resp) if resp.status().is_success() => resp
-            .json::<Value>()
-            .await
-            .map(|v| parse_pricing_metadata(&v))
-            .unwrap_or_default(),
-        _ => PricingCache::default(),
-    };
-
-    let perf = match perf_res {
-        Ok(resp) if resp.status().is_success() => resp
-            .json::<Value>()
-            .await
-            .map(|v| parse_perf_metrics_summary(&v))
-            .unwrap_or_default(),
-        _ => HashMap::new(),
-    };
-
-    let resp = models_res.map_err(|e| format!("拉取上游模型列表失败: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body_text = resp.text().await.unwrap_or_default();
-        let snippet: String = body_text.chars().take(160).collect();
-        return Err(format!("上游返回 HTTP {}: {snippet}", status.as_u16()));
-    }
-
-    let json_body: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("解析上游模型列表失败: {e}"))?;
+    let pricing = pricing_res.map(|s| s.parsed).unwrap_or_default();
+    let json_body = models_res?;
 
     if app_id == AppId::Claude {
         let full = build_claude_models_catalog(&json_body, &pricing);
@@ -4437,10 +4705,12 @@ async fn handle_request(
 pub async fn serve_proxy_on_listener(listener: TcpListener, paths: AppPaths) -> Result<(), String> {
     let direct_client = Client::builder()
         .no_proxy()
+        .gzip(false)
         .connect_timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| format!("创建直连 HTTP 客户端失败: {e}"))?;
     let system_proxy_client = Client::builder()
+        .gzip(false)
         .connect_timeout(Duration::from_secs(15))
         .build()
         .unwrap_or_else(|_| direct_client.clone());
@@ -4449,7 +4719,6 @@ pub async fn serve_proxy_on_listener(listener: TcpListener, paths: AppPaths) -> 
         paths,
         direct_client,
         system_proxy_client,
-        pricing_cache: RwLock::new(None),
         synthetic_routes: RwLock::new(HashMap::new()),
         codex_model_messages: RwLock::new(None),
     });
@@ -5668,5 +5937,197 @@ mod tests {
         assert!(flux.capabilities.contains(&"image".to_string()));
         assert!(!flux.capabilities.contains(&"chat".to_string()));
         assert_eq!(flux.context_window, None);
+    }
+
+    #[tokio::test]
+    async fn shared_catalog_cache_supports_gzip_caching_stale_fallback_and_cred_isolation() {
+        use std::sync::atomic::AtomicUsize;
+
+        const GZIP_PRICING: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xab, 0x56, 0x4a, 0x49,
+            0x2c, 0x49, 0x54, 0xb2, 0x8a, 0xae, 0x56, 0xca, 0xcd, 0x4f, 0x49, 0xcd, 0x89, 0xcf,
+            0x4b, 0xcc, 0x4d, 0x55, 0xb2, 0x52, 0x4a, 0x2f, 0x28, 0xd1, 0x35, 0xd3, 0x33, 0xd2,
+            0x2d, 0xce, 0xcf, 0x51, 0xd2, 0x51, 0x2a, 0x2c, 0xcd, 0x2f, 0x49, 0x8c, 0x2f, 0xa9,
+            0x2c, 0x00, 0x4a, 0x19, 0xe8, 0x40, 0x55, 0x16, 0x25, 0x96, 0x64, 0xe6, 0x2b, 0x59,
+            0x19, 0xea, 0x01, 0x45, 0x92, 0xf3, 0x73, 0x0b, 0x72, 0x52, 0x81, 0xfc, 0x3c, 0x98,
+            0xb0, 0xb1, 0x9e, 0x41, 0x6d, 0x6c, 0x2d, 0x00, 0x6a, 0xf6, 0xf0, 0x5c, 0x5f, 0x00,
+            0x00, 0x00,
+        ];
+
+        let pricing_hits = Arc::new(AtomicUsize::new(0));
+        let empty_first_hits = Arc::new(AtomicUsize::new(0));
+        let models_hits = Arc::new(AtomicUsize::new(0));
+        let saw_gzip_header = Arc::new(AtomicBool::new(false));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let p_hits = pricing_hits.clone();
+        let e_hits = empty_first_hits.clone();
+        let m_hits = models_hits.clone();
+        let gzip_flag = saw_gzip_header.clone();
+
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let p_hits = p_hits.clone();
+                let e_hits = e_hits.clone();
+                let m_hits = m_hits.clone();
+                let gzip_flag = gzip_flag.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let p_hits = p_hits.clone();
+                        let e_hits = e_hits.clone();
+                        let m_hits = m_hits.clone();
+                        let gzip_flag = gzip_flag.clone();
+                        async move {
+                            let path = req.uri().path().to_string();
+                            if let Some(ae) = req.headers().get("accept-encoding") {
+                                if ae.to_str().unwrap_or("").contains("gzip") {
+                                    gzip_flag.store(true, Ordering::SeqCst);
+                                }
+                            }
+                            let resp = match path.as_str() {
+                                "/api/pricing" => {
+                                    let n = p_hits.fetch_add(1, Ordering::SeqCst);
+                                    if n == 0 {
+                                        Response::builder()
+                                            .status(StatusCode::OK)
+                                            .header("content-type", "application/json")
+                                            .header("content-encoding", "gzip")
+                                            .body(full_body(Bytes::from_static(GZIP_PRICING)))
+                                            .unwrap()
+                                    } else {
+                                        Response::builder()
+                                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                                            .body(full_body("upstream down"))
+                                            .unwrap()
+                                    }
+                                }
+                                "/empty-first/api/pricing" => {
+                                    let n = e_hits.fetch_add(1, Ordering::SeqCst);
+                                    if n == 0 {
+                                        Response::builder()
+                                            .status(StatusCode::OK)
+                                            .header("content-type", "application/json")
+                                            .body(full_body(r#"{"data":[]}"#))
+                                            .unwrap()
+                                    } else {
+                                        Response::builder()
+                                            .status(StatusCode::OK)
+                                            .header("content-type", "application/json")
+                                            .header("content-encoding", "gzip")
+                                            .body(full_body(Bytes::from_static(GZIP_PRICING)))
+                                            .unwrap()
+                                    }
+                                }
+                                "/v1/models" => {
+                                    let n = m_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                                    let auth = req
+                                        .headers()
+                                        .get("authorization")
+                                        .and_then(|v| v.to_str().ok())
+                                        .unwrap_or("");
+                                    let body = json!({
+                                        "data": [{"id": "gpt-6.2-sol"}],
+                                        "hit": n,
+                                        "auth": auth
+                                    });
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header("content-type", "application/json")
+                                        .body(full_body(serde_json::to_vec(&body).unwrap()))
+                                        .unwrap()
+                                }
+                                _ => Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(full_body("not found"))
+                                    .unwrap(),
+                            };
+                            Ok::<_, Infallible>(resp)
+                        }
+                    });
+                    let _ = http1::Builder::new().serve_connection(io, svc).await;
+                });
+            }
+        });
+
+        let base = format!("http://{addr}");
+        let cache = SharedCatalogCache::new();
+
+        // 1. First fetch decodes gzip response and populates cache.
+        let snap1 = cache
+            .get_or_fetch_pricing(&base, true, false, true)
+            .await
+            .unwrap();
+        assert!(saw_gzip_header.load(Ordering::SeqCst));
+        assert_eq!(pricing_hits.load(Ordering::SeqCst), 1);
+        let p1 = snap1.parsed.prices.get("gpt-6.2-sol").unwrap();
+        assert!((p1.input_usd_per_m.unwrap() - 2.0).abs() < 1e-6);
+        assert!((p1.output_usd_per_m.unwrap() - 6.0).abs() < 1e-6);
+
+        // 2. Second fetch hits warm cache without calling server again.
+        let snap2 = cache
+            .get_or_fetch_pricing(&base, true, false, true)
+            .await
+            .unwrap();
+        assert_eq!(pricing_hits.load(Ordering::SeqCst), 1);
+        assert!(snap2.parsed.prices.contains_key("gpt-6.2-sol"));
+
+        // 3. Forced refresh that fails falls back to stale pricing when allowed.
+        let snap3 = cache
+            .get_or_fetch_pricing(&base, true, true, true)
+            .await
+            .unwrap();
+        assert_eq!(pricing_hits.load(Ordering::SeqCst), 2);
+        assert!(snap3.parsed.prices.contains_key("gpt-6.2-sol"));
+
+        // 4. Forced refresh without stale fallback surfaces upstream HTTP error.
+        let err = cache
+            .get_or_fetch_pricing(&base, true, true, false)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("HTTP 503"));
+
+        // 5. /v1/models is cached per credential and invalidated when key changes.
+        let m1 = cache
+            .get_or_fetch_models_list(false, &base, true, "sk-key-a", false)
+            .await
+            .unwrap();
+        let m2 = cache
+            .get_or_fetch_models_list(false, &base, true, "sk-key-a", false)
+            .await
+            .unwrap();
+        assert_eq!(models_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(m1["hit"], json!(1));
+        assert_eq!(m2["hit"], json!(1));
+
+        let m3 = cache
+            .get_or_fetch_models_list(false, &base, true, "sk-key-b", false)
+            .await
+            .unwrap();
+        assert_eq!(models_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(m3["auth"], json!("Bearer sk-key-b"));
+
+        // 6. Empty pricing response is never cached as fresh, so next call recovers.
+        let empty_cache = SharedCatalogCache::new();
+        let empty_base = format!("{base}/empty-first");
+        let first = empty_cache
+            .get_or_fetch_pricing(&empty_base, true, false, true)
+            .await
+            .unwrap();
+        assert!(first.parsed.prices.is_empty());
+        let recovered = empty_cache
+            .get_or_fetch_pricing(&empty_base, true, false, true)
+            .await
+            .unwrap();
+        assert_eq!(empty_first_hits.load(Ordering::SeqCst), 2);
+        assert!(recovered.parsed.prices.contains_key("gpt-6.2-sol"));
+
+        server_task.abort();
     }
 }

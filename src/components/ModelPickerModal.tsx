@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   Brain,
@@ -257,6 +257,300 @@ function buildCardTitle(
   return parts.join("\n");
 }
 
+interface ModelCardProps {
+  model: ClientModelOption;
+  isPlazaOverview: boolean;
+  checked: boolean;
+  lockedLast: boolean;
+  isRecommended: boolean;
+  copied: boolean;
+  saving: boolean;
+  currency: PlazaCurrency;
+  tokenUnit: TokenUnit;
+  priceMode: PlazaPriceMode;
+  onSelect: (modelId: string) => void;
+}
+
+const ModelCard = memo(function ModelCard({
+  model,
+  isPlazaOverview,
+  checked,
+  lockedLast,
+  isRecommended,
+  copied,
+  saving,
+  currency,
+  tokenUnit,
+  priceMode,
+  onSelect,
+}: ModelCardProps) {
+  const ctxLabel = formatContextWindow(model.contextWindow);
+  const speedBadge = getSpeedBadge(model);
+  const discountBadge = formatOfficialDiscountBadge(model.officialMultiplier);
+  const promoBadge = formatPromoBadge(model.promoEndsOn);
+  const isPerRequest =
+    model.quotaType === 1 || (model.requestUsd != null && model.inputUsdPerM == null);
+
+  const inPrice = formatPlazaMoney(model.inputUsdPerM, { currency, tokenUnit });
+  const cachePrice = formatPlazaMoney(model.cacheUsdPerM, { currency, tokenUnit });
+  const outPrice = formatPlazaMoney(model.outputUsdPerM, { currency, tokenUnit });
+  const inOrigPromo =
+    model.promoEndsOn && model.inputUsdPerM != null
+      ? formatPlazaMoney(model.inputUsdPerM * 2, { currency, tokenUnit })
+      : null;
+  const outOrigPromo =
+    model.promoEndsOn && model.outputUsdPerM != null
+      ? formatPlazaMoney(model.outputUsdPerM * 2, { currency, tokenUnit })
+      : null;
+
+  const primaryAvg = getPrimaryAggregatedPrice(model);
+  const avgMainText = primaryAvg
+    ? formatPlazaMoney(primaryAvg.usd, { currency, tokenUnit })
+    : null;
+  const stdCompareText =
+    model.standardLoadUsdPerM != null && model.standardLoadUsdPerM > 0
+      ? formatPlazaMoney(model.standardLoadUsdPerM, { currency, tokenUnit })
+      : null;
+  const reqPriceText = formatPlazaMoney(model.requestUsd, {
+    currency,
+    tokenUnit,
+    perToken: false,
+  });
+
+  const titleText = useMemo(
+    () => buildCardTitle(model, currency, tokenUnit, lockedLast),
+    [currency, lockedLast, model, tokenUnit],
+  );
+
+  return (
+    <button
+      type="button"
+      disabled={saving}
+      onClick={() => onSelect(model.id)}
+      title={titleText}
+      className={`group text-left tako-mcp-cell rounded-[11px] border transition flex flex-col gap-1.5 min-w-0 cursor-pointer ${
+        !isPlazaOverview && checked
+          ? "border-[var(--accent-border)] bg-[var(--accent-soft)]/35 hover:bg-[var(--accent-soft)]/55"
+          : "border-[var(--border)] bg-[var(--bg-card)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)]/40"
+      }`}
+    >
+      {/* Row 1: Icon + Name + Check/Copy */}
+      <div className="flex items-start justify-between gap-2 min-w-0">
+        <div className="flex items-center gap-2 min-w-0 flex-1">
+          <ModelFamilyIcon family={model.family} size="sm" />
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <span className="text-[12.5px] font-semibold text-[var(--text-primary)] truncate">
+                {model.displayName}
+              </span>
+              {isRecommended && (
+                <Star className="h-3 w-3 text-[var(--warning)] fill-current shrink-0" />
+              )}
+            </div>
+            <div className="text-[10.5px] font-mono text-[var(--text-muted)] truncate">
+              {model.id}
+            </div>
+          </div>
+        </div>
+
+        {isPlazaOverview ? (
+          <span
+            className="h-5 px-1.5 rounded bg-[var(--bg-subtle)] text-[var(--text-muted)] group-hover:text-[var(--text-primary)] inline-flex items-center gap-1 text-[10px] shrink-0"
+            title="点击复制模型 ID"
+          >
+            {copied ? (
+              <>
+                <Check className="h-2.5 w-2.5 text-[var(--success)]" />
+                <span className="text-[var(--success)]">已复制</span>
+              </>
+            ) : (
+              <>
+                <Copy className="h-2.5 w-2.5" />
+                <span>复制</span>
+              </>
+            )}
+          </span>
+        ) : (
+          <span
+            className={`h-4 w-4 rounded-[5px] flex items-center justify-center shrink-0 transition ${
+              checked
+                ? "bg-[var(--accent)] text-white"
+                : "border border-[var(--border-strong)] bg-[var(--bg-card)]"
+            }`}
+          >
+            {lockedLast ? (
+              <Lock className="h-2.5 w-2.5" />
+            ) : checked ? (
+              <Check className="h-3 w-3 stroke-[2.5]" />
+            ) : null}
+          </span>
+        )}
+      </div>
+
+      {/* Row 2: Promo & Official Multiplier Badges */}
+      {(promoBadge || discountBadge || model.isDynamicPricing) && (
+        <div className="flex flex-wrap items-center gap-1">
+          {promoBadge && (
+            <span
+              className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-semibold"
+              style={{
+                backgroundColor: "var(--warning-soft)",
+                color: "var(--warning)",
+              }}
+            >
+              <Flame className="h-2.5 w-2.5 shrink-0" />
+              <span>{promoBadge.replace(/^🔥\s*/, "")}</span>
+            </span>
+          )}
+          {discountBadge && (
+            <span
+              className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium tabular-nums"
+              style={
+                (model.officialMultiplier ?? 1) <= 1.005
+                  ? {
+                      backgroundColor: "var(--success-soft)",
+                      color: "var(--success)",
+                    }
+                  : {
+                      backgroundColor: "var(--bg-subtle)",
+                      color: "var(--text-secondary)",
+                    }
+              }
+            >
+              {discountBadge}
+            </span>
+          )}
+          {model.isDynamicPricing && (
+            <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] text-[var(--text-secondary)] text-[10px]">
+              阶梯计费
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Row 3: PR #296 Pricing Block (Detail vs Avg) */}
+      <div className="rounded-[8px] bg-[var(--bg-canvas)]/75 border border-[var(--border)] px-2 py-1.5 text-[11px]">
+        {model.isFree ? (
+          <div className="flex items-center justify-between">
+            <span className="text-[var(--text-muted)]">平台计费</span>
+            <span
+              className="font-semibold px-1.5 py-0.5 rounded text-[10.5px]"
+              style={{
+                backgroundColor: "var(--success-soft)",
+                color: "var(--success)",
+              }}
+            >
+              免费可用
+            </span>
+          </div>
+        ) : isPerRequest && reqPriceText ? (
+          <div className="flex items-center justify-between tabular-nums">
+            <span className="text-[var(--text-muted)]">按次计费</span>
+            <span className="font-semibold text-[var(--text-primary)]">
+              {reqPriceText} <span className="text-[10px] font-normal text-[var(--text-muted)]">/ 次</span>
+            </span>
+          </div>
+        ) : priceMode === "detail" ? (
+          <div className="grid grid-cols-3 gap-1.5 tabular-nums">
+            <div className="min-w-0">
+              <div className="text-[10px] text-[var(--text-muted)]">输入/{tokenUnit}</div>
+              <div className="font-semibold text-[var(--text-primary)] truncate">
+                {inPrice ?? "—"}
+                {inOrigPromo && (
+                  <span className="ml-1 text-[10px] font-normal line-through text-[var(--text-muted)]">
+                    {inOrigPromo}
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="min-w-0">
+              <div className="text-[10px] text-[var(--text-muted)]">缓存读/{tokenUnit}</div>
+              <div className="font-semibold text-[var(--success)] truncate">
+                {cachePrice ?? "—"}
+              </div>
+            </div>
+            <div className="min-w-0">
+              <div className="text-[10px] text-[var(--text-muted)]">输出/{tokenUnit}</div>
+              <div className="font-semibold text-[var(--text-primary)] truncate">
+                {outPrice ?? "—"}
+                {outOrigPromo && (
+                  <span className="ml-1 text-[10px] font-normal line-through text-[var(--text-muted)]">
+                    {outOrigPromo}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-0.5 tabular-nums">
+            <div className="flex items-center justify-between gap-1">
+              <span className="text-[10.5px] text-[var(--text-muted)]">
+                {primaryAvg?.source === "realized"
+                  ? "7日实付均价"
+                  : primaryAvg?.source === "standard"
+                    ? "标准负载均价"
+                    : "输入基准价"}
+              </span>
+              <span className="text-[12px] font-semibold text-[var(--accent)]">
+                {avgMainText ? `${avgMainText}/${tokenUnit}` : "—"}
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-1 text-[10px] text-[var(--text-muted)]">
+              <span className="truncate">
+                标准负载 {stdCompareText ? `${stdCompareText}/${tokenUnit}` : "—"}
+              </span>
+              <span>
+                {model.cacheHitRate != null
+                  ? `缓存命中 ${(model.cacheHitRate * 100).toFixed(0)}%`
+                  : "无近期缓存统计"}
+              </span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Row 4: Description & Meta Pills */}
+      <div className="flex items-center justify-between gap-1.5 text-[10.5px] text-[var(--text-secondary)] min-w-0 mt-auto">
+        <span className="truncate flex-1">{model.description}</span>
+        <div className="flex items-center gap-1 shrink-0">
+          {speedBadge && (
+            <span
+              className="px-1.5 py-0.5 rounded text-[10px] font-medium tabular-nums"
+              style={speedBadge.style}
+            >
+              {speedBadge.label}
+            </span>
+          )}
+          {ctxLabel && (
+            <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] text-[var(--text-muted)] text-[10px] tabular-nums">
+              <Layers className="h-2.5 w-2.5" />
+              <span>{ctxLabel}</span>
+            </span>
+          )}
+          {model.effortLevels.length > 0 && (
+            <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] text-[var(--text-muted)] text-[10px] tabular-nums">
+              <Brain className="h-2.5 w-2.5" />
+              <span>{model.effortLevels.length}档</span>
+            </span>
+          )}
+          {!ctxLabel &&
+            model.capabilities
+              .filter((c) => c !== "chat")
+              .slice(0, 2)
+              .map((cap) => (
+                <span
+                  key={cap}
+                  className="px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] text-[var(--text-muted)] text-[10px]"
+                >
+                  {CAPABILITY_LABELS[cap] ?? cap}
+                </span>
+              ))}
+        </div>
+      </div>
+    </button>
+  );
+});
+
 export function ModelPickerModal({
   appId,
   appName,
@@ -275,6 +569,7 @@ export function ModelPickerModal({
   const [mode, setMode] = useState<ModelFilterMode>("recommended");
   const [customIds, setCustomIds] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState("");
+  const deferredSearch = useDeferredValue(search);
   const [activeCategory, setActiveCategory] = useState<CategoryFilter>("__all__");
   const [quickFilter, setQuickFilter] = useState<PlazaQuickFilterId>("all");
   const [capabilityFilter, setCapabilityFilter] = useState<ModelCapability | null>(null);
@@ -284,6 +579,11 @@ export function ModelPickerModal({
   const [currency, setCurrency] = useState<PlazaCurrency>(() => readStoredPlazaCurrency());
   const [tokenUnit, setTokenUnit] = useState<TokenUnit>(() => readStoredTokenUnit());
   const [priceMode, setPriceMode] = useState<PlazaPriceMode>(() => readStoredPlazaPriceMode());
+
+  const cacheRef = useRef<Partial<Record<AppId, ClientModelsResponse>>>({});
+  const inflightRef = useRef<Partial<Record<AppId, Promise<ClientModelsResponse>>>>({});
+  const reqSeqRef = useRef(0);
+  const prefetchStartedRef = useRef(false);
 
   useEffect(() => {
     if (appId) {
@@ -315,32 +615,115 @@ export function ModelPickerModal({
     writeStoredPlazaPriceMode(next);
   };
 
-  const loadModels = useCallback(async (targetView: AppId) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const resp =
-        targetView === "dsh-tako"
-          ? await api.listPlazaModels()
-          : await api.listClientModels(targetView);
-      setData(resp);
-      setMode(resp.filter.mode);
-      if (resp.filter.mode === "custom" && resp.filter.enabledIds.length > 0) {
-        setCustomIds(new Set(resp.filter.enabledIds.map((s) => s.toLowerCase())));
-      } else {
-        const defaults = resp.models.filter((m) => m.visible).map((m) => m.id.toLowerCase());
-        setCustomIds(new Set(defaults));
-      }
-    } catch (err) {
-      setData(null);
-      setError(String(err));
-    } finally {
-      setLoading(false);
+  const applyResponse = useCallback((resp: ClientModelsResponse) => {
+    setData(resp);
+    setMode(resp.filter.mode);
+    if (resp.filter.mode === "custom" && resp.filter.enabledIds.length > 0) {
+      setCustomIds(new Set(resp.filter.enabledIds.map((s) => s.toLowerCase())));
+    } else {
+      const defaults = resp.models.filter((m) => m.visible).map((m) => m.id.toLowerCase());
+      setCustomIds(new Set(defaults));
     }
   }, []);
 
+  const fetchView = useCallback(
+    (view: AppId, forceRefresh: boolean): Promise<ClientModelsResponse> => {
+      if (!forceRefresh) {
+        const pending = inflightRef.current[view];
+        if (pending) return pending;
+      }
+      const req =
+        view === "dsh-tako"
+          ? api.listPlazaModels(forceRefresh)
+          : api.listClientModels(view, forceRefresh);
+      inflightRef.current[view] = req;
+      return req.finally(() => {
+        if (inflightRef.current[view] === req) {
+          delete inflightRef.current[view];
+        }
+      });
+    },
+    [],
+  );
+
+  const prefetchOtherViews = useCallback(
+    (currentView: AppId) => {
+      if (prefetchStartedRef.current) return;
+      prefetchStartedRef.current = true;
+      const targets: AppId[] = loggedIn
+        ? (["dsh-tako", "codex", "claude", "antigravity"] as AppId[]).filter(
+            (v) => v !== currentView && !cacheRef.current[v],
+          )
+        : currentView !== "dsh-tako" && !cacheRef.current["dsh-tako"]
+          ? ["dsh-tako"]
+          : [];
+      for (const view of targets) {
+        void fetchView(view, false)
+          .then((resp) => {
+            if (!cacheRef.current[view]) {
+              cacheRef.current[view] = resp;
+            }
+          })
+          .catch(() => {
+            // Silent best-effort warm-up; errors only surface if the user opens that tab.
+          });
+      }
+    },
+    [fetchView, loggedIn],
+  );
+
+  const loadModels = useCallback(
+    async (targetView: AppId, forceRefresh = false) => {
+      const seq = ++reqSeqRef.current;
+      if (forceRefresh) {
+        cacheRef.current = {};
+        prefetchStartedRef.current = false;
+      } else {
+        const cached = cacheRef.current[targetView];
+        if (cached) {
+          setError(null);
+          setLoading(false);
+          applyResponse(cached);
+          if (appId === "dsh-tako") {
+            prefetchOtherViews(targetView);
+          }
+          return;
+        }
+        setData(null);
+      }
+
+      setLoading(true);
+      setError(null);
+      try {
+        const resp = await fetchView(targetView, forceRefresh);
+        cacheRef.current[targetView] = resp;
+        if (seq !== reqSeqRef.current) return;
+        applyResponse(resp);
+        if (appId === "dsh-tako") {
+          prefetchOtherViews(targetView);
+        }
+      } catch (err) {
+        if (seq !== reqSeqRef.current) return;
+        if (!forceRefresh) {
+          setData(null);
+        }
+        setError(String(err));
+      } finally {
+        if (seq === reqSeqRef.current) {
+          setLoading(false);
+        }
+      }
+    },
+    [appId, applyResponse, fetchView, prefetchOtherViews],
+  );
+
   useEffect(() => {
     if (!appId) {
+      reqSeqRef.current += 1;
+      cacheRef.current = {};
+      inflightRef.current = {};
+      prefetchStartedRef.current = false;
+      setLoading(false);
       setData(null);
       setError(null);
       setSearch("");
@@ -354,6 +737,7 @@ export function ModelPickerModal({
 
   useEffect(() => {
     if (!appId) return;
+    if (appId !== "dsh-tako" && activeView !== appId) return;
     setActiveCategory("__all__");
     void loadModels(activeView);
   }, [appId, activeView, loadModels]);
@@ -430,7 +814,7 @@ export function ModelPickerModal({
 
   const filteredModels = useMemo(() => {
     if (!data) return [];
-    const q = search.trim().toLowerCase();
+    const q = deferredSearch.trim().toLowerCase();
     const matched = data.models.filter((m) => {
       if (!matchesPlazaQuickFilter(m, quickFilter)) {
         return false;
@@ -479,7 +863,16 @@ export function ModelPickerModal({
       });
     }
     return indexed.map((entry) => entry.item);
-  }, [activeCategory, capabilityFilter, checkedIds, data, priceMode, quickFilter, search, sortBy]);
+  }, [
+    activeCategory,
+    capabilityFilter,
+    checkedIds,
+    data,
+    deferredSearch,
+    priceMode,
+    quickFilter,
+    sortBy,
+  ]);
 
   const handleSelectMode = (nextMode: ModelFilterMode) => {
     if (!data || isPlazaOverview) return;
@@ -489,8 +882,27 @@ export function ModelPickerModal({
     setMode(nextMode);
   };
 
-  const handleCardClick = (modelId: string) => {
-    if (isPlazaOverview) {
+  const selectionStateRef = useRef({
+    isPlazaOverview,
+    mode,
+    customIds,
+    checkedIds,
+  });
+  selectionStateRef.current = {
+    isPlazaOverview,
+    mode,
+    customIds,
+    checkedIds,
+  };
+
+  const handleCardClick = useCallback((modelId: string) => {
+    const {
+      isPlazaOverview: plaza,
+      mode: curMode,
+      customIds: curCustom,
+      checkedIds: curChecked,
+    } = selectionStateRef.current;
+    if (plaza) {
       try {
         void navigator.clipboard?.writeText(modelId);
         setCopiedId(modelId);
@@ -503,7 +915,7 @@ export function ModelPickerModal({
       return;
     }
     const key = modelId.toLowerCase();
-    const baseSet = mode === "custom" ? new Set(customIds) : new Set(checkedIds);
+    const baseSet = curMode === "custom" ? new Set(curCustom) : new Set(curChecked);
     if (baseSet.has(key)) {
       if (baseSet.size <= 1) return;
       baseSet.delete(key);
@@ -512,7 +924,7 @@ export function ModelPickerModal({
     }
     setMode("custom");
     setCustomIds(baseSet);
-  };
+  }, []);
 
   const visibleUnselectedCount = useMemo(() => {
     if (isPlazaOverview) return 0;
@@ -567,6 +979,7 @@ export function ModelPickerModal({
         enabledIds: orderedIds,
       };
       const nextState = await api.saveClientModelFilter(activeView, payload);
+      delete cacheRef.current[activeView];
       let restarted = false;
       if (restartNow) {
         await api.restartApp(activeView);
@@ -683,7 +1096,7 @@ export function ModelPickerModal({
             <button
               type="button"
               disabled={loading || saving}
-              onClick={() => void loadModels(activeView)}
+              onClick={() => void loadModels(activeView, true)}
               title="重新同步网关最新模型与实付价格"
               className="h-7 w-7 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] flex items-center justify-center transition cursor-pointer disabled:opacity-50"
             >
@@ -1078,276 +1491,21 @@ export function ModelPickerModal({
                     const checked = checkedIds.has(key);
                     const lockedLast = !isPlazaOverview && checked && checkedIds.size <= 1;
                     const isRecommended = recommendedSet.has(key) || model.recommended;
-                    const ctxLabel = formatContextWindow(model.contextWindow);
-                    const speedBadge = getSpeedBadge(model);
-                    const discountBadge = formatOfficialDiscountBadge(model.officialMultiplier);
-                    const promoBadge = formatPromoBadge(model.promoEndsOn);
-                    const isPerRequest =
-                      model.quotaType === 1 ||
-                      (model.requestUsd != null && model.inputUsdPerM == null);
-
-                    const inPrice = formatPlazaMoney(model.inputUsdPerM, { currency, tokenUnit });
-                    const cachePrice = formatPlazaMoney(model.cacheUsdPerM, {
-                      currency,
-                      tokenUnit,
-                    });
-                    const outPrice = formatPlazaMoney(model.outputUsdPerM, { currency, tokenUnit });
-                    const inOrigPromo =
-                      model.promoEndsOn && model.inputUsdPerM != null
-                        ? formatPlazaMoney(model.inputUsdPerM * 2, { currency, tokenUnit })
-                        : null;
-                    const outOrigPromo =
-                      model.promoEndsOn && model.outputUsdPerM != null
-                        ? formatPlazaMoney(model.outputUsdPerM * 2, { currency, tokenUnit })
-                        : null;
-
-                    const primaryAvg = getPrimaryAggregatedPrice(model);
-                    const avgMainText = primaryAvg
-                      ? formatPlazaMoney(primaryAvg.usd, { currency, tokenUnit })
-                      : null;
-                    const stdCompareText =
-                      model.standardLoadUsdPerM != null && model.standardLoadUsdPerM > 0
-                        ? formatPlazaMoney(model.standardLoadUsdPerM, { currency, tokenUnit })
-                        : null;
-                    const reqPriceText = formatPlazaMoney(model.requestUsd, {
-                      currency,
-                      tokenUnit,
-                      perToken: false,
-                    });
-
                     return (
-                      <button
+                      <ModelCard
                         key={model.id}
-                        type="button"
-                        disabled={saving}
-                        onClick={() => handleCardClick(model.id)}
-                        title={buildCardTitle(model, currency, tokenUnit, lockedLast)}
-                        className={`group text-left tako-mcp-cell rounded-[11px] border transition flex flex-col gap-1.5 min-w-0 cursor-pointer ${
-                          !isPlazaOverview && checked
-                            ? "border-[var(--accent-border)] bg-[var(--accent-soft)]/35 hover:bg-[var(--accent-soft)]/55"
-                            : "border-[var(--border)] bg-[var(--bg-card)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)]/40"
-                        }`}
-                      >
-                        {/* Row 1: Icon + Name + Check/Copy */}
-                        <div className="flex items-start justify-between gap-2 min-w-0">
-                          <div className="flex items-center gap-2 min-w-0 flex-1">
-                            <ModelFamilyIcon family={model.family} size="sm" />
-                            <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-1.5 min-w-0">
-                                <span className="text-[12.5px] font-semibold text-[var(--text-primary)] truncate">
-                                  {model.displayName}
-                                </span>
-                                {isRecommended && (
-                                  <Star className="h-3 w-3 text-[var(--warning)] fill-current shrink-0" />
-                                )}
-                              </div>
-                              <div className="text-[10.5px] font-mono text-[var(--text-muted)] truncate">
-                                {model.id}
-                              </div>
-                            </div>
-                          </div>
-
-                          {isPlazaOverview ? (
-                            <span
-                              className="h-5 px-1.5 rounded bg-[var(--bg-subtle)] text-[var(--text-muted)] group-hover:text-[var(--text-primary)] inline-flex items-center gap-1 text-[10px] shrink-0"
-                              title="点击复制模型 ID"
-                            >
-                              {copiedId === model.id ? (
-                                <>
-                                  <Check className="h-2.5 w-2.5 text-[var(--success)]" />
-                                  <span className="text-[var(--success)]">已复制</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Copy className="h-2.5 w-2.5" />
-                                  <span>复制</span>
-                                </>
-                              )}
-                            </span>
-                          ) : (
-                            <span
-                              className={`h-4 w-4 rounded-[5px] flex items-center justify-center shrink-0 transition ${
-                                checked
-                                  ? "bg-[var(--accent)] text-white"
-                                  : "border border-[var(--border-strong)] bg-[var(--bg-card)]"
-                              }`}
-                            >
-                              {lockedLast ? (
-                                <Lock className="h-2.5 w-2.5" />
-                              ) : checked ? (
-                                <Check className="h-3 w-3 stroke-[2.5]" />
-                              ) : null}
-                            </span>
-                          )}
-                        </div>
-
-                        {/* Row 2: Promo & Official Multiplier Badges */}
-                        {(promoBadge || discountBadge || model.isDynamicPricing) && (
-                          <div className="flex flex-wrap items-center gap-1">
-                            {promoBadge && (
-                              <span
-                                className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] font-semibold"
-                                style={{
-                                  backgroundColor: "var(--warning-soft)",
-                                  color: "var(--warning)",
-                                }}
-                              >
-                                <Flame className="h-2.5 w-2.5 shrink-0" />
-                                <span>{promoBadge.replace(/^🔥\s*/, "")}</span>
-                              </span>
-                            )}
-                            {discountBadge && (
-                              <span
-                                className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium tabular-nums"
-                                style={
-                                  (model.officialMultiplier ?? 1) <= 1.005
-                                    ? {
-                                        backgroundColor: "var(--success-soft)",
-                                        color: "var(--success)",
-                                      }
-                                    : {
-                                        backgroundColor: "var(--bg-subtle)",
-                                        color: "var(--text-secondary)",
-                                      }
-                                }
-                              >
-                                {discountBadge}
-                              </span>
-                            )}
-                            {model.isDynamicPricing && (
-                              <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] text-[var(--text-secondary)] text-[10px]">
-                                阶梯计费
-                              </span>
-                            )}
-                          </div>
-                        )}
-
-                        {/* Row 3: PR #296 Pricing Block (Detail vs Avg) */}
-                        <div className="rounded-[8px] bg-[var(--bg-canvas)]/75 border border-[var(--border)] px-2 py-1.5 text-[11px]">
-                          {model.isFree ? (
-                            <div className="flex items-center justify-between">
-                              <span className="text-[var(--text-muted)]">平台计费</span>
-                              <span
-                                className="font-semibold px-1.5 py-0.5 rounded text-[10.5px]"
-                                style={{
-                                  backgroundColor: "var(--success-soft)",
-                                  color: "var(--success)",
-                                }}
-                              >
-                                免费可用
-                              </span>
-                            </div>
-                          ) : isPerRequest && reqPriceText ? (
-                            <div className="flex items-center justify-between tabular-nums">
-                              <span className="text-[var(--text-muted)]">按次计费</span>
-                              <span className="font-semibold text-[var(--text-primary)]">
-                                {reqPriceText} <span className="text-[10px] font-normal text-[var(--text-muted)]">/ 次</span>
-                              </span>
-                            </div>
-                          ) : priceMode === "detail" ? (
-                            <div className="grid grid-cols-3 gap-1.5 tabular-nums">
-                              <div className="min-w-0">
-                                <div className="text-[10px] text-[var(--text-muted)]">
-                                  输入/{tokenUnit}
-                                </div>
-                                <div className="font-semibold text-[var(--text-primary)] truncate">
-                                  {inPrice ?? "—"}
-                                  {inOrigPromo && (
-                                    <span className="ml-1 text-[10px] font-normal line-through text-[var(--text-muted)]">
-                                      {inOrigPromo}
-                                    </span>
-                                  )}
-                                </div>
-                              </div>
-                              <div className="min-w-0">
-                                <div className="text-[10px] text-[var(--text-muted)]">
-                                  缓存读/{tokenUnit}
-                                </div>
-                                <div className="font-semibold text-[var(--success)] truncate">
-                                  {cachePrice ?? "—"}
-                                </div>
-                              </div>
-                              <div className="min-w-0">
-                                <div className="text-[10px] text-[var(--text-muted)]">
-                                  输出/{tokenUnit}
-                                </div>
-                                <div className="font-semibold text-[var(--text-primary)] truncate">
-                                  {outPrice ?? "—"}
-                                  {outOrigPromo && (
-                                    <span className="ml-1 text-[10px] font-normal line-through text-[var(--text-muted)]">
-                                      {outOrigPromo}
-                                    </span>
-                                  )}
-                                </div>
-                              </div>
-                            </div>
-                          ) : (
-                            <div className="flex flex-col gap-0.5 tabular-nums">
-                              <div className="flex items-center justify-between gap-1">
-                                <span className="text-[10.5px] text-[var(--text-muted)]">
-                                  {primaryAvg?.source === "realized"
-                                    ? "7日实付均价"
-                                    : primaryAvg?.source === "standard"
-                                      ? "标准负载均价"
-                                      : "输入基准价"}
-                                </span>
-                                <span className="text-[12px] font-semibold text-[var(--accent)]">
-                                  {avgMainText ? `${avgMainText}/${tokenUnit}` : "—"}
-                                </span>
-                              </div>
-                              <div className="flex items-center justify-between gap-1 text-[10px] text-[var(--text-muted)]">
-                                <span className="truncate">
-                                  标准负载 {stdCompareText ? `${stdCompareText}/${tokenUnit}` : "—"}
-                                </span>
-                                <span>
-                                  {model.cacheHitRate != null
-                                    ? `缓存命中 ${(model.cacheHitRate * 100).toFixed(0)}%`
-                                    : "无近期缓存统计"}
-                                </span>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-
-                        {/* Row 4: Description & Meta Pills */}
-                        <div className="flex items-center justify-between gap-1.5 text-[10.5px] text-[var(--text-secondary)] min-w-0 mt-auto">
-                          <span className="truncate flex-1">{model.description}</span>
-                          <div className="flex items-center gap-1 shrink-0">
-                            {speedBadge && (
-                              <span
-                                className="px-1.5 py-0.5 rounded text-[10px] font-medium tabular-nums"
-                                style={speedBadge.style}
-                              >
-                                {speedBadge.label}
-                              </span>
-                            )}
-                            {ctxLabel && (
-                              <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] text-[var(--text-muted)] text-[10px] tabular-nums">
-                                <Layers className="h-2.5 w-2.5" />
-                                <span>{ctxLabel}</span>
-                              </span>
-                            )}
-                            {model.effortLevels.length > 0 && (
-                              <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] text-[var(--text-muted)] text-[10px] tabular-nums">
-                                <Brain className="h-2.5 w-2.5" />
-                                <span>{model.effortLevels.length}档</span>
-                              </span>
-                            )}
-                            {!ctxLabel &&
-                              model.capabilities
-                                .filter((c) => c !== "chat")
-                                .slice(0, 2)
-                                .map((cap) => (
-                                  <span
-                                    key={cap}
-                                    className="px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] text-[var(--text-muted)] text-[10px]"
-                                  >
-                                    {CAPABILITY_LABELS[cap] ?? cap}
-                                  </span>
-                                ))}
-                          </div>
-                        </div>
-                      </button>
+                        model={model}
+                        isPlazaOverview={isPlazaOverview}
+                        checked={checked}
+                        lockedLast={lockedLast}
+                        isRecommended={isRecommended}
+                        copied={copiedId === model.id}
+                        saving={saving}
+                        currency={currency}
+                        tokenUnit={tokenUnit}
+                        priceMode={priceMode}
+                        onSelect={handleCardClick}
+                      />
                     );
                   })}
                 </div>

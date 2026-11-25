@@ -522,9 +522,10 @@ export const api = {
   closeApp: (appId: AppId) => invoke<AppSnapshot>("close_app", { appId }),
   launchApp: (appId: AppId) => invoke<AppSnapshot>("launch_app", { appId }),
   diagnoseApp: (appId: AppId) => invoke<DiagnosticResult>("diagnose_app", { appId }),
-  listClientModels: (appId: AppId) =>
-    invoke<ClientModelsResponse>("list_client_models", { appId }),
-  listPlazaModels: () => invoke<ClientModelsResponse>("list_plaza_models"),
+  listClientModels: (appId: AppId, forceRefresh = false) =>
+    invoke<ClientModelsResponse>("list_client_models", { appId, forceRefresh }),
+  listPlazaModels: (forceRefresh = false) =>
+    invoke<ClientModelsResponse>("list_plaza_models", { forceRefresh }),
   saveClientModelFilter: (appId: AppId, filter: ClientModelFilter) =>
     invoke<SwitchState>("save_client_model_filter", { appId, filter }),
   checkAppUpdates: () => invoke<ManifestCheckResult>("check_app_updates"),
