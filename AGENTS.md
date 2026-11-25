@@ -28,6 +28,9 @@
 | `src/App.tsx` | 主界面：无界融合顶栏、双密度（紧凑/舒适）与原生窗口主题联动、账号登录/登出、一键三端汉化开关、模型广场直达入口、四大客户端卡片与更新检查 |
 | `src/components/TopHeaderBar.tsx` / `WindowChrome.tsx` | 融合自定义标题栏、Windows 原生规范控制键（最小化/最大化还原/关闭）、8 方向无死角边缘缩放热区与右键系统窗口菜单 |
 | `src/components/McpInlineTheater.tsx` | 主界面下方 5 合 1 超级 MCP 内联实景剧场（「效果演示」零扣费媒体交互 + 「现场试跑」Live Playground） |
+| `src/components/ExtensionsHubPanel.tsx` / `extensions/` | 通用扩展中心四页签、共享搜索与抽屉、通用 MCP 矩阵、提示词预设双栏编辑器 |
+| `src-tauri/src/extensions/` | 基于 `AppPaths` 的路径与原子存储、第三方 MCP 收编和三端同步、提示词历史归档与汉化块保护 |
+| `src-tauri/tests/ext_hub_phase1_blackbox.rs` / `scripts/test_ext_hub_phase1_ui.mjs` | 临时目录黑盒测试与模拟 IPC 浏览器验收，覆盖双尺寸、深浅色和双密度 |
 | `src/components/ModelPickerModal.tsx` | 模型广场总览与分客户端模型选择弹窗：人民币/内部额度切换、明细价/均价双视图、官方倍率折扣与 6 场景筛选 |
 | `src/components/BrandIcons.tsx` / `ModelIcons.tsx` | 客户端品牌图标与模型厂商图标（Codex / Claude / Antigravity / DeepSeek 等） |
 | `src/lib/plaza-pricing.ts` | 与网关模型广场 PR #296 对齐的纯函数计价库（`CNY = internalUSD / 3`、`/1M`·`/1K`、官方倍率折算与快捷筛选） |
@@ -84,6 +87,11 @@
 7. **默认绕过系统代理与本地网关断连中止规则（`config.rs`、`agy_proxy.rs`、`auth.rs`、`mcp_server.rs`）**：
    - `SwitchState.bypass_system_proxy`（JSON 键 `bypassSystemProxy`）默认值为 `true`（直连 Tako 网关 `.no_proxy()`），避免用户开启慢速全局/系统代理时劫持网关上行；在设置中关闭后无需重启守护进程即可动态切回系统代理。
    - 本地网关转发无需改写的超大请求体（> 64 KiB）时采用流式透传，并在下游客户端断开 TCP 连接时立即中止上游请求，防止超时重试堆积僵尸上传。
+8. **通用扩展中心（`extensions/`）**：
+   - 只纳管 `Claude`、`Codex` 和 `Antigravity`，复用 `SyncPlatform as ExtPlatform`。全部核心入口接收 `&AppPaths`，测试使用 `TempDir` 和 `AppPaths::for_test`。
+   - 中心库存放于 `switch/extensions/mcp.json` 和 `prompts.json`。快照自动收编历史配置，不改写客户端原文件；首次修改先备份，所有写入经 `write_atomic`。
+   - 通用 MCP 排除 `tako`、`tako-web-page` 和 `node_repl`。Claude 开关联动 1p、已存在的 3p 和 `.claude.json`，保留其他字段；全关仍保留中心记录，备份恢复保留各端参数差异。
+   - 提示词只修改用户正文，原样保留汉化托管块。快照归档手写正文，并回写已启用预设的外部修改；跨端同步仅作用于勾选的平台。
 
 ---
 
@@ -110,6 +118,8 @@ python3 -c 'import json; d=json.load(open("manifest/manifest.json")); assert set
 # 4. 超级 MCP 内联剧场与安全门禁校验
 python3 scripts/verify_client_mcp_ui.py --self-test && python3 scripts/verify_client_mcp_ui.py
 ```
+
+扩展中心浏览器回归见 [`docs/extensions-hub.md`](./docs/extensions-hub.md)。脚本使用模拟 IPC，不启动桌面应用，也不读取真实客户端配置。
 
 ---
 

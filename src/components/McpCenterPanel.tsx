@@ -22,10 +22,7 @@ import {
   type NodeRuntimeInfo,
 } from "../lib/api";
 import { McpInlineTheater, type McpToolKey } from "./McpInlineTheater";
-import { MultiPlatformSyncPanel } from "./MultiPlatformSyncPanel";
-import { SegmentedControl, StatusPill, ToggleSwitch } from "./UiPrimitives";
-
-export type McpCenterSection = "builtin" | "mcp-sync" | "skill-sync";
+import { StatusPill, ToggleSwitch } from "./UiPrimitives";
 
 interface McpCardSpec {
   key: McpToolKey;
@@ -79,10 +76,7 @@ interface McpCenterPanelProps {
   loggedIn: boolean;
   loggingIn: boolean;
   initialDrawerTab?: McpToolKey | null;
-  initialSection?: McpCenterSection | null;
   onConsumeInitialTab?: () => void;
-  onConsumeInitialSection?: () => void;
-  onNotify?: (msg: string) => void;
   onGoHome: () => void;
   onToggleCoreTool: (key: McpToolKey) => void;
   onToggleWebPage: (next: boolean) => Promise<void>;
@@ -97,10 +91,7 @@ export function McpCenterPanel({
   loggedIn,
   loggingIn,
   initialDrawerTab,
-  initialSection,
   onConsumeInitialTab,
-  onConsumeInitialSection,
-  onNotify,
   onGoHome,
   onToggleCoreTool,
   onToggleWebPage,
@@ -108,25 +99,17 @@ export function McpCenterPanel({
   onSelectConsultModel,
   onRequestLogin,
 }: McpCenterPanelProps) {
-  const [activeSection, setActiveSection] = useState<McpCenterSection>("builtin");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerTab, setDrawerTab] = useState<McpToolKey>("image");
 
   useEffect(() => {
     if (initialDrawerTab) {
-      setActiveSection("builtin");
       setDrawerTab(initialDrawerTab);
       setDrawerOpen(true);
       onConsumeInitialTab?.();
     }
   }, [initialDrawerTab, onConsumeInitialTab]);
 
-  useEffect(() => {
-    if (initialSection) {
-      setActiveSection(initialSection);
-      onConsumeInitialSection?.();
-    }
-  }, [initialSection, onConsumeInitialSection]);
   const [authGuideOpen, setAuthGuideOpen] = useState(false);
 
   const [tokenOpen, setTokenOpen] = useState(false);
@@ -222,48 +205,22 @@ export function McpCenterPanel({
         </div>
 
         <div className="flex items-center gap-3 shrink-0">
-          {activeSection === "builtin" && (
-            <>
-              <span className="text-[12px] text-[var(--text-muted)] tabular-nums">
-                <strong className="text-[var(--text-primary)] font-semibold">{enabledCount}</strong> / 6 已开启
-              </span>
-              <button
-                type="button"
-                data-testid="open-mcp-demo"
-                onClick={() => openTheaterDrawer(drawerTab)}
-                className="h-[32px] px-3 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-primary)] inline-flex items-center gap-1.5 transition cursor-pointer"
-              >
-                <Sparkles className="h-3.5 w-3.5 text-[var(--accent)]" />
-                <span>效果演示</span>
-              </button>
-            </>
-          )}
+          <span className="text-[12px] text-[var(--text-muted)] tabular-nums">
+            <strong className="text-[var(--text-primary)] font-semibold">{enabledCount}</strong> / 6 已开启
+          </span>
+          <button
+            type="button"
+            data-testid="open-mcp-demo"
+            onClick={() => openTheaterDrawer(drawerTab)}
+            className="h-[32px] px-3 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-primary)] inline-flex items-center gap-1.5 transition cursor-pointer"
+          >
+            <Sparkles className="h-3.5 w-3.5 text-[var(--accent)]" />
+            <span>效果演示</span>
+          </button>
         </div>
       </div>
 
-      {/* Section Switcher: Built-in Tako MCP | Cross-Platform MCP Sync | Cross-Platform Skills Sync */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <SegmentedControl<McpCenterSection>
-          value={activeSection}
-          onChange={setActiveSection}
-          options={[
-            { id: "builtin", label: "Tako 内置工具" },
-            { id: "mcp-sync", label: "多平台 MCP 同步" },
-            { id: "skill-sync", label: "多平台 Skill 同步" },
-          ]}
-        />
-      </div>
-
-      {activeSection === "mcp-sync" && (
-        <MultiPlatformSyncPanel mode="mcp" onNotify={onNotify} />
-      )}
-
-      {activeSection === "skill-sync" && (
-        <MultiPlatformSyncPanel mode="skill" onNotify={onNotify} />
-      )}
-
       {/* Capabilities Grid: Full-width Tako Web Page + 2-Column 5 Core Abilities */}
-      {activeSection === "builtin" && (
       <div className="grid grid-cols-1 min-[640px]:grid-cols-2 tako-list-stack">
         {/* Featured Full-Width Card: Tako Web Page (Tencent Cloud EdgeOne) */}
         <article
@@ -474,7 +431,6 @@ export function McpCenterPanel({
           );
         })}
       </div>
-      )}
 
       {/* EdgeOne Authorization Flow Modal */}
       {authGuideOpen && (

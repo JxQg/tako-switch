@@ -209,11 +209,12 @@ async fn gateway_honors_bypass_system_proxy_toggle_live_without_restart() {
     std::env::remove_var("NO_PROXY");
     std::env::remove_var("no_proxy");
 
-    // Point baseUrl to an `.invalid` hostname:
-    // - With `bypass_system_proxy = true` (default), `.no_proxy()` skips `HTTP_PROXY` and fails DNS locally (0 proxy hits).
-    // - With `bypass_system_proxy = false`, `system_proxy_client` sends `GET http://tako-upstream.invalid/...` via `HTTP_PROXY` (200 OK, proxy_hits > 0).
+    // A closed loopback port fails immediately without depending on system DNS timeouts.
+    let closed_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_upstream_addr = closed_upstream.local_addr().unwrap();
+    drop(closed_upstream);
     let mut state = read_switch_state(&paths);
-    state.base_url = "http://tako-upstream.invalid".to_string();
+    state.base_url = format!("http://{closed_upstream_addr}");
     assert!(state.bypass_system_proxy);
     save_switch_state(&paths, &state).unwrap();
 

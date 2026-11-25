@@ -74,6 +74,27 @@ REQUIRED_TESTIDS = [
     "mcp-toggle-webpage",
 ]
 
+REQUIRED_EXT_HUB_TESTIDS = [
+    "open-ext-hub-mcp",
+    "open-ext-hub-skills",
+    "open-ext-hub-plugins",
+    "open-ext-hub-prompts",
+    "ext-hub-tab-mcp",
+    "ext-hub-tab-skills",
+    "ext-hub-tab-plugins",
+    "ext-hub-tab-prompts",
+    "ext-mcp-tako-notice",
+    "ext-mcp-goto-super",
+    "ext-mcp-search",
+    "ext-mcp-add-btn",
+    "ext-prompts-new-btn",
+    "ext-prompts-platform-claude",
+    "ext-prompts-platform-codex",
+    "ext-prompts-platform-antigravity",
+    "ext-prompts-sync-other-btn",
+    "ext-prompts-save-btn",
+]
+
 AGY_ZH_DICT_REL = Path("src-tauri/src/adapters/antigravity_zh_dict.json")
 MIN_AGY_ZH_DICT_ENTRIES = 1200
 REQUIRED_AGY_ZH_DICT_KEYS = (
@@ -306,6 +327,55 @@ def has_mcp_tool_attr(src_files: Dict[Path, str], tool_id: str) -> bool:
     has_dynamic_attr = any(dynamic_attr_re.search(c) for c in src_files.values())
     has_tool_const = any(tool_str_re.search(c) for c in src_files.values())
     return has_dynamic_attr and has_tool_const
+
+
+def has_extension_testid(src_files: Dict[Path, str], testid: str) -> bool:
+    if has_testid(src_files, testid):
+        return True
+    for prefix in ("open-ext-hub-", "ext-hub-tab-", "ext-prompts-platform-"):
+        if testid.startswith(prefix):
+            suffix = re.escape(testid[len(prefix) :])
+            dynamic = re.compile(r"data-testid=\{\s*`" + re.escape(prefix) + r"\$\{[^}]+\}`\s*\}")
+            return any(dynamic.search(content) for content in src_files.values()) and any(
+                re.search(rf'''["']{suffix}["']''', content) for content in src_files.values()
+            )
+    all_source = "\n".join(src_files.values())
+    return (
+        bool(re.search(rf'''testId:\s*["']{re.escape(testid)}["']''', all_source))
+        and "data-testid={actions.primary.testId}" in all_source
+    ) or (
+        bool(re.search(rf'''testId=["']{re.escape(testid)}["']''', all_source))
+        and "data-testid={testId}" in all_source
+    )
+
+
+def extension_contract_checks(repo_root: Path, src_files: Dict[Path, str]) -> List[Tuple[str, bool, str]]:
+    checks: List[Tuple[str, bool, str]] = []
+    overview = src_files.get(repo_root / "src/components/OverviewPanel.tsx", "")
+    mcp_center = src_files.get(repo_root / "src/components/McpCenterPanel.tsx", "")
+    for testid in REQUIRED_EXT_HUB_TESTIDS:
+        checks.append((f"extensions:testid:{testid}", has_extension_testid(src_files, testid), testid))
+    clean_home = (
+        "Tako 模式下自动注入，开关即时生效" in overview
+        and "本项目特有王牌模组" not in overview
+        and "open-multi-sync" not in overview
+        and "grid-cols-2 min-[760px]:grid-cols-4" in overview
+    )
+    checks.append(("extensions:home-contract", clean_home, "home subtitle, independent entries and 720px 2-column grid"))
+    checks.append(("extensions:super-mcp-isolated", "MultiPlatformSyncPanel" not in mcp_center and "activeSection" not in mcp_center, "super MCP no longer hosts the generic sync UI"))
+    extension_files = {
+        path: content for path, content in src_files.items()
+        if path == repo_root / "src/components/ExtensionsHubPanel.tsx"
+        or path.parent == repo_root / "src/components/extensions"
+    }
+    hits = [
+        f"{path.relative_to(repo_root)}:{index}"
+        for path, content in extension_files.items()
+        for index, line in enumerate(content.splitlines(), 1)
+        if re.search(r"#[0-9a-fA-F]{3,8}\b|tracking-\[", line)
+    ]
+    checks.append(("extensions:theme-tokens", bool(extension_files) and not hits, "CSS variables only" if not hits else ", ".join(hits)))
+    return checks
 
 
 def _strip_comments_preserve_lines(text: str) -> str:
@@ -582,6 +652,8 @@ def run_checks(repo_root: Path) -> List[Tuple[str, bool, str]]:
             )
         )
 
+    checks.extend(extension_contract_checks(repo_root, src_files))
+
     all_required_assets = REQUIRED_WEBP_ASSETS + [REQUIRED_MP4_ASSET] + REQUIRED_MP3_ASSETS
     for asset_name in all_required_assets:
         ok = asset_name in all_src
@@ -851,6 +923,18 @@ export const McpInlineTheater = () => (
         assert has_mcp_tool_attr(clean_files, tool_id)
     assert find_exposed_mcp_tool_names(clean_files) == []
 
+    extension_files = {
+        Path("src/components/OverviewPanel.tsx"): '''
+const IDS = ["mcp", "skills", "plugins", "prompts"];
+<button data-testid={`open-ext-hub-${id}`} />
+''',
+        Path("src/components/ExtensionsHubPanel.tsx"): '''<button data-testid={actions.primary.testId} />''',
+        Path("src/components/extensions/McpHubView.tsx"): '''primary: { testId: "ext-mcp-add-btn" }''',
+    }
+    assert has_extension_testid(extension_files, "open-ext-hub-prompts")
+    assert has_extension_testid(extension_files, "ext-mcp-add-btn")
+    assert not has_extension_testid(extension_files, "ext-prompts-save-btn")
+
     leaky_files = {
         Path("src/App.tsx"): """
 export const Leaky = () => (
@@ -869,6 +953,7 @@ export const Leaky = () => (
         root = Path(tmp)
         (root / "public" / "mcp-demo").mkdir(parents=True)
         (root / "src" / "components").mkdir(parents=True)
+        (root / "src" / "components" / "extensions").mkdir()
         (root / "src-tauri" / "src" / "adapters").mkdir(parents=True)
         (root / "scripts").mkdir(parents=True)
 
@@ -959,6 +1044,16 @@ export const McpInlineTheater = () => (
 );
 """,
             encoding="utf-8",
+        )
+        (root / "src/components/OverviewPanel.tsx").write_text(
+            'const subtitle = "Tako 模式下自动注入，开关即时生效";\n'
+            '<div className="grid-cols-2 min-[760px]:grid-cols-4">\n'
+            + "\n".join(f'<button data-testid="{testid}" />' for testid in REQUIRED_EXT_HUB_TESTIDS)
+            + "\n</div>",
+            encoding="utf-8",
+        )
+        (root / "src/components/ExtensionsHubPanel.tsx").write_text(
+            '<section className="bg-[var(--bg-card)]" />', encoding="utf-8"
         )
         (root / "src-tauri" / "tauri.conf.json").write_text(
             json.dumps(

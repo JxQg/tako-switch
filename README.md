@@ -61,6 +61,8 @@ Tako Switch 在每次写入前都会自动备份原配置至 `~/.tako/switch/bac
 
 ## 本地目录结构与隐私安全
 
+首页提供独立的[通用扩展中心](./docs/extensions-hub.md)，用于管理 Claude、Codex 和 Antigravity 的第三方 MCP 与提示词预设。扫描会收录历史配置，三端开关全部关闭后仍保留中心记录。提示词与汉化托管块独立保存，Skills 和插件页签当前保留入口。
+
 Tako Switch 的所有配置均保存在用户主目录的独立子目录下，与 `tako-cli`（`~/.tako/config.json`）**完全隔离，互不覆盖**：
 
 | 路径 | 用途 |
@@ -70,6 +72,8 @@ Tako Switch 的所有配置均保存在用户主目录的独立子目录下，�
 | `~/.tako/switch/state.json` | 网关地址、客户端切换模式、MCP 工具开关与各客户端模型筛选策略 |
 | `~/.tako/switch/backups/<app>/` | 首次写入前的原始配置文件与官方登录态快照，用于无损恢复 |
 | `~/.tako/switch/manifest-cache.json` | 托管桌面客户端安装包清单本地缓存 |
+| `~/.tako/switch/extensions/mcp.json` | 通用 MCP 中心记录、三端开关与参数差异 |
+| `~/.tako/switch/extensions/prompts.json` | 三端提示词预设及启用状态 |
 
 > **上游安装包清单同步**：仓库内 [`manifest/manifest.json`](./manifest/manifest.json) 由 GitHub Actions 每 6 小时自动同步三端官方无墙源链接（仅几十 KB 的文本清单）；用户一键安装客户端时，3–4 GB 的第三方原厂安装包直接从官方 CDN 拉取，不经第三方中转。
 
