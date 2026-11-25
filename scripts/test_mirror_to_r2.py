@@ -163,5 +163,107 @@ class MirrorToR2Tests(unittest.TestCase):
         )
 
 
+class TimeoutRetryTests(unittest.TestCase):
+    def _client(self) -> object:
+        return mod.S3Client(bucket="b", endpoint_url="https://ep.example.com", region="auto")
+
+    def test_head_object_passes_timeout_to_subprocess(self) -> None:
+        import subprocess as sp
+        from unittest import mock
+
+        client = self._client()
+        fake_res = sp.CompletedProcess(args=[], returncode=0, stdout="{}", stderr="")
+        with mock.patch.object(mod.subprocess, "run", return_value=fake_res) as run_mock:
+            self.assertEqual(client.head_object("apps/k"), {})
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertEqual(run_mock.call_args.kwargs.get("timeout"), mod.API_TIMEOUT_SECONDS)
+
+    def test_head_object_timeout_retried_then_raises_with_key(self) -> None:
+        import subprocess as sp
+        from unittest import mock
+
+        client = self._client()
+
+        def always_timeout(*args, **kwargs):
+            raise sp.TimeoutExpired(cmd=args[0], timeout=kwargs.get("timeout"))
+
+        with mock.patch.object(mod.subprocess, "run", side_effect=always_timeout) as run_mock:
+            with self.assertRaises(RuntimeError) as ctx:
+                client.head_object("apps/stuck-key")
+        self.assertEqual(run_mock.call_count, mod.AWS_MAX_ATTEMPTS)
+        self.assertIn("apps/stuck-key", str(ctx.exception))
+        self.assertIn("timed out", str(ctx.exception))
+
+    def test_list_objects_single_timeout_recovers(self) -> None:
+        import subprocess as sp
+        from unittest import mock
+
+        client = self._client()
+        fake_res = sp.CompletedProcess(args=[], returncode=0, stdout='{"Contents": []}', stderr="")
+        calls = []
+
+        def flaky(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise sp.TimeoutExpired(cmd=args[0], timeout=kwargs.get("timeout"))
+            return fake_res
+
+        with mock.patch.object(mod.subprocess, "run", side_effect=flaky) as run_mock:
+            self.assertEqual(client.list_objects("apps/claude/"), [])
+        self.assertEqual(run_mock.call_count, 2)
+
+    def test_upload_timeout_scales_with_file_size(self) -> None:
+        import subprocess as sp
+        import tempfile
+        from unittest import mock
+
+        client = self._client()
+        with tempfile.TemporaryDirectory() as td:
+            big = Path(td) / "big.bin"
+            big.write_bytes(b"x" * 16)
+            fake_res = sp.CompletedProcess(args=[], returncode=0)
+            with mock.patch.object(mod.subprocess, "run", return_value=fake_res) as run_mock:
+                client.upload_file(big, "apps/small.bin", cache_control="x")
+            small_timeout = run_mock.call_args.kwargs.get("timeout")
+            self.assertEqual(small_timeout, mod.UPLOAD_TIMEOUT_SECONDS)
+
+            # Simulate a huge file by monkeypatching stat size.
+            real_stat = Path.stat
+
+            def fake_stat(self, *a, **k):
+                if self == big:
+                    import os
+                    st = real_stat(self, *a, **k)
+                    return os.stat_result((st[0], st[1], st[2], st[3], st[4], st[5], 512 * 1024 * 1024, st[7], st[8], st[9]))
+                return real_stat(self, *a, **k)
+
+            with mock.patch.object(Path, "stat", fake_stat):
+                with mock.patch.object(mod.subprocess, "run", return_value=fake_res) as run_mock:
+                    client.upload_file(big, "apps/huge.bin", cache_control="x")
+                huge_timeout = run_mock.call_args.kwargs.get("timeout")
+            self.assertGreater(huge_timeout, mod.UPLOAD_TIMEOUT_SECONDS)
+
+    def test_upload_timeout_error_mentions_key_and_elapsed(self) -> None:
+        import subprocess as sp
+        import tempfile
+        from unittest import mock
+
+        client = self._client()
+        with tempfile.TemporaryDirectory() as td:
+            f = Path(td) / "x.bin"
+            f.write_bytes(b"x")
+
+            def always_timeout(*args, **kwargs):
+                raise sp.TimeoutExpired(cmd=args[0], timeout=kwargs.get("timeout"))
+
+            with mock.patch.object(mod.subprocess, "run", side_effect=always_timeout) as run_mock:
+                with self.assertRaises(RuntimeError) as ctx:
+                    client.upload_file(f, "apps/timeout.bin", cache_control="x")
+        self.assertEqual(run_mock.call_count, mod.AWS_MAX_ATTEMPTS)
+        msg = str(ctx.exception)
+        self.assertIn("apps/timeout.bin", msg)
+        self.assertIn("attempts", msg)
+
+
 if __name__ == "__main__":
     unittest.main()
