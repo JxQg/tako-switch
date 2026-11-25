@@ -301,9 +301,10 @@ async function assertLayout(page, label) {
     const top = document
       .querySelector('[data-testid="ext-hub-actions"]')
       .getBoundingClientRect();
-    const nav = document
-      .querySelector('nav[aria-label="扩展类型"]')
-      .getBoundingClientRect();
+    const nav = (
+      document.querySelector('[role="tablist"][aria-label="通用扩展"]') ??
+      document.querySelector('nav[aria-label="扩展类型"]')
+    ).getBoundingClientRect();
     const overlap =
       top.left < nav.right - 1 &&
       top.right > nav.left + 1 &&

@@ -2,7 +2,7 @@
 
 ## 入口与平台
 
-从首页“通用扩展中心”进入插件管理。插件中心管理 Claude、Codex 和 Antigravity，提供已安装、发现和市场源视图。MCP 和 Skills 入口继续打开现有同步功能。
+从首页“通用扩展中心”进入插件管理。插件中心管理 Claude、Codex 和 Antigravity，提供已安装、发现和市场源视图，并与通用 MCP、Skills 技能、提示词预设共享扩展中心顶栏切换器。
 
 插件中心依赖对应客户端的 CLI（命令行程序）。探测顺序是桌面安装包内置 CLI、用户 CLI 安装目录、系统 `PATH`。状态徽章区分内置和 PATH 来源。未检出 CLI 时显示空状态，不安装额外软件。
 
@@ -55,7 +55,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --test ext_hub_phase3_blackbox
 
 ```bash
 npm run dev -- --port 1433
-npm run test:extensions-ui
+npm run test:plugins-ui
 ```
 
 默认测试地址为 `http://127.0.0.1:1433/`，可通过 `EXT_HUB_PREVIEW_URL` 覆盖。Windows 默认使用已安装的 Chrome；其他平台使用 Playwright Chromium。可以设置 `EXT_HUB_CHROME` 指定浏览器可执行文件。

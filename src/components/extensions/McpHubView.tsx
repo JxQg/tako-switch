@@ -2,6 +2,7 @@ import {
   useCallback,
   useDeferredValue,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useState,
 } from "react";
@@ -35,6 +36,7 @@ import {
   ExtError,
   ExtHelpPopover,
   ExtMatrixHeader,
+  ExtPlatformChoices,
   ExtSearchInput,
   ExtSlideDrawer,
   useExtensionBackup,
@@ -166,7 +168,7 @@ export function McpHubView({
     [onNotify, receive],
   );
   const backup = useExtensionBackup(api.exportMcpBackup, importBackup);
-  useEffect(() => {
+  useLayoutEffect(() => {
     onActionsChange({
       disabled: busy,
       primary: {
@@ -823,28 +825,7 @@ function McpEditor({
           <legend className="text-[12px] font-medium text-[var(--text-secondary)]">
             立即同步到
           </legend>
-          <div className="flex flex-wrap gap-4">
-            {EXT_PLATFORMS.map((platform) => (
-              <label
-                key={platform.id}
-                className="flex items-center gap-1.5 text-[12px] text-[var(--text-primary)]"
-              >
-                <input
-                  type="checkbox"
-                  checked={targets.includes(platform.id)}
-                  onChange={(event) =>
-                    setTargets((previous) =>
-                      event.target.checked
-                        ? [...previous, platform.id]
-                        : previous.filter((target) => target !== platform.id),
-                    )
-                  }
-                  className="accent-[var(--accent)]"
-                />
-                {platform.label}
-              </label>
-            ))}
-          </div>
+          <ExtPlatformChoices value={targets} onChange={setTargets} />
         </fieldset>
       </div>
     </ExtSlideDrawer>

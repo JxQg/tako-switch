@@ -3,13 +3,16 @@ import { FileText, Plug, Puzzle, Zap, type LucideIcon } from "lucide-react";
 import type { ExtensionsSummary } from "../lib/api";
 import type { ExtensionTab } from "./UiPrimitives";
 import {
+  EXT_BUTTON,
   EXT_PRIMARY_BUTTON,
   ExtMoreDropdown,
   type ExtensionActions,
   type ExtensionNavigationGuard,
 } from "./extensions/ExtensionPrimitives";
 import { McpHubView } from "./extensions/McpHubView";
+import { PluginsHubView } from "./extensions/PluginsHubView";
 import { PromptsHubView } from "./extensions/PromptsHubView";
+import { SkillsHubView } from "./extensions/SkillsHubView";
 
 export const EXTENSION_TABS: {
   id: ExtensionTab;
@@ -47,12 +50,22 @@ export function ExtensionsHubPanel({
     (count: number) => onCountChange("mcp", count),
     [onCountChange],
   );
+  const countSkills = useCallback(
+    (count: number) => onCountChange("skills", count),
+    [onCountChange],
+  );
+  const countPlugins = useCallback(
+    (count: number) => onCountChange("plugins", count),
+    [onCountChange],
+  );
   const countPrompts = useCallback(
     (count: number) => onCountChange("prompts", count),
     [onCountChange],
   );
+
+  const SecondaryIcon = actions.secondary?.icon;
   const PrimaryIcon = actions.primary?.icon;
-  const placeholder = activeTab === "skills" || activeTab === "plugins";
+
   return (
     <section
       className="tako-page-sub flex min-w-0 flex-col"
@@ -84,28 +97,43 @@ export function ExtensionsHubPanel({
             </button>
           ))}
         </div>
-        {!placeholder && (
-          <div className="flex shrink-0 items-center gap-1.5">
-            {actions.more && (
-              <ExtMoreDropdown
-                items={actions.more}
-                disabled={actions.disabled}
+        <div
+          data-testid="ext-hub-actions"
+          className="flex shrink-0 items-center gap-1.5"
+        >
+          {actions.secondary && SecondaryIcon && (
+            <button
+              type="button"
+              className={EXT_BUTTON}
+              data-testid={actions.secondary.testId}
+              disabled={actions.secondary.disabled}
+              onClick={actions.secondary.onClick}
+            >
+              <SecondaryIcon
+                className={`h-3.5 w-3.5 ${actions.secondary.spinning ? "animate-spin" : ""}`}
               />
-            )}
-            {actions.primary && PrimaryIcon && (
-              <button
-                type="button"
-                className={EXT_PRIMARY_BUTTON}
-                data-testid={actions.primary.testId}
-                disabled={actions.primary.disabled}
-                onClick={actions.primary.onClick}
-              >
-                <PrimaryIcon className="h-3.5 w-3.5" />
-                {actions.primary.label}
-              </button>
-            )}
-          </div>
-        )}
+              <span>{actions.secondary.label}</span>
+            </button>
+          )}
+          {actions.more && (
+            <ExtMoreDropdown
+              items={actions.more}
+              disabled={actions.disabled}
+            />
+          )}
+          {actions.primary && PrimaryIcon && (
+            <button
+              type="button"
+              className={EXT_PRIMARY_BUTTON}
+              data-testid={actions.primary.testId}
+              disabled={actions.primary.disabled}
+              onClick={actions.primary.onClick}
+            >
+              <PrimaryIcon className="h-3.5 w-3.5" />
+              <span>{actions.primary.label}</span>
+            </button>
+          )}
+        </div>
       </div>
       {activeTab === "mcp" && (
         <McpHubView
@@ -115,6 +143,19 @@ export function ExtensionsHubPanel({
           onNotify={onNotify}
         />
       )}
+      {activeTab === "skills" && (
+        <SkillsHubView
+          onActionsChange={setActions}
+          onCountChange={countSkills}
+          onNotify={onNotify}
+        />
+      )}
+      {activeTab === "plugins" && (
+        <PluginsHubView
+          onActionsChange={setActions}
+          onCountChange={countPlugins}
+        />
+      )}
       {activeTab === "prompts" && (
         <PromptsHubView
           onActionsChange={setActions}
@@ -122,24 +163,6 @@ export function ExtensionsHubPanel({
           onNotify={onNotify}
           onNavigationGuardChange={onNavigationGuardChange}
         />
-      )}
-      {placeholder && (
-        <div
-          role="tabpanel"
-          id={`ext-panel-${activeTab}`}
-          aria-labelledby={`ext-tab-${activeTab}`}
-          className="flex min-h-[240px] min-w-0 flex-col items-center justify-center gap-3 border-y border-[var(--border)] text-[var(--text-muted)]"
-        >
-          {activeTab === "skills" ? (
-            <Zap className="h-7 w-7" strokeWidth={1.4} />
-          ) : (
-            <Puzzle className="h-7 w-7" strokeWidth={1.4} />
-          )}
-          <h2 className="text-[14px] font-semibold text-[var(--text-primary)]">
-            {activeTab === "skills" ? "Skills 技能" : "插件管理"}
-          </h2>
-          <span className="text-[12px]">暂未开放</span>
-        </div>
       )}
     </section>
   );

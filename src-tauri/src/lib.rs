@@ -6,7 +6,6 @@ pub mod extensions;
 pub mod installer;
 pub mod manifest;
 pub mod mcp_server;
-pub mod sync_hub;
 
 use adapters::{
     get_adapter, snapshot_app, AppId, AppMode, AppSnapshot, DesktopAppAdapter, DiagnosticResult,
@@ -1968,22 +1967,7 @@ async fn run_mcp_live_demo(
     mcp_server::execute_live_demo_for_paths(&paths, input).await
 }
 
-#[tauri::command]
-async fn get_multi_platform_sync_snapshot() -> Result<sync_hub::MultiPlatformSyncSnapshot, String> {
-    let paths = AppPaths::detect()?;
-    tauri::async_runtime::spawn_blocking(move || sync_hub::build_multi_platform_sync_snapshot(&paths))
-        .await
-        .map_err(|e| format!("扫描多平台 MCP/Skill 失败: {e}"))
-}
-
-async fn with_extension_paths<T: Send + 'static>(
-    operation: impl FnOnce(&AppPaths) -> Result<T, String> + Send + 'static,
-) -> Result<T, String> {
-    let paths = AppPaths::detect()?;
-    tauri::async_runtime::spawn_blocking(move || operation(&paths))
-        .await
-        .map_err(|err| format!("扩展中心操作失败: {err}"))?
-}
+use extensions::with_extension_paths;
 
 #[tauri::command]
 async fn get_extensions_summary() -> Result<extensions::ExtensionsSummary, String> {
@@ -2201,74 +2185,6 @@ async fn remove_plugin_marketplace(
         &paths, platform, extensions::plugins::PluginAction::RemoveMarketplace, &name,
     )
     .await
-}
-
-#[tauri::command]
-async fn sync_mcp_to_platforms(
-    name: String,
-    source: sync_hub::SyncPlatform,
-    targets: Vec<sync_hub::SyncPlatform>,
-) -> Result<sync_hub::MultiPlatformSyncSnapshot, String> {
-    let paths = AppPaths::detect()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        sync_hub::sync_mcp_to_platforms_for_paths(&paths, &name, source, &targets)
-    })
-    .await
-    .map_err(|e| format!("同步 MCP 失败: {e}"))?
-}
-
-#[tauri::command]
-async fn sync_all_mcps(
-    targets: Vec<sync_hub::SyncPlatform>,
-    preferred_source: Option<sync_hub::SyncPlatform>,
-) -> Result<sync_hub::BatchSyncOutcome, String> {
-    let paths = AppPaths::detect()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        sync_hub::sync_all_mcps_for_paths(&paths, &targets, preferred_source)
-    })
-    .await
-    .map_err(|e| format!("批量同步 MCP 失败: {e}"))?
-}
-
-#[tauri::command]
-async fn sync_skill_to_platforms(
-    name: String,
-    source: sync_hub::SyncPlatform,
-    targets: Vec<sync_hub::SyncPlatform>,
-) -> Result<sync_hub::MultiPlatformSyncSnapshot, String> {
-    let paths = AppPaths::detect()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        sync_hub::sync_skill_to_platforms_for_paths(&paths, &name, source, &targets)
-    })
-    .await
-    .map_err(|e| format!("同步 Skill 失败: {e}"))?
-}
-
-#[tauri::command]
-async fn sync_all_skills(
-    targets: Vec<sync_hub::SyncPlatform>,
-    preferred_source: Option<sync_hub::SyncPlatform>,
-) -> Result<sync_hub::BatchSyncOutcome, String> {
-    let paths = AppPaths::detect()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        sync_hub::sync_all_skills_for_paths(&paths, &targets, preferred_source)
-    })
-    .await
-    .map_err(|e| format!("批量同步 Skill 失败: {e}"))?
-}
-
-#[tauri::command]
-async fn remove_synced_item(
-    kind: String,
-    name: String,
-    platform: sync_hub::SyncPlatform,
-) -> Result<sync_hub::MultiPlatformSyncSnapshot, String> {
-    let paths = AppPaths::detect()?;
-    tauri::async_runtime::spawn_blocking(move || {
-        sync_hub::remove_synced_item_for_paths(&paths, &kind, &name, platform)
-    })
-    .await
-    .map_err(|e| format!("移除同步项失败: {e}"))?
 }
 
 #[tauri::command]
@@ -2615,12 +2531,6 @@ pub fn run() {
             sync_prompt_to_platforms,
             export_prompts_backup,
             import_prompts_backup,
-            get_multi_platform_sync_snapshot,
-            sync_mcp_to_platforms,
-            sync_all_mcps,
-            sync_skill_to_platforms,
-            sync_all_skills,
-            remove_synced_item,
             extensions::skills::get_skills_hub_snapshot,
             extensions::skills::toggle_skill_platform,
             extensions::skills::align_skill_platforms,

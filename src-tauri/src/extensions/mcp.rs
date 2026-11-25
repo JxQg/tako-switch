@@ -1,6 +1,6 @@
 use super::{
-    apply_file_updates, extensions_dir, mcp_config_paths, read_json_store, read_optional_file,
-    store_lock, ExtPlatform, FileUpdate,
+    apply_file_updates, extension_store_path, mcp_config_paths, read_json_store,
+    read_optional_file, store_lock, ExtPlatform, FileUpdate,
 };
 use crate::config::AppPaths;
 use serde::{Deserialize, Serialize};
@@ -82,7 +82,7 @@ pub struct McpHubSnapshot {
 }
 
 pub fn mcp_store_path(paths: &AppPaths) -> PathBuf {
-    extensions_dir(paths).join("mcp.json")
+    extension_store_path(paths, "mcp.json")
 }
 
 pub fn is_reserved_mcp_id(id: &str) -> bool {

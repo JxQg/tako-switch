@@ -6,10 +6,14 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import {
+  AlertCircle,
+  Check,
   ChevronDown,
   CircleHelp,
   Download,
+  MoreHorizontal,
   Search,
   Upload,
   X,
@@ -24,15 +28,26 @@ export const EXT_PLATFORMS: { id: ExtPlatform; label: string }[] = [
 ];
 
 export const EXT_BUTTON =
-  "ext-button inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-2.5 text-[12px] font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--text-primary)] disabled:opacity-50 cursor-pointer";
+  "ext-button inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-2.5 text-[12px] font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--text-primary)] focus-visible:outline-2 focus-visible:outline-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer";
 export const EXT_PRIMARY_BUTTON =
-  "ext-button inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-transparent bg-[var(--accent)] px-3 text-[12px] font-semibold text-[var(--on-accent)] hover:bg-[var(--accent-hover)] disabled:opacity-50 cursor-pointer";
+  "ext-button inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border border-transparent bg-[var(--accent)] px-3 text-[12px] font-semibold text-[var(--on-accent)] hover:bg-[var(--accent-hover)] focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50 cursor-pointer";
 export const EXT_ICON_BUTTON =
-  "inline-flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--text-primary)] disabled:opacity-40 cursor-pointer";
+  "inline-flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-md text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--text-primary)] focus-visible:outline-2 focus-visible:outline-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer";
 export const EXT_INPUT =
-  "min-w-0 w-full rounded-lg border border-[var(--border)] bg-[var(--bg-canvas)] px-2.5 py-2 text-[12px] text-[var(--text-primary)] outline-none focus:border-[var(--accent)]";
+  "min-w-0 w-full rounded-lg border border-[var(--border)] bg-[var(--bg-canvas)] px-2.5 py-2 text-[12px] text-[var(--text-primary)] outline-none placeholder:text-[var(--text-muted)] focus:border-[var(--accent)]";
+
+export interface ExtensionSecondaryAction {
+  label: string;
+  icon: LucideIcon;
+  testId?: string;
+  onClick: () => void;
+  disabled?: boolean;
+  spinning?: boolean;
+}
 
 export interface ExtensionActions {
+  secondary?: ExtensionSecondaryAction;
+  more?: ExtensionMenuItem[];
   primary?: {
     label: string;
     icon: LucideIcon;
@@ -40,7 +55,6 @@ export interface ExtensionActions {
     onClick: () => void;
     disabled?: boolean;
   };
-  more?: ExtensionMenuItem[];
   disabled?: boolean;
 }
 
@@ -50,6 +64,7 @@ export interface ExtensionMenuItem {
   label: string;
   icon: LucideIcon;
   onClick: () => void;
+  checked?: boolean;
   disabled?: boolean;
   danger?: boolean;
 }
@@ -93,6 +108,8 @@ export function ExtSearchInput({
 
 function useDismiss(open: boolean, onClose: () => void) {
   const ref = useRef<HTMLDivElement>(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
   useEffect(() => {
     if (!open) return;
     const dismiss = (event: PointerEvent) => {
@@ -100,23 +117,25 @@ function useDismiss(open: boolean, onClose: () => void) {
         ref.current &&
         event.target instanceof Node &&
         !ref.current.contains(event.target)
-      )
-        onClose();
+      ) {
+        closeRef.current();
+      }
     };
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
-        onClose();
+        event.stopImmediatePropagation();
+        closeRef.current();
       }
     };
     document.addEventListener("pointerdown", dismiss);
-    document.addEventListener("keydown", onKey, true);
+    window.addEventListener("keydown", onKey, true);
     return () => {
       document.removeEventListener("pointerdown", dismiss);
-      document.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("keydown", onKey, true);
     };
-  }, [open, onClose]);
+  }, [open]);
   return ref;
 }
 
@@ -127,25 +146,38 @@ export function ExtHelpPopover({
   label?: string;
   children: ReactNode;
 }) {
-  const [open, setOpen] = useState(false);
-  const close = useCallback(() => setOpen(false), []);
+  const [hovered, setHovered] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const open = hovered || pinned;
+  const close = useCallback(() => {
+    setHovered(false);
+    setPinned(false);
+  }, []);
   const ref = useDismiss(open, close);
   const id = useId();
   return (
     <div
       ref={ref}
       className="relative shrink-0"
-      onMouseEnter={() => setOpen(true)}
-      onMouseLeave={close}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
     >
       <button
         type="button"
+        title={label}
         aria-label={label}
         aria-expanded={open}
         aria-describedby={open ? id : undefined}
-        onClick={() => setOpen((value) => !value)}
-        onFocus={() => setOpen(true)}
-        className="h-[26px] w-[26px] rounded-full border border-[var(--border)] bg-[var(--bg-card)] text-[var(--text-muted)] flex items-center justify-center cursor-pointer hover:text-[var(--text-primary)]"
+        onClick={() => {
+          setPinned((prev) => !prev);
+          setHovered(false);
+        }}
+        onFocus={(event) => {
+          if (event.currentTarget.matches(":focus-visible")) {
+            setPinned(true);
+          }
+        }}
+        className="h-[26px] w-[26px] rounded-full border border-[var(--border)] bg-[var(--bg-card)] text-[var(--text-muted)] flex items-center justify-center cursor-pointer hover:text-[var(--text-primary)] focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
       >
         <CircleHelp className="h-3.5 w-3.5" />
       </button>
@@ -153,7 +185,7 @@ export function ExtHelpPopover({
         <div
           id={id}
           role="tooltip"
-          className="absolute right-0 top-full z-30 mt-1 w-[min(360px,70vw)] rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-3 text-[11.5px] leading-relaxed text-[var(--text-secondary)] shadow-[var(--shadow-modal)] break-words"
+          className="absolute right-0 top-full z-40 mt-1 w-[min(340px,calc(100vw-32px))] rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-3 text-[11.5px] leading-relaxed text-[var(--text-secondary)] shadow-[var(--shadow-modal)] break-words"
         >
           {children}
         </div>
@@ -165,53 +197,82 @@ export function ExtHelpPopover({
 export function ExtMoreDropdown({
   items,
   disabled = false,
+  iconOnly = false,
+  label = "更多",
 }: {
   items: ExtensionMenuItem[];
   disabled?: boolean;
+  iconOnly?: boolean;
+  label?: string;
 }) {
   const [open, setOpen] = useState(false);
   const close = useCallback(() => setOpen(false), []);
   const ref = useDismiss(open, close);
   return (
     <div className="relative shrink-0" ref={ref}>
-      <button
-        type="button"
-        className={EXT_BUTTON}
-        aria-haspopup="menu"
-        aria-expanded={open}
-        disabled={disabled}
-        onClick={() => setOpen((value) => !value)}
-      >
-        更多 <ChevronDown className="h-3 w-3" />
-      </button>
+      {iconOnly ? (
+        <button
+          type="button"
+          title={label}
+          aria-label={label}
+          aria-haspopup="menu"
+          aria-expanded={open}
+          disabled={disabled}
+          onClick={() => setOpen((value) => !value)}
+          className={EXT_ICON_BUTTON}
+        >
+          <MoreHorizontal className="h-3.5 w-3.5" />
+        </button>
+      ) : (
+        <button
+          type="button"
+          className={EXT_BUTTON}
+          aria-label={label}
+          aria-haspopup="menu"
+          aria-expanded={open}
+          disabled={disabled}
+          onClick={() => setOpen((value) => !value)}
+        >
+          <span>{label}</span>
+          <ChevronDown className="h-3 w-3" />
+        </button>
+      )}
       {open && (
         <div
           role="menu"
-          className="absolute right-0 top-full z-30 mt-1 w-[210px] rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-1 shadow-[var(--shadow-modal)]"
+          className="absolute right-0 top-full z-40 mt-1 w-[min(220px,calc(100vw-24px))] rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-1 shadow-[var(--shadow-modal)]"
         >
           {items.map(
             ({
-              label,
+              label: itemLabel,
               icon: Icon,
               onClick,
+              checked,
               disabled: itemDisabled,
               danger,
-            }) => (
-              <button
-                key={label}
-                role="menuitem"
-                type="button"
-                disabled={itemDisabled}
-                onClick={() => {
-                  close();
-                  onClick();
-                }}
-                className={`flex w-full min-w-0 items-center gap-2 rounded-md px-2.5 py-2 text-left text-[12px] hover:bg-[var(--bg-subtle)] disabled:opacity-40 cursor-pointer ${danger ? "text-[var(--danger)]" : "text-[var(--text-secondary)]"}`}
-              >
-                <Icon className="h-3.5 w-3.5 shrink-0" />
-                <span className="truncate">{label}</span>
-              </button>
-            ),
+            }) => {
+              const isRadio = checked !== undefined;
+              return (
+                <button
+                  key={itemLabel}
+                  role={isRadio ? "menuitemradio" : "menuitem"}
+                  aria-checked={isRadio ? checked : undefined}
+                  type="button"
+                  disabled={itemDisabled}
+                  onClick={() => {
+                    close();
+                    onClick();
+                  }}
+                  className={`flex w-full min-w-0 items-center gap-2 rounded-md px-2.5 py-2 text-left text-[12px] hover:bg-[var(--bg-subtle)] disabled:opacity-40 cursor-pointer ${danger ? "text-[var(--danger)]" : "text-[var(--text-secondary)]"}`}
+                >
+                  <Icon className="h-3.5 w-3.5 shrink-0" />
+                  <span className="min-w-0 flex-1 truncate">{itemLabel}</span>
+                  {checked && (
+                    <Check className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                  )}
+                </button>
+              );
+            },
           )}
         </div>
       )}
@@ -224,28 +285,46 @@ export function ExtSlideDrawer({
   onClose,
   children,
   footer,
+  busy = false,
 }: {
   title: string;
   onClose: () => void;
   children: ReactNode;
   footer?: ReactNode;
+  busy?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const id = useId();
+  const closeRef = useRef(onClose);
+  const busyRef = useRef(busy);
+  closeRef.current = onClose;
+  busyRef.current = busy;
+
   useEffect(() => {
-    const previous = document.activeElement;
+    const previous =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
     const focusable = () =>
       Array.from(
         ref.current?.querySelectorAll<HTMLElement>(
-          "button:not(:disabled), input:not(:disabled), textarea, select, [tabindex='0']",
+          "button:not(:disabled), input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex='0']",
         ) ?? [],
       );
-    focusable()[0]?.focus();
+    (
+      ref.current?.querySelector<HTMLElement>(
+        "input:not(:disabled):not([type='file']), textarea:not(:disabled), select:not(:disabled)",
+      ) ?? focusable()[0]
+    )?.focus();
+
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
-        onClose();
+        event.stopImmediatePropagation();
+        if (!busyRef.current) {
+          closeRef.current();
+        }
       }
       if (event.key === "Tab") {
         const items = focusable();
@@ -254,24 +333,26 @@ export function ExtSlideDrawer({
         if (event.shiftKey && document.activeElement === first) {
           event.preventDefault();
           last?.focus();
-        }
-        if (!event.shiftKey && document.activeElement === last) {
+        } else if (!event.shiftKey && document.activeElement === last) {
           event.preventDefault();
           first?.focus();
         }
       }
     };
-    document.addEventListener("keydown", onKey, true);
+    window.addEventListener("keydown", onKey, true);
     return () => {
-      document.removeEventListener("keydown", onKey, true);
-      if (previous instanceof HTMLElement) previous.focus();
+      window.removeEventListener("keydown", onKey, true);
+      previous?.focus();
     };
-  }, [onClose]);
-  return (
+  }, []);
+
+  return createPortal(
     <div
-      className="fixed inset-0 z-50 modal-backdrop flex justify-end"
+      className="fixed inset-0 z-50 modal-backdrop flex justify-end overflow-hidden"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
+        if (event.target === event.currentTarget && !busy) {
+          onClose();
+        }
       }}
     >
       <div
@@ -279,7 +360,7 @@ export function ExtSlideDrawer({
         role="dialog"
         aria-modal="true"
         aria-labelledby={id}
-        className="drawer-enter flex h-full w-[min(500px,94vw)] min-w-0 flex-col border-l border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-modal)]"
+        className="flex h-full w-[min(500px,94vw)] min-w-0 flex-col border-l border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-modal)]"
       >
         <header className="flex h-[48px] shrink-0 items-center justify-between gap-2 border-b border-[var(--border)] px-4">
           <h2
@@ -290,6 +371,7 @@ export function ExtSlideDrawer({
           </h2>
           <button
             type="button"
+            disabled={busy}
             onClick={onClose}
             title="关闭抽屉"
             aria-label="关闭抽屉"
@@ -298,7 +380,7 @@ export function ExtSlideDrawer({
             <X className="h-4 w-4" />
           </button>
         </header>
-        <div className="min-h-0 flex-1 overflow-y-auto subtle-scroll p-4">
+        <div className="min-h-0 flex-1 overflow-y-auto subtle-scroll p-4 flex flex-col gap-3">
           {children}
         </div>
         {footer && (
@@ -307,40 +389,104 @@ export function ExtSlideDrawer({
           </footer>
         )}
       </div>
+    </div>,
+    document.body,
+  );
+}
+
+export function ExtPlatformChoices({
+  value,
+  onChange,
+  disabled = false,
+  platforms = EXT_PLATFORMS,
+}: {
+  value: ExtPlatform[];
+  onChange: (targets: ExtPlatform[]) => void;
+  disabled?: boolean;
+  platforms?: { id: ExtPlatform; label: string }[];
+}) {
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
+      {platforms.map((platform) => (
+        <label
+          key={platform.id}
+          className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap text-[12px] text-[var(--text-secondary)]"
+        >
+          <input
+            type="checkbox"
+            checked={value.includes(platform.id)}
+            disabled={disabled}
+            onChange={(event) =>
+              onChange(
+                event.target.checked
+                  ? [...value, platform.id]
+                  : value.filter((target) => target !== platform.id),
+              )
+            }
+            className="h-3.5 w-3.5 accent-[var(--accent)]"
+          />
+          {platform.label}
+        </label>
+      ))}
     </div>
   );
 }
 
 export function ExtMatrixHeader({
   columns = "minmax(0, 1fr) 70px 64px 76px 86px",
+  leadingLabel = "名称 / 配置",
+  trailingLabel = "操作",
 }: {
   columns?: string;
+  leadingLabel?: string;
+  trailingLabel?: string;
 }) {
   return (
     <div
-      className="grid items-center gap-1 border-b border-[var(--border)] bg-[var(--bg-subtle)] px-3 py-2 text-[11px] text-[var(--text-muted)]"
+      className="grid min-w-0 items-center gap-1 border-b border-[var(--border)] bg-[var(--bg-subtle)] px-3 py-2 text-[11px] text-[var(--text-muted)]"
       style={{ gridTemplateColumns: columns }}
     >
-      <span className="min-w-0 truncate">名称 / 配置</span>
+      <span className="min-w-0 truncate">{leadingLabel}</span>
       {EXT_PLATFORMS.map((platform) => (
         <span key={platform.id} className="text-center whitespace-nowrap">
           {platform.label}
         </span>
       ))}
-      <span className="text-right">操作</span>
+      <span className="text-right whitespace-nowrap">{trailingLabel}</span>
     </div>
   );
 }
 
-export function ExtError({ message }: { message: string | null }) {
-  return message ? (
+export function ExtError({
+  message,
+  onDismiss,
+}: {
+  message: string | null;
+  onDismiss?: () => void;
+}) {
+  if (!message) return null;
+  return (
     <div
       role="alert"
-      className="rounded-lg border border-[var(--danger)]/25 bg-[var(--danger-soft)] px-3 py-2 text-[12px] text-[var(--danger)] break-words"
+      className="flex min-w-0 items-start gap-2 rounded-lg border border-[var(--danger)]/30 bg-[var(--danger-soft)] px-3 py-2 text-[12px] text-[var(--danger)]"
     >
-      {message}
+      <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+      <span className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]">
+        {message}
+      </span>
+      {onDismiss && (
+        <button
+          type="button"
+          aria-label="关闭错误提示"
+          title="关闭错误提示"
+          onClick={onDismiss}
+          className="shrink-0 cursor-pointer"
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
+      )}
     </div>
-  ) : null;
+  );
 }
 
 export function useExtensionBackup(
@@ -397,6 +543,7 @@ export function useExtensionBackup(
   const drawer = open && (
     <ExtSlideDrawer
       title={mode === "export" ? "导出 JSON 备份" : "导入 JSON 备份"}
+      busy={busy}
       onClose={close}
       footer={
         <button
@@ -414,32 +561,30 @@ export function useExtensionBackup(
         </button>
       }
     >
-      <div className="flex flex-col gap-3">
-        <ExtError message={error} />
-        {mode === "import" && (
-          <input
-            type="file"
-            accept="application/json,.json"
-            aria-label="选择 JSON 备份文件"
-            className="min-w-0 max-w-full text-[12px] text-[var(--text-secondary)]"
-            onChange={(event) => {
-              const file = event.target.files?.[0];
-              if (file)
-                void file
-                  .text()
-                  .then(setDraft)
-                  .catch((err: unknown) => setError(String(err)));
-            }}
-          />
-        )}
-        <textarea
-          aria-label="JSON 备份内容"
-          readOnly={mode === "export"}
-          value={draft}
-          onChange={(event) => setDraft(event.target.value)}
-          className={`${EXT_INPUT} min-h-[300px] resize-y font-mono`}
+      <ExtError message={error} />
+      {mode === "import" && (
+        <input
+          type="file"
+          accept="application/json,.json"
+          aria-label="选择 JSON 备份文件"
+          className="min-w-0 max-w-full text-[12px] text-[var(--text-secondary)]"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file)
+              void file
+                .text()
+                .then(setDraft)
+                .catch((err: unknown) => setError(String(err)));
+          }}
         />
-      </div>
+      )}
+      <textarea
+        aria-label="JSON 备份内容"
+        readOnly={mode === "export"}
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        className={`${EXT_INPUT} min-h-[300px] resize-y font-mono`}
+      />
     </ExtSlideDrawer>
   );
   return { begin, drawer };

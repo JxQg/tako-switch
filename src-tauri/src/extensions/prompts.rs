@@ -1,5 +1,5 @@
 use super::{
-    apply_file_updates, extensions_dir, platform_key, prompt_path, read_json_store,
+    apply_file_updates, extension_store_path, platform_key, prompt_path, read_json_store,
     read_optional_file, store_lock, validate_extension_id, ExtPlatform, FileUpdate,
 };
 use crate::adapters::{TAKO_CHINESE_BLOCK_END, TAKO_CHINESE_BLOCK_START};
@@ -59,7 +59,7 @@ pub struct PromptsHubSnapshot {
 }
 
 pub fn prompts_store_path(paths: &AppPaths) -> PathBuf {
-    extensions_dir(paths).join("prompts.json")
+    extension_store_path(paths, "prompts.json")
 }
 
 struct PromptDocument {

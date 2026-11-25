@@ -2,10 +2,10 @@ import {
   useCallback,
   useDeferredValue,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
-  type ReactNode,
 } from "react";
 import {
   AlertCircle,
@@ -31,11 +31,13 @@ import {
 import { ToggleSwitch } from "../UiPrimitives";
 import {
   EXT_BUTTON,
+  EXT_INPUT,
   EXT_PLATFORMS,
   EXT_PRIMARY_BUTTON,
   ExtHelpPopover,
   ExtSearchInput,
   ExtSlideDrawer,
+  type ExtensionActions,
 } from "./ExtensionPrimitives";
 
 type PluginTab = "installed" | "discover" | "marketplaces";
@@ -47,7 +49,7 @@ export function PluginsHubView({
   onActionsChange,
   onCountChange,
 }: {
-  onActionsChange: (actions: ReactNode) => void;
+  onActionsChange: (actions: ExtensionActions) => void;
   onCountChange: (count: number) => void;
 }) {
   const [platform, setPlatform] = useState<ExtPlatform>("claude");
@@ -97,7 +99,16 @@ export function PluginsHubView({
             : next,
         );
         if (includeAvailable) setCatalogLoaded(true);
-        onCountChange(next.installed.length);
+        void api
+          .getExtensionsSummary()
+          .then((summary) => {
+            onCountChange(
+              summary && typeof summary.pluginsCount === "number"
+                ? summary.pluginsCount
+                : next.installed.length,
+            );
+          })
+          .catch(() => onCountChange(next.installed.length));
       } catch (failure) {
         if (id === requestId.current && platform === currentPlatform.current)
           setError(parsePluginError(failure));
@@ -139,36 +150,27 @@ export function PluginsHubView({
     snapshot?.cliAvailable === true &&
     snapshot.marketplacesSupported;
 
-  useEffect(() => {
-    onActionsChange(
-      <>
-        <button
-          type="button"
-          data-testid="ext-plugins-refresh-btn"
-          disabled={loading || busy !== null}
-          onClick={() => void load(tab !== "installed")}
-          className={EXT_BUTTON}
-        >
-          <RefreshCw
-            className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`}
-          />
-          <span>刷新</span>
-        </button>
-        <button
-          type="button"
-          data-testid="ext-plugins-market-btn"
-          disabled={!canManageMarket || loading || busy !== null}
-          onClick={() => {
-            setSource("");
-            setMarketOpen(true);
-          }}
-          className={EXT_PRIMARY_BUTTON}
-        >
-          <Plus className="h-3.5 w-3.5" />
-          <span>添加市场</span>
-        </button>
-      </>,
-    );
+  useLayoutEffect(() => {
+    onActionsChange({
+      secondary: {
+        label: "刷新",
+        icon: RefreshCw,
+        testId: "ext-plugins-refresh-btn",
+        disabled: loading || busy !== null,
+        spinning: loading,
+        onClick: () => void load(tab !== "installed"),
+      },
+      primary: {
+        label: "添加市场",
+        icon: Plus,
+        testId: "ext-plugins-market-btn",
+        disabled: !canManageMarket || loading || busy !== null,
+        onClick: () => {
+          setSource("");
+          setMarketOpen(true);
+        },
+      },
+    });
   }, [onActionsChange, canManageMarket, loading, busy, load, tab]);
 
   const runAction = async (
@@ -612,7 +614,7 @@ export function PluginsHubView({
                 onChange={(event) => setSource(event.target.value)}
                 disabled={busy !== null}
                 placeholder="owner/repo 或 https://..."
-                className="h-[var(--density-ctrl-h)] min-w-0 w-full rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-3 text-[12px] font-mono outline-none focus:border-[var(--accent)]"
+                className={`${EXT_INPUT} font-mono`}
               />
             </label>
             {error && (

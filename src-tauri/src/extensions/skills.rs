@@ -1,6 +1,8 @@
 use super::{
-    extensions_dir, http_client_for_paths, platform_skills_dirs, read_json_store,
-    validate_identifier, write_json_store, ExtPlatform,
+    build_http_client, extension_store_path, extensions_dir, normalize_platforms,
+    platform_skills_dirs, read_json_store_checked, skills_ssot_dir, store_lock as lock_store,
+    validate_extension_id as validate_identifier, with_extension_paths, write_json_store,
+    ExtPlatform,
 };
 use crate::config::{backup_file_once, write_atomic, AppPaths};
 use base64::Engine;
@@ -10,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Cursor, ErrorKind, Read};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
 
 #[cfg(windows)]
 use std::os::windows::fs::FileTypeExt;
@@ -18,7 +20,6 @@ use std::os::windows::fs::FileTypeExt;
 const MAX_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_FILES: usize = 10_000;
 const MAX_DEPTH: usize = 16;
-static STORE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -265,22 +266,16 @@ struct Frontmatter {
     description: String,
 }
 
-fn lock_store() -> Result<MutexGuard<'static, ()>, String> {
-    STORE_LOCK
-        .lock()
-        .map_err(|e| format!("技能配置锁不可用: {e}"))
-}
-
 pub fn master_skills_dir(paths: &AppPaths) -> PathBuf {
-    paths.switch_dir().join("skills")
+    skills_ssot_dir(paths)
 }
 
 fn skills_store_path(paths: &AppPaths) -> PathBuf {
-    extensions_dir(paths).join("skills.json")
+    extension_store_path(paths, "skills.json")
 }
 
 fn repos_store_path(paths: &AppPaths) -> PathBuf {
-    extensions_dir(paths).join("skill_repos.json")
+    extension_store_path(paths, "skill_repos.json")
 }
 
 fn is_link(metadata: &fs::Metadata) -> bool {
@@ -336,7 +331,7 @@ fn ensure_plain_ancestors(paths: &AppPaths, path: &Path) -> Result<(), String> {
 fn read_store(paths: &AppPaths) -> Result<SkillsStore, String> {
     ensure_plain_ancestors(paths, &extensions_dir(paths))?;
     ensure_plain_ancestors(paths, &master_skills_dir(paths))?;
-    let store: SkillsStore = read_json_store(&skills_store_path(paths))?;
+    let store: SkillsStore = read_json_store_checked(&skills_store_path(paths))?;
     let mut ids = BTreeSet::new();
     for skill in &store.skills {
         validate_identifier(&skill.id)?;
@@ -358,7 +353,7 @@ fn save_store(paths: &AppPaths, store: &SkillsStore) -> Result<(), String> {
 
 fn read_repos(paths: &AppPaths) -> Result<SkillReposStore, String> {
     ensure_plain_ancestors(paths, &extensions_dir(paths))?;
-    let store: SkillReposStore = read_json_store(&repos_store_path(paths))?;
+    let store: SkillReposStore = read_json_store_checked(&repos_store_path(paths))?;
     if !repos_store_path(paths).exists() {
         write_json_store(&repos_store_path(paths), &store)?;
     }
@@ -1080,14 +1075,6 @@ pub fn scan_adopt_local_skills_for_paths(paths: &AppPaths) -> Result<SkillsHubSn
     get_skills_hub_snapshot_for_paths(paths)
 }
 
-fn normalize_targets(targets: &[ExtPlatform]) -> Vec<ExtPlatform> {
-    ExtPlatform::all()
-        .iter()
-        .copied()
-        .filter(|platform| targets.contains(platform))
-        .collect()
-}
-
 fn align_platforms(
     paths: &AppPaths,
     store: &mut SkillsStore,
@@ -1101,7 +1088,7 @@ fn align_platforms(
         .position(|skill| skill.id == id)
         .ok_or_else(|| format!("未找到技能: {id}"))?;
     let files = collect_local_files(&master_skills_dir(paths).join(id))?;
-    let targets = normalize_targets(targets);
+    let targets = normalize_platforms(targets);
     let mut transaction = DirectoryTransaction::new(paths);
     stage_platforms(
         paths,
@@ -1226,7 +1213,7 @@ pub fn set_skill_default_targets_for_paths(
 ) -> Result<SkillsHubSnapshot, String> {
     let _guard = lock_store()?;
     let mut store = read_store(paths)?;
-    store.default_targets = normalize_targets(targets);
+    store.default_targets = normalize_platforms(targets);
     save_store(paths, &store)?;
     snapshot(paths, &store)
 }
@@ -1274,7 +1261,7 @@ fn install_batch(
         }
     }
     let mut transaction = DirectoryTransaction::new(paths);
-    let targets = normalize_targets(targets);
+    let targets = normalize_platforms(targets);
     for (mut skill, files) in incoming {
         transaction.stage_files(&master_skills_dir(paths).join(&skill.id), &files)?;
         stage_platforms(
@@ -1461,7 +1448,7 @@ async fn fetch_repo_archive(
     paths: &AppPaths,
     repo: &SkillRepo,
 ) -> Result<(String, Vec<(String, SkillFiles)>), String> {
-    let client = http_client_for_paths(paths)?;
+    let client = build_http_client(paths, Duration::from_secs(45), true)?;
     let mut branch = repo.branch.clone();
     let mut response = client
         .get(archive_url(repo, &branch)?)
@@ -1696,25 +1683,14 @@ pub async fn update_installed_skill_for_paths(
     snapshot(paths, &store)
 }
 
-async fn blocking<T, F>(operation: F) -> Result<T, String>
-where
-    T: Send + 'static,
-    F: FnOnce(&AppPaths) -> Result<T, String> + Send + 'static,
-{
-    let paths = AppPaths::detect()?;
-    tauri::async_runtime::spawn_blocking(move || operation(&paths))
-        .await
-        .map_err(|e| format!("技能操作失败: {e}"))?
-}
-
 #[tauri::command]
 pub async fn get_skills_hub_snapshot() -> Result<SkillsHubSnapshot, String> {
-    blocking(get_skills_hub_snapshot_for_paths).await
+    with_extension_paths(get_skills_hub_snapshot_for_paths).await
 }
 
 #[tauri::command]
 pub async fn scan_adopt_local_skills() -> Result<SkillsHubSnapshot, String> {
-    blocking(scan_adopt_local_skills_for_paths).await
+    with_extension_paths(scan_adopt_local_skills_for_paths).await
 }
 
 #[tauri::command]
@@ -1723,7 +1699,8 @@ pub async fn toggle_skill_platform(
     platform: ExtPlatform,
     enabled: bool,
 ) -> Result<SkillsHubSnapshot, String> {
-    blocking(move |paths| toggle_skill_platform_for_paths(paths, &id, platform, enabled)).await
+    with_extension_paths(move |paths| toggle_skill_platform_for_paths(paths, &id, platform, enabled))
+        .await
 }
 
 #[tauri::command]
@@ -1731,41 +1708,41 @@ pub async fn align_skill_platforms(
     id: String,
     targets: Vec<ExtPlatform>,
 ) -> Result<SkillsHubSnapshot, String> {
-    blocking(move |paths| align_skill_platforms_for_paths(paths, &id, &targets)).await
+    with_extension_paths(move |paths| align_skill_platforms_for_paths(paths, &id, &targets)).await
 }
 
 #[tauri::command]
 pub async fn uninstall_skill(id: String) -> Result<SkillsHubSnapshot, String> {
-    blocking(move |paths| uninstall_skill_for_paths(paths, &id)).await
+    with_extension_paths(move |paths| uninstall_skill_for_paths(paths, &id)).await
 }
 
 #[tauri::command]
 pub async fn set_skill_sync_method(method: SkillSyncMethod) -> Result<SkillsHubSnapshot, String> {
-    blocking(move |paths| set_skill_sync_method_for_paths(paths, method)).await
+    with_extension_paths(move |paths| set_skill_sync_method_for_paths(paths, method)).await
 }
 
 #[tauri::command]
 pub async fn set_skill_default_targets(
     targets: Vec<ExtPlatform>,
 ) -> Result<SkillsHubSnapshot, String> {
-    blocking(move |paths| set_skill_default_targets_for_paths(paths, &targets)).await
+    with_extension_paths(move |paths| set_skill_default_targets_for_paths(paths, &targets)).await
 }
 
 #[tauri::command]
 pub async fn import_local_skill(
     input: ImportLocalSkillRequest,
 ) -> Result<SkillsHubSnapshot, String> {
-    blocking(move |paths| import_local_skill_for_paths(paths, input)).await
+    with_extension_paths(move |paths| import_local_skill_for_paths(paths, input)).await
 }
 
 #[tauri::command]
 pub async fn upsert_skill_repo(repo: SkillRepo) -> Result<SkillsHubSnapshot, String> {
-    blocking(move |paths| upsert_skill_repo_for_paths(paths, repo)).await
+    with_extension_paths(move |paths| upsert_skill_repo_for_paths(paths, repo)).await
 }
 
 #[tauri::command]
 pub async fn remove_skill_repo(owner: String, name: String) -> Result<SkillsHubSnapshot, String> {
-    blocking(move |paths| remove_skill_repo_for_paths(paths, &owner, &name)).await
+    with_extension_paths(move |paths| remove_skill_repo_for_paths(paths, &owner, &name)).await
 }
 
 #[tauri::command]

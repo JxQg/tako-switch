@@ -33,6 +33,7 @@ import {
   EXT_PRIMARY_BUTTON,
   ExtError,
   ExtHelpPopover,
+  ExtPlatformChoices,
   ExtSlideDrawer,
   useExtensionBackup,
   type ExtensionActions,
@@ -168,7 +169,7 @@ export function PromptsHubView({
     [receive, onNotify],
   );
   const backup = useExtensionBackup(api.exportPromptsBackup, importBackup);
-  useEffect(() => {
+  useLayoutEffect(() => {
     onActionsChange({
       disabled: busy,
       primary: {
@@ -400,32 +401,13 @@ export function PromptsHubView({
               </button>
               {syncOpen && (
                 <div className="absolute left-0 top-full z-30 mt-1 w-[220px] rounded-lg border border-[var(--border)] bg-[var(--bg-card)] p-3 shadow-[var(--shadow-modal)]">
-                  <div className="flex flex-col gap-2.5">
-                    {EXT_PLATFORMS.filter((item) => item.id !== platform).map(
-                      (item) => (
-                        <label
-                          key={item.id}
-                          className="flex items-center gap-2 text-[12px] text-[var(--text-primary)]"
-                        >
-                          <input
-                            type="checkbox"
-                            checked={syncTargets.includes(item.id)}
-                            onChange={(event) =>
-                              setSyncTargets((targets) =>
-                                event.target.checked
-                                  ? [...targets, item.id]
-                                  : targets.filter(
-                                      (target) => target !== item.id,
-                                    ),
-                              )
-                            }
-                            className="accent-[var(--accent)]"
-                          />
-                          {item.label}
-                        </label>
-                      ),
+                  <ExtPlatformChoices
+                    value={syncTargets}
+                    onChange={setSyncTargets}
+                    platforms={EXT_PLATFORMS.filter(
+                      (item) => item.id !== platform,
                     )}
-                  </div>
+                  />
                   <label className="mt-3 flex items-center gap-2 border-t border-[var(--border)] pt-3 text-[11px] text-[var(--text-secondary)]">
                     <input
                       type="checkbox"

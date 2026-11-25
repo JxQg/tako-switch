@@ -1,4 +1,7 @@
-use super::{http_client_for_paths, is_safe_name, read_json_store, write_json_store, ExtPlatform};
+use super::{
+    build_http_client, codex_config_path, extension_store_path,
+    is_safe_ascii_name as is_safe_name, read_json_store_checked, write_json_store, ExtPlatform,
+};
 use crate::config::{backup_file_once, write_atomic, AppPaths};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -159,6 +162,8 @@ struct CachedCatalog {
 struct PluginCatalogCache {
     #[serde(default)]
     catalogs: BTreeMap<String, CachedCatalog>,
+    #[serde(default)]
+    installed_counts: BTreeMap<ExtPlatform, usize>,
 }
 
 fn invalid_parameter() -> PluginError {
@@ -1054,7 +1059,7 @@ fn exclude_installed(available: &mut Vec<PluginEntry>, installed: &[PluginEntry]
 }
 
 fn read_codex_doc(paths: &AppPaths) -> Result<DocumentMut, PluginError> {
-    let path = paths.codex_dir.join("config.toml");
+    let path = codex_config_path(paths);
     check_sandbox_path(paths, &path)?;
     let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -1092,7 +1097,7 @@ fn apply_codex_enabled(paths: &AppPaths, entries: &mut [PluginEntry]) -> Result<
 }
 
 fn set_codex_enabled(paths: &AppPaths, id: &str, enabled: bool) -> Result<(), PluginError> {
-    let path = paths.codex_dir.join("config.toml");
+    let path = codex_config_path(paths);
     let mut document = read_codex_doc(paths)?;
     if !document.contains_key("plugins") {
         document["plugins"] = Item::Table(Table::new());
@@ -1258,17 +1263,17 @@ async fn antigravity_catalog(
     let urls = overrides
         .and_then(|value| value.catalog_urls.clone())
         .unwrap_or_else(|| CATALOG_URLS.map(str::to_string));
-    let cache_path = super::extensions_dir(paths).join(CACHE_FILE);
+    let cache_path = extension_store_path(paths, CACHE_FILE);
     check_sandbox_path(paths, &cache_path)?;
     let mut warnings = Vec::new();
-    let mut cache = match read_json_store::<PluginCatalogCache>(paths, CACHE_FILE) {
+    let mut cache = match read_json_store_checked::<PluginCatalogCache>(&cache_path) {
         Ok(cache) => cache,
         Err(error) => {
             warnings.push(error);
             PluginCatalogCache::default()
         }
     };
-    let client = http_client_for_paths(paths)?;
+    let client = build_http_client(paths, Duration::from_secs(20), true)?;
     let (official, partners) = tokio::join!(
         fetch_catalog(paths, &client, &urls[0], OFFICIAL_MARKETPLACE),
         fetch_catalog(paths, &client, &urls[1], PARTNER_MARKETPLACE),
@@ -1303,11 +1308,93 @@ async fn antigravity_catalog(
         }
     }
     if changed {
-        write_json_store(paths, CACHE_FILE, &cache)?;
+        write_json_store(&cache_path, &cache)?;
     }
     let mut seen = HashSet::new();
     entries.retain(|entry| seen.insert(entry.id.clone()));
     Ok((entries, from_cache, warnings))
+}
+
+fn record_cached_installed_count(paths: &AppPaths, platform: ExtPlatform, count: usize) {
+    let cache_path = extension_store_path(paths, CACHE_FILE);
+    if check_sandbox_path(paths, &cache_path).is_err() {
+        return;
+    }
+    if let Ok(mut cache) = read_json_store_checked::<PluginCatalogCache>(&cache_path) {
+        if cache.installed_counts.get(&platform).copied() != Some(count) {
+            cache.installed_counts.insert(platform, count);
+            let _ = write_json_store(&cache_path, &cache);
+        }
+    }
+}
+
+fn count_disk_plugins_for_platform(paths: &AppPaths, platform: ExtPlatform) -> usize {
+    match platform {
+        ExtPlatform::Antigravity => {
+            let root = paths.agy_gemini_config_dir.join("plugins");
+            let Ok(entries) = fs::read_dir(root) else {
+                return 0;
+            };
+            entries
+                .flatten()
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    is_installed_directory(&name)
+                        && ["", ".antigravity-plugin", ".gemini-plugin", ".claude-plugin"]
+                            .iter()
+                            .any(|folder| entry.path().join(folder).join("plugin.json").is_file())
+                })
+                .count()
+        }
+        ExtPlatform::Claude => {
+            let path = paths.home.join(".claude/plugins/installed_plugins.json");
+            let Ok(bytes) = fs::read(path) else {
+                return 0;
+            };
+            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                return 0;
+            };
+            plugin_rows(&value, "installed")
+                .map(|rows| rows.len())
+                .unwrap_or(0)
+        }
+        ExtPlatform::Codex => {
+            let plugins_dir = paths.codex_dir.join("plugins");
+            if let Ok(entries) = fs::read_dir(&plugins_dir) {
+                let dir_count = entries
+                    .flatten()
+                    .filter(|entry| entry.path().is_dir())
+                    .count();
+                if dir_count > 0 {
+                    return dir_count;
+                }
+            }
+            read_codex_doc(paths)
+                .ok()
+                .and_then(|doc| {
+                    doc.get("plugins")
+                        .and_then(Item::as_table_like)
+                        .map(|table| table.len())
+                })
+                .unwrap_or(0)
+        }
+    }
+}
+
+/// 快速无子进程统计三端已安装插件数（优先使用最近一次 CLI 快照缓存，未探测端回退磁盘扫描）。
+pub fn count_local_installed_plugins_for_paths(paths: &AppPaths) -> usize {
+    let cache = read_json_store_checked::<PluginCatalogCache>(&extension_store_path(paths, CACHE_FILE))
+        .unwrap_or_default();
+    ExtPlatform::all()
+        .iter()
+        .map(|&platform| {
+            cache
+                .installed_counts
+                .get(&platform)
+                .copied()
+                .unwrap_or_else(|| count_disk_plugins_for_platform(paths, platform))
+        })
+        .sum()
 }
 
 async fn snapshot(
@@ -1334,6 +1421,9 @@ async fn snapshot(
     let Some(cli) = cli else { return Ok(snapshot) };
     snapshot.installed = installed_entries(paths, platform, &cli, overrides).await?;
     if !include_available {
+        if overrides.is_none() || extension_store_path(paths, CACHE_FILE).exists() {
+            record_cached_installed_count(paths, platform, snapshot.installed.len());
+        }
         return Ok(snapshot);
     }
     if platform == ExtPlatform::Antigravity {
@@ -1370,6 +1460,9 @@ async fn snapshot(
         snapshot.marketplaces = parse_marketplaces(&extract_cli_json(&marketplaces?)?)?;
     }
     exclude_installed(&mut snapshot.available, &snapshot.installed);
+    if overrides.is_none() || extension_store_path(paths, CACHE_FILE).exists() {
+        record_cached_installed_count(paths, platform, snapshot.installed.len());
+    }
     Ok(snapshot)
 }
 

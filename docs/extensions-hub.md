@@ -2,7 +2,7 @@
 
 ## 入口与范围
 
-首页的“通用扩展中心”提供通用 MCP、Skills 技能、插件管理和提示词预设四个入口。当前实现通用 MCP 和提示词预设，Skills 和插件页签保留入口。
+首页的“通用扩展中心”提供通用 MCP、Skills 技能、插件管理和提示词预设四个统一页签入口（详见 [`docs/skills-hub.md`](./skills-hub.md) 与 [`docs/extensions-plugins.md`](./extensions-plugins.md)）。
 
 扩展中心只管理 Claude、Codex 和 Antigravity。Tako 超级 MCP 仍在“配置与演示”页面独立管理，不出现在通用 MCP 列表中。
 

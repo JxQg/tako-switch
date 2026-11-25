@@ -396,8 +396,7 @@ export interface LiveDemoResult {
   citations: LiveDemoCitation[];
 }
 
-export type SyncPlatform = "claude" | "codex" | "antigravity";
-export type ExtPlatform = SyncPlatform;
+export type ExtPlatform = "claude" | "codex" | "antigravity";
 export type SkillSyncMethod = "auto" | "symlink" | "copy";
 export type SkillLinkMode = "symlink" | "copy";
 export type SkillSource = "local" | "adopted" | "zip" | "github";

@@ -2,14 +2,13 @@ import {
   useCallback,
   useDeferredValue,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
-  type ReactNode,
 } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
-  AlertCircle,
   ArrowUp,
   ArrowUpCircle,
   Check,
@@ -26,7 +25,6 @@ import {
   ShieldCheck,
   Trash2,
   Upload,
-  X,
 } from "lucide-react";
 import {
   api,
@@ -40,14 +38,18 @@ import {
 } from "../../lib/api";
 import { ToggleSwitch } from "../UiPrimitives";
 import {
+  EXT_BUTTON,
+  EXT_INPUT,
   EXT_PLATFORMS,
+  EXT_PRIMARY_BUTTON,
+  ExtError,
   ExtHelpPopover,
+  ExtMatrixHeader,
   ExtMoreDropdown,
+  ExtPlatformChoices,
   ExtSearchInput,
   ExtSlideDrawer,
-  extButtonClass,
-  extInputClass,
-  extPrimaryClass,
+  type ExtensionActions,
 } from "./ExtensionPrimitives";
 
 const MATRIX_COLUMNS = "minmax(0, 1fr) 70px 64px 76px 92px";
@@ -69,76 +71,13 @@ function sourceLabel(item: ManagedSkill): string {
     : SOURCE_LABELS[item.skill.source];
 }
 
-function PlatformChoices({
-  value,
-  onChange,
-  disabled = false,
-}: {
-  value: ExtPlatform[];
-  onChange: (targets: ExtPlatform[]) => void;
-  disabled?: boolean;
-}) {
-  return (
-    <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2">
-      {EXT_PLATFORMS.map((platform) => (
-        <label
-          key={platform.id}
-          className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap text-[12px] text-[var(--text-secondary)]"
-        >
-          <input
-            type="checkbox"
-            checked={value.includes(platform.id)}
-            disabled={disabled}
-            onChange={(event) =>
-              onChange(
-                event.target.checked
-                  ? [...value, platform.id]
-                  : value.filter((target) => target !== platform.id),
-              )
-            }
-            className="h-3.5 w-3.5 accent-[var(--accent)]"
-          />
-          {platform.label}
-        </label>
-      ))}
-    </div>
-  );
-}
-
-function ErrorNotice({
-  message,
-  onDismiss,
-}: {
-  message: string;
-  onDismiss: () => void;
-}) {
-  return (
-    <div
-      role="alert"
-      className="flex min-w-0 items-start gap-2 rounded-[7px] border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-[12px] text-[var(--danger)]"
-    >
-      <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-      <span className="min-w-0 flex-1 break-words [overflow-wrap:anywhere]">
-        {message}
-      </span>
-      <button
-        type="button"
-        aria-label="关闭错误提示"
-        title="关闭错误提示"
-        onClick={onDismiss}
-        className="shrink-0 cursor-pointer"
-      >
-        <X className="h-3.5 w-3.5" />
-      </button>
-    </div>
-  );
-}
-
 export function SkillsHubView({
-  renderHeader,
+  onActionsChange,
+  onCountChange,
   onNotify,
 }: {
-  renderHeader: (actions: ReactNode, count: number) => ReactNode;
+  onActionsChange: (actions: ExtensionActions) => void;
+  onCountChange: (count: number) => void;
   onNotify?: (message: string) => void;
 }) {
   const [snapshot, setSnapshot] = useState<SkillsHubSnapshot | null>(null);
@@ -182,6 +121,10 @@ export function SkillsHubView({
       mounted.current = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (snapshot) onCountChange(snapshot.skills.length);
+  }, [snapshot, onCountChange]);
 
   useEffect(() => {
     if (!notice) return;
@@ -309,51 +252,62 @@ export function SkillsHubView({
     setDrawer("repos");
   };
 
-  const actions = (
-    <>
-      <ExtMoreDropdown
-        disabled={busy || loading}
-        items={[
-          {
-            label: "扫描收编本机技能",
-            icon: ScanSearch,
-            onSelect: () =>
-              void run(() =>
-                applySnapshot(api.scanAdoptLocalSkills(), "本机技能已收编"),
-              ),
-          },
-          { label: "管理仓库源", icon: Settings2, onSelect: openRepos },
-          {
-            label: "检查更新",
-            icon: RefreshCw,
-            onSelect: () => void checkUpdates(),
-          },
-          ...SYNC_METHODS.map((method) => ({
-            label: method.label,
-            icon: method.id === "copy" ? FolderInput : Link2,
-            checked: snapshot?.syncMethod === method.id,
-            onSelect: () =>
-              void run(() =>
-                applySnapshot(
-                  api.setSkillSyncMethod(method.id),
-                  "同步策略已更新",
-                ),
-              ),
-          })),
-        ]}
-      />
-      <button
-        type="button"
-        data-testid="ext-skills-import-btn"
-        disabled={busy || loading}
-        onClick={openImport}
-        className={extPrimaryClass}
-      >
-        <Plus className="h-3.5 w-3.5" />
-        导入技能
-      </button>
-    </>
-  );
+  const actionHandlersRef = useRef({
+    scan: () => {},
+    openRepos: () => {},
+    checkUpdates: () => {},
+    setSyncMethod: (_method: SkillSyncMethod) => {},
+    openImport: () => {},
+  });
+  actionHandlersRef.current = {
+    scan: () =>
+      void run(() =>
+        applySnapshot(api.scanAdoptLocalSkills(), "本机技能已收编"),
+      ),
+    openRepos,
+    checkUpdates: () => void checkUpdates(),
+    setSyncMethod: (method: SkillSyncMethod) =>
+      void run(() =>
+        applySnapshot(api.setSkillSyncMethod(method), "同步策略已更新"),
+      ),
+    openImport,
+  };
+
+  useLayoutEffect(() => {
+    onActionsChange({
+      disabled: busy || loading,
+      more: [
+        {
+          label: "扫描收编本机技能",
+          icon: ScanSearch,
+          onClick: () => actionHandlersRef.current.scan(),
+        },
+        {
+          label: "管理仓库源",
+          icon: Settings2,
+          onClick: () => actionHandlersRef.current.openRepos(),
+        },
+        {
+          label: "检查更新",
+          icon: RefreshCw,
+          onClick: () => actionHandlersRef.current.checkUpdates(),
+        },
+        ...SYNC_METHODS.map((method) => ({
+          label: method.label,
+          icon: method.id === "copy" ? FolderInput : Link2,
+          checked: snapshot?.syncMethod === method.id,
+          onClick: () => actionHandlersRef.current.setSyncMethod(method.id),
+        })),
+      ],
+      primary: {
+        label: "导入技能",
+        icon: Plus,
+        testId: "ext-skills-import-btn",
+        disabled: busy || loading,
+        onClick: () => actionHandlersRef.current.openImport(),
+      },
+    });
+  }, [onActionsChange, busy, loading, snapshot?.syncMethod]);
 
   const installed = (snapshot?.skills ?? []).filter((item) =>
     `${item.skill.name} ${item.skill.id} ${item.skill.description} ${sourceLabel(item)}`
@@ -463,7 +417,7 @@ export function SkillsHubView({
             onClick={() =>
               void run(() => refreshRepo(repo), drawer === "repos")
             }
-            className={`${extButtonClass} !h-7 !w-7 !px-0`}
+            className={`${EXT_BUTTON} !h-7 !w-7 !px-0`}
           >
             <RefreshCw className="h-3.5 w-3.5" />
           </button>
@@ -486,7 +440,7 @@ export function SkillsHubView({
                 );
               }, drawer === "repos")
             }
-            className={`${extButtonClass} !h-7 !w-7 !px-0 !text-[var(--danger)]`}
+            className={`${EXT_BUTTON} !h-7 !w-7 !px-0 !text-[var(--danger)]`}
           >
             <Trash2 className="h-3.5 w-3.5" />
           </button>
@@ -497,7 +451,6 @@ export function SkillsHubView({
 
   return (
     <>
-      {renderHeader(actions, snapshot?.skills.length ?? 0)}
       <section
         data-testid="ext-skills-view"
         aria-label="Skills 技能"
@@ -550,9 +503,7 @@ export function SkillsHubView({
             </ExtHelpPopover>
           </div>
         </div>
-        {error && (
-          <ErrorNotice message={error} onDismiss={() => setError(null)} />
-        )}
+        <ExtError message={error} onDismiss={() => setError(null)} />
         {notice && !onNotify && (
           <div role="status" className="text-[12px] text-[var(--success)]">
             {notice}
@@ -577,19 +528,12 @@ export function SkillsHubView({
           </div>
         ) : tab === "installed" ? (
           <>
-            <div className="min-w-0">
-              <div
-                className="grid min-w-0 items-center border-b border-[var(--border)] px-2 pb-2 text-[11px] text-[var(--text-muted)]"
-                style={{ gridTemplateColumns: MATRIX_COLUMNS }}
-              >
-                <span className="min-w-0 truncate">技能名称 / 来源</span>
-                {EXT_PLATFORMS.map((platform) => (
-                  <span key={platform.id} className="text-center">
-                    {platform.label}
-                  </span>
-                ))}
-                <span className="text-right">状态 / 操作</span>
-              </div>
+            <div className="min-w-0 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-card)]">
+              <ExtMatrixHeader
+                columns={MATRIX_COLUMNS}
+                leadingLabel="技能名称 / 来源"
+                trailingLabel="状态 / 操作"
+              />
               {installed.map((item) => (
                 <div
                   key={item.skill.id}
@@ -703,7 +647,7 @@ export function SkillsHubView({
                         {
                           label: "三端对齐",
                           icon: Link2,
-                          onSelect: () =>
+                          onClick: () =>
                             void run(() =>
                               applySnapshot(
                                 api.alignSkillPlatforms(
@@ -718,7 +662,7 @@ export function SkillsHubView({
                           label: "彻底卸载",
                           icon: Trash2,
                           danger: true,
-                          onSelect: () => {
+                          onClick: () => {
                             setDrawerError(null);
                             setUninstalling(item);
                           },
@@ -756,7 +700,7 @@ export function SkillsHubView({
                   type="button"
                   disabled={busy}
                   onClick={openRepos}
-                  className={`${extButtonClass} !h-7`}
+                  className={`${EXT_BUTTON} !h-7`}
                 >
                   <Plus className="h-3 w-3" />
                   添加仓库
@@ -773,7 +717,7 @@ export function SkillsHubView({
               <span className="shrink-0 text-[11px] font-medium text-[var(--text-secondary)]">
                 默认同步端
               </span>
-              <PlatformChoices
+              <ExtPlatformChoices
                 value={snapshot?.defaultTargets ?? []}
                 disabled={busy}
                 onChange={(targets) =>
@@ -845,7 +789,7 @@ export function SkillsHubView({
                             );
                           })
                         }
-                        className={`${extButtonClass} !h-7 !px-2 !text-[11px]`}
+                        className={`${EXT_BUTTON} !h-7 !px-2 !text-[11px]`}
                       >
                         {installedItem ? (
                           <Check className="h-3 w-3" />
@@ -880,7 +824,7 @@ export function SkillsHubView({
                       busy || !snapshot?.repos.some((repo) => repo.enabled)
                     }
                     onClick={() => void checkUpdates()}
-                    className={extButtonClass}
+                    className={EXT_BUTTON}
                   >
                     <RefreshCw className="h-3.5 w-3.5" />
                     拉取技能
@@ -902,7 +846,7 @@ export function SkillsHubView({
                 type="button"
                 disabled={busy}
                 onClick={() => setDrawer(null)}
-                className={extButtonClass}
+                className={EXT_BUTTON}
               >
                 取消
               </button>
@@ -916,7 +860,7 @@ export function SkillsHubView({
                     : !zipFile && !nativeZipPath)
                 }
                 onClick={() => void handleImport()}
-                className={extPrimaryClass}
+                className={EXT_PRIMARY_BUTTON}
               >
                 {busy ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -947,12 +891,10 @@ export function SkillsHubView({
               </button>
             ))}
           </div>
-          {drawerError && (
-            <ErrorNotice
-              message={drawerError}
-              onDismiss={() => setDrawerError(null)}
-            />
-          )}
+          <ExtError
+            message={drawerError}
+            onDismiss={() => setDrawerError(null)}
+          />
           {importMode === "zip" ? (
             <label
               onDragOver={(event) => {
@@ -1002,13 +944,13 @@ export function SkillsHubView({
                 disabled={busy}
                 onChange={(event) => setImportPath(event.target.value)}
                 placeholder="包含 SKILL.md 的目录"
-                className={extInputClass}
+                className={EXT_INPUT}
               />
             </label>
           )}
           <fieldset className="min-w-0">
             <legend className="mb-2 text-[12px] font-medium">同步端</legend>
-            <PlatformChoices
+            <ExtPlatformChoices
               value={importTargets}
               onChange={setImportTargets}
               disabled={busy}
@@ -1022,12 +964,10 @@ export function SkillsHubView({
           busy={busy}
           onClose={() => setDrawer(null)}
         >
-          {drawerError && (
-            <ErrorNotice
-              message={drawerError}
-              onDismiss={() => setDrawerError(null)}
-            />
-          )}
+          <ExtError
+            message={drawerError}
+            onDismiss={() => setDrawerError(null)}
+          />
           <form
             onSubmit={(event) => {
               event.preventDefault();
@@ -1042,7 +982,7 @@ export function SkillsHubView({
                 disabled={busy}
                 onChange={(event) => setRepoInput(event.target.value)}
                 placeholder="owner/repo"
-                className={extInputClass}
+                className={EXT_INPUT}
                 required
               />
             </label>
@@ -1053,13 +993,13 @@ export function SkillsHubView({
                 disabled={busy}
                 onChange={(event) => setBranchInput(event.target.value)}
                 placeholder="main"
-                className={extInputClass}
+                className={EXT_INPUT}
               />
             </label>
             <button
               type="submit"
               disabled={busy || !repoInput.trim()}
-              className={`${extPrimaryClass} self-end`}
+              className={`${EXT_PRIMARY_BUTTON} self-end`}
             >
               <Plus className="h-3.5 w-3.5" />
               添加仓库
@@ -1079,7 +1019,7 @@ export function SkillsHubView({
                 type="button"
                 disabled={busy}
                 onClick={() => setUninstalling(null)}
-                className={extButtonClass}
+                className={EXT_BUTTON}
               >
                 取消
               </button>
@@ -1095,7 +1035,7 @@ export function SkillsHubView({
                     setUninstalling(null);
                   }, true)
                 }
-                className={`${extButtonClass} !border-[var(--danger)] !bg-[var(--danger-soft)] !text-[var(--danger)]`}
+                className={`${EXT_BUTTON} !border-[var(--danger)] !bg-[var(--danger-soft)] !text-[var(--danger)]`}
               >
                 <Trash2 className="h-3.5 w-3.5" />
                 彻底卸载
@@ -1103,12 +1043,10 @@ export function SkillsHubView({
             </>
           }
         >
-          {drawerError && (
-            <ErrorNotice
-              message={drawerError}
-              onDismiss={() => setDrawerError(null)}
-            />
-          )}
+          <ExtError
+            message={drawerError}
+            onDismiss={() => setDrawerError(null)}
+          />
           <div className="flex items-start gap-2 text-[13px]">
             <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-[var(--warning)]" />
             <p className="min-w-0 break-words">

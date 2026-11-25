@@ -83,10 +83,21 @@ REQUIRED_EXT_HUB_TESTIDS = [
     "ext-hub-tab-skills",
     "ext-hub-tab-plugins",
     "ext-hub-tab-prompts",
+    "ext-hub-actions",
     "ext-mcp-tako-notice",
     "ext-mcp-goto-super",
     "ext-mcp-search",
     "ext-mcp-add-btn",
+    "ext-skills-view",
+    "ext-skills-import-btn",
+    "ext-skills-search",
+    "ext-skills-subtab-installed",
+    "ext-skills-subtab-discover",
+    "ext-plugins-view",
+    "ext-plugins-market-btn",
+    "ext-plugins-refresh-btn",
+    "ext-plugins-search",
+    "ext-plugins-empty-unsupported",
     "ext-prompts-new-btn",
     "ext-prompts-platform-claude",
     "ext-prompts-platform-codex",
@@ -132,6 +143,8 @@ FORBIDDEN_LEGACY_ASSETS = [
 
 FORBIDDEN_LEGACY_FILES = [
     Path("src/components/McpShowcaseModal.tsx"),
+    Path("src/components/MultiPlatformSyncPanel.tsx"),
+    Path("src-tauri/src/sync_hub.rs"),
 ]
 
 CONTROLLED_AGY_I18N_REL = Path("src-tauri/src/adapters/antigravity_i18n.rs")
@@ -332,7 +345,14 @@ def has_mcp_tool_attr(src_files: Dict[Path, str], tool_id: str) -> bool:
 def has_extension_testid(src_files: Dict[Path, str], testid: str) -> bool:
     if has_testid(src_files, testid):
         return True
-    for prefix in ("open-ext-hub-", "ext-hub-tab-", "ext-prompts-platform-"):
+    for prefix in (
+        "open-ext-hub-",
+        "ext-hub-tab-",
+        "ext-prompts-platform-",
+        "ext-skills-subtab-",
+        "ext-plugins-platform-",
+        "ext-plugins-subtab-",
+    ):
         if testid.startswith(prefix):
             suffix = re.escape(testid[len(prefix) :])
             dynamic = re.compile(r"data-testid=\{\s*`" + re.escape(prefix) + r"\$\{[^}]+\}`\s*\}")
@@ -342,7 +362,10 @@ def has_extension_testid(src_files: Dict[Path, str], testid: str) -> bool:
     all_source = "\n".join(src_files.values())
     return (
         bool(re.search(rf'''testId:\s*["']{re.escape(testid)}["']''', all_source))
-        and "data-testid={actions.primary.testId}" in all_source
+        and (
+            "data-testid={actions.primary.testId}" in all_source
+            or "data-testid={actions.secondary.testId}" in all_source
+        )
     ) or (
         bool(re.search(rf'''testId=["']{re.escape(testid)}["']''', all_source))
         and "data-testid={testId}" in all_source
