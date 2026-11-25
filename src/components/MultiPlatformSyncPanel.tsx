@@ -24,6 +24,7 @@ const PLATFORMS: { id: SyncPlatform; label: string }[] = [
   { id: "claude", label: "Claude" },
   { id: "codex", label: "Codex" },
   { id: "antigravity", label: "Antigravity" },
+  { id: "workbuddy", label: "WorkBuddy" },
 ];
 
 interface MultiPlatformSyncPanelProps {
@@ -181,14 +182,14 @@ export function MultiPlatformSyncPanel({
     setBatchSyncing(true);
     setError(null);
     try {
-      const allTargets: SyncPlatform[] = ["claude", "codex", "antigravity"];
+      const allTargets: SyncPlatform[] = ["claude", "codex", "antigravity", "workbuddy"];
       if (mode === "mcp") {
         const res = await api.syncAllMcps(allTargets, null);
         setSnapshot(res.snapshot);
         onNotify?.(
           res.syncedWrites > 0
             ? `已同步 ${res.syncedItems} 个 MCP（共写入 ${res.syncedWrites} 处配置）`
-            : "三端自定义 MCP 已全部对齐，无需变更",
+            : "各端自定义 MCP 已全部对齐，无需变更",
         );
       } else {
         const res = await api.syncAllSkills(allTargets, null);
@@ -196,7 +197,7 @@ export function MultiPlatformSyncPanel({
         onNotify?.(
           res.syncedWrites > 0
             ? `已同步 ${res.syncedItems} 个 Skill（共写入 ${res.syncedWrites} 处目录）`
-            : "三端 Skills 已全部对齐，无需变更",
+            : "各端 Skills 已全部对齐，无需变更",
         );
       }
     } catch (err) {
@@ -502,5 +503,6 @@ export function MultiPlatformSyncPanel({
 function platformLabel(p: SyncPlatform): string {
   if (p === "claude") return "Claude";
   if (p === "codex") return "Codex";
+  if (p === "workbuddy") return "WorkBuddy";
   return "Antigravity";
 }

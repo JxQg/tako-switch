@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import packageJson from "../../package.json";
 import {
   ArrowUpCircle,
   ChevronDown,
@@ -524,7 +525,7 @@ export function GeneralSettingsPanel({
                 <div className="min-w-0">
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <span className="text-[12.5px] font-medium text-[var(--text-primary)]">
-                      Tako Switch v{dashboard?.appVersion ?? "2.2.7"}
+                      Tako Switch v{dashboard?.appVersion ?? packageJson.version}
                     </span>
                     <button
                       type="button"

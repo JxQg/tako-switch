@@ -48,6 +48,7 @@ INSTALLED_MACOS_PATHS: dict[str, list[Path]] = {
     "claude": [Path("/Applications/Claude.app")],
     "codex": [Path("/Applications/ChatGPT.app"), Path("/Applications/Codex.app")],
     "antigravity": [Path("/Applications/Antigravity.app")],
+    "workbuddy": [Path("/Applications/WorkBuddy.app")],
     "dsh-tako": [Path("/Applications/DSH Tako.app")],
 }
 
@@ -55,6 +56,7 @@ EXPECTED_BUNDLE_IDS: dict[str, str] = {
     "claude": "com.anthropic.claudefordesktop",
     "codex": "com.openai.codex",
     "antigravity": "com.google.antigravity",
+    "workbuddy": "com.tencent.workbuddy.mac",
     "dsh-tako": "tech.shiroha.dsh-tako",
 }
 
@@ -62,11 +64,11 @@ RISK_KEYWORDS: dict[str, list[str]] = {
     "breaking": ["breaking", "removed", "incompatible", "migration required", "drop support"],
     "auth_region": ["oauth", "sign-in", "login", "region", "geo", "account required"],
     "packaging_runtime": ["electron", "asar", "msix", "codesign", "integrity", "sandbox", "webview"],
-    "config_mcp": ["config.toml", "mcp", "model_provider", "managed-settings", "3p", "gateway"],
+    "config_mcp": ["config.toml", "mcp", "model_provider", "managed-settings", "3p", "gateway", "models.json"],
     "updater_downloader": ["auto-update", "autoupdate", "downloads.claude.ai", "squirrel", "sparkle"],
 }
 
-APP_ORDER = ("claude", "codex", "antigravity", "dsh-tako")
+APP_ORDER = ("claude", "codex", "antigravity", "workbuddy", "dsh-tako")
 
 
 def load_sync_manifest_module():
@@ -272,6 +274,26 @@ def fetch_changelogs(upstream_apps: dict) -> dict[str, dict]:
     except Exception as exc:
         agy_info["error"] = str(exc)
     notes["antigravity"] = agy_info
+
+    # 5. WorkBuddy (official domestic changelog page)
+    wb_info: dict = {"source": "https://www.workbuddy.cn/docs/workbuddy/Changelog", "entries": [], "error": None}
+    try:
+        wb_html = http_get_text("https://www.workbuddy.cn/docs/workbuddy/Changelog")
+        main_m = re.search(r"<main[^>]*>(.*?)</main>", wb_html, flags=re.S)
+        wb_text = re.sub(r"<[^>]+>", "\n", main_m.group(1) if main_m else wb_html)
+        wb_lines = [ln.strip() for ln in wb_text.splitlines() if ln.strip()]
+        joined = "\n".join(wb_lines)
+        ver_m = re.search(r"(\d+\.\d+\.\d+)\s*版本发布[^（(]*[（(](\d{4}-\d{2}-\d{2})[）)]", joined)
+        wb_info["entries"].append(
+            {
+                "version": ver_m.group(1) if ver_m else str((upstream_apps.get("workbuddy") or {}).get("version") or ""),
+                "publishedAt": ver_m.group(2) if ver_m else None,
+                "body": joined[:1200],
+            }
+        )
+    except Exception as exc:
+        wb_info["error"] = str(exc)
+    notes["workbuddy"] = wb_info
 
     for app_id, info in notes.items():
         combined_text = "\n".join(str(e.get("body") or "") for e in info.get("entries") or [])
@@ -724,6 +746,26 @@ def verify_macos_bundle(
         masque = resources / "masque-proxy-origins.txt"
         if masque.is_file():
             extra_audit["masqueProxyOrigins"] = masque.read_text(encoding="utf-8", errors="replace").strip()
+
+    elif app_id == "workbuddy":
+        loc_details.append("WorkBuddy 国内版原生简体中文")
+        asar_path = resources / "app.asar"
+        if asar_path.is_file():
+            asar = SimpleAsarReader(asar_path)
+            prod_raw = asar.read_file("cli/product.json")
+            if prod_raw:
+                prod = json.loads(prod_raw.decode("utf-8", errors="replace"))
+                if (prod.get("productFeatures") or {}).get("CustomModelsJSON") is True:
+                    inj_details.append("cli/product.json CustomModelsJSON=true（支持 ~/.workbuddy/models.json 热加载）")
+                else:
+                    inj_status = "fail"
+                    inj_details.append("cli/product.json 缺少 CustomModelsJSON=true，无法通过 models.json 接入 Tako 网关")
+            else:
+                inj_status = "warn"
+                inj_details.append("app.asar 中未找到 cli/product.json，请人工核对 models.json 兼容")
+        else:
+            inj_status = "fail"
+            inj_details.append("Resources 下缺少 app.asar")
 
     elif app_id == "dsh-tako":
         loc_details.append("自研客户端原生简体中文")

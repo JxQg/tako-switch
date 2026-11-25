@@ -118,6 +118,39 @@
           "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.1-4615540875067392/windows-x64/Antigravity-x64.exe"
         }
       }
+    },
+    "workbuddy": {
+      "displayName": "WorkBuddy",
+      "version": "5.11.3",
+      "platforms": {
+        "macos-arm64": {
+          "url": "https://acc-1258344699.cos.accelerate.myqcloud.com/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.11.3.43806934-ecace0f7.dmg",
+          "fallbackUrl": "https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.11.3.43806934-ecace0f7.dmg",
+          "version": "5.11.3",
+          "installType": "dmg",
+          "sha256": "f3b99997b0aebfe22af4f8c0070b37946b9f839b51cf9510eb6a97c9e45aa639",
+          "size": 375366665,
+          "appBundleName": "WorkBuddy.app"
+        },
+        "macos-x64": {
+          "url": "https://acc-1258344699.cos.accelerate.myqcloud.com/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.11.3.43806934-ecace0f7.dmg",
+          "fallbackUrl": "https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.11.3.43806934-ecace0f7.dmg",
+          "version": "5.11.3",
+          "installType": "dmg",
+          "size": 408506969,
+          "appBundleName": "WorkBuddy.app"
+        },
+        "windows-x64": {
+          "url": "https://acc-1258344699.cos.accelerate.myqcloud.com/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-5.11.3.43806934-ecace0f7.exe",
+          "fallbackUrl": "https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-5.11.3.43806934-ecace0f7.exe",
+          "version": "5.11.3",
+          "installType": "exe",
+          "size": 459823168,
+          "silentArgs": [
+            "/S"
+          ]
+        }
+      }
     }
   }
 }

@@ -50,6 +50,10 @@ CODEX_MAC_ARM_APPCAST = "https://persistent.oaistatic.com/codex-app-prod/appcast
 CODEX_MAC_X64_APPCAST = "https://persistent.oaistatic.com/codex-app-prod/appcast-x64.xml"
 CODEX_WIN_MSIX_URL = "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix"
 
+WORKBUDDY_DOWNLOAD_HISTORY_URL = "https://www.workbuddy.cn/docs/workbuddy/Download-History"
+WORKBUDDY_COS_ORIGIN_HOST = "acc-1258344699.cos.ap-guangzhou.myqcloud.com"
+WORKBUDDY_COS_ACCEL_HOST = "acc-1258344699.cos.accelerate.myqcloud.com"
+
 
 def http_get_text(url: str, timeout: int = 20) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "tako-switch-manifest-sync/1.0"})
@@ -284,6 +288,56 @@ def parse_dsh_tako_github_release(raw: str) -> dict:
     return {"version": version, "platforms": platforms}
 
 
+def _workbuddy_version_key(ver: str) -> tuple[int, ...]:
+    parts = [int(p) for p in re.findall(r"\d+", ver)]
+    return tuple(parts)
+
+
+def parse_workbuddy_download_history(raw: str) -> dict:
+    """Parse official WorkBuddy SaaS download-history page for latest 3-platform COS URLs."""
+    pat = re.compile(
+        r"https://acc-1258344699\.cos\.[a-z0-9-]+\.myqcloud\.com/workbuddy/saas/"
+        r"(darwin-arm64|darwin-x64|win32-x64-user)/"
+        r"WorkBuddy-\1-(\d+\.\d+\.\d+)(?:\.\d+)?-[0-9a-f]+\.(dmg|exe)",
+        re.I,
+    )
+    by_ver: dict[str, dict[str, str]] = {}
+    for m in pat.finditer(raw):
+        plat_raw = m.group(1).lower()
+        ver = m.group(2)
+        url = m.group(0)
+        plat_key = {
+            "darwin-arm64": "macos-arm64",
+            "darwin-x64": "macos-x64",
+            "win32-x64-user": "windows-x64",
+        }[plat_raw]
+        by_ver.setdefault(ver, {})[plat_key] = url
+
+    if not by_ver:
+        raise ValueError("No WorkBuddy COS download links found in download-history HTML")
+
+    latest_ver = max(by_ver.keys(), key=_workbuddy_version_key)
+    selected = by_ver[latest_ver]
+    platforms: dict[str, dict] = {}
+    for plat_key, origin_url in selected.items():
+        accel_url = origin_url.replace(WORKBUDDY_COS_ORIGIN_HOST, WORKBUDDY_COS_ACCEL_HOST)
+        fallback_url = origin_url if accel_url != origin_url else None
+        art: dict = {
+            "url": accel_url,
+            "version": latest_ver,
+            "installType": "exe" if plat_key == "windows-x64" else "dmg",
+        }
+        if fallback_url:
+            art["fallbackUrl"] = fallback_url
+        if plat_key == "windows-x64":
+            art["silentArgs"] = ["/S"]
+        else:
+            art["appBundleName"] = "WorkBuddy.app"
+        platforms[plat_key] = art
+
+    return {"version": latest_ver, "platforms": platforms}
+
+
 def apply_mirror(artifact: dict, mirror_base: str | None, app_id: str, plat: str, ver: str) -> dict:
     if not mirror_base:
         return artifact
@@ -399,6 +453,16 @@ def build_manifest(mirror_base: str | None = None) -> dict:
     if codex_win_head.get("content-length", "").isdigit():
         codex_win_art["size"] = int(codex_win_head["content-length"])
 
+    # 4. WorkBuddy (official domestic Tencent COS archive — no overseas mirror needed)
+    workbuddy = parse_workbuddy_download_history(http_get_text(WORKBUDDY_DOWNLOAD_HISTORY_URL))
+    for art in workbuddy["platforms"].values():
+        try:
+            head = http_head(art["url"])
+            if head.get("content-length", "").isdigit():
+                art["size"] = int(head["content-length"])
+        except Exception:
+            pass
+
     return {
         "schemaVersion": 1,
         "generatedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -432,6 +496,11 @@ def build_manifest(mirror_base: str | None = None) -> dict:
                 "displayName": "Google Antigravity",
                 "version": agy_top_ver,
                 "platforms": agy_platforms,
+            },
+            "workbuddy": {
+                "displayName": "WorkBuddy",
+                "version": workbuddy["version"],
+                "platforms": workbuddy["platforms"],
             },
         },
     }

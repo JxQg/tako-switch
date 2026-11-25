@@ -98,6 +98,7 @@ fn ui_patch_app_label(app_id: AppId) -> &'static str {
         AppId::Codex => "Codex",
         AppId::Antigravity => "Antigravity",
         AppId::DshTako => "DSH Tako",
+        AppId::WorkBuddy => "WorkBuddy",
     }
 }
 
@@ -565,6 +566,7 @@ fn parse_tray_mode_id(id: &str) -> Option<(AppId, AppMode)> {
         "codex" => AppId::Codex,
         "claude" => AppId::Claude,
         "antigravity" => AppId::Antigravity,
+        "workbuddy" => AppId::WorkBuddy,
         _ => return None,
     };
     let mode = match parts.next()? {
@@ -578,54 +580,59 @@ fn parse_tray_mode_id(id: &str) -> Option<(AppId, AppMode)> {
 #[tauri::command]
 async fn get_dashboard(app: AppHandle, refresh_account: bool) -> Result<DashboardPayload, String> {
     let paths = AppPaths::detect()?;
-    let account = if refresh_account {
-        let status = fetch_account_status(&paths).await;
-        update_account_and_tray(&app, &paths, status.clone(), false);
-        status
-    } else {
-        let key_opt = config::read_main_api_key(&paths);
-        let st = read_switch_state(&paths);
-        let masked = key_opt.as_deref().map(auth::mask_api_key);
-        let cached = key_opt.as_ref().and_then(|_| {
-            current_cached_account(&app, &paths).filter(|c| c.logged_in && c.masked_key == masked)
-        });
-        if let Some(c) = cached {
-            AccountStatus {
-                base_url: st.normalized_base_url(),
-                wallet_remain_usd: c.wallet_remain_usd.or_else(|| c.wallet_remain.map(quota_units_to_usd)),
-                wallet_used_usd: c.wallet_used_usd.or_else(|| c.wallet_used.map(quota_units_to_usd)),
-                ..c
-            }
+    let paths_for_local = paths.clone();
+    let local_task = tauri::async_runtime::spawn_blocking(move || {
+        (
+            read_switch_state(&paths_for_local),
+            AppId::all()
+                .iter()
+                .map(|&id| snapshot_app(&paths_for_local, id))
+                .collect(),
+            load_cached_manifest(&paths_for_local),
+            agy_proxy::is_proxy_healthy(agy_proxy::LOCAL_GATEWAY_PORT),
+        )
+    });
+
+    let account_task = async {
+        if refresh_account {
+            let status = fetch_account_status(&paths).await;
+            update_account_and_tray(&app, &paths, status.clone(), false);
+            status
         } else {
-            AccountStatus {
-                logged_in: key_opt.is_some(),
-                base_url: st.normalized_base_url(),
-                masked_key: masked,
-                user_name: None,
-                plan_name: None,
-                wallet_remain: None,
-                wallet_used: None,
-                wallet_remain_usd: None,
-                wallet_used_usd: None,
-                quota: None,
-                error: None,
+            let key_opt = config::read_main_api_key(&paths);
+            let st = read_switch_state(&paths);
+            let masked = key_opt.as_deref().map(auth::mask_api_key);
+            let cached = key_opt.as_ref().and_then(|_| {
+                current_cached_account(&app, &paths).filter(|c| c.logged_in && c.masked_key == masked)
+            });
+            if let Some(c) = cached {
+                AccountStatus {
+                    base_url: st.normalized_base_url(),
+                    wallet_remain_usd: c.wallet_remain_usd.or_else(|| c.wallet_remain.map(quota_units_to_usd)),
+                    wallet_used_usd: c.wallet_used_usd.or_else(|| c.wallet_used.map(quota_units_to_usd)),
+                    ..c
+                }
+            } else {
+                AccountStatus {
+                    logged_in: key_opt.is_some(),
+                    base_url: st.normalized_base_url(),
+                    masked_key: masked,
+                    user_name: None,
+                    plan_name: None,
+                    wallet_remain: None,
+                    wallet_used: None,
+                    wallet_remain_usd: None,
+                    wallet_used_usd: None,
+                    quota: None,
+                    error: None,
+                }
             }
         }
     };
+
+    let (account, local_res) = tokio::join!(account_task, local_task);
     let (state, apps, cached_manifest, local_gateway_healthy) =
-        tauri::async_runtime::spawn_blocking(move || {
-            (
-                read_switch_state(&paths),
-                AppId::all()
-                    .iter()
-                    .map(|&id| snapshot_app(&paths, id))
-                    .collect(),
-                load_cached_manifest(&paths),
-                agy_proxy::is_proxy_healthy(agy_proxy::LOCAL_GATEWAY_PORT),
-            )
-        })
-        .await
-        .map_err(|err| format!("读取客户端状态失败: {err}"))?;
+        local_res.map_err(|err| format!("读取客户端状态失败: {err}"))?;
 
     Ok(DashboardPayload {
         account,
@@ -1059,7 +1066,7 @@ fn should_sync_standalone_locale(paths: &AppPaths, app_id: AppId, enable: bool) 
         return true;
     }
     match app_id {
-        AppId::DshTako => false,
+        AppId::DshTako | AppId::WorkBuddy => false,
         AppId::Codex => paths.codex_dir.exists(),
         AppId::Claude => {
             paths.claude_1p_dir.exists()
@@ -1965,6 +1972,8 @@ async fn ensure_default_tako_mode_before_launch(
     }
     if app_id == AppId::Claude {
         let _ = crate::agy_proxy::refresh_claude_catalog_cache(paths).await;
+    } else if app_id == AppId::WorkBuddy {
+        let _ = crate::agy_proxy::refresh_workbuddy_catalog_cache(paths).await;
     }
     get_adapter(app_id).apply_mode(paths, AppMode::Tako)?;
     Ok(true)
@@ -1981,8 +1990,12 @@ async fn set_app_mode(
     let mut state = read_switch_state(&paths);
     state.set_explicit_official(app_id, mode == AppMode::Official);
     save_switch_state(&paths, &state)?;
-    if app_id == AppId::Claude && mode == AppMode::Tako {
-        let _ = crate::agy_proxy::refresh_claude_catalog_cache(&paths).await;
+    if mode == AppMode::Tako {
+        if app_id == AppId::Claude {
+            let _ = crate::agy_proxy::refresh_claude_catalog_cache(&paths).await;
+        } else if app_id == AppId::WorkBuddy {
+            let _ = crate::agy_proxy::refresh_workbuddy_catalog_cache(&paths).await;
+        }
     }
     let adapter = get_adapter(app_id);
     let mode_str = match mode {
@@ -2121,6 +2134,12 @@ async fn save_client_model_filter(
     save_switch_state(&paths, &state)?;
     if app_id == AppId::Claude {
         let _ = crate::agy_proxy::refresh_claude_catalog_cache(&paths).await;
+        let adapter = get_adapter(app_id);
+        if adapter.read_mode(&paths) == AppMode::Tako {
+            adapter.apply_mode(&paths, AppMode::Tako)?;
+        }
+    } else if app_id == AppId::WorkBuddy {
+        let _ = crate::agy_proxy::refresh_workbuddy_catalog_cache(&paths).await;
         let adapter = get_adapter(app_id);
         if adapter.read_mode(&paths) == AppMode::Tako {
             adapter.apply_mode(&paths, AppMode::Tako)?;

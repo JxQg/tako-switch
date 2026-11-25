@@ -15,6 +15,8 @@ pub enum SyncPlatform {
     Claude,
     Codex,
     Antigravity,
+    #[serde(rename = "workbuddy")]
+    WorkBuddy,
 }
 
 impl SyncPlatform {
@@ -23,6 +25,7 @@ impl SyncPlatform {
             SyncPlatform::Claude,
             SyncPlatform::Codex,
             SyncPlatform::Antigravity,
+            SyncPlatform::WorkBuddy,
         ]
     }
 
@@ -31,6 +34,7 @@ impl SyncPlatform {
             SyncPlatform::Claude => "Claude",
             SyncPlatform::Codex => "Codex",
             SyncPlatform::Antigravity => "Antigravity",
+            SyncPlatform::WorkBuddy => "WorkBuddy",
         }
     }
 }
@@ -164,6 +168,7 @@ fn primary_mcp_path(paths: &AppPaths, platform: SyncPlatform) -> PathBuf {
         }
         SyncPlatform::Codex => paths.codex_dir.join("config.toml"),
         SyncPlatform::Antigravity => paths.agy_gemini_config_dir.join("mcp_config.json"),
+        SyncPlatform::WorkBuddy => paths.workbuddy_dir.join("mcp.json"),
     }
 }
 
@@ -172,6 +177,7 @@ fn primary_skills_dir(paths: &AppPaths, platform: SyncPlatform) -> PathBuf {
         SyncPlatform::Claude => paths.home.join(".claude").join("skills"),
         SyncPlatform::Codex => paths.codex_dir.join("skills"),
         SyncPlatform::Antigravity => paths.agy_gemini_config_dir.join("skills"),
+        SyncPlatform::WorkBuddy => paths.workbuddy_dir.join("skills"),
     }
 }
 
@@ -427,6 +433,7 @@ fn read_platform_mcps(paths: &AppPaths, platform: SyncPlatform) -> BTreeMap<Stri
         SyncPlatform::Antigravity => {
             read_json_mcp_servers(&paths.agy_gemini_config_dir.join("mcp_config.json"))
         }
+        SyncPlatform::WorkBuddy => read_json_mcp_servers(&paths.workbuddy_dir.join("mcp.json")),
     }
 }
 
@@ -553,6 +560,12 @@ fn write_platform_mcp(
             name,
             spec,
         ),
+        SyncPlatform::WorkBuddy => {
+            let mcp_path = paths.workbuddy_dir.join("mcp.json");
+            upsert_json_mcp_server(&mcp_path, name, spec)?;
+            let entry = spec_to_json_value(spec);
+            crate::adapters::workbuddy::approve_workbuddy_mcp_server(paths, name, &entry)
+        }
     }
 }
 
@@ -572,6 +585,11 @@ fn remove_platform_mcp(paths: &AppPaths, platform: SyncPlatform, name: &str) -> 
         }
         SyncPlatform::Antigravity => {
             remove_json_mcp_server(&paths.agy_gemini_config_dir.join("mcp_config.json"), name)
+        }
+        SyncPlatform::WorkBuddy => {
+            remove_json_mcp_server(&paths.workbuddy_dir.join("mcp.json"), name)?;
+            let _ = crate::adapters::workbuddy::revoke_workbuddy_mcp_server(paths, name, false);
+            Ok(())
         }
     }
 }
@@ -1191,10 +1209,22 @@ mod tests {
         )
         .unwrap();
 
-        // Batch sync all custom MCPs across Claude, Codex, Antigravity
+        // Batch sync all custom MCPs across Claude, Codex, Antigravity, WorkBuddy
         let outcome = sync_all_mcps_for_paths(&paths, SyncPlatform::all(), None).unwrap();
         assert_eq!(outcome.synced_items, 2);
-        assert_eq!(outcome.synced_writes, 4);
+        assert_eq!(outcome.synced_writes, 6);
+
+        // Verify WorkBuddy got both custom MCPs, NOT built-in `tako`, and auto-trusted both
+        let wb_mcps = read_platform_mcps(&paths, SyncPlatform::WorkBuddy);
+        assert!(wb_mcps.contains_key("filesystem"));
+        assert!(wb_mcps.contains_key("remote_docs"));
+        assert!(!wb_mcps.contains_key("tako"));
+        let wb_approvals_path = paths.workbuddy_dir.join("mcp-approvals.json");
+        let wb_approvals: Value =
+            serde_json::from_str(&fs::read_to_string(&wb_approvals_path).unwrap()).unwrap();
+        let wb_approvals_obj = wb_approvals.as_object().unwrap();
+        assert!(wb_approvals_obj.keys().any(|k| k.ends_with("::filesystem")));
+        assert!(wb_approvals_obj.keys().any(|k| k.ends_with("::remote_docs")));
 
         // Verify Codex got `filesystem` without losing `model = "gpt-6.2-sol"` or `remote_docs`
         let codex_text = fs::read_to_string(&codex_cfg).unwrap();

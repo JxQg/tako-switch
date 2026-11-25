@@ -42,6 +42,14 @@ pub const DEFAULT_ANTIGRAVITY_RECOMMENDED_MODELS: &[&str] = &[
     "swe-2",
     "gemini-3.1-flash-image",
 ];
+pub const DEFAULT_WORKBUDDY_RECOMMENDED_MODELS: &[&str] = &[
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
+    "deepseek-v4.1-flash",
+    "swe-2",
+];
 
 #[derive(Debug, Clone)]
 pub struct AppPaths {
@@ -52,6 +60,7 @@ pub struct AppPaths {
     pub claude_1p_dir: PathBuf,
     pub claude_3p_dir: PathBuf,
     pub agy_gemini_config_dir: PathBuf,
+    pub workbuddy_dir: PathBuf,
     pub launch_agents_dir: PathBuf,
     pub agy_app_override_dir: Option<PathBuf>,
     pub claude_app_override_dir: Option<PathBuf>,
@@ -83,6 +92,10 @@ impl AppPaths {
 
         let (claude_1p_dir, claude_3p_dir) = detect_claude_dirs(&home);
         let agy_gemini_config_dir = home.join(".gemini").join("config");
+        let workbuddy_dir = std::env::var_os("WORKBUDDY_CONFIG_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".workbuddy"));
         let launch_agents_dir = home.join("Library").join("LaunchAgents");
 
         Ok(Self {
@@ -93,6 +106,7 @@ impl AppPaths {
             claude_1p_dir,
             claude_3p_dir,
             agy_gemini_config_dir,
+            workbuddy_dir,
             launch_agents_dir,
             agy_app_override_dir: None,
             claude_app_override_dir: None,
@@ -109,6 +123,7 @@ impl AppPaths {
             claude_1p_dir: root.join("claude_1p"),
             claude_3p_dir: root.join("claude_3p"),
             agy_gemini_config_dir: root.join(".gemini").join("config"),
+            workbuddy_dir: root.join(".workbuddy"),
             launch_agents_dir: root.join("LaunchAgents"),
             agy_app_override_dir: None,
             claude_app_override_dir: None,
@@ -312,6 +327,7 @@ impl ClientModelFilter {
             AppId::Claude => Self::default_claude(),
             AppId::Codex => Self::default_codex(),
             AppId::Antigravity => Self::default_antigravity(),
+            AppId::WorkBuddy => Self::default_workbuddy(),
         }
     }
 
@@ -352,12 +368,23 @@ impl ClientModelFilter {
         }
     }
 
+    pub fn default_workbuddy() -> Self {
+        Self {
+            mode: ModelFilterMode::Recommended,
+            enabled_ids: DEFAULT_WORKBUDDY_RECOMMENDED_MODELS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }
+    }
+
     pub fn recommended_ids_for(app_id: AppId) -> &'static [&'static str] {
         match app_id {
             AppId::DshTako => &[],
             AppId::Claude => DEFAULT_CLAUDE_RECOMMENDED_MODELS,
             AppId::Codex => DEFAULT_CODEX_RECOMMENDED_MODELS,
             AppId::Antigravity => DEFAULT_ANTIGRAVITY_RECOMMENDED_MODELS,
+            AppId::WorkBuddy => DEFAULT_WORKBUDDY_RECOMMENDED_MODELS,
         }
     }
 
@@ -392,6 +419,8 @@ pub struct ModelFiltersConfig {
     pub codex: ClientModelFilter,
     #[serde(default = "ClientModelFilter::default_antigravity")]
     pub antigravity: ClientModelFilter,
+    #[serde(default = "ClientModelFilter::default_workbuddy")]
+    pub workbuddy: ClientModelFilter,
 }
 
 impl Default for ModelFiltersConfig {
@@ -401,6 +430,7 @@ impl Default for ModelFiltersConfig {
             claude: ClientModelFilter::default_claude(),
             codex: ClientModelFilter::default_codex(),
             antigravity: ClientModelFilter::default_antigravity(),
+            workbuddy: ClientModelFilter::default_workbuddy(),
         }
     }
 }
@@ -412,6 +442,7 @@ impl ModelFiltersConfig {
             AppId::Claude => &self.claude,
             AppId::Codex => &self.codex,
             AppId::Antigravity => &self.antigravity,
+            AppId::WorkBuddy => &self.workbuddy,
         }
     }
 
@@ -421,6 +452,7 @@ impl ModelFiltersConfig {
             AppId::Claude => &mut self.claude,
             AppId::Codex => &mut self.codex,
             AppId::Antigravity => &mut self.antigravity,
+            AppId::WorkBuddy => &mut self.workbuddy,
         }
     }
 }

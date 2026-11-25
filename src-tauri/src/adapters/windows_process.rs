@@ -89,6 +89,7 @@ fn exe_name(id: AppId) -> &'static str {
         AppId::Codex => "Codex.exe",
         AppId::Claude => "Claude.exe",
         AppId::Antigravity => "Antigravity.exe",
+        AppId::WorkBuddy => "WorkBuddy.exe",
     }
 }
 
@@ -175,6 +176,7 @@ mod tests {
             (AppId::Codex, "CODEX.EXE"),
             (AppId::Claude, "claude.exe"),
             (AppId::Antigravity, "AntiGravity.Exe"),
+            (AppId::WorkBuddy, "workbuddy.exe"),
         ] {
             assert!(matches_ascii_name(
                 &name.encode_utf16().collect::<Vec<_>>(),

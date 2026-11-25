@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { AlertCircle, ExternalLink, FileText, Globe, MessageSquare, X } from "lucide-react";
+import packageJson from "../package.json";
 import {
   api,
   parseUiPatchBlockError,
@@ -369,8 +370,11 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
 
-    void loadDashboard(true).then((data) => {
+    void loadDashboard(false).then((data) => {
       if (disposed || !data) return;
+      if (data.account.loggedIn) {
+        void loadDashboard(true);
+      }
       if (!initialChinesePromptCheckedRef.current) {
         initialChinesePromptCheckedRef.current = true;
         const unpatchedIds = data.apps
@@ -968,7 +972,11 @@ export default function App() {
           Boolean(a.uiPatch.updateAvailable)),
     );
     const anyInstalledMissingZh = dashboard.apps.some(
-      (a) => a.id !== "dsh-tako" && a.install.installed && !a.chineseConfigured,
+      (a) =>
+        a.id !== "dsh-tako" &&
+        a.id !== "workbuddy" &&
+        a.install.installed &&
+        !a.chineseConfigured,
     );
     const nextEnable =
       currentEnabled && (needsUiPatch || anyInstalledMissingZh) ? true : !currentEnabled;
@@ -1287,7 +1295,7 @@ export default function App() {
         scrolled={headerScrolled}
         windowFocused={nativeWindow.isFocused}
         isMaximized={nativeWindow.isMaximized}
-        appVersion={dashboard?.appVersion ?? "2.2.7"}
+        appVersion={dashboard?.appVersion ?? packageJson.version}
         activeRoute={activeRoute}
         account={dashboard?.account}
         isDark={isDark}

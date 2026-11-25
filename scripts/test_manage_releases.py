@@ -54,7 +54,10 @@ class ManageReleasesTests(unittest.TestCase):
         rendered = self.mod.render_manifest_from_pinned(pinned, generated_at="2026-11-25T12:00:00Z")
         self.assertEqual(rendered["schemaVersion"], 1)
         self.assertEqual(rendered["generatedAt"], "2026-11-25T12:00:00Z")
-        self.assertEqual(set(rendered["apps"].keys()), {"dsh-tako", "codex", "claude", "antigravity"})
+        self.assertEqual(
+            set(rendered["apps"].keys()),
+            {"dsh-tako", "codex", "claude", "antigravity", "workbuddy"},
+        )
         # Companion metadata must not leak into public manifest apps schema
         self.assertNotIn("companionArtifacts", rendered["apps"]["claude"])
         self.assertNotIn("gates", rendered["apps"]["claude"])

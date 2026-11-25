@@ -17,6 +17,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub const PATCH_MARKER_FILE: &str = "__tako_i18n_patch.json";
@@ -193,6 +194,137 @@ fn resolve_antigravity_target(paths: &AppPaths) -> TargetResolution {
         path_buf
     };
     resolve_target_from_dir(&base_dir, install.version)
+}
+
+/// Lightweight header-only Electron ASAR v1 reader for fast status inspection.
+/// Reads only the 16-byte pickle prefix and JSON directory header (typically < 1 MB)
+/// instead of loading and cloning hundreds of MB of archive payloads into memory.
+#[derive(Debug, Clone)]
+pub struct AsarHeaderIndex {
+    path: PathBuf,
+    file_len: u64,
+    data_offset: u64,
+    header: Value,
+}
+
+impl AsarHeaderIndex {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let mut file = fs::File::open(path)
+            .map_err(|e| format!("打开 ASAR 文件 {} 失败: {e}", path.display()))?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| format!("读取 ASAR 文件元数据失败: {e}"))?
+            .len();
+        if file_len < 16 {
+            return Err("ASAR 文件过短，不足 16 字节头部".to_string());
+        }
+
+        let mut prefix = [0u8; 16];
+        file.read_exact(&mut prefix)
+            .map_err(|e| format!("读取 ASAR 头部失败: {e}"))?;
+
+        let u0 = u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
+        let u1 = u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]);
+        let strlen = u32::from_le_bytes([prefix[12], prefix[13], prefix[14], prefix[15]]) as u64;
+
+        if u0 != 4 {
+            return Err(format!("不支持的 ASAR Pickle 头部标识: {u0}"));
+        }
+        let data_offset = 8u64
+            .checked_add(u1 as u64)
+            .ok_or_else(|| "ASAR 头部长度溢出".to_string())?;
+        let json_end = 16u64
+            .checked_add(strlen)
+            .ok_or_else(|| "ASAR JSON 长度溢出".to_string())?;
+        if json_end > data_offset || data_offset > file_len {
+            return Err("ASAR 头部偏移越界或文件已截断".to_string());
+        }
+        if strlen > 64 * 1024 * 1024 {
+            return Err("ASAR 头部 JSON 体积异常过大".to_string());
+        }
+
+        let mut header_bytes = vec![0u8; strlen as usize];
+        file.read_exact(&mut header_bytes)
+            .map_err(|e| format!("读取 ASAR 头部 JSON 失败: {e}"))?;
+        let header: Value = serde_json::from_slice(&header_bytes)
+            .map_err(|e| format!("解析 ASAR 头部 JSON 失败: {e}"))?;
+        if header.get("files").and_then(Value::as_object).is_none() {
+            return Err("ASAR 头部缺少根 files 对象".to_string());
+        }
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            file_len,
+            data_offset,
+            header,
+        })
+    }
+
+    fn lookup_packed_range(&self, rel_path: &str) -> Option<(u64, u64)> {
+        let norm = rel_path.trim_matches('/');
+        if norm.is_empty() {
+            return None;
+        }
+        let mut cursor = &self.header;
+        for seg in norm.split('/') {
+            if seg.is_empty() {
+                continue;
+            }
+            cursor = cursor.get("files")?.as_object()?.get(seg)?;
+        }
+        if cursor.get("files").is_some()
+            || cursor.get("unpacked").and_then(Value::as_bool) == Some(true)
+            || cursor.get("link").is_some()
+        {
+            return None;
+        }
+        let size = cursor.get("size")?.as_u64()?;
+        let offset = match cursor.get("offset")? {
+            Value::String(s) => s.parse::<u64>().ok()?,
+            Value::Number(n) => n.as_u64()?,
+            _ => return None,
+        };
+        let start = self.data_offset.checked_add(offset)?;
+        let end = start.checked_add(size)?;
+        if end > self.file_len {
+            return None;
+        }
+        Some((start, size))
+    }
+
+    pub fn has_packed_file(&self, rel_path: &str) -> bool {
+        self.lookup_packed_range(rel_path).is_some()
+    }
+
+    pub fn read_file(&self, rel_path: &str) -> Result<Option<Vec<u8>>, String> {
+        let Some((start, size)) = self.lookup_packed_range(rel_path) else {
+            return Ok(None);
+        };
+        if size > 32 * 1024 * 1024 {
+            return Err(format!("ASAR 条目 {rel_path} 体积过大 ({size} bytes)"));
+        }
+        let mut file = fs::File::open(&self.path)
+            .map_err(|e| format!("打开 ASAR 文件 {} 失败: {e}", self.path.display()))?;
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| format!("定位 ASAR 条目 {rel_path} 失败: {e}"))?;
+        let mut buf = vec![0u8; size as usize];
+        file.read_exact(&mut buf)
+            .map_err(|e| format!("读取 ASAR 条目 {rel_path} 失败: {e}"))?;
+        Ok(Some(buf))
+    }
+}
+
+/// Fast read-only backup integrity check used during dashboard status inspection.
+/// Full cryptographic SHA-256 verification still runs inside `verify_clean_backup_*`
+/// whenever a patch or restore mutation is executed.
+pub fn quick_check_clean_backup_asar(orig_path: &Path, expected_sha256: &str) -> bool {
+    if expected_sha256.trim().is_empty() || !orig_path.is_file() {
+        return false;
+    }
+    match AsarHeaderIndex::open(orig_path) {
+        Ok(idx) => !idx.has_packed_file(PATCH_MARKER_FILE),
+        Err(_) => false,
+    }
 }
 
 /// Pure-Rust Electron ASAR v1 reader and writer with Chromium Pickle 4-byte alignment.
@@ -1758,6 +1890,13 @@ fn is_patchable_asar(archive: &AsarArchive) -> bool {
         || archive.get_file("dist/updater.js").is_some()
 }
 
+fn is_patchable_asar_index(index: &AsarHeaderIndex) -> bool {
+    index.has_packed_file("dist/preload.js")
+        || index.has_packed_file("dist/menu.js")
+        || index.has_packed_file("dist/tray.js")
+        || index.has_packed_file("dist/updater.js")
+}
+
 pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
     let target_patch_version = effective_ui_patch_version(paths, AppId::Antigravity);
     let target = match resolve_antigravity_target(paths) {
@@ -1790,20 +1929,8 @@ pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
     };
 
     let asar_path_str = target.asar_path.to_string_lossy().to_string();
-    let Ok(asar_bytes) = fs::read(&target.asar_path) else {
-        return UiPatchInfo {
-            status: UiPatchStatus::Unsupported,
-            patch_version: None,
-            target_patch_version: Some(target_patch_version),
-            update_available: false,
-            has_valid_backup: false,
-            target_asar_path: Some(asar_path_str),
-            note: Some("无法读取 app.asar 文件".to_string()),
-        };
-    };
-
-    let archive = match AsarArchive::parse(&asar_bytes) {
-        Ok(a) => a,
+    let index = match AsarHeaderIndex::open(&target.asar_path) {
+        Ok(idx) => idx,
         Err(err) => {
             return UiPatchInfo {
                 status: UiPatchStatus::Unsupported,
@@ -1818,8 +1945,8 @@ pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
     };
 
     let meta = read_patch_meta(paths);
-    if let Some(marker_bytes) = archive.get_file(PATCH_MARKER_FILE) {
-        let marker = serde_json::from_slice::<PatchMarkerPayload>(marker_bytes).ok();
+    if let Ok(Some(marker_bytes)) = index.read_file(PATCH_MARKER_FILE) {
+        let marker = serde_json::from_slice::<PatchMarkerPayload>(&marker_bytes).ok();
         let patch_version = marker
             .as_ref()
             .map(|m| m.patch_version.clone())
@@ -1829,7 +1956,8 @@ pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
             .map(|m| m.original_asar_sha256.as_str())
             .or_else(|| marker.as_ref().map(|m| m.original_asar_sha256.as_str()))
             .unwrap_or("");
-        let has_valid_backup = verify_clean_backup_asar(paths, expected_sha).is_ok();
+        let backup_path = ui_patch_backup_dir(paths).join("app.asar.orig");
+        let has_valid_backup = quick_check_clean_backup_asar(&backup_path, expected_sha);
         let update_available = patch_version.as_deref() != Some(target_patch_version.as_str());
         let note = if update_available {
             format!(
@@ -1850,7 +1978,7 @@ pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
         };
     }
 
-    if !is_patchable_asar(&archive) {
+    if !is_patchable_asar_index(&index) {
         return UiPatchInfo {
             status: UiPatchStatus::Unsupported,
             patch_version: None,

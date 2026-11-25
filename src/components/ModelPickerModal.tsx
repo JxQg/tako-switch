@@ -69,6 +69,7 @@ const VIEW_TABS: { id: AppId; label: string; shortLabel: string }[] = [
   { id: "codex", label: "Codex", shortLabel: "Codex" },
   { id: "claude", label: "Claude", shortLabel: "Claude" },
   { id: "antigravity", label: "Antigravity", shortLabel: "反重力" },
+  { id: "workbuddy", label: "WorkBuddy", shortLabel: "WorkBuddy" },
 ];
 
 const QUICK_FILTERS: {
@@ -114,6 +115,8 @@ const CLIENT_HINTS: Record<AppId, string> = {
   codex: "Codex 原生支持多厂商模型，可切换精简推荐或自由勾选展示列表。",
   antigravity:
     "Antigravity 最多映射 32 个自定义槽位，精简勾选可避免主力模型被裁掉。",
+  workbuddy:
+    "WorkBuddy 通过 ~/.workbuddy/models.json 接入本地 Tako 网关：勾选保存后自动热更新，在「自定义模型」分组可见。",
 };
 
 function formatContextWindow(tokens: number | null): string | null {
@@ -651,7 +654,7 @@ export function ModelPickerModal({
       if (prefetchStartedRef.current) return;
       prefetchStartedRef.current = true;
       const targets: AppId[] = loggedIn
-        ? (["dsh-tako", "codex", "claude", "antigravity"] as AppId[]).filter(
+        ? (["dsh-tako", "codex", "claude", "antigravity", "workbuddy"] as AppId[]).filter(
             (v) => v !== currentView && !cacheRef.current[v],
           )
         : currentView !== "dsh-tako" && !cacheRef.current["dsh-tako"]
@@ -1539,14 +1542,21 @@ export function ModelPickerModal({
 
           {isPlazaOverview ? (
             <div className="flex items-center flex-wrap gap-1.5 shrink-0">
-              {(["codex", "claude", "antigravity"] as const).map((cid) => (
+              {(["codex", "claude", "antigravity", "workbuddy"] as const).map((cid) => (
                 <button
                   key={cid}
                   type="button"
                   onClick={() => setActiveView(cid)}
                   className="h-7 px-2.5 rounded-[8px] border border-[var(--border)] bg-[var(--bg-subtle)]/70 hover:bg-[var(--bg-subtle)] text-[11.5px] font-medium text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
                 >
-                  配到 {cid === "codex" ? "Codex" : cid === "claude" ? "Claude" : "反重力"}
+                  配到{" "}
+                  {cid === "codex"
+                    ? "Codex"
+                    : cid === "claude"
+                      ? "Claude"
+                      : cid === "workbuddy"
+                        ? "WorkBuddy"
+                        : "反重力"}
                 </button>
               ))}
               <button

@@ -41,6 +41,7 @@ pub const LOCAL_GATEWAY_URL: &str = AGY_PROXY_URL;
 pub const CODEX_PROXY_BASE_URL: &str = "http://127.0.0.1:18419/codex/v1";
 pub const CODEX_PROXY_CATALOG_URL: &str = "http://127.0.0.1:18419/codex/models";
 pub const CLAUDE_PROXY_BASE_URL: &str = "http://127.0.0.1:18419/claude";
+pub const WORKBUDDY_PROXY_BASE_URL: &str = "http://127.0.0.1:18419/workbuddy/v1";
 pub const CLAUDE_CODE_MIRROR_BASE_URL: &str = "https://dl.lven.asia/apps/claude-code";
 pub const CLAUDE_CODE_UPSTREAM_BASE_URL: &str = "https://downloads.claude.ai/claude-code-releases";
 const CLAUDE_CODE_RELEASES_PREFIX: &str = "/claude-code-releases/";
@@ -75,6 +76,7 @@ pub enum ClientKind {
     Antigravity,
     Codex,
     Claude,
+    WorkBuddy,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -3352,6 +3354,400 @@ pub fn load_claude_inference_models(
     Some(build_claude_inference_models(&catalog, filter))
 }
 
+fn workbuddy_catalog_cache_path(paths: &AppPaths) -> std::path::PathBuf {
+    paths.switch_dir().join("workbuddy-catalog.json")
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedWorkBuddyModel {
+    id: String,
+    display_name: String,
+    context_window: Option<u64>,
+    supports_images: bool,
+    supports_reasoning: bool,
+    effort_levels: Vec<String>,
+}
+
+fn is_workbuddy_chat_capable(opt: &ClientModelOption) -> bool {
+    let lower = opt.id.to_ascii_lowercase();
+    if lower.contains("embedding")
+        || lower.starts_with("text-embedding")
+        || lower.starts_with("tts-")
+        || lower.starts_with("whisper")
+        || lower.contains("-image")
+        || lower.contains("sora")
+        || lower.contains("veo")
+        || lower.contains("kling")
+        || lower.contains("vidu")
+        || lower.contains("seedance")
+        || lower.contains("seedream")
+        || lower.contains("mj-")
+        || lower.contains("midjourney")
+    {
+        return false;
+    }
+    if opt.capabilities.is_empty() {
+        return true;
+    }
+    opt.capabilities
+        .iter()
+        .any(|c| matches!(c.as_str(), "chat" | "code" | "reason"))
+}
+
+fn workbuddy_reasoning_for_model(
+    id: &str,
+    pricing: &PricingCache,
+    capabilities: &[String],
+) -> (bool, Vec<String>) {
+    const VALID_ORDER: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+    let normalize_levels = |raw: &[String]| -> Vec<String> {
+        let mut out = Vec::new();
+        for &lvl in VALID_ORDER {
+            if raw.iter().any(|r| r.eq_ignore_ascii_case(lvl)) {
+                out.push(lvl.to_string());
+            }
+        }
+        out
+    };
+
+    if let Some(levels) = pricing.reasoning_levels.get(id).or_else(|| {
+        pricing
+            .reasoning_levels
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(id))
+            .map(|(_, v)| v)
+    }) {
+        let ordered = normalize_levels(levels);
+        if !ordered.is_empty() {
+            return (true, ordered);
+        }
+    }
+
+    let lower = id.trim().to_ascii_lowercase();
+    if lower.starts_with("gpt-6") || lower.starts_with("gpt-5") || lower == "swe-2-1" {
+        return (
+            true,
+            vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+                "max".to_string(),
+            ],
+        );
+    }
+    if lower == "swe-2" || lower == "swe-2-flash" {
+        return (
+            true,
+            vec![
+                "medium".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ],
+        );
+    }
+    if lower == "gemini-4-neon" || lower == "gemini-4-hydrogen" {
+        return (
+            true,
+            vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+            ],
+        );
+    }
+    if lower.starts_with("o1")
+        || lower.starts_with("o3")
+        || lower.starts_with("o4")
+        || lower.starts_with("claude-opus")
+        || lower.starts_with("claude-sonnet")
+        || lower.starts_with("gemini-4")
+        || lower.starts_with("gemini-3")
+        || lower.starts_with("deepseek-r")
+        || lower.starts_with("deepseek-v4")
+        || lower.starts_with("kimi-k3")
+        || lower.starts_with("glm-5")
+        || lower.starts_with("grok-4")
+        || lower.starts_with("minimax-m")
+        || lower.starts_with("mimo-v2")
+        || lower.starts_with("swe-")
+        || lower.starts_with("qwq")
+        || lower.contains("thinking")
+        || lower.contains("reason")
+        || capabilities.iter().any(|c| c == "reason")
+    {
+        return (
+            true,
+            vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+            ],
+        );
+    }
+
+    (false, Vec::new())
+}
+
+pub fn build_workbuddy_model_options(
+    upstream_models: &Value,
+    pricing: &PricingCache,
+    perf: &HashMap<String, ModelPerfInfo>,
+    filter: &ClientModelFilter,
+) -> ClientModelsResponse {
+    let raw_items = upstream_models
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut all_ids = HashSet::new();
+    let mut candidate_ids = Vec::new();
+    for item in &raw_items {
+        let Some(id) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if id.eq_ignore_ascii_case("codex-auto-review") {
+            continue;
+        }
+        let eps = extract_endpoint_types(item);
+        let supports_chat = eps.iter().any(|ep| {
+            matches!(
+                ep.as_str(),
+                "openai" | "openai-response" | "anthropic" | "gemini"
+            )
+        });
+        if !supports_chat || is_non_chat_or_noise_model(id, &eps) {
+            continue;
+        }
+        if all_ids.insert(id.to_string()) {
+            candidate_ids.push(id.to_string());
+        }
+    }
+
+    let mut ids: Vec<String> = candidate_ids
+        .into_iter()
+        .filter(|id| !is_duplicate_alias(id, &all_ids))
+        .collect();
+    ids.sort_by_key(|a| codex_model_sort_key(a));
+
+    let allowed = normalized_filter_set(AppId::WorkBuddy, filter);
+    let mut models: Vec<ClientModelOption> = ids
+        .into_iter()
+        .filter_map(|id| {
+            let (price_info, perf_info) = resolve_model_metrics(&id, pricing, perf);
+            let description = concise_model_description(
+                &id,
+                pricing.descriptions.get(&id).map(String::as_str),
+            );
+            let display_name = display_base_name(&id, None);
+            let (supports_reasoning, effort_levels) =
+                workbuddy_reasoning_for_model(&id, pricing, &price_info.capabilities);
+            let capabilities = if price_info.capabilities.is_empty() {
+                derive_model_capabilities(
+                    &id,
+                    None,
+                    &price_info.tags,
+                    &description,
+                    supports_reasoning,
+                )
+            } else {
+                price_info.capabilities
+            };
+            let promo_ends_on = price_info
+                .promo_ends_on
+                .or_else(|| resolve_promo_ends_on(&id, None));
+            let vendor_name = price_info
+                .vendor_name
+                .or_else(|| infer_vendor_name(&id, None));
+            let resolved_ctx = price_info
+                .context_window
+                .or_else(|| Some(model_context_window(&id)));
+            let visible = match &allowed {
+                None => true,
+                Some(set) => set.contains(&catalog_filter_key(AppId::WorkBuddy, &id)),
+            };
+            let opt = ClientModelOption {
+                family: model_family_label(AppId::WorkBuddy, &id).to_string(),
+                recommended: is_recommended_model(AppId::WorkBuddy, &id),
+                id,
+                display_name,
+                description,
+                context_window: resolved_ctx,
+                visible,
+                effort_levels,
+                is_free: price_info.is_free,
+                is_dynamic_pricing: price_info.is_dynamic_pricing,
+                standard_load_usd_per_m: price_info.standard_load_usd_per_m,
+                standard_load_max_usd_per_m: price_info.standard_load_max_usd_per_m,
+                realized_usd_per_m: price_info.realized_usd_per_m,
+                cache_hit_rate: price_info.cache_hit_rate,
+                input_usd_per_m: price_info.input_usd_per_m,
+                cache_usd_per_m: price_info.cache_usd_per_m,
+                output_usd_per_m: price_info.output_usd_per_m,
+                request_usd: price_info.request_usd,
+                quota_type: price_info.quota_type,
+                model_ratio: price_info.model_ratio,
+                official_multiplier: price_info.official_multiplier,
+                promo_ends_on,
+                capabilities,
+                tags: price_info.tags,
+                vendor_name,
+                channels: price_info.channels,
+                avg_tps: perf_info.avg_tps,
+                avg_latency_ms: perf_info.avg_latency_ms,
+                success_rate: perf_info.success_rate,
+            };
+            is_workbuddy_chat_capable(&opt).then_some(opt)
+        })
+        .collect();
+
+    if models.iter().all(|m| !m.visible) && !models.is_empty() {
+        for m in models.iter_mut().take(6) {
+            m.visible = true;
+        }
+    }
+
+    let visible_count = models.iter().filter(|m| m.visible).count();
+    let total_count = models.len();
+    ClientModelsResponse {
+        app_id: AppId::WorkBuddy,
+        filter: filter.clone(),
+        recommended_ids: ClientModelFilter::recommended_ids_for(AppId::WorkBuddy)
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+        visible_count,
+        total_count,
+        models,
+    }
+}
+
+fn write_workbuddy_catalog_cache(paths: &AppPaths, resp: &ClientModelsResponse) {
+    let entries: Vec<CachedWorkBuddyModel> = resp
+        .models
+        .iter()
+        .map(|m| CachedWorkBuddyModel {
+            id: m.id.clone(),
+            display_name: m.display_name.clone(),
+            context_window: m.context_window,
+            supports_images: m.capabilities.iter().any(|c| c == "vision"),
+            supports_reasoning: !m.effort_levels.is_empty(),
+            effort_levels: m.effort_levels.clone(),
+        })
+        .collect();
+    if let Ok(bytes) = serde_json::to_vec(&entries) {
+        let _ = fs::create_dir_all(paths.switch_dir());
+        let _ = fs::write(workbuddy_catalog_cache_path(paths), bytes);
+    }
+}
+
+/// Refreshes the cached WorkBuddy model catalog so `WorkBuddyAdapter::apply_mode`
+/// can write accurate `models.json` capabilities without performing network I/O itself.
+pub async fn refresh_workbuddy_catalog_cache(paths: &AppPaths) -> Result<(), String> {
+    let state = read_switch_state(paths);
+    let base_url = state.normalized_base_url();
+    let api_key = read_main_api_key(paths)
+        .ok_or_else(|| "未登录 Tako 账号或缺少 API Key".to_string())?;
+    let cache = shared_catalog_cache();
+
+    let (models_res, pricing_res) = tokio::join!(
+        cache.get_or_fetch_models_list(
+            false,
+            &base_url,
+            state.bypass_system_proxy,
+            &api_key,
+            false
+        ),
+        cache.get_or_fetch_pricing(&base_url, state.bypass_system_proxy, false, true)
+    );
+
+    let json_body = models_res?;
+    let pricing = pricing_res.map(|s| s.parsed).unwrap_or_default();
+    let empty_perf = HashMap::new();
+    let resp = build_workbuddy_model_options(
+        &json_body,
+        &pricing,
+        &empty_perf,
+        &state.model_filters.workbuddy,
+    );
+    write_workbuddy_catalog_cache(paths, &resp);
+    Ok(())
+}
+
+pub fn load_workbuddy_model_catalog(
+    paths: &AppPaths,
+    filter: &ClientModelFilter,
+) -> Option<Vec<crate::adapters::workbuddy::WorkBuddyModelEntrySpec>> {
+    let bytes = fs::read(workbuddy_catalog_cache_path(paths)).ok()?;
+    let cached: Vec<CachedWorkBuddyModel> = serde_json::from_slice(&bytes).ok()?;
+    if cached.is_empty() {
+        return None;
+    }
+    let allowed = normalized_filter_set(AppId::WorkBuddy, filter);
+    let mut selected: Vec<crate::adapters::workbuddy::WorkBuddyModelEntrySpec> = cached
+        .into_iter()
+        .filter(|m| match &allowed {
+            None => true,
+            Some(set) => set.contains(&catalog_filter_key(AppId::WorkBuddy, &m.id)),
+        })
+        .map(|m| crate::adapters::workbuddy::WorkBuddyModelEntrySpec {
+            id: m.id,
+            display_name: m.display_name,
+            context_window: m.context_window,
+            supports_images: m.supports_images,
+            supports_reasoning: m.supports_reasoning,
+            effort_levels: m.effort_levels,
+        })
+        .collect();
+    if selected.is_empty() {
+        return None;
+    }
+    // Order recommended models first when using Recommended mode so default model is deterministic.
+    if filter.mode == ModelFilterMode::Recommended {
+        let rec = ClientModelFilter::recommended_ids_for(AppId::WorkBuddy);
+        selected.sort_by_key(|item| {
+            rec.iter()
+                .position(|r| r.eq_ignore_ascii_case(&item.id))
+                .unwrap_or(usize::MAX)
+        });
+    }
+    Some(selected)
+}
+
+/// Normalizes WorkBuddy chat/responses JSON bodies before forwarding upstream:
+/// WorkBuddy's `CustomModelIdPrefix` feature prepends `custom:` (or `custom-local:`)
+/// to custom model IDs loaded from `~/.workbuddy/models.json`; strip it so upstream
+/// Tako API receives the canonical model ID.
+pub fn normalize_workbuddy_request_body(body: &[u8]) -> Vec<u8> {
+    let Ok(mut val) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    let Some(obj) = val.as_object_mut() else {
+        return body.to_vec();
+    };
+    let Some(raw_model) = obj.get("model").and_then(Value::as_str) else {
+        return body.to_vec();
+    };
+    let stripped = raw_model
+        .strip_prefix("custom:")
+        .or_else(|| raw_model.strip_prefix("custom-local:"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(clean_model) = stripped else {
+        return body.to_vec();
+    };
+    obj.insert("model".to_string(), Value::String(clean_model.to_string()));
+    serde_json::to_vec(&val).unwrap_or_else(|_| body.to_vec())
+}
+
 pub fn filter_claude_models_catalog(full_catalog: &Value, filter: &ClientModelFilter) -> Value {
     let raw_data = full_catalog
         .get("data")
@@ -3555,7 +3951,10 @@ fn build_upstream_headers(
     } else {
         None
     };
-    let main_key = if matches!(kind, ClientKind::Codex | ClientKind::Claude) {
+    let main_key = if matches!(
+        kind,
+        ClientKind::Codex | ClientKind::Claude | ClientKind::WorkBuddy
+    ) {
         read_main_api_key(paths)
     } else {
         None
@@ -3574,7 +3973,7 @@ fn build_upstream_headers(
             {
                 continue;
             }
-            ClientKind::Codex | ClientKind::Claude
+            ClientKind::Codex | ClientKind::Claude | ClientKind::WorkBuddy
                 if main_key.is_some()
                     && (name_str.eq_ignore_ascii_case("authorization")
                         || name_str.eq_ignore_ascii_case("x-api-key")) =>
@@ -3602,7 +4001,7 @@ fn build_upstream_headers(
                 }
             }
         }
-        ClientKind::Codex | ClientKind::Claude => {
+        ClientKind::Codex | ClientKind::Claude | ClientKind::WorkBuddy => {
             if let Some(key) = main_key {
                 if let Ok(r_val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
                     out.insert(
@@ -4170,7 +4569,7 @@ pub async fn fetch_client_models_for_ui_with_refresh(
 
     let (is_v1beta, credential) = match app_id {
         AppId::DshTako => unreachable!(),
-        AppId::Claude | AppId::Codex => {
+        AppId::Claude | AppId::Codex | AppId::WorkBuddy => {
             let api_key = read_main_api_key(paths).ok_or_else(|| {
                 "未登录 Tako 账号或缺少 API Key，无法拉取模型列表".to_string()
             })?;
@@ -4232,6 +4631,16 @@ pub async fn fetch_client_models_for_ui_with_refresh(
             &perf,
             &switch_state.model_filters.antigravity,
         ),
+        AppId::WorkBuddy => {
+            let resp = build_workbuddy_model_options(
+                &json_body,
+                &pricing,
+                &perf,
+                &switch_state.model_filters.workbuddy,
+            );
+            write_workbuddy_catalog_cache(paths, &resp);
+            resp
+        }
     })
 }
 
@@ -4467,7 +4876,7 @@ async fn handle_request(
             "ok": true,
             "service": "tako-switch-gateway",
             "version": env!("CARGO_PKG_VERSION"),
-            "routes": ["antigravity", "codex", "claude", "claude-code-releases"]
+            "routes": ["antigravity", "codex", "claude", "workbuddy", "claude-code-releases"]
         });
         let bytes = serde_json::to_vec(&payload).unwrap_or_default();
         return Ok(Response::builder()
@@ -4577,6 +4986,37 @@ async fn handle_request(
                 Err(resp) => return Ok(resp),
             };
             (ClientKind::Codex, stripped, body, sig)
+        } else if path == "/workbuddy" || path.starts_with("/workbuddy/") {
+            let stripped_path = path.strip_prefix("/workbuddy").unwrap_or(&path);
+            let target_pq = strip_route_prefix(&path_and_query, "/workbuddy");
+            if method == Method::POST
+                && (stripped_path == "/v1/chat/completions"
+                    || stripped_path == "/v1/responses"
+                    || stripped_path == "/chat/completions")
+            {
+                let bytes = match collect_body(incoming_body).await {
+                    Ok(b) => b,
+                    Err(resp) => return Ok(resp),
+                };
+                let normalized = Bytes::from(normalize_workbuddy_request_body(&bytes));
+                let final_pq = if stripped_path == "/chat/completions" {
+                    format!("/v1{target_pq}")
+                } else {
+                    target_pq
+                };
+                (
+                    ClientKind::WorkBuddy,
+                    final_pq,
+                    reqwest::Body::from(normalized),
+                    BodyDoneSignal::new(true),
+                )
+            } else {
+                let (body, sig) = match passthrough_body(incoming_body).await {
+                    Ok(pair) => pair,
+                    Err(resp) => return Ok(resp),
+                };
+                (ClientKind::WorkBuddy, target_pq, body, sig)
+            }
         } else if path == "/claude" || path.starts_with("/claude/") {
             let stripped_path = path.strip_prefix("/claude").unwrap_or(&path);
             let target_pq = strip_route_prefix(&path_and_query, "/claude");
@@ -4916,7 +5356,10 @@ pub fn is_proxy_healthy_current_version(port: u16) -> bool {
         return false;
     };
     let expected_ver = format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"));
-    text.contains("200 OK") && text.contains("tako-switch-gateway") && text.contains(&expected_ver)
+    text.contains("200 OK")
+        && text.contains("tako-switch-gateway")
+        && text.contains(&expected_ver)
+        && text.contains("\"workbuddy\"")
 }
 
 pub fn ensure_in_process_proxy_running() {
@@ -6407,5 +6850,89 @@ mod tests {
         std::env::remove_var("TAKO_CLAUDE_CODE_UPSTREAM_URL");
         proxy_task.abort();
         backend_task.abort();
+    }
+
+    #[test]
+    fn workbuddy_request_body_strips_custom_model_prefix() {
+        let prefixed = br#"{"model":"custom:claude-opus-5-5","messages":[{"role":"user","content":"hi"}]}"#;
+        let out: Value = serde_json::from_slice(&normalize_workbuddy_request_body(prefixed)).unwrap();
+        assert_eq!(out["model"], "claude-opus-5-5");
+        assert_eq!(out["messages"][0]["content"], "hi");
+
+        let local_prefixed = br#"{"model":"custom-local:gpt-6.2-sol","stream":true}"#;
+        let out2: Value =
+            serde_json::from_slice(&normalize_workbuddy_request_body(local_prefixed)).unwrap();
+        assert_eq!(out2["model"], "gpt-6.2-sol");
+        assert_eq!(out2["stream"], true);
+
+        let canonical = br#"{"model":"deepseek-v4.1-flash"}"#;
+        let out3: Value = serde_json::from_slice(&normalize_workbuddy_request_body(canonical)).unwrap();
+        assert_eq!(out3["model"], "deepseek-v4.1-flash");
+    }
+
+    #[test]
+    fn workbuddy_model_options_filters_non_chat_and_marks_recommended() {
+        let upstream = json!({
+            "data": [
+                {"id": "claude-opus-5-5", "supported_endpoint_types": ["anthropic", "openai"]},
+                {"id": "gpt-6.2-sol", "supported_endpoint_types": ["openai", "openai-response"]},
+                {"id": "swe-2", "supported_endpoint_types": ["openai", "openai-response"]},
+                {"id": "gemini-4-neon", "supported_endpoint_types": ["gemini", "openai"]},
+                {"id": "gpt-4o-mini", "supported_endpoint_types": ["openai"]},
+                {"id": "claude-haiku-4-5", "supported_endpoint_types": ["anthropic", "openai"]},
+                {"id": "gemini-3.1-flash-image", "supported_endpoint_types": ["gemini", "openai"]},
+                {"id": "text-embedding-3-large", "supported_endpoint_types": ["openai"]}
+            ]
+        });
+        let mut pricing = PricingCache::default();
+        pricing.reasoning_levels.insert(
+            "claude-opus-5-5".to_string(),
+            vec!["low".to_string(), "medium".to_string(), "high".to_string()],
+        );
+        pricing.reasoning_levels.insert(
+            "swe-2".to_string(),
+            vec!["medium".to_string(), "high".to_string(), "max".to_string()],
+        );
+        pricing.reasoning_levels.insert(
+            "gemini-4-neon".to_string(),
+            vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+            ],
+        );
+        let perf = HashMap::new();
+        let filter = ClientModelFilter::default_workbuddy();
+        let resp = build_workbuddy_model_options(&upstream, &pricing, &perf, &filter);
+        assert_eq!(resp.app_id, AppId::WorkBuddy);
+        let ids: Vec<&str> = resp.models.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"claude-opus-5-5"));
+        assert!(ids.contains(&"gpt-6.2-sol"));
+        assert!(ids.contains(&"swe-2"));
+        assert!(ids.contains(&"gemini-4-neon"));
+        assert!(ids.contains(&"gpt-4o-mini"));
+        assert!(ids.contains(&"claude-haiku-4-5"));
+        assert!(!ids.contains(&"gemini-3.1-flash-image"));
+        assert!(!ids.contains(&"text-embedding-3-large"));
+        assert_eq!(resp.visible_count, 3);
+
+        let by_id = |target: &str| {
+            resp.models
+                .iter()
+                .find(|m| m.id == target)
+                .expect(target)
+                .effort_levels
+                .clone()
+        };
+        assert_eq!(by_id("claude-opus-5-5"), vec!["low", "medium", "high"]);
+        assert_eq!(by_id("swe-2"), vec!["medium", "high", "max"]);
+        assert_eq!(by_id("gemini-4-neon"), vec!["low", "medium", "high", "xhigh"]);
+        assert_eq!(
+            by_id("gpt-6.2-sol"),
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert!(by_id("gpt-4o-mini").is_empty());
+        assert!(by_id("claude-haiku-4-5").is_empty());
     }
 }

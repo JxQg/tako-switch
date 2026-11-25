@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type AppId = "dsh-tako" | "codex" | "claude" | "antigravity";
+export type AppId = "dsh-tako" | "codex" | "claude" | "antigravity" | "workbuddy";
 export type AppMode = "official" | "tako";
 export type UiDensity = "compact" | "comfortable";
 export type ThemePref = "system" | "light" | "dark";
@@ -63,6 +63,7 @@ export interface ModelFiltersConfig {
   claude: ClientModelFilter;
   codex: ClientModelFilter;
   antigravity: ClientModelFilter;
+  workbuddy?: ClientModelFilter;
 }
 
 export interface ModelChannelPrice {
@@ -435,7 +436,7 @@ export interface LiveDemoResult {
   citations: LiveDemoCitation[];
 }
 
-export type SyncPlatform = "claude" | "codex" | "antigravity";
+export type SyncPlatform = "claude" | "codex" | "antigravity" | "workbuddy";
 
 export interface SyncedMcpSpec {
   transport: string;

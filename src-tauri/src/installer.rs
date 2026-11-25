@@ -108,6 +108,8 @@ fn route_display_label(url: &str) -> &'static str {
     let lower = url.to_ascii_lowercase();
     if lower.contains("dl.lven.asia") || lower.contains("dogedns") {
         "国内加速"
+    } else if lower.contains("myqcloud.com") {
+        "腾讯云 COS"
     } else if lower.contains("oss-cn-") || lower.contains("aliyuncs.com") {
         "国内 OSS"
     } else if lower.contains("github.com") || lower.contains("githubusercontent.com") {
@@ -380,6 +382,7 @@ fn default_app_bundle_name(app_id: AppId, artifact: &PlatformArtifact) -> String
         AppId::Codex => "ChatGPT.app".to_string(),
         AppId::Claude => "Claude.app".to_string(),
         AppId::Antigravity => "Antigravity.app".to_string(),
+        AppId::WorkBuddy => "WorkBuddy.app".to_string(),
     }
 }
 
@@ -607,7 +610,9 @@ fn resolve_post_install_target_mode(
                 && !crate::adapters::dsh_tako::has_any_dsh_tako_key(paths)
         }
         AppId::Antigravity => crate::config::effective_agy_api_key(paths).is_some(),
-        AppId::Codex | AppId::Claude => crate::config::read_main_api_key(paths).is_some(),
+        AppId::Codex | AppId::Claude | AppId::WorkBuddy => {
+            crate::config::read_main_api_key(paths).is_some()
+        }
     };
     if has_credentials {
         AppMode::Tako
@@ -1016,7 +1021,7 @@ fn install_platform_package(
         }
         "exe" => {
             let default_args: Vec<String> = match app_id {
-                AppId::DshTako => vec!["/S".to_string()],
+                AppId::DshTako | AppId::WorkBuddy => vec!["/S".to_string()],
                 AppId::Claude => vec!["--silent".to_string()],
                 AppId::Antigravity => vec![
                     "/VERYSILENT".to_string(),
@@ -1227,6 +1232,8 @@ pub async fn install_or_upgrade_app(
         emit_progress(app, app_id, "configuring", 95, msg);
         if app_id == AppId::Claude {
             let _ = crate::agy_proxy::refresh_claude_catalog_cache(paths).await;
+        } else if app_id == AppId::WorkBuddy {
+            let _ = crate::agy_proxy::refresh_workbuddy_catalog_cache(paths).await;
         }
         let adapter = get_adapter(app_id);
         if let Err(err) = adapter.apply_mode(paths, target_mode) {
@@ -1258,7 +1265,7 @@ pub async fn install_or_upgrade_app(
                         paths, true,
                     );
             }
-            AppId::DshTako => {}
+            AppId::DshTako | AppId::WorkBuddy => {}
         }
 
         if matches!(app_id, AppId::Claude | AppId::Antigravity) {

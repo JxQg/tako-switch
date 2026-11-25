@@ -190,6 +190,7 @@ class WinLabServer:
 
         class Handler(BaseHTTPRequestHandler):
             server_version = f"{SERVICE_NAME}/{SERVICE_VERSION}"
+            protocol_version = "HTTP/1.1"
 
             def log_message(self, fmt: str, *args: Any) -> None:
                 if os.environ.get("WIN_LAB_QUIET_LOG", "0") == "1":
@@ -207,6 +208,7 @@ class WinLabServer:
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(raw)))
                 self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
                 self.end_headers()
                 if self.command != "HEAD":
                     self.wfile.write(raw)
@@ -216,6 +218,7 @@ class WinLabServer:
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
                 self.end_headers()
                 if self.command != "HEAD":
                     self.wfile.write(data)

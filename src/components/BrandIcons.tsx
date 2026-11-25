@@ -1,4 +1,5 @@
 import antigravityIcon from "../assets/icons/antigravity.png";
+import workbuddyIcon from "../assets/icons/workbuddy.png";
 import type { AppId } from "../lib/api";
 
 export function TakoBrandMark({ className = "h-7 w-7" }: { className?: string }) {
@@ -98,6 +99,21 @@ export function AppBrandIcon({
             fillRule="nonzero"
           />
         </svg>
+      </span>
+    );
+  }
+
+  if (appId === "workbuddy") {
+    return (
+      <span
+        className={`${className} shrink-0 rounded-[6px] overflow-hidden inline-flex items-center justify-center bg-white ring-1 ring-inset ring-black/[0.06] dark:bg-[#1e2433] dark:ring-white/10`}
+      >
+        <img
+          src={workbuddyIcon}
+          alt="WorkBuddy"
+          className="h-full w-full object-cover"
+          draggable={false}
+        />
       </span>
     );
   }

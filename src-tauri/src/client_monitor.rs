@@ -180,6 +180,10 @@ fn collect_matching_log_files(paths: &AppPaths, app_id: AppId) -> Vec<PathBuf> {
             AppId::DshTako => {
                 scan_dirs.push((logs_root.join("DSH Tako"), 2));
             }
+            AppId::WorkBuddy => {
+                scan_dirs.push((paths.workbuddy_dir.join("logs"), 3));
+                scan_dirs.push((logs_root.join("WorkBuddy"), 2));
+            }
         }
     }
 
@@ -232,6 +236,10 @@ fn collect_matching_log_files(paths: &AppPaths, app_id: AppId) -> Vec<PathBuf> {
             AppId::DshTako => {
                 scan_dirs.push((appdata.join("DSH Tako").join("logs"), 2));
             }
+            AppId::WorkBuddy => {
+                scan_dirs.push((paths.workbuddy_dir.join("logs"), 3));
+                scan_dirs.push((appdata.join("WorkBuddy").join("logs"), 2));
+            }
         }
     }
 
@@ -262,6 +270,7 @@ fn macos_diagnostic_report_prefixes(app_id: AppId) -> &'static [&'static str] {
         AppId::Codex => &["ChatGPT-", "Codex-"],
         AppId::Antigravity => &["Antigravity-"],
         AppId::DshTako => &["DSH Tako-"],
+        AppId::WorkBuddy => &["WorkBuddy-", "WorkBuddy Helper"],
     }
 }
 
@@ -563,6 +572,7 @@ fn collect_os_crash_evidence(paths: &AppPaths, app_id: AppId, baseline: &LaunchB
             AppId::Codex => "ChatGPT|Codex",
             AppId::Antigravity => "Antigravity",
             AppId::DshTako => "DSH Tako",
+            AppId::WorkBuddy => "WorkBuddy",
         };
         let script = format!(
             "$since = (Get-Date).AddSeconds(-90); \

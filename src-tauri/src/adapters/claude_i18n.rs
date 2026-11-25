@@ -1,5 +1,6 @@
 use crate::adapters::antigravity_i18n::{
-    sha256_hex, AsarArchive, UiPatchInfo, UiPatchStatus, PATCH_MARKER_FILE,
+    quick_check_clean_backup_asar, sha256_hex, AsarArchive, AsarHeaderIndex, UiPatchInfo,
+    UiPatchStatus, PATCH_MARKER_FILE,
 };
 use crate::adapters::i18n_packs::{effective_ui_patch_version, load_i18n_overlay_dict};
 #[cfg(target_os = "macos")]
@@ -1424,9 +1425,9 @@ pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
     };
 
     let target_asar_str = target.ion_asar_path.to_string_lossy().to_string();
-    let (Ok(app_bytes), Ok(ion_bytes)) = (
-        fs::read(&target.app_asar_path),
-        fs::read(&target.ion_asar_path),
+    let (Ok(app_index), Ok(ion_index)) = (
+        AsarHeaderIndex::open(&target.app_asar_path),
+        AsarHeaderIndex::open(&target.ion_asar_path),
     ) else {
         return UiPatchInfo {
             status: UiPatchStatus::Unsupported,
@@ -1435,30 +1436,16 @@ pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
             update_available: false,
             has_valid_backup: false,
             target_asar_path: Some(target_asar_str),
-            note: Some("无法读取 Claude Desktop 资源包文件".to_string()),
-        };
-    };
-
-    let (Ok(app_archive), Ok(ion_archive)) = (
-        AsarArchive::parse(&app_bytes),
-        AsarArchive::parse(&ion_bytes),
-    ) else {
-        return UiPatchInfo {
-            status: UiPatchStatus::Unsupported,
-            patch_version: None,
-            target_patch_version: Some(target_patch_version),
-            update_available: false,
-            has_valid_backup: false,
-            target_asar_path: Some(target_asar_str),
-            note: Some("解析 Claude Desktop ASAR 资源包失败".to_string()),
+            note: Some("读取或解析 Claude Desktop ASAR 资源包头部失败".to_string()),
         };
     };
 
     let meta = read_patch_meta(paths);
-    let app_marker_bytes = app_archive.get_file(PATCH_MARKER_FILE);
-    let ion_marker_bytes = ion_archive.get_file(PATCH_MARKER_FILE);
+    let app_marker_bytes = app_index.read_file(PATCH_MARKER_FILE).ok().flatten();
+    let ion_marker_bytes = ion_index.read_file(PATCH_MARKER_FILE).ok().flatten();
 
-    if let (Some(app_mb), Some(ion_mb)) = (app_marker_bytes, ion_marker_bytes) {
+    if let (Some(app_mb), Some(ion_mb)) = (app_marker_bytes.as_deref(), ion_marker_bytes.as_deref())
+    {
         let app_marker = serde_json::from_slice::<ClaudePatchMarker>(app_mb).ok();
         let ion_marker = serde_json::from_slice::<ClaudePatchMarker>(ion_mb).ok();
         let patch_version = ion_marker
@@ -1476,9 +1463,13 @@ pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
             .map(|m| m.original_ion_asar_sha256.as_str())
             .or_else(|| ion_marker.as_ref().map(|m| m.original_asar_sha256.as_str()))
             .unwrap_or("");
+        let backup_dir = ui_patch_backup_dir(paths);
         let has_valid_backup =
-            verify_clean_backup_file(paths, "app.asar.orig", expected_app_sha).is_ok()
-                && verify_clean_backup_file(paths, "ion-dist.asar.orig", expected_ion_sha).is_ok();
+            quick_check_clean_backup_asar(&backup_dir.join("app.asar.orig"), expected_app_sha)
+                && quick_check_clean_backup_asar(
+                    &backup_dir.join("ion-dist.asar.orig"),
+                    expected_ion_sha,
+                );
         let update_available = patch_version.as_deref() != Some(target_patch_version.as_str());
         let note = if update_available {
             format!(
@@ -1514,7 +1505,7 @@ pub fn inspect_claude_ui_patch(paths: &AppPaths) -> UiPatchInfo {
         };
     }
 
-    if ion_archive.get_file("i18n/en-US.json").is_none() {
+    if !ion_index.has_packed_file("i18n/en-US.json") {
         return UiPatchInfo {
             status: UiPatchStatus::Unsupported,
             patch_version: None,

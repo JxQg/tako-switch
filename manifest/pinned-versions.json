@@ -176,12 +176,51 @@
           "sha512": "9ef2324ee671b56f677e7286558eece41e457b19fee3d11b00ccc3fad6d554d5f01fd444b81e879b1fbca321f6fbb8d6f1069152c6e1cad1ef1908b15c0d6130",
           "size": 170272672,
           "silentArgs": [
-            "/VERYSILENT",
-            "/NORESTART",
-            "/CLOSEAPPLICATIONS"
+            "/S"
           ],
           "sha256": "b90d07974759f2f267be4c966ec7e62839b0873b2aa7d2732e74de955a077df0",
           "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.1-4615540875067392/windows-x64/Antigravity-x64.exe"
+        }
+      }
+    },
+    "workbuddy": {
+      "displayName": "WorkBuddy",
+      "version": "5.11.3",
+      "status": "approved",
+      "approvedAt": "2026-11-25T16:30:00Z",
+      "changelogSummary": "WorkBuddy 5.11.3（2026-11-15）：腾讯官方国内 COS 加速直链分发，原生简体中文，支持 ~/.workbuddy/models.json 本地自定义模型接入 Tako 网关与 ~/.workbuddy/mcp.json 超级 MCP 注入。",
+      "gates": {
+        "localization": "pass",
+        "injection": "pass",
+        "anomalyAudit": "pass"
+      },
+      "platforms": {
+        "macos-arm64": {
+          "url": "https://acc-1258344699.cos.accelerate.myqcloud.com/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.11.3.43806934-ecace0f7.dmg",
+          "fallbackUrl": "https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.11.3.43806934-ecace0f7.dmg",
+          "version": "5.11.3",
+          "installType": "dmg",
+          "sha256": "f3b99997b0aebfe22af4f8c0070b37946b9f839b51cf9510eb6a97c9e45aa639",
+          "size": 375366665,
+          "appBundleName": "WorkBuddy.app"
+        },
+        "macos-x64": {
+          "url": "https://acc-1258344699.cos.accelerate.myqcloud.com/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.11.3.43806934-ecace0f7.dmg",
+          "fallbackUrl": "https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.11.3.43806934-ecace0f7.dmg",
+          "version": "5.11.3",
+          "installType": "dmg",
+          "size": 408506969,
+          "appBundleName": "WorkBuddy.app"
+        },
+        "windows-x64": {
+          "url": "https://acc-1258344699.cos.accelerate.myqcloud.com/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-5.11.3.43806934-ecace0f7.exe",
+          "fallbackUrl": "https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-5.11.3.43806934-ecace0f7.exe",
+          "version": "5.11.3",
+          "installType": "exe",
+          "size": 459823168,
+          "silentArgs": [
+            "/S"
+          ]
         }
       }
     }
