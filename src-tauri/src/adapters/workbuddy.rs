@@ -20,6 +20,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "windows")]
+use std::path::{Component, Path};
+
 #[cfg(target_os = "macos")]
 use crate::adapters::{
     find_macos_app, is_macos_bundle_id_running, launch_macos_app, quit_macos_bundle_id,
@@ -882,18 +885,17 @@ impl DesktopAppAdapter for WorkBuddyAdapter {
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const WORKBUDDY_PRODUCT_REG_GUID: &str = "BFD312E9-1019-4F57-9F44-F86246833B50";
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const WINDOWS_PROBE_READ_LIMIT: usize = 64 * 1024;
+
 /// Known WorkBuddy NSIS (`electron-builder`) and legacy Inno Setup `Uninstall` subkey names.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const KNOWN_WORKBUDDY_UNINSTALL_KEYS: &[&str] = &[
-    "BFD312E9-1019-4F57-9F44-F86246833B50",
+    WORKBUDDY_PRODUCT_REG_GUID,
     "{BFD312E9-1019-4F57-9F44-F86246833B50}_is1",
-    "{BFD312E9-1019-4F57-9F44-F86246833B50}}_is1",
     "{61A882F2-969F-45BF-A652-FA5C6B03DE22}_is1",
-    "{61A882F2-969F-45BF-A652-FA5C6B03DE22}}_is1",
     "{B7353D0F-D01C-4EC3-96A9-5CEA88358454}_is1",
-    "{B7353D0F-D01C-4EC3-96A9-5CEA88358454}}_is1",
     "{E5979B74-105C-46B5-AED6-599C029B689D}_is1",
-    "{E5979B74-105C-46B5-AED6-599C029B689D}}_is1",
 ];
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -903,7 +905,6 @@ struct WindowsUninstallRecord {
     display_name: Option<String>,
     display_version: Option<String>,
     install_location: Option<String>,
-    install_source: Option<String>,
     display_icon: Option<String>,
     uninstall_string: Option<String>,
     quiet_uninstall_string: Option<String>,
@@ -927,41 +928,25 @@ fn strip_windows_icon_index(raw: &str) -> &str {
 /// - `D:\Program Files\WorkBuddy\Uninstall WorkBuddy.exe /allusers`
 /// - `"D:\WorkBuddy\WorkBuddy.exe" "%1"`
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn parse_windows_exe_path_str(raw: &str) -> Option<String> {
+fn parse_windows_exe_path_str(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
     if let Some(rest) = trimmed.strip_prefix('"') {
-        let end_quote = rest.find('"')?;
-        let inner = strip_windows_icon_index(&rest[..end_quote]).trim();
-        return (!inner.is_empty()).then(|| inner.to_string());
+        let (inner, _) = rest.split_once('"')?;
+        let path = strip_windows_icon_index(inner);
+        return path
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("exe"))
+            .then_some(path);
     }
 
     let without_icon = strip_windows_icon_index(trimmed);
-    if without_icon.len() >= 4
-        && without_icon[without_icon.len() - 4..].eq_ignore_ascii_case(".exe")
-    {
-        return Some(without_icon.to_string());
-    }
-
     let bytes = without_icon.as_bytes();
-    for i in 0..bytes.len().saturating_sub(3) {
-        if without_icon
-            .get(i..i + 4)
-            .is_some_and(|seg| seg.eq_ignore_ascii_case(".exe"))
+    for (i, suffix) in bytes.windows(4).enumerate() {
+        let end = i + suffix.len();
+        if suffix.eq_ignore_ascii_case(b".exe")
+            && matches!(bytes.get(end), None | Some(b' ' | b'\t' | b'"'))
         {
-            let boundary_ok = match bytes.get(i + 4) {
-                None => true,
-                Some(b' ' | b'\t' | b',' | b'"' | b'/') => true,
-                Some(_) => false,
-            };
-            if boundary_ok {
-                let candidate = without_icon[..i + 4].trim();
-                if !candidate.is_empty() {
-                    return Some(candidate.to_string());
-                }
-            }
+            return Some(&without_icon[..end]);
         }
     }
     None
@@ -1047,10 +1032,10 @@ fn collect_workbuddy_exe_candidates_from_cmd_str(cmd: &str, out: &mut Vec<String
     let Some(exe_str) = parse_windows_exe_path_str(cmd) else {
         return;
     };
-    if windows_path_file_name(&exe_str).eq_ignore_ascii_case("WorkBuddy.exe") {
-        push_unique_str(out, exe_str.clone());
+    if windows_path_file_name(exe_str).eq_ignore_ascii_case("WorkBuddy.exe") {
+        push_unique_str(out, exe_str.to_string());
     }
-    if let Some(parent) = windows_path_parent(&exe_str) {
+    if let Some(parent) = windows_path_parent(exe_str) {
         if let Some(sibling_wb) = join_windows_workbuddy_exe(parent) {
             push_unique_str(out, sibling_wb);
         }
@@ -1058,7 +1043,10 @@ fn collect_workbuddy_exe_candidates_from_cmd_str(cmd: &str, out: &mut Vec<String
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn is_workbuddy_uninstall_entry(rec: &WindowsUninstallRecord) -> bool {
+fn is_workbuddy_uninstall_entry(
+    rec: &WindowsUninstallRecord,
+    mut env_lookup: impl FnMut(&str) -> Option<String>,
+) -> bool {
     let key_trimmed = rec.key_name.trim();
     if KNOWN_WORKBUDDY_UNINSTALL_KEYS
         .iter()
@@ -1077,8 +1065,9 @@ fn is_workbuddy_uninstall_entry(rec: &WindowsUninstallRecord) -> bool {
         .into_iter()
         .flatten()
     {
-        if let Some(exe) = parse_windows_exe_path_str(raw_cmd) {
-            let fname = windows_path_file_name(&exe);
+        let expanded = expand_windows_env_vars(raw_cmd, &mut env_lookup);
+        if let Some(exe) = parse_windows_exe_path_str(&expanded) {
+            let fname = windows_path_file_name(exe);
             if fname.eq_ignore_ascii_case("WorkBuddy.exe")
                 || fname.eq_ignore_ascii_case("Uninstall WorkBuddy.exe")
             {
@@ -1101,12 +1090,11 @@ fn extract_candidates_from_uninstall_record(
     mut env_lookup: impl FnMut(&str) -> Option<String>,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    for dir_opt in [&rec.install_location, &rec.install_source] {
-        if let Some(raw_dir) = dir_opt.as_deref() {
-            let expanded = expand_windows_env_vars(raw_dir, &mut env_lookup);
-            if let Some(exe) = join_windows_workbuddy_exe(&expanded) {
-                push_unique_str(&mut out, exe);
-            }
+    // InstallSource points to the installer media, not to the installed app.
+    if let Some(raw_dir) = rec.install_location.as_deref() {
+        let expanded = expand_windows_env_vars(raw_dir, &mut env_lookup);
+        if let Some(exe) = join_windows_workbuddy_exe(&expanded) {
+            push_unique_str(&mut out, exe);
         }
     }
     for cmd_opt in [
@@ -1212,24 +1200,55 @@ fn extract_workbuddy_paths_from_decoded_text(text: &str, out: &mut Vec<String>) 
 /// field offsets as well as ANSI `LocalBasePath`.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn extract_workbuddy_exe_from_lnk_bytes(bytes: &[u8]) -> Vec<String> {
-    let capped = &bytes[..bytes.len().min(64 * 1024)];
+    let capped = &bytes[..bytes.len().min(WINDOWS_PROBE_READ_LIMIT)];
     let mut out = Vec::new();
 
     for offset in [0usize, 1usize] {
         if capped.len() <= offset + 1 {
             continue;
         }
-        let u16_units: Vec<u16> = capped[offset..]
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
+        let (pairs, _) = capped[offset..].as_chunks::<2>();
+        let u16_units: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
         let decoded = String::from_utf16_lossy(&u16_units);
         extract_workbuddy_paths_from_decoded_text(&decoded, &mut out);
     }
 
-    let ansi = String::from_utf8_lossy(capped);
-    extract_workbuddy_paths_from_decoded_text(&ansi, &mut out);
+    #[cfg(target_os = "windows")]
+    {
+        const CP_ACP: u32 = 0;
+        if let Some(ansi) = decode_windows_ansi(capped, CP_ACP) {
+            extract_workbuddy_paths_from_decoded_text(&ansi, &mut out);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    extract_workbuddy_paths_from_decoded_text(&String::from_utf8_lossy(capped), &mut out);
     out
+}
+
+#[cfg(target_os = "windows")]
+fn decode_windows_ansi(bytes: &[u8], code_page: u32) -> Option<String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MultiByteToWideChar(
+            code_page: u32,
+            flags: u32,
+            bytes: *const u8,
+            byte_count: i32,
+            units: *mut u16,
+            unit_capacity: i32,
+        ) -> i32;
+    }
+
+    let len = i32::try_from(bytes.len()).ok()?;
+    if len == 0 {
+        return None;
+    }
+    let mut units = vec![0; bytes.len()];
+    // SAFETY: Both buffers are valid for the lengths passed to Win32 and do not overlap.
+    let written = unsafe {
+        MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, units.as_mut_ptr(), len)
+    };
+    (written > 0).then(|| String::from_utf16_lossy(&units[..written as usize]))
 }
 
 #[cfg(target_os = "windows")]
@@ -1238,14 +1257,14 @@ fn lookup_host_env(name: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-struct RegistryUninstallMatch {
+struct RegistryInstallRecord {
     display_version: Option<String>,
     candidates: Vec<String>,
 }
 
 #[cfg(target_os = "windows")]
 struct WindowsRegistryProbe {
-    uninstall_matches: Vec<RegistryUninstallMatch>,
+    install_records: Vec<RegistryInstallRecord>,
     extra_candidates: Vec<String>,
 }
 
@@ -1254,34 +1273,35 @@ fn read_windows_registry_candidates() -> WindowsRegistryProbe {
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
     use winreg::RegKey;
 
-    let mut uninstall_matches: Vec<RegistryUninstallMatch> = Vec::new();
-    let mut extra_candidates: Vec<String> = Vec::new();
+    let mut install_records = Vec::new();
+    let mut extra_candidates = Vec::new();
 
+    // A per-user upgrade to a custom directory may coexist with an older machine-wide install.
     let roots = [
         RegKey::predef(HKEY_CURRENT_USER),
         RegKey::predef(HKEY_LOCAL_MACHINE),
     ];
 
-    // 1. Electron-builder NSIS product key (`Software\BFD312E9-1019-4F57-9F44-F86246833B50\InstallLocation`)
     let product_subkeys = [
         format!(r"Software\{WORKBUDDY_PRODUCT_REG_GUID}"),
         format!(r"Software\WOW6432Node\{WORKBUDDY_PRODUCT_REG_GUID}"),
     ];
     for root in &roots {
+        // NSIS records the chosen directory here even if the Uninstall entry omits it.
         for sub_path in &product_subkeys {
             if let Ok(sub) = root.open_subkey(sub_path) {
                 if let Ok(loc) = sub.get_value::<String, _>("InstallLocation") {
                     let expanded = expand_windows_env_vars(&loc, lookup_host_env);
                     if let Some(exe) = join_windows_workbuddy_exe(&expanded) {
-                        push_unique_str(&mut extra_candidates, exe);
+                        install_records.push(RegistryInstallRecord {
+                            display_version: None,
+                            candidates: vec![exe],
+                        });
                     }
                 }
             }
         }
-    }
 
-    // 2. Uninstall entries (`InstallLocation`, `DisplayIcon`, `UninstallString`, `QuietUninstallString`)
-    for root in &roots {
         for sub_path in [
             r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
             r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
@@ -1302,14 +1322,13 @@ fn read_windows_registry_candidates() -> WindowsRegistryProbe {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty()),
                     install_location: sub.get_value::<String, _>("InstallLocation").ok(),
-                    install_source: sub.get_value::<String, _>("InstallSource").ok(),
                     display_icon: sub.get_value::<String, _>("DisplayIcon").ok(),
                     uninstall_string: sub.get_value::<String, _>("UninstallString").ok(),
                     quiet_uninstall_string: sub.get_value::<String, _>("QuietUninstallString").ok(),
                 };
-                if is_workbuddy_uninstall_entry(&rec) {
+                if is_workbuddy_uninstall_entry(&rec, lookup_host_env) {
                     let candidates = extract_candidates_from_uninstall_record(&rec, lookup_host_env);
-                    uninstall_matches.push(RegistryUninstallMatch {
+                    install_records.push(RegistryInstallRecord {
                         display_version: rec.display_version,
                         candidates,
                     });
@@ -1318,7 +1337,7 @@ fn read_windows_registry_candidates() -> WindowsRegistryProbe {
         }
     }
 
-    // 3. Deep-link protocol, Applications shell command, App Paths, and login Run entry
+    // Deep-link protocol, Applications shell command, App Paths, and login Run entry.
     for root in &roots {
         for cmd_subkey in [
             r"Software\Classes\workbuddy\shell\open\command",
@@ -1351,37 +1370,38 @@ fn read_windows_registry_candidates() -> WindowsRegistryProbe {
     }
 
     WindowsRegistryProbe {
-        uninstall_matches,
+        install_records,
         extra_candidates,
     }
 }
 
 #[cfg(target_os = "windows")]
-fn ps_hidden(script: &str) -> Option<String> {
+fn read_exe_file_version(exe: &Path) -> Option<String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let out = std::process::Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-Item -LiteralPath $env:TAKO_SWITCH_WORKBUDDY_EXE).VersionInfo.ProductVersion",
+        ])
+        .env("TAKO_SWITCH_WORKBUDDY_EXE", exe)
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-#[cfg(target_os = "windows")]
-fn read_exe_file_version(exe: &std::path::Path) -> Option<String> {
-    let escaped = exe.to_string_lossy().replace('\'', "''");
-    let script = format!("(Get-Item -LiteralPath '{escaped}').VersionInfo.ProductVersion");
-    ps_hidden(&script)
-        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn read_unpacked_package_json_version(exe: &std::path::Path) -> Option<String> {
+#[cfg(target_os = "windows")]
+fn read_unpacked_package_json_version(paths: &AppPaths, exe: &Path) -> Option<String> {
     let pkg_path = exe.parent()?.join("resources").join("app").join("package.json");
+    if !is_windows_probe_file(paths, &pkg_path) {
+        return None;
+    }
     let raw = fs::read_to_string(pkg_path).ok()?;
     let val: Value = serde_json::from_str(&raw).ok()?;
     val.get("version")
@@ -1396,16 +1416,50 @@ fn read_installer_log_tail(log_path: &std::path::Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = fs::File::open(log_path).ok()?;
     let len = file.metadata().ok()?.len();
-    if len > 64 * 1024 {
-        let _ = file.seek(SeekFrom::End(-(64 * 1024)));
+    let limit = WINDOWS_PROBE_READ_LIMIT as u64;
+    let start = len.saturating_sub(limit);
+    let mut previous = *b"\n";
+    if start != 0 {
+        file.seek(SeekFrom::Start(start - 1)).ok()?;
+        file.read_exact(&mut previous).ok()?;
     }
-    let mut buf = Vec::with_capacity(len.min(64 * 1024) as usize);
-    file.read_to_end(&mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    let mut buf = Vec::with_capacity(len.min(limit) as usize);
+    file.take(len.min(limit)).read_to_end(&mut buf).ok()?;
+    let first_complete_line = if previous[0] == b'\n' {
+        0
+    } else {
+        buf.iter().position(|&b| b == b'\n').map_or(buf.len(), |i| i + 1)
+    };
+    Some(String::from_utf8_lossy(&buf[first_complete_line..]).into_owned())
 }
 
 #[cfg(target_os = "windows")]
-fn find_windows_workbuddy_exe_and_version(paths: &AppPaths) -> Option<(Option<String>, PathBuf)> {
+fn is_windows_probe_file(paths: &AppPaths, path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    if paths.is_test {
+        // A test shortcut or installer log must not resolve to host files through a junction.
+        let Ok(relative) = path.strip_prefix(&paths.home) else {
+            return false;
+        };
+        if relative.components().any(|c| c == Component::ParentDir) {
+            return false;
+        }
+        let Ok(root) = paths.home.canonicalize() else {
+            return false;
+        };
+        if !path.canonicalize().is_ok_and(|resolved| resolved.starts_with(root)) {
+            return false;
+        }
+    }
+    path.is_file()
+}
+
+#[cfg(target_os = "windows")]
+fn probe_windows_workbuddy(paths: &AppPaths) -> Option<(PathBuf, Option<String>)> {
+    use std::io::Read;
+
     let mut candidates: Vec<PathBuf> = Vec::new();
     let mut push_path = |p: PathBuf| {
         if !p.as_os_str().is_empty()
@@ -1419,11 +1473,11 @@ fn find_windows_workbuddy_exe_and_version(paths: &AppPaths) -> Option<(Option<St
         }
     };
 
-    let uninstall_matches = if paths.is_test {
+    let install_records = if paths.is_test {
         Vec::new()
     } else {
         let probe = read_windows_registry_candidates();
-        for entry in &probe.uninstall_matches {
+        for entry in &probe.install_records {
             for c in &entry.candidates {
                 push_path(PathBuf::from(c));
             }
@@ -1434,7 +1488,7 @@ fn find_windows_workbuddy_exe_and_version(paths: &AppPaths) -> Option<(Option<St
         if let Some(running_exe) = super::windows_process::running_exe_path(AppId::WorkBuddy) {
             push_path(running_exe);
         }
-        probe.uninstall_matches
+        probe.install_records
     };
 
     let local_app_data = if paths.is_test {
@@ -1520,25 +1574,37 @@ fn find_windows_workbuddy_exe_and_version(paths: &AppPaths) -> Option<(Option<St
         lnk_paths.push(public_dir.join("Desktop").join("WorkBuddy.lnk"));
     }
     for lnk in lnk_paths {
-        if lnk.is_file() {
-            if let Ok(bytes) = fs::read(&lnk) {
-                for raw_target in extract_workbuddy_exe_from_lnk_bytes(&bytes) {
-                    let expanded = if paths.is_test {
-                        raw_target
-                    } else {
-                        expand_windows_env_vars(&raw_target, lookup_host_env)
-                    };
-                    push_path(PathBuf::from(expanded));
-                }
-            }
+        if !is_windows_probe_file(paths, &lnk) {
+            continue;
+        }
+        let Ok(file) = fs::File::open(&lnk) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(WINDOWS_PROBE_READ_LIMIT as u64)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            continue;
+        }
+        for raw_target in extract_workbuddy_exe_from_lnk_bytes(&bytes) {
+            let expanded = if paths.is_test {
+                raw_target
+            } else {
+                expand_windows_env_vars(&raw_target, lookup_host_env)
+            };
+            push_path(PathBuf::from(expanded));
         }
     }
 
     // WorkBuddy NSIS installer log (`~/.workbuddy/logs/installer.log`)
     let installer_log = paths.workbuddy_dir.join("logs").join("installer.log");
-    if let Some(log_tail) = read_installer_log_tail(&installer_log) {
-        for raw_exe in parse_workbuddy_installer_log_candidates(&log_tail) {
-            push_path(PathBuf::from(raw_exe));
+    if is_windows_probe_file(paths, &installer_log) {
+        if let Some(log_tail) = read_installer_log_tail(&installer_log) {
+            for raw_exe in parse_workbuddy_installer_log_candidates(&log_tail) {
+                push_path(PathBuf::from(raw_exe));
+            }
         }
     }
 
@@ -1553,10 +1619,12 @@ fn find_windows_workbuddy_exe_and_version(paths: &AppPaths) -> Option<(Option<St
         }
     }
 
-    let found_exe = candidates.into_iter().find(|p| p.is_file())?;
+    let found_exe = candidates
+        .into_iter()
+        .find(|p| is_windows_probe_file(paths, p))?;
     let found_str = found_exe.to_string_lossy();
-    let reg_ver = uninstall_matches
-        .iter()
+    let reg_ver = install_records
+        .into_iter()
         .find(|entry| {
             entry.display_version.is_some()
                 && entry
@@ -1564,34 +1632,22 @@ fn find_windows_workbuddy_exe_and_version(paths: &AppPaths) -> Option<(Option<St
                     .iter()
                     .any(|c| c.eq_ignore_ascii_case(&found_str))
         })
-        .and_then(|entry| entry.display_version.clone())
-        .or_else(|| {
-            uninstall_matches
-                .into_iter()
-                .find_map(|entry| entry.display_version)
-        });
-
-    let ver = reg_ver
-        .or_else(|| read_unpacked_package_json_version(&found_exe))
-        .or_else(|| {
-            if paths.is_test {
-                None
-            } else {
-                read_exe_file_version(&found_exe)
-            }
-        });
-
-    Some((ver, found_exe))
-}
-
-#[cfg(target_os = "windows")]
-fn find_windows_workbuddy_exe(paths: &AppPaths) -> Option<PathBuf> {
-    find_windows_workbuddy_exe_and_version(paths).map(|(_, exe)| exe)
+        .and_then(|entry| entry.display_version);
+    Some((found_exe, reg_ver))
 }
 
 #[cfg(target_os = "windows")]
 fn detect_windows_workbuddy(paths: &AppPaths) -> Option<(Option<String>, String, String)> {
-    let (ver, exe) = find_windows_workbuddy_exe_and_version(paths)?;
+    let (exe, reg_ver) = probe_windows_workbuddy(paths)?;
+    let ver = reg_ver
+        .or_else(|| read_unpacked_package_json_version(paths, &exe))
+        .or_else(|| {
+            if paths.is_test {
+                None
+            } else {
+                read_exe_file_version(&exe)
+            }
+        });
     Some((ver, exe.to_string_lossy().to_string(), "nsis".to_string()))
 }
 
@@ -1612,7 +1668,7 @@ fn launch_windows_workbuddy(paths: &AppPaths) -> Result<(), String> {
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
-    let exe = find_windows_workbuddy_exe(paths)
+    let (exe, _) = probe_windows_workbuddy(paths)
         .ok_or_else(|| "未检测到 WorkBuddy.exe，请先安装 WorkBuddy".to_string())?;
     let mut cmd = std::process::Command::new(&exe);
     if let Some(parent) = exe.parent() {
@@ -1895,7 +1951,6 @@ mod tests {
             display_name: Some("WorkBuddy 5.11.3".to_string()),
             display_version: Some("5.11.3".to_string()),
             install_location: None,
-            install_source: None,
             display_icon: Some(r"D:\Program Files\WorkBuddy\WorkBuddy.exe,0".to_string()),
             uninstall_string: Some(
                 r#""D:\Program Files\WorkBuddy\Uninstall WorkBuddy.exe" /currentuser"#.to_string(),
@@ -1905,7 +1960,7 @@ mod tests {
                     .to_string(),
             ),
         };
-        assert!(is_workbuddy_uninstall_entry(&nsis_rec));
+        assert!(is_workbuddy_uninstall_entry(&nsis_rec, |_| None));
         let cands = extract_candidates_from_uninstall_record(&nsis_rec, |_| None);
         assert_eq!(cands, vec![r"D:\Program Files\WorkBuddy\WorkBuddy.exe"]);
 
@@ -1915,14 +1970,13 @@ mod tests {
             display_name: None,
             display_version: Some("5.8.0".to_string()),
             install_location: Some(r"%LOCALAPPDATA%\Programs\WorkBuddy\".to_string()),
-            install_source: None,
             display_icon: None,
             uninstall_string: Some(
                 r"E:\Custom Apps\WorkBuddy\Uninstall WorkBuddy.exe /allusers".to_string(),
             ),
             quiet_uninstall_string: None,
         };
-        assert!(is_workbuddy_uninstall_entry(&legacy_rec));
+        assert!(is_workbuddy_uninstall_entry(&legacy_rec, |_| None));
         let legacy_cands = extract_candidates_from_uninstall_record(&legacy_rec, |k| {
             (k == "LOCALAPPDATA").then(|| r"C:\Users\Demo\AppData\Local".to_string())
         });
@@ -1940,12 +1994,58 @@ mod tests {
             display_name: Some("Microsoft Visual Studio Code".to_string()),
             display_version: Some("1.146.0".to_string()),
             install_location: Some(r"D:\Program Files\Microsoft VS Code\".to_string()),
-            install_source: None,
             display_icon: Some(r"D:\Program Files\Microsoft VS Code\Code.exe".to_string()),
             uninstall_string: Some(r#""D:\Program Files\Microsoft VS Code\unins000.exe""#.to_string()),
             quiet_uninstall_string: None,
         };
-        assert!(!is_workbuddy_uninstall_entry(&unrelated));
+        assert!(!is_workbuddy_uninstall_entry(&unrelated, |_| None));
+
+        let env_only = WindowsUninstallRecord {
+            display_icon: Some(r#""%workbuddy_exe%",-1"#.to_string()),
+            ..WindowsUninstallRecord::default()
+        };
+        let lookup = |name: &str| {
+            name.eq_ignore_ascii_case("WORKBUDDY_EXE")
+                .then(|| r"D:\Custom Apps\WorkBuddy.exe".to_string())
+        };
+        assert!(is_workbuddy_uninstall_entry(&env_only, lookup));
+        assert_eq!(
+            extract_candidates_from_uninstall_record(&env_only, lookup),
+            vec![r"D:\Custom Apps\WorkBuddy.exe"]
+        );
+    }
+
+    #[test]
+    fn windows_uninstall_nonstandard_key_requires_matching_metadata() {
+        let mut record = WindowsUninstallRecord {
+            key_name: "{61A882F2-969F-45BF-A652-FA5C6B03DE22}_is1".to_string(),
+            ..WindowsUninstallRecord::default()
+        };
+        assert!(is_workbuddy_uninstall_entry(&record, |_| None));
+
+        record.key_name = record.key_name.replace("}_is1", "}}_is1");
+        assert!(!is_workbuddy_uninstall_entry(&record, |_| None));
+
+        record.display_name = Some("WorkBuddy".to_string());
+        assert!(is_workbuddy_uninstall_entry(&record, |_| None));
+    }
+
+    #[test]
+    fn windows_registry_command_parser_respects_executable_boundaries() {
+        assert_eq!(
+            parse_windows_exe_path_str("D:\\办公软件\\WorkBuddy.exe 参数"),
+            Some(r"D:\办公软件\WorkBuddy.exe")
+        );
+        assert_eq!(
+            parse_windows_exe_path_str("D:/archive.exe/WorkBuddy/Uninstall WorkBuddy.EXE /S"),
+            Some("D:/archive.exe/WorkBuddy/Uninstall WorkBuddy.EXE")
+        );
+        assert_eq!(
+            parse_windows_exe_path_str(r"D:\Custom Apps\WorkBuddy.exe D:\Other.exe"),
+            Some(r"D:\Custom Apps\WorkBuddy.exe")
+        );
+        assert_eq!(parse_windows_exe_path_str(r#""D:\WorkBuddy\icon.ico",0"#), None);
+        assert_eq!(parse_windows_exe_path_str("没有可执行文件"), None);
     }
 
     #[test]
@@ -1964,25 +2064,87 @@ mod tests {
             ]
         );
 
-        // Build synthetic .lnk binary with odd-aligned UTF-16LE CJK path (no NUL before next length prefix)
-        // plus an ANSI %LOCALAPPDATA% fallback block.
-        let mut lnk = vec![0x4Cu8, 0x00, 0x00, 0x00, 0xFF]; // 5 bytes -> odd offset!
         let target_u16 = r"D:\办公软件\WorkBuddy\WorkBuddy.exe";
-        lnk.extend_from_slice(&(target_u16.encode_utf16().count() as u16).to_le_bytes());
-        for unit in target_u16.encode_utf16() {
-            lnk.extend_from_slice(&unit.to_le_bytes());
+        for prefix_len in [4, 5] {
+            let mut lnk = vec![0; prefix_len];
+            lnk.extend_from_slice(&(target_u16.encode_utf16().count() as u16).to_le_bytes());
+            for unit in target_u16.encode_utf16() {
+                lnk.extend_from_slice(&unit.to_le_bytes());
+            }
+            lnk.extend_from_slice(&18u16.to_le_bytes()); // next StringData count, without a NUL
+            lnk.extend_from_slice(b"\0%LOCALAPPDATA%\\Programs\\WorkBuddy\\WorkBuddy.exe\0");
+            assert_eq!(
+                extract_workbuddy_exe_from_lnk_bytes(&lnk),
+                vec![
+                    target_u16,
+                    r"%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe",
+                ]
+            );
         }
-        lnk.extend_from_slice(&18u16.to_le_bytes()); // immediately followed by next StringData count
-        lnk.extend_from_slice(b"\0%LOCALAPPDATA%\\Programs\\WorkBuddy\\WorkBuddy.exe\0");
+    }
 
-        let lnk_cands = extract_workbuddy_exe_from_lnk_bytes(&lnk);
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_lnk_ansi_decoder_preserves_non_utf8_path() {
+        const CP_GBK: u32 = 936;
+        let bytes = b"\0D:\\\xb0\xec\xb9\xab\xc8\xed\xbc\xfe\\WorkBuddy\\WorkBuddy.exe\0";
+        let decoded = decode_windows_ansi(bytes, CP_GBK).unwrap();
+        let mut candidates = Vec::new();
+        extract_workbuddy_paths_from_decoded_text(&decoded, &mut candidates);
+        assert_eq!(candidates, vec![r"D:\办公软件\WorkBuddy\WorkBuddy.exe"]);
+    }
+
+    #[test]
+    fn windows_installer_log_tail_skips_a_partial_utf8_line() {
+        let (dir, _) = test_paths();
+        let path = dir.path().join("installer.log");
+        let partial = "中 INFO install target dir: D:\\Old\r\n";
+        let fresh = "INFO final install directory: D:\\办公软件\\WorkBuddy\r\n";
+        let remaining = WINDOWS_PROBE_READ_LIMIT + 1 - partial.len() - fresh.len();
+        let body = format!("{partial}{fresh}{}", "x".repeat(remaining));
+        fs::write(&path, body).unwrap();
+
+        let tail = read_installer_log_tail(&path).unwrap();
+        assert!(tail.starts_with(fresh));
+        assert!(tail.len() <= WINDOWS_PROBE_READ_LIMIT);
         assert_eq!(
-            lnk_cands,
-            vec![
-                r"D:\办公软件\WorkBuddy\WorkBuddy.exe",
-                r"%LOCALAPPDATA%\Programs\WorkBuddy\WorkBuddy.exe",
-            ]
+            parse_workbuddy_installer_log_candidates(&tail),
+            vec![r"D:\办公软件\WorkBuddy\WorkBuddy.exe"]
         );
+
+        let first_omitted = "x".repeat(20) + "\n";
+        let remaining = WINDOWS_PROBE_READ_LIMIT - fresh.len();
+        fs::write(&path, format!("{first_omitted}{fresh}{}", "x".repeat(remaining))).unwrap();
+        assert!(read_installer_log_tail(&path).unwrap().starts_with(fresh));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_test_probes_reject_executables_outside_the_fixture() {
+        let host = TempDir::new().unwrap();
+        let fixture = host.path().join("fixture");
+        let paths = AppPaths::for_test(&fixture);
+        let outside = host.path().join("WorkBuddy.exe");
+        write_atomic(&outside, b"MZ", false).unwrap();
+        let log = format!(
+            "INFO final install directory: {}\nINFO extraction sentinel OK: {} present\n",
+            host.path().display(),
+            fixture.join("..").join("WorkBuddy.exe").display()
+        );
+        write_atomic(
+            &paths.workbuddy_dir.join("logs").join("installer.log"),
+            log.as_bytes(),
+            false,
+        )
+        .unwrap();
+        let lnk: Vec<_> = outside
+            .to_string_lossy()
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        write_atomic(&paths.home.join("Desktop").join("WorkBuddy.lnk"), &lnk, false).unwrap();
+        assert!(!WorkBuddyAdapter.detect_install(&paths).installed);
     }
 
     #[cfg(target_os = "windows")]
@@ -2012,6 +2174,12 @@ mod tests {
             custom_dir.display()
         );
         write_atomic(&log_path, log_body.as_bytes(), false).unwrap();
+
+        let default_dir = paths.home.join("AppData/Local/Programs/WorkBuddy");
+        let default_exe = default_dir.join("WorkBuddy.exe");
+        write_atomic(&default_exe, b"MZ", false).unwrap();
+        assert_eq!(probe_windows_workbuddy(&paths).unwrap().0, default_exe);
+        fs::remove_file(&default_exe).unwrap();
 
         let info = adapter.detect_install(&paths);
         assert!(info.installed);

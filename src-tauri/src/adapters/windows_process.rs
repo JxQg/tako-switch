@@ -152,7 +152,12 @@ pub(super) fn running_exe_path(id: AppId) -> Option<std::path::PathBuf> {
         }
         if let Some(raw) = query_process_image_path(pid) {
             let candidate = std::path::PathBuf::from(raw);
-            if candidate.is_file() {
+            // A PID from the snapshot may have been reused before OpenProcess.
+            let matches_snapshot = candidate
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| matches_ascii_name(image, name));
+            if matches_snapshot && candidate.is_file() {
                 resolved = Some(candidate);
                 return true;
             }
