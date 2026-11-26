@@ -105,11 +105,11 @@ fn is_codex_package_image_path(path: &str) -> bool {
     path.to_ascii_lowercase().contains("openai.codex")
 }
 
-fn is_codex_packaged_chatgpt_process(process_id: u32) -> bool {
+fn query_process_image_path(process_id: u32) -> Option<String> {
     // SAFETY: Querying process image path with limited access does not mutate target process state.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return false;
+        return None;
     }
     let proc_handle = Snapshot(handle);
     let mut buf = [0u16; 1024];
@@ -117,11 +117,16 @@ fn is_codex_packaged_chatgpt_process(process_id: u32) -> bool {
     // SAFETY: `buf` is writable for `len` u16 elements and `proc_handle` is a valid process handle.
     let ok = unsafe { QueryFullProcessImageNameW(proc_handle.0, 0, buf.as_mut_ptr(), &mut len) };
     if ok == 0 {
-        return false;
+        return None;
     }
     let used = (len as usize).min(buf.len());
-    let path = String::from_utf16_lossy(&buf[..used]);
-    is_codex_package_image_path(&path)
+    Some(String::from_utf16_lossy(&buf[..used]))
+}
+
+fn is_codex_packaged_chatgpt_process(process_id: u32) -> bool {
+    query_process_image_path(process_id)
+        .as_deref()
+        .is_some_and(is_codex_package_image_path)
 }
 
 fn matches_app_process(id: AppId, image: &[u16], process_id: u32) -> bool {
@@ -137,6 +142,24 @@ fn matches_app_process(id: AppId, image: &[u16], process_id: u32) -> bool {
 
 pub(super) fn is_running(id: AppId) -> bool {
     find_process(|image, pid| matches_app_process(id, image, pid)).unwrap_or(false)
+}
+
+pub(super) fn running_exe_path(id: AppId) -> Option<std::path::PathBuf> {
+    let mut resolved = None;
+    let _ = find_process(|image, pid| {
+        if !matches_app_process(id, image, pid) {
+            return false;
+        }
+        if let Some(raw) = query_process_image_path(pid) {
+            let candidate = std::path::PathBuf::from(raw);
+            if candidate.is_file() {
+                resolved = Some(candidate);
+                return true;
+            }
+        }
+        false
+    });
+    resolved
 }
 
 pub(crate) fn running_states() -> Result<BTreeMap<String, bool>, String> {
@@ -215,5 +238,12 @@ mod tests {
             keys,
             ["antigravity", "claude", "codex", "dsh-tako", "workbuddy"]
         );
+    }
+
+    #[test]
+    fn queries_current_process_full_image_path() {
+        let resolved = query_process_image_path(std::process::id())
+            .expect("current test binary image path must be queryable");
+        assert!(std::path::Path::new(&resolved).is_file());
     }
 }
