@@ -43,9 +43,7 @@ def iter_release_files(release_dir: Path) -> list[Path]:
     """All files to ship under tako-switch/releases/<tag>/ (latest.json excluded —
     it is the mutable pointer and is uploaded to LATEST_JSON_KEY separately)."""
     files = [
-        p
-        for p in sorted(release_dir.iterdir(), key=lambda path: path.name)
-        if p.is_file() and p.name != "latest.json"
+        p for p in sorted(release_dir.iterdir()) if p.is_file() and p.name != "latest.json"
     ]
     if not files:
         raise RuntimeError(f"no release files found in {release_dir}")
