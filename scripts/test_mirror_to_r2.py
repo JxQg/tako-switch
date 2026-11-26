@@ -396,6 +396,88 @@ class TimeoutRetryTests(unittest.TestCase):
             self.assertEqual(
                 doge_keys,
                 [
+                    "apps/agy-cli/darwin_arm64/1.5.17/cli_mac_arm64.tar.gz",
+                    "tako-switch/agy-cli/manifests/darwin_arm64.json",
+                    "tako-switch/agy-cli/manifests/index.json",
+                ],
+            )
+
+    def test_mirror_agy_cli_uploads_to_doge_when_r2_already_has_archive(self) -> None:
+        import hashlib
+        import json
+        import tempfile
+        import unittest.mock
+
+        payload = b"fake-agy-cli-tarball-content"
+        sha512 = hashlib.sha512(payload).hexdigest()
+        archive_key = "apps/agy-cli/darwin_arm64/1.5.17/cli_mac_arm64.tar.gz"
+        official_url = (
+            "https://storage.googleapis.com/antigravity-public/antigravity-cli/"
+            "1.5.17-4823843970351104/darwin-arm/cli_mac_arm64.tar.gz"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            mf_dir = Path(tmp) / "manifests"
+            mf_dir.mkdir(parents=True)
+            (mf_dir / "darwin_arm64.json").write_text(
+                json.dumps(
+                    {
+                        "version": "1.5.17",
+                        "url": f"https://dl.lven.asia/{archive_key}",
+                        "fallbackUrl": official_url,
+                        "sha512": sha512,
+                        "size": len(payload),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (mf_dir / "index.json").write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "tool": "agy",
+                        "version": "1.5.17",
+                        "platforms": {
+                            "darwin_arm64": {
+                                "url": f"https://dl.lven.asia/{archive_key}",
+                                "fallbackUrl": official_url,
+                                "sha512": sha512,
+                                "size": len(payload),
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # R2 already has the archive, but DogeCloud OSS is missing it.
+            fake_r2 = FakeS3(existing={archive_key: {"ContentLength": len(payload)}})
+            fake_doge = FakeS3()
+
+            def fake_download(url: str, dest: Path) -> None:
+                dest.write_bytes(payload)
+
+            with unittest.mock.patch.object(mod, "download_file", side_effect=fake_download) as dl_mock:
+                mirrored = mod.mirror_agy_cli_manifests_to_r2(
+                    manifests_dir=mf_dir,
+                    s3=fake_r2,
+                    mirror_base="https://dl.lven.asia/apps",
+                    key_prefix="apps",
+                    manifest_s3_prefix="tako-switch/agy-cli/manifests",
+                    keep_versions=2,
+                    doge_s3=fake_doge,
+                )
+
+            self.assertEqual(mirrored, [archive_key])
+            self.assertEqual(dl_mock.call_count, 1)
+            self.assertEqual([k for k, _, _ in fake_r2.uploaded], [
+                "tako-switch/agy-cli/manifests/darwin_arm64.json",
+                "tako-switch/agy-cli/manifests/index.json",
+            ])
+            self.assertEqual(
+                [k for k, _, _ in fake_doge.uploaded],
+                [
+                    archive_key,
                     "tako-switch/agy-cli/manifests/darwin_arm64.json",
                     "tako-switch/agy-cli/manifests/index.json",
                 ],

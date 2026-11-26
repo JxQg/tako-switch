@@ -653,20 +653,40 @@ def mirror_agy_cli_manifests_to_r2(
         expected_size = data.get("size")
         expected_sha512 = str(data.get("sha512") or "").strip().lower()
         head = s3.head_object(key)
-        obj_ready = False
+        primary_ready = False
         obj_size = expected_size
 
         if head is not None:
             remote_size = head.get("ContentLength")
             if expected_size is None or remote_size == expected_size:
                 print(f"[skip] agy-cli {key} already exists in s3://{s3.bucket} ({remote_size} bytes)")
-                obj_ready = True
+                primary_ready = True
                 if isinstance(remote_size, int) and remote_size > 0:
                     obj_size = remote_size
 
-        if not obj_ready:
+        doge_ready = True
+        if doge_s3 is not None:
+            doge_ready = False
+            doge_head = doge_s3.head_object(key)
+            if doge_head is not None:
+                doge_size = doge_head.get("ContentLength")
+                if expected_size is None or doge_size == expected_size:
+                    print(
+                        f"[skip] agy-cli {key} already exists in DogeCloud OSS "
+                        f"s3://{doge_s3.bucket} ({doge_size} bytes)"
+                    )
+                    doge_ready = True
+
+        obj_ready = primary_ready
+        if not primary_ready or not doge_ready:
             if dry_run:
-                print(f"[dry-run] would mirror agy-cli {official_url} -> s3://{s3.bucket}/{key}")
+                if not primary_ready:
+                    print(f"[dry-run] would mirror agy-cli {official_url} -> s3://{s3.bucket}/{key}")
+                if not doge_ready and doge_s3 is not None:
+                    print(
+                        f"[dry-run] would mirror agy-cli {official_url} -> "
+                        f"DogeCloud OSS s3://{doge_s3.bucket}/{key}"
+                    )
                 obj_ready = True
             else:
                 with tempfile.TemporaryDirectory(prefix="tako-mirror-agy-cli-") as tmpdir:
@@ -684,18 +704,33 @@ def mirror_agy_cli_manifests_to_r2(
                             f"agy-cli size mismatch for {official_url}: "
                             f"expected {expected_size}, got {actual_size}"
                         )
-                    print(
-                        f"[upload] agy-cli s3://{s3.bucket}/{key} "
-                        f"({actual_size} bytes, sha512={actual_sha512[:12]}...)"
-                    )
-                    s3.upload_file(
-                        local_file,
-                        key,
-                        cache_control="public, max-age=31536000, immutable",
-                        content_type="application/octet-stream",
-                        metadata={"sha256": actual_sha256},
-                    )
-                    obj_ready = True
+                    if not primary_ready:
+                        print(
+                            f"[upload] agy-cli s3://{s3.bucket}/{key} "
+                            f"({actual_size} bytes, sha512={actual_sha512[:12]}...)"
+                        )
+                        s3.upload_file(
+                            local_file,
+                            key,
+                            cache_control="public, max-age=31536000, immutable",
+                            content_type="application/octet-stream",
+                            metadata={"sha256": actual_sha256},
+                        )
+                        primary_ready = True
+                    if not doge_ready and doge_s3 is not None:
+                        print(
+                            f"[upload] agy-cli to DogeCloud OSS s3://{doge_s3.bucket}/{key} "
+                            f"({actual_size} bytes, sha512={actual_sha512[:12]}...)"
+                        )
+                        doge_s3.upload_file(
+                            local_file,
+                            key,
+                            cache_control="public, max-age=31536000, immutable",
+                            content_type="application/octet-stream",
+                            metadata={"sha256": actual_sha256},
+                        )
+                        doge_ready = True
+                    obj_ready = primary_ready
                     obj_size = actual_size
 
         if obj_ready:
