@@ -3,6 +3,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -598,6 +599,70 @@ pub fn write_atomic(path: &Path, content: &[u8], secret_mode: bool) -> Result<()
     Ok(())
 }
 
+pub fn copy_file_atomic(
+    src_path: &Path,
+    dst_path: &Path,
+    secret_mode: bool,
+) -> Result<(), String> {
+    let parent = dst_path
+        .parent()
+        .ok_or_else(|| format!("路径缺少父目录: {}", dst_path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|e| format!("创建目录 {} 失败: {e}", parent.display()))?;
+
+    let nonce: u32 = rand::thread_rng().gen();
+    let file_name = dst_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("config");
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{}.{}", std::process::id(), nonce));
+
+    let copy_res = (|| -> Result<(), String> {
+        let src_file = fs::File::open(src_path)
+            .map_err(|e| format!("读取待备份文件 {} 失败: {e}", src_path.display()))?;
+        let dst_file = fs::File::create(&tmp_path)
+            .map_err(|e| format!("写入临时文件 {} 失败: {e}", tmp_path.display()))?;
+        let mut reader = BufReader::with_capacity(64 * 1024, src_file);
+        let mut writer = BufWriter::with_capacity(64 * 1024, dst_file);
+        io::copy(&mut reader, &mut writer)
+            .map_err(|e| format!("写入临时文件 {} 失败: {e}", tmp_path.display()))?;
+        writer
+            .flush()
+            .map_err(|e| format!("刷新临时文件 {} 失败: {e}", tmp_path.display()))?;
+        Ok(())
+    })();
+    if let Err(err) = copy_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    #[cfg(unix)]
+    if secret_mode {
+        let perms = fs::Permissions::from_mode(0o600);
+        if let Err(e) = fs::set_permissions(&tmp_path, perms) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("设置权限 {} 失败: {e}", tmp_path.display()));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = secret_mode;
+
+    if let Err(err) = fs::rename(&tmp_path, dst_path) {
+        #[cfg(windows)]
+        {
+            if dst_path.exists() {
+                let _ = fs::remove_file(dst_path);
+                if fs::rename(&tmp_path, dst_path).is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("原子替换 {} 失败: {err}", dst_path.display()));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchAuth {
@@ -743,9 +808,7 @@ pub fn backup_file_once(
         return Ok(());
     }
     if src_path.exists() {
-        let bytes = fs::read(src_path)
-            .map_err(|e| format!("读取待备份文件 {} 失败: {e}", src_path.display()))?;
-        write_atomic(&bfile, &bytes, true)
+        copy_file_atomic(src_path, &bfile, true)
     } else {
         write_atomic(&missing_marker, b"absent", false)
     }

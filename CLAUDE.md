@@ -92,7 +92,7 @@
    - 中心库存放于 `switch/extensions/` 与 `switch/skills/`。快照自动收编历史配置，不改写客户端原文件；首次修改先 `backup_file_once` 备份，所有写入经 `write_atomic` 落盘，所有持久化结构体加 `#[serde(default)]` 兼容低版本平滑升级。
    - 通用 MCP 排除内置 `tako`、`tako-web-page` 和 `node_repl`；Claude 开关联动 `1p`、已存在的 `3p` 和 `~/.claude.json`，全关仍保留中心记录。
    - 提示词只修改用户正文，原样保留汉化托管块；快照自动归档手写正文并回写外部修改。
-   - Skills 主副本位于 `switch/skills/<id>`，全关保留主副本；自动模式优先目录软链，无权限回退原子复制，移除链接/Junction 时仅删链接本身；ZIP 解压内存预检路径、深度与 50 MiB 上限，仓库拉取遵循 `bypass_system_proxy`。
+   - Skills 主副本位于 `switch/skills/<id>`，全关保留主副本；自动模式优先目录软链，无权限回退 64 KiB 流式原子复制（本机上限 512 MiB / 20,000 文件，单技能异常隔离不阻断全局），移除链接/Junction 时仅删链接本身；ZIP 与仓库归档预检路径、深度并按 200 MiB 上限流式解压，仓库拉取遵循 `bypass_system_proxy`。
    - 插件管理按桌面内置、用户安装目录、系统 PATH 顺序探测 CLI，Windows 无窗口执行并关闭 stdin；Codex 开关经 `toml_edit` 无损保存，Antigravity 目录遵循系统代理开关并缓存至 `extensions/plugin_cache.json`。
 
 ---

@@ -5,15 +5,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tako_switch_lib::config::{read_switch_state, save_switch_state, write_atomic, AppPaths};
 use tako_switch_lib::extensions::skills::{
-    align_skill_platforms_for_paths, discover_repo_skills_for_paths,
-    get_skills_hub_snapshot_for_paths, import_local_skill_for_paths,
-    install_discovered_skill_for_paths, master_skills_dir, remove_skill_repo_for_paths,
-    scan_adopt_local_skills_for_paths, set_skill_default_targets_for_paths,
-    set_skill_sync_method_for_paths, toggle_skill_platform_for_paths, uninstall_skill_for_paths,
+    align_skill_platforms_for_paths, discard_skill_zip_upload_for_paths,
+    discover_repo_skills_for_paths, get_skills_hub_snapshot_for_paths,
+    import_local_skill_for_paths, install_discovered_skill_for_paths, master_skills_dir,
+    remove_skill_repo_for_paths, scan_adopt_local_skills_for_paths,
+    set_skill_default_targets_for_paths, set_skill_sync_method_for_paths,
+    stage_skill_zip_chunk_for_paths, toggle_skill_platform_for_paths, uninstall_skill_for_paths,
     update_installed_skill_for_paths, upsert_skill_repo_for_paths, ImportLocalSkillRequest,
     ManagedSkill, SkillLinkMode, SkillRepo, SkillSource, SkillSyncMethod, SkillsHubSnapshot,
 };
-use tako_switch_lib::extensions::{platform_skills_dirs, ExtPlatform};
+use tako_switch_lib::extensions::{get_extensions_summary_for_paths, platform_skills_dirs, ExtPlatform};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -483,11 +484,17 @@ fn tc_p2_03_rejects_zip_slip_absolute_drive_duplicate_and_symlink_entries_before
 #[test]
 fn tc_p2_03_size_depth_invalid_frontmatter_and_batch_collisions_do_not_partially_import() {
     let (_directory, paths) = sandbox();
-    let huge = vec![b'x'; 50 * 1024 * 1024 + 1];
-    let archive = zip_bytes(&[("huge/SKILL.md", &huge)]);
+    let chunk_50m = vec![b'x'; 50 * 1024 * 1024];
+    let archive = zip_bytes(&[
+        ("huge/SKILL.md", b"# Huge"),
+        ("huge/a.bin", &chunk_50m),
+        ("huge/b.bin", &chunk_50m),
+        ("huge/c.bin", &chunk_50m),
+        ("huge/d.bin", &chunk_50m),
+    ]);
     assert!(import_zip(&paths, &archive, Vec::new())
         .unwrap_err()
-        .contains("50 MiB"));
+        .contains("200 MiB"));
     let deep = format!("{}SKILL.md", "nested/".repeat(18));
     assert!(import_zip(&paths, &zip_bytes(&[(&deep, b"# Deep")]), Vec::new()).is_err());
     let invalid = zip_bytes(&[
@@ -772,6 +779,9 @@ async fn tc_p2_04_mock_repo_discovery_main_fallback_install_hash_change_update_a
     );
     let snapshot = get_skills_hub_snapshot_for_paths(&paths).unwrap();
     assert!(managed(&snapshot, "repo-skill").skill.update_available);
+    let summary_before_update = get_extensions_summary_for_paths(&paths).unwrap();
+    assert_eq!(summary_before_update.skills_count, 1);
+    assert_eq!(summary_before_update.skills_updatable_count, 1);
     assert_eq!(
         managed(&snapshot, "repo-skill").skill.installed_hash,
         original_hash
@@ -780,6 +790,8 @@ async fn tc_p2_04_mock_repo_discovery_main_fallback_install_hash_change_update_a
         .await
         .unwrap();
     assert!(!managed(&updated, "repo-skill").skill.update_available);
+    let summary_after_update = get_extensions_summary_for_paths(&paths).unwrap();
+    assert_eq!(summary_after_update.skills_updatable_count, 0);
     assert_ne!(
         managed(&updated, "repo-skill").skill.installed_hash,
         original_hash
@@ -928,4 +940,170 @@ async fn tc_p2_04_repo_download_honors_live_proxy_policy_using_local_http_only()
         .iter()
         .any(|request| request.starts_with("GET http://")));
     direct_task.abort();
+}
+
+#[test]
+fn tc_p2_05_adopts_over_50mb_skill_keeps_dist_skips_env_caches_and_decouples_home_summary() {
+    let (_directory, paths) = sandbox();
+    let external_agents = paths.home.join(".agents/skills/dashi-ppt");
+    seed(
+        &external_agents,
+        "SKILL.md",
+        b"---\nname: dashi-ppt\ndescription: Heavy offline template skill\n---\n# Dashi\n",
+    );
+    let dist_payload = vec![b'd'; 28 * 1024 * 1024];
+    let src_payload = vec![b's'; 28 * 1024 * 1024];
+    seed(&external_agents, "project/dist/bundle.js", &dist_payload);
+    seed(&external_agents, "project/src/templates.bin", &src_payload);
+    for ignored in [".venv", "venv", ".pytest_cache", ".mypy_cache", ".ruff_cache"] {
+        seed(&external_agents, &format!("{ignored}/cache.bin"), b"skip-me");
+    }
+    seed(&external_agents, "Thumbs.db", b"skip-thumbs");
+
+    let codex_skill = target(&paths, ExtPlatform::Codex, "dashi-ppt");
+    fs::create_dir_all(codex_skill.parent().unwrap()).unwrap();
+    #[cfg(unix)]
+    let linked_external = std::os::unix::fs::symlink(&external_agents, &codex_skill).is_ok();
+    #[cfg(windows)]
+    let linked_external = std::os::windows::fs::symlink_dir(&external_agents, &codex_skill).is_ok();
+    if !linked_external {
+        seed(
+            &codex_skill,
+            "SKILL.md",
+            b"---\nname: dashi-ppt\ndescription: Heavy offline template skill\n---\n# Dashi\n",
+        );
+        seed(&codex_skill, "project/dist/bundle.js", &dist_payload);
+        seed(&codex_skill, "project/src/templates.bin", &src_payload);
+        seed(&codex_skill, ".venv/cache.bin", b"skip-me");
+        seed(&codex_skill, "Thumbs.db", b"skip-thumbs");
+    }
+
+    // 1. Home summary must be zero-copy lightweight and never fail on 56 MiB skill
+    let summary = get_extensions_summary_for_paths(&paths).unwrap();
+    assert_eq!(summary.skills_count, 1);
+    assert!(
+        !master(&paths, "dashi-ppt").exists(),
+        "home summary should not perform heavy file copy adoption"
+    );
+
+    // 2. Entering Skills Hub streams 56 MiB skill into master, keeps dist/, filters env caches, preserves external symlink
+    let snapshot = get_skills_hub_snapshot_for_paths(&paths).unwrap();
+    assert!(snapshot.warnings.is_empty(), "{:?}", snapshot.warnings);
+    assert_eq!(snapshot.skills.len(), 1);
+    let item = managed(&snapshot, "dashi-ppt");
+    assert_eq!(item.skill.source, SkillSource::Adopted);
+    assert!(!item.platforms[&ExtPlatform::Codex].has_diff);
+    if linked_external {
+        assert_eq!(
+            item.platforms[&ExtPlatform::Codex].actual_method,
+            Some(SkillLinkMode::Symlink)
+        );
+        assert_eq!(
+            fs::canonicalize(&codex_skill).unwrap(),
+            fs::canonicalize(&external_agents).unwrap(),
+            "passive adoption must preserve existing external symlink"
+        );
+    }
+    assert_eq!(
+        fs::metadata(master(&paths, "dashi-ppt").join("project/dist/bundle.js"))
+            .unwrap()
+            .len(),
+        dist_payload.len() as u64
+    );
+    assert!(!master(&paths, "dashi-ppt").join(".venv").exists());
+    assert!(!master(&paths, "dashi-ppt").join("venv").exists());
+    assert!(!master(&paths, "dashi-ppt").join(".pytest_cache").exists());
+    assert!(!master(&paths, "dashi-ppt").join("Thumbs.db").exists());
+    assert_no_staging(&paths.home);
+}
+
+#[test]
+fn tc_p2_06_isolates_corrupted_skills_with_warnings_without_breaking_hub_or_summary() {
+    let (_directory, paths) = sandbox();
+    skill(
+        &target(&paths, ExtPlatform::Claude, "healthy"),
+        "Healthy Skill",
+        "Works cleanly",
+    );
+    seed(
+        &target(&paths, ExtPlatform::Codex, "broken-yaml"),
+        "SKILL.md",
+        b"---\nname: [unclosed\n---\n# Broken",
+    );
+    seed(
+        &target(&paths, ExtPlatform::Antigravity, "invalid space"),
+        "SKILL.md",
+        b"# Invalid folder identifier",
+    );
+
+    let summary = get_extensions_summary_for_paths(&paths).unwrap();
+    assert!(summary.skills_count >= 1);
+
+    let snapshot = get_skills_hub_snapshot_for_paths(&paths).unwrap();
+    assert_eq!(snapshot.skills.len(), 1);
+    assert_eq!(snapshot.skills[0].skill.id, "healthy");
+    assert!(
+        snapshot
+            .warnings
+            .iter()
+            .any(|w| w.contains("broken-yaml") && w.contains("frontmatter")),
+        "expected broken-yaml warning in {:?}",
+        snapshot.warnings
+    );
+    assert!(
+        snapshot
+            .warnings
+            .iter()
+            .any(|w| w.contains("invalid space")),
+        "expected invalid identifier warning in {:?}",
+        snapshot.warnings
+    );
+    assert!(!master(&paths, "broken-yaml").exists());
+    assert_no_staging(&paths.home);
+}
+
+#[test]
+fn tc_p2_07_chunked_zip_upload_installs_and_cleans_up_temp_files() {
+    let (_directory, paths) = sandbox();
+    let archive = zip_bytes(&[
+        (
+            "chunked-skill/SKILL.md",
+            b"---\nname: Chunked Skill\ndescription: Uploaded in slices\n---\n# Chunked",
+        ),
+        ("chunked-skill/assets/data.txt", b"slice-payload"),
+    ]);
+    let mid = archive.len() / 2;
+    let c1 = base64::engine::general_purpose::STANDARD.encode(&archive[..mid]);
+    let c2 = base64::engine::general_purpose::STANDARD.encode(&archive[mid..]);
+
+    let upload_id = stage_skill_zip_chunk_for_paths(&paths, None, &c1).unwrap();
+    let same_id = stage_skill_zip_chunk_for_paths(&paths, Some(&upload_id), &c2).unwrap();
+    assert_eq!(upload_id, same_id);
+
+    let snapshot = import_local_skill_for_paths(
+        &paths,
+        ImportLocalSkillRequest {
+            upload_id: Some(upload_id),
+            targets: Some(vec![ExtPlatform::Codex]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(managed(&snapshot, "chunked-skill").skill.name, "Chunked Skill");
+    assert_eq!(
+        fs::read(target(&paths, ExtPlatform::Codex, "chunked-skill").join("assets/data.txt"))
+            .unwrap(),
+        b"slice-payload"
+    );
+    assert!(!paths
+        .switch_dir()
+        .join("extensions/.tmp-uploads")
+        .exists());
+
+    let discarded = stage_skill_zip_chunk_for_paths(&paths, None, &c1).unwrap();
+    discard_skill_zip_upload_for_paths(&paths, &discarded).unwrap();
+    assert!(!paths
+        .switch_dir()
+        .join("extensions/.tmp-uploads")
+        .exists());
 }

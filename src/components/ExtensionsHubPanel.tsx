@@ -30,7 +30,11 @@ interface ExtensionsHubPanelProps {
   activeTab: ExtensionTab;
   onTabChange: (tab: ExtensionTab) => void;
   summary: ExtensionsSummary | null;
-  onCountChange: (tab: ExtensionTab, count: number) => void;
+  onCountChange: (
+    tab: ExtensionTab,
+    count: number,
+    updatableCount?: number,
+  ) => void;
   onGoSuperMcp: () => void;
   onNotify?: (message: string) => void;
   onNavigationGuardChange: (guard: ExtensionNavigationGuard | null) => void;
@@ -51,7 +55,8 @@ export function ExtensionsHubPanel({
     [onCountChange],
   );
   const countSkills = useCallback(
-    (count: number) => onCountChange("skills", count),
+    (count: number, updatableCount?: number) =>
+      onCountChange("skills", count, updatableCount),
     [onCountChange],
   );
   const countPlugins = useCallback(

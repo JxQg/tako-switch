@@ -68,7 +68,7 @@ interface OverviewPanelProps {
   onNavigate: (route: NavRoute) => void;
   onOpenMcpDetail: (tab?: McpToolKey) => void;
   extensionsSummary: ExtensionsSummary | null;
-  onOpenExtensions: (tab: ExtensionTab) => void;
+  onOpenExtensions: (tab?: ExtensionTab) => void;
   onSetMode: (app: AppSnapshot, mode: AppMode) => void;
   onLaunchApp: (appId: AppId) => void;
   onRestartApp: (appId: AppId) => void;
@@ -797,21 +797,115 @@ export function OverviewPanel({
           })}
         </div>
       </section>
-      <section className="flex min-w-0 flex-col gap-2">
-        <h2 className="px-0.5 text-[12.5px] font-semibold text-[var(--text-secondary)]">通用扩展中心</h2>
+      {/* Section 3: Universal Extensions Hub Framed Module */}
+      <section
+        data-testid="ext-hub-home-section"
+        className="tako-mcp-section border border-[var(--border)] bg-[var(--bg-card)] shadow-[var(--shadow-card)] min-w-0"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-[var(--density-list-gap)]">
+          <div className="flex items-center gap-2 min-w-0">
+            <LayoutGrid className="h-4 w-4 text-[var(--accent)] shrink-0" />
+            <h2 className="text-[13px] font-semibold text-[var(--text-primary)] shrink-0">
+              通用扩展中心
+            </h2>
+            <span className="hidden min-[480px]:inline-flex items-center h-5 px-2.5 rounded-full bg-[var(--bg-pill)] border border-[var(--border)] text-[11px] font-medium text-[var(--text-secondary)] truncate">
+              Claude · Codex · Antigravity
+            </span>
+          </div>
+
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              data-testid="open-ext-hub"
+              onClick={() => onOpenExtensions()}
+              className="h-7 px-2.5 rounded-full border border-[var(--accent-border)] bg-[var(--accent-soft)] hover:bg-[var(--accent-border)] text-[var(--accent)] text-[11.5px] font-medium inline-flex items-center gap-1 transition cursor-pointer"
+            >
+              <span>打开扩展中心</span>
+              <ChevronRight className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+
         <div className="grid grid-cols-2 min-[760px]:grid-cols-4 tako-list-stack">
-          {([
-            { id: "mcp", label: "通用 MCP", icon: Plug, count: extensionsSummary?.mcpCount },
-            { id: "skills", label: "Skills 技能", icon: Zap, count: extensionsSummary?.skillsCount },
-            { id: "plugins", label: "插件管理", icon: Puzzle, count: extensionsSummary?.pluginsCount },
-            { id: "prompts", label: "提示词预设", icon: FileText, count: extensionsSummary?.promptsCount },
-          ] satisfies { id: ExtensionTab; label: string; icon: typeof Plug; count: number | undefined }[]).map(({ id, label, icon: Icon, count }) => (
-            <button key={id} type="button" data-testid={`open-ext-hub-${id}`} onClick={() => onOpenExtensions(id)}
-              className="flex min-w-0 items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--bg-card)] px-3 py-3 text-left text-[var(--text-secondary)] hover:border-[var(--border-strong)] hover:bg-[var(--bg-subtle)] cursor-pointer">
-              <Icon className="h-4 w-4 shrink-0 text-[var(--accent)]" strokeWidth={1.8} />
-              <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-[var(--text-primary)]">{label}</span>
-              <span className="shrink-0 text-[11px] text-[var(--text-muted)] tabular-nums">{count ?? 0}</span>
-              <ChevronRight className="h-3 w-3 shrink-0 text-[var(--text-muted)]" />
+          {(
+            [
+              {
+                id: "mcp",
+                label: "通用 MCP",
+                icon: Plug,
+                count: extensionsSummary?.mcpCount ?? 0,
+                countText: `${extensionsSummary?.mcpCount ?? 0} 个服务`,
+                subtitle: "三端开关 · 粘贴导入",
+              },
+              {
+                id: "skills",
+                label: "Skills 技能",
+                icon: Zap,
+                count: extensionsSummary?.skillsCount ?? 0,
+                countText:
+                  (extensionsSummary?.skillsUpdatableCount ?? 0) > 0
+                    ? `${extensionsSummary?.skillsCount ?? 0} 项 · ${extensionsSummary?.skillsUpdatableCount} 可更新`
+                    : `${extensionsSummary?.skillsCount ?? 0} 项`,
+                subtitle: "本地/ZIP · GitHub",
+              },
+              {
+                id: "plugins",
+                label: "插件管理",
+                icon: Puzzle,
+                count: extensionsSummary?.pluginsCount ?? 0,
+                countText: `${extensionsSummary?.pluginsCount ?? 0} 个已安装`,
+                subtitle: "内置 CLI · 发现与市场",
+              },
+              {
+                id: "prompts",
+                label: "提示词预设",
+                icon: FileText,
+                count: extensionsSummary?.promptsCount ?? 0,
+                countText: `${extensionsSummary?.promptsCount ?? 0} 套预设`,
+                subtitle: "双栏直编 · 汉化共存",
+              },
+            ] satisfies {
+              id: ExtensionTab;
+              label: string;
+              icon: typeof Plug;
+              count: number;
+              countText: string;
+              subtitle: string;
+            }[]
+          ).map(({ id, label, icon: Icon, count, countText, subtitle }) => (
+            <button
+              key={id}
+              type="button"
+              data-testid={`open-ext-hub-${id}`}
+              title={`${label}（${countText}）· ${subtitle}`}
+              onClick={() => onOpenExtensions(id)}
+              className="group rounded-[10px] border border-[var(--border)] bg-[var(--bg-subtle)]/55 hover:bg-[var(--accent-soft)]/40 hover:border-[var(--accent-border)] tako-mcp-cell flex flex-col justify-between gap-1.5 text-left transition select-none min-w-0 cursor-pointer"
+            >
+              <div className="flex items-center justify-between gap-1.5 min-w-0 w-full">
+                <span className="flex items-center gap-1.5 min-w-0 text-[12px] font-semibold text-[var(--text-primary)]">
+                  <Icon
+                    className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]"
+                    strokeWidth={1.9}
+                  />
+                  <span className="truncate">{label}</span>
+                </span>
+                <ChevronRight className="h-3 w-3 shrink-0 text-[var(--text-muted)] group-hover:text-[var(--accent)] transition-colors" />
+              </div>
+
+              <div className="flex items-baseline justify-between gap-1.5 min-w-0 w-full">
+                <span
+                  className={`shrink-0 tabular-nums text-[11px] font-semibold leading-tight ${
+                    count > 0
+                      ? "text-[var(--success)]"
+                      : "text-[var(--text-muted)]"
+                  }`}
+                >
+                  {countText}
+                </span>
+                <span className="min-w-0 truncate text-[10.5px] leading-tight text-[var(--text-muted)]">
+                  {subtitle}
+                </span>
+              </div>
             </button>
           ))}
         </div>

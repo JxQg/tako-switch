@@ -64,6 +64,25 @@ const SYNC_METHODS: { id: SkillSyncMethod; label: string }[] = [
   { id: "symlink", label: "仅使用软链" },
   { id: "copy", label: "强制复制" },
 ];
+const MAX_ARCHIVE_BYTES = 200 * 1024 * 1024;
+const INLINE_ZIP_THRESHOLD_BYTES = 16 * 1024 * 1024;
+const ZIP_CHUNK_BYTES = 4 * 1024 * 1024;
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result !== "string") {
+        reject(new Error("读取 ZIP 文件失败"));
+        return;
+      }
+      resolve(reader.result.slice(reader.result.indexOf(",") + 1));
+    };
+    reader.onerror = () =>
+      reject(reader.error ?? new Error("读取 ZIP 文件失败"));
+    reader.readAsDataURL(blob);
+  });
+}
 
 function sourceLabel(item: ManagedSkill): string {
   return item.skill.repoOwner && item.skill.repoName
@@ -77,7 +96,7 @@ export function SkillsHubView({
   onNotify,
 }: {
   onActionsChange: (actions: ExtensionActions) => void;
-  onCountChange: (count: number) => void;
+  onCountChange: (count: number, updatableCount?: number) => void;
   onNotify?: (message: string) => void;
 }) {
   const [snapshot, setSnapshot] = useState<SkillsHubSnapshot | null>(null);
@@ -103,6 +122,9 @@ export function SkillsHubView({
   const [repoInput, setRepoInput] = useState("");
   const [branchInput, setBranchInput] = useState("main");
   const [notice, setNotice] = useState<string | null>(null);
+  const [dismissedWarningsSig, setDismissedWarningsSig] = useState<
+    string | null
+  >(null);
 
   useEffect(() => {
     mounted.current = true;
@@ -123,7 +145,12 @@ export function SkillsHubView({
   }, []);
 
   useEffect(() => {
-    if (snapshot) onCountChange(snapshot.skills.length);
+    if (snapshot) {
+      const updatable = snapshot.skills.filter(
+        (item) => item.skill.updateAvailable,
+      ).length;
+      onCountChange(snapshot.skills.length, updatable);
+    }
   }, [snapshot, onCountChange]);
 
   useEffect(() => {
@@ -137,8 +164,8 @@ export function SkillsHubView({
       setDrawerError("请选择 .zip 文件");
       return;
     }
-    if (file.size > 50 * 1024 * 1024) {
-      setDrawerError("ZIP 文件不能超过 50 MiB");
+    if (file.size > MAX_ARCHIVE_BYTES) {
+      setDrawerError("ZIP 文件不能超过 200 MiB");
       return;
     }
     setZipFile(file);
@@ -322,32 +349,46 @@ export function SkillsHubView({
   const updates =
     snapshot?.skills.filter((item) => item.skill.updateAvailable).length ?? 0;
 
+  const warnings = snapshot?.warnings ?? [];
+  const warningsSig = warnings.join("\n");
+
   const handleImport = async () => {
     await run(async () => {
       let zipBase64: string | undefined;
+      let uploadId: string | undefined;
       let path: string | undefined;
       if (importMode === "path") path = importPath.trim();
       else if (nativeZipPath) path = nativeZipPath;
       else if (zipFile) {
-        zipBase64 = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => {
-            if (typeof reader.result !== "string") {
-              reject(new Error("读取 ZIP 文件失败"));
-              return;
+        if (zipFile.size <= INLINE_ZIP_THRESHOLD_BYTES) {
+          zipBase64 = await blobToBase64(zipFile);
+        } else {
+          let stagedId: string | null = null;
+          try {
+            for (
+              let offset = 0;
+              offset < zipFile.size;
+              offset += ZIP_CHUNK_BYTES
+            ) {
+              const slice = zipFile.slice(offset, offset + ZIP_CHUNK_BYTES);
+              const chunkBase64 = await blobToBase64(slice);
+              stagedId = await api.stageSkillZipChunk(stagedId, chunkBase64);
             }
-            resolve(reader.result.slice(reader.result.indexOf(",") + 1));
-          };
-          reader.onerror = () =>
-            reject(reader.error ?? new Error("读取 ZIP 文件失败"));
-          reader.readAsDataURL(zipFile);
-        });
+            uploadId = stagedId ?? undefined;
+          } catch (err) {
+            if (stagedId) {
+              void api.discardSkillZipUpload(stagedId).catch(() => {});
+            }
+            throw err;
+          }
+        }
       }
-      if (!path && !zipBase64)
+      if (!path && !zipBase64 && !uploadId)
         throw new Error("请选择 ZIP 文件或填写本地目录路径");
       const next = await api.importLocalSkill({
         path,
         zipBase64,
+        ...(uploadId ? { uploadId } : {}),
         targets: importTargets,
       });
       setSnapshot(next);
@@ -504,6 +545,33 @@ export function SkillsHubView({
           </div>
         </div>
         <ExtError message={error} onDismiss={() => setError(null)} />
+        {warnings.length > 0 && dismissedWarningsSig !== warningsSig && (
+          <div
+            data-testid="ext-skills-warnings"
+            role="status"
+            className="flex min-w-0 items-center justify-between gap-2 rounded-md border border-[var(--border)] bg-[var(--warning-soft)] px-2.5 py-1.5 text-[11px] text-[var(--warning)]"
+          >
+            <span className="min-w-0 truncate" title={warnings[0]}>
+              已隔离跳过 {warnings.length} 个异常技能目录，其余技能不受影响
+            </span>
+            <div className="flex shrink-0 items-center gap-1.5">
+              <ExtHelpPopover label="查看跳过原因">
+                {warnings.map((warning) => (
+                  <p className="mb-1.5 break-all last:mb-0" key={warning}>
+                    {warning}
+                  </p>
+                ))}
+              </ExtHelpPopover>
+              <button
+                type="button"
+                onClick={() => setDismissedWarningsSig(warningsSig)}
+                className="shrink-0 cursor-pointer whitespace-nowrap text-[11px] underline opacity-80 hover:opacity-100"
+              >
+                忽略
+              </button>
+            </div>
+          </div>
+        )}
         {notice && !onNotify && (
           <div role="status" className="text-[12px] text-[var(--success)]">
             {notice}
@@ -918,7 +986,7 @@ export function SkillsHubView({
                   "拖入 ZIP 文件或选择文件"}
               </span>
               <span className="text-[10.5px] text-[var(--text-muted)]">
-                ZIP · 50 MiB
+                ZIP ≤ 200 MiB · 本地目录 ≤ 512 MiB
               </span>
               <input
                 type="file"

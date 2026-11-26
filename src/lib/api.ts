@@ -513,6 +513,7 @@ export interface SkillsHubSnapshot {
   masterDir: string;
   skills: ManagedSkill[];
   repos: SkillRepo[];
+  warnings?: string[];
 }
 
 export interface DiscoverableSkill {
@@ -531,12 +532,14 @@ export interface DiscoverableSkill {
 export interface ImportLocalSkillRequest {
   path?: string | null;
   zipBase64?: string | null;
+  uploadId?: string | null;
   targets?: ExtPlatform[];
 }
 
 export interface ExtensionsSummary {
   mcpCount: number;
   skillsCount: number;
+  skillsUpdatableCount?: number;
   pluginsCount: number;
   promptsCount: number;
 }
@@ -595,6 +598,10 @@ export const api = {
     invoke<SkillsHubSnapshot>("set_skill_sync_method", { method }),
   setSkillDefaultTargets: (targets: ExtPlatform[]) =>
     invoke<SkillsHubSnapshot>("set_skill_default_targets", { targets }),
+  stageSkillZipChunk: (uploadId: string | null, chunkBase64: string) =>
+    invoke<string>("stage_skill_zip_chunk", { uploadId, chunkBase64 }),
+  discardSkillZipUpload: (uploadId: string) =>
+    invoke<void>("discard_skill_zip_upload", { uploadId }),
   importLocalSkill: (input: ImportLocalSkillRequest) =>
     invoke<SkillsHubSnapshot>("import_local_skill", { input }),
   scanAdoptLocalSkills: () => invoke<SkillsHubSnapshot>("scan_adopt_local_skills"),

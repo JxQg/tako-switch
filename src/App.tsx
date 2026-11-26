@@ -291,14 +291,29 @@ export default function App() {
     return () => { cancelled = true; };
   }, [activeRoute]);
 
-  const handleExtensionCountChange = useCallback((tab: ExtensionTab, count: number) => {
-    const keys: Record<ExtensionTab, keyof ExtensionsSummary> = {
-      mcp: "mcpCount", skills: "skillsCount", plugins: "pluginsCount", prompts: "promptsCount",
-    };
-    setExtensionsSummary((previous) => ({
-      mcpCount: 0, skillsCount: 0, pluginsCount: 0, promptsCount: 0, ...previous, [keys[tab]]: count,
-    }));
-  }, []);
+  const handleExtensionCountChange = useCallback(
+    (tab: ExtensionTab, count: number, updatableCount?: number) => {
+      const keys: Record<ExtensionTab, keyof ExtensionsSummary> = {
+        mcp: "mcpCount",
+        skills: "skillsCount",
+        plugins: "pluginsCount",
+        prompts: "promptsCount",
+      };
+      setExtensionsSummary((previous) => ({
+        mcpCount: 0,
+        skillsCount: 0,
+        skillsUpdatableCount: 0,
+        pluginsCount: 0,
+        promptsCount: 0,
+        ...previous,
+        [keys[tab]]: count,
+        ...(tab === "skills" && updatableCount !== undefined
+          ? { skillsUpdatableCount: updatableCount }
+          : {}),
+      }));
+    },
+    [],
+  );
 
   const loadDashboard = useCallback(async (refreshAccount: boolean) => {
     try {
@@ -1406,7 +1421,7 @@ export default function App() {
             }}
             extensionsSummary={extensionsSummary}
             onOpenExtensions={(tab) => {
-              setExtensionTab(tab);
+              if (tab) setExtensionTab(tab);
               setActiveRoute("extensions");
             }}
             onSetMode={(app, mode) => void handleSetMode(app, mode)}

@@ -112,6 +112,9 @@ function installMock({ theme, density, native = false }) {
         archiveUrlOverride: null,
       },
     ],
+    warnings: [
+      "跳过 Codex 技能 broken-link：目录软链目标不存在或已失效",
+    ],
   };
   const state = {
     uiDensity: density,
@@ -177,6 +180,17 @@ function installMock({ theme, density, native = false }) {
       if (command === "plugin:event|unlisten") return;
       if (command === "get_dashboard") return structuredClone(dashboard);
       if (command === "get_running_states") return {};
+      if (command === "get_extensions_summary") {
+        return {
+          mcpCount: 8,
+          skillsCount: hub.skills.length,
+          skillsUpdatableCount: hub.skills.filter(
+            (item) => item.skill.updateAvailable,
+          ).length,
+          pluginsCount: 0,
+          promptsCount: 4,
+        };
+      }
       if (command === "save_settings") {
         Object.assign(state, payload.input);
         return structuredClone(state);
@@ -270,7 +284,7 @@ async function verifyBounds(page, label) {
   const result = await page.evaluate(() => {
     const outside = Array.from(
       document.querySelectorAll(
-        "header, header button, [data-testid=ext-skills-view] button, [data-testid=ext-skills-view] input, [role=dialog], [role=menu], [role=tooltip]",
+        "header, header button, [data-testid=ext-hub-home-section], [data-testid=ext-hub-home-section] button, [data-testid=ext-skills-view] button, [data-testid=ext-skills-view] input, [role=dialog], [role=menu], [role=tooltip]",
       ),
     )
       .map((element) => ({
@@ -338,10 +352,53 @@ if (preview) {
           const page = await context.newPage();
           const errors = [];
           page.on("pageerror", (error) => errors.push(error.message));
+          const label = `${width}x${height}-${theme}-${density}`;
           await page.goto(`http://127.0.0.1:${address.port}`);
+          await page.getByTestId("ext-hub-home-section").waitFor();
+          await page
+            .getByTestId("open-ext-hub-skills")
+            .filter({ hasText: "3 项 · 1 可更新" })
+            .waitFor();
+          await verifyBounds(page, `${label}-overview`);
+          const homeGridRows = await page
+            .locator('[data-testid^="open-ext-hub-"]')
+            .evaluateAll((elements) =>
+              new Set(
+                elements.map((el) => Math.round(el.getBoundingClientRect().top)),
+              ).size,
+            );
+          assert.equal(homeGridRows, width >= 760 ? 1 : 2);
+          await page.screenshot({
+            path: path.join(output, `${label}-overview.png`),
+          });
           await page.getByTestId("open-ext-hub-skills").click();
           await page.getByTestId("ext-skill-row-code-review").waitFor();
-          const label = `${width}x${height}-${theme}-${density}`;
+          if (width === 820 && theme === "light" && density === "comfortable") {
+            await page.getByTestId("topbar-back-home").click();
+            await page.getByTestId("open-ext-hub").click();
+            assert.equal(
+              await page
+                .getByTestId("ext-hub-tab-skills")
+                .getAttribute("aria-selected"),
+              "true",
+            );
+            await page.getByTestId("ext-skill-row-code-review").waitFor();
+          }
+          await page.getByTestId("ext-skills-warnings").waitFor();
+          await verifyBounds(page, `${label}-warnings`);
+          const warnHelp = page.getByRole("button", {
+            name: "查看跳过原因",
+            exact: true,
+          });
+          await warnHelp.click();
+          await page.getByRole("tooltip").waitFor();
+          await verifyBounds(page, `${label}-warnings-popover`);
+          await page.keyboard.press("Escape");
+          await page
+            .getByTestId("ext-skills-warnings")
+            .getByRole("button", { name: "忽略", exact: true })
+            .click();
+          assert.equal(await page.getByTestId("ext-skills-warnings").count(), 0);
           await verifyBounds(page, `${label}-installed`);
           await page.screenshot({
             path: path.join(output, `${label}-installed.png`),

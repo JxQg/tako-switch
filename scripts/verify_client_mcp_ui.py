@@ -75,6 +75,8 @@ REQUIRED_TESTIDS = [
 ]
 
 REQUIRED_EXT_HUB_TESTIDS = [
+    "ext-hub-home-section",
+    "open-ext-hub",
     "open-ext-hub-mcp",
     "open-ext-hub-skills",
     "open-ext-hub-plugins",
@@ -383,6 +385,8 @@ def extension_contract_checks(repo_root: Path, src_files: Dict[Path, str]) -> Li
         and "本项目特有王牌模组" not in overview
         and "open-multi-sync" not in overview
         and "grid-cols-2 min-[760px]:grid-cols-4" in overview
+        and "Claude · Codex · Antigravity" in overview
+        and "打开扩展中心" in overview
     )
     checks.append(("extensions:home-contract", clean_home, "home subtitle, independent entries and 720px 2-column grid"))
     checks.append(("extensions:super-mcp-isolated", "MultiPlatformSyncPanel" not in mcp_center and "activeSection" not in mcp_center, "super MCP no longer hosts the generic sync UI"))
@@ -1070,6 +1074,8 @@ export const McpInlineTheater = () => (
         )
         (root / "src/components/OverviewPanel.tsx").write_text(
             'const subtitle = "Tako 模式下自动注入，开关即时生效";\n'
+            'const scope = "Claude · Codex · Antigravity";\n'
+            'const cta = "打开扩展中心";\n'
             '<div className="grid-cols-2 min-[760px]:grid-cols-4">\n'
             + "\n".join(f'<button data-testid="{testid}" />' for testid in REQUIRED_EXT_HUB_TESTIDS)
             + "\n</div>",

@@ -1,25 +1,36 @@
 use super::{
     build_http_client, extension_store_path, extensions_dir, normalize_platforms,
-    platform_skills_dirs, read_json_store_checked, skills_ssot_dir, store_lock as lock_store,
-    validate_extension_id as validate_identifier, with_extension_paths, write_json_store,
-    ExtPlatform,
+    platform_skills_dirs, read_json_store, read_json_store_checked, skills_ssot_dir,
+    store_lock as lock_store, validate_extension_id as validate_identifier, with_extension_paths,
+    write_json_store, ExtPlatform,
 };
-use crate::config::{backup_file_once, write_atomic, AppPaths};
+use crate::config::{backup_file_once, AppPaths};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::{Cursor, ErrorKind, Read};
+use std::fs::{self, OpenOptions};
+use std::io::{BufWriter, Cursor, ErrorKind, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use std::os::windows::fs::FileTypeExt;
 
-const MAX_BYTES: u64 = 50 * 1024 * 1024;
-const MAX_FILES: usize = 10_000;
+pub const MAX_LOCAL_SKILL_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_ARCHIVE_BYTES: u64 = 200 * 1024 * 1024;
+const MAX_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SKILL_MD_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_FILES: usize = 20_000;
 const MAX_DEPTH: usize = 16;
+const STREAM_BUF_SIZE: usize = 64 * 1024;
+const HASH_CACHE_MIN_BYTES: u64 = 256 * 1024;
+const HASH_CACHE_MAX_ENTRIES: usize = 512;
+const STALE_TEMP_TTL: Duration = Duration::from_secs(3600);
+
+type HashCacheMap = BTreeMap<PathBuf, ([u8; 32], String)>;
+static TREE_HASH_CACHE: Mutex<Option<HashCacheMap>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -211,6 +222,8 @@ pub struct SkillsHubSnapshot {
     pub skills: Vec<ManagedSkill>,
     #[serde(default)]
     pub repos: Vec<SkillRepo>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -246,16 +259,26 @@ pub struct ImportLocalSkillRequest {
     #[serde(default)]
     pub zip_base64: Option<String>,
     #[serde(default)]
+    pub upload_id: Option<String>,
+    #[serde(default)]
     pub targets: Option<Vec<ExtPlatform>>,
 }
 
 #[derive(Debug, Clone)]
-struct SkillFile {
-    bytes: Vec<u8>,
+struct LocalFileEntry {
+    source: PathBuf,
+    size: u64,
     executable: bool,
+    meta_stamp: [u8; 32],
 }
 
-type SkillFiles = BTreeMap<String, SkillFile>;
+#[derive(Debug, Clone)]
+struct LocalSkillTree {
+    canonical_root: PathBuf,
+    files: BTreeMap<String, LocalFileEntry>,
+    total_bytes: u64,
+    meta_digest: [u8; 32],
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -276,6 +299,10 @@ fn skills_store_path(paths: &AppPaths) -> PathBuf {
 
 fn repos_store_path(paths: &AppPaths) -> PathBuf {
     extension_store_path(paths, "skill_repos.json")
+}
+
+fn temp_uploads_dir(paths: &AppPaths) -> PathBuf {
+    extensions_dir(paths).join(".tmp-uploads")
 }
 
 fn is_link(metadata: &fs::Metadata) -> bool {
@@ -361,7 +388,88 @@ fn read_repos(paths: &AppPaths) -> Result<SkillReposStore, String> {
 }
 
 fn skipped(name: &str) -> bool {
-    matches!(name, ".git" | "node_modules" | "__pycache__" | ".DS_Store")
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "__pycache__"
+            | ".venv"
+            | "venv"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | ".ruff_cache"
+            | ".DS_Store"
+            | "Thumbs.db"
+    )
+}
+
+/// 首页轻量只读技能计数：仅读取 `skills.json` 并浅层检查各端 `SKILL.md` 目录存在性，零文件读取、零落盘拷贝。
+/// 返回 `(已发现/纳管技能总数, 已标记可更新技能数)`。
+pub fn skills_summary_counts_for_paths(paths: &AppPaths) -> (usize, usize) {
+    let mut seen = BTreeSet::new();
+    let mut updatable = BTreeSet::new();
+    let store: SkillsStore = read_json_store(&skills_store_path(paths));
+    for skill in store.skills {
+        if validate_identifier(&skill.id).is_ok() {
+            let key = skill.id.to_lowercase();
+            if skill.update_available {
+                updatable.insert(key.clone());
+            }
+            seen.insert(key);
+        }
+    }
+    let roots = std::iter::once(master_skills_dir(paths)).chain(
+        ExtPlatform::all()
+            .iter()
+            .flat_map(|&platform| platform_skills_dirs(paths, platform)),
+    );
+    for root in roots {
+        let Ok(entries) = fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let id = entry.file_name().to_string_lossy().to_string();
+            if id.starts_with('.') || validate_identifier(&id).is_err() {
+                continue;
+            }
+            if entry.path().join("SKILL.md").is_file() {
+                seen.insert(id.to_lowercase());
+            }
+        }
+    }
+    (seen.len(), updatable.len())
+}
+
+pub fn count_skills_for_summary_for_paths(paths: &AppPaths) -> usize {
+    skills_summary_counts_for_paths(paths).0
+}
+
+fn cleanup_stale_temp_artifacts(paths: &AppPaths) {
+    let now = SystemTime::now();
+    let is_stale = |path: &Path| -> bool {
+        fs::symlink_metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .is_some_and(|age| age > STALE_TEMP_TTL)
+    };
+    let ext_dir = extensions_dir(paths);
+    if let Ok(entries) = fs::read_dir(&ext_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".tako-archive-") && is_stale(&entry.path()) {
+                let _ = remove_path(&entry.path());
+            }
+        }
+    }
+    let uploads = temp_uploads_dir(paths);
+    if let Ok(entries) = fs::read_dir(&uploads) {
+        for entry in entries.flatten() {
+            if is_stale(&entry.path()) {
+                let _ = remove_path(&entry.path());
+            }
+        }
+    }
 }
 
 fn parse_frontmatter(bytes: &[u8], fallback: &str) -> Result<Frontmatter, String> {
@@ -395,31 +503,97 @@ fn parse_frontmatter(bytes: &[u8], fallback: &str) -> Result<Frontmatter, String
     Ok(frontmatter)
 }
 
-fn collect_local_files(root: &Path) -> Result<SkillFiles, String> {
+fn read_frontmatter_file(skill_md: &Path, fallback: &str) -> Result<Frontmatter, String> {
+    let file =
+        fs::File::open(skill_md).map_err(|e| format!("打开 {} 失败: {e}", skill_md.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SKILL_MD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("读取 {} 失败: {e}", skill_md.display()))?;
+    if bytes.len() as u64 > MAX_SKILL_MD_BYTES {
+        return Err("SKILL.md 超过 2 MiB 解析上限".to_string());
+    }
+    parse_frontmatter(&bytes, fallback)
+}
+
+fn compute_file_meta_stamp(relative: &str, metadata: &fs::Metadata) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update((relative.len() as u64).to_le_bytes());
+    hasher.update(relative.as_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    if let Ok(modified) = metadata.modified() {
+        if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
+            hasher.update(dur.as_nanos().to_le_bytes());
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        hasher.update(metadata.creation_time().to_le_bytes());
+        hasher.update(metadata.last_write_time().to_le_bytes());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        hasher.update(metadata.ino().to_le_bytes());
+        hasher.update(metadata.ctime_nsec().to_le_bytes());
+        hasher.update(metadata.mtime_nsec().to_le_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn build_tree_from_entries(
+    canonical_root: PathBuf,
+    files: BTreeMap<String, LocalFileEntry>,
+) -> LocalSkillTree {
+    let mut total_bytes = 0u64;
+    let mut meta_hasher = Sha256::new();
+    for entry in files.values() {
+        total_bytes = total_bytes.saturating_add(entry.size);
+        meta_hasher.update(entry.meta_stamp);
+    }
+    LocalSkillTree {
+        canonical_root,
+        files,
+        total_bytes,
+        meta_digest: meta_hasher.finalize().into(),
+    }
+}
+
+fn collect_tree_entries(
+    root: &Path,
+    max_bytes: u64,
+) -> Result<(PathBuf, BTreeMap<String, LocalFileEntry>), String> {
     let canonical =
         fs::canonicalize(root).map_err(|e| format!("读取技能目录 {} 失败: {e}", root.display()))?;
     let mut files = BTreeMap::new();
-    let mut total = 0;
-    collect_local_tree(&canonical, &canonical, "", &mut files, &mut total, 0)?;
+    let mut total = 0u64;
+    collect_local_tree(&canonical, &canonical, "", &mut files, &mut total, 0, max_bytes)?;
+    Ok((canonical, files))
+}
+
+fn scan_local_tree(root: &Path, max_bytes: u64) -> Result<LocalSkillTree, String> {
+    let (canonical, files) = collect_tree_entries(root, max_bytes)?;
     if !files.contains_key("SKILL.md") {
         return Err(format!("技能目录缺少 SKILL.md: {}", root.display()));
     }
-    Ok(files)
+    Ok(build_tree_from_entries(canonical, files))
 }
 
 fn collect_local_tree(
     root: &Path,
     directory: &Path,
     prefix: &str,
-    files: &mut SkillFiles,
+    files: &mut BTreeMap<String, LocalFileEntry>,
     total: &mut u64,
     depth: usize,
+    max_bytes: u64,
 ) -> Result<(), String> {
     if depth > MAX_DEPTH {
         return Err("技能目录嵌套过深".to_string());
     }
-    let entries = fs::read_dir(directory)
-        .map_err(|e| format!("读取目录 {} 失败: {e}", directory.display()))?;
+    let entries =
+        fs::read_dir(directory).map_err(|e| format!("读取目录 {} 失败: {e}", directory.display()))?;
     for entry in entries {
         let entry = entry.map_err(|e| format!("读取技能目录项失败: {e}"))?;
         let name = entry
@@ -443,21 +617,24 @@ fn collect_local_tree(
         let metadata =
             fs::metadata(&canonical).map_err(|e| format!("读取技能文件属性失败: {e}"))?;
         if metadata.is_dir() {
-            collect_local_tree(root, &canonical, &relative, files, total, depth + 1)?;
+            collect_local_tree(
+                root,
+                &canonical,
+                &relative,
+                files,
+                total,
+                depth + 1,
+                max_bytes,
+            )?;
         } else if metadata.is_file() {
-            if files.len() >= MAX_FILES || metadata.len() > MAX_BYTES.saturating_sub(*total) {
-                return Err("技能超过 50 MiB 或文件数量上限".to_string());
+            let size = metadata.len();
+            if files.len() >= MAX_FILES || size > max_bytes.saturating_sub(*total) {
+                return Err(format!(
+                    "技能超过 {} MiB 或文件数量上限",
+                    max_bytes / (1024 * 1024)
+                ));
             }
-            let mut bytes = Vec::new();
-            fs::File::open(&canonical)
-                .map_err(|e| format!("打开技能文件失败: {e}"))?
-                .take(MAX_BYTES.saturating_sub(*total) + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|e| format!("读取技能文件失败: {e}"))?;
-            *total += bytes.len() as u64;
-            if *total > MAX_BYTES {
-                return Err("技能超过 50 MiB 解压体积上限".to_string());
-            }
+            *total += size;
             #[cfg(unix)]
             let executable = {
                 use std::os::unix::fs::PermissionsExt;
@@ -465,7 +642,16 @@ fn collect_local_tree(
             };
             #[cfg(not(unix))]
             let executable = false;
-            files.insert(relative, SkillFile { bytes, executable });
+            let meta_stamp = compute_file_meta_stamp(&relative, &metadata);
+            files.insert(
+                relative,
+                LocalFileEntry {
+                    source: canonical,
+                    size,
+                    executable,
+                    meta_stamp,
+                },
+            );
         } else {
             return Err(format!("技能包含不支持的文件类型: {relative}"));
         }
@@ -495,19 +681,61 @@ fn validate_path_segment(segment: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_zip(bytes: &[u8]) -> Result<SkillFiles, String> {
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err("ZIP 文件超过 50 MiB 上限".to_string());
+struct TempExtractDir {
+    path: PathBuf,
+}
+
+impl TempExtractDir {
+    fn new(paths: &AppPaths) -> Result<Self, String> {
+        let base = extensions_dir(paths);
+        ensure_plain_ancestors(paths, &base)?;
+        fs::create_dir_all(&base).map_err(|e| format!("创建扩展目录失败: {e}"))?;
+        let nonce = format!("{}-{:016x}", std::process::id(), rand::random::<u64>());
+        let path = base.join(format!(".tako-archive-{nonce}"));
+        fs::create_dir_all(&path).map_err(|e| format!("创建技能解压临时目录失败: {e}"))?;
+        Ok(Self { path })
     }
+}
+
+impl Drop for TempExtractDir {
+    fn drop(&mut self) {
+        let _ = remove_path(&self.path);
+    }
+}
+
+struct StagedUploadCleanup {
+    path: PathBuf,
+}
+
+impl Drop for StagedUploadCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        if let Some(parent) = self.path.parent() {
+            if fs::read_dir(parent)
+                .ok()
+                .is_some_and(|mut entries| entries.next().is_none())
+            {
+                let _ = fs::remove_dir(parent);
+            }
+        }
+    }
+}
+
+fn extract_zip_reader_to_dir<R: Read + Seek>(
+    reader: R,
+    dest: &Path,
+    max_bytes: u64,
+) -> Result<Vec<String>, String> {
     let mut archive =
-        zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("读取 ZIP 失败: {e}"))?;
+        zip::ZipArchive::new(reader).map_err(|e| format!("读取 ZIP 失败: {e}"))?;
     if archive.len() > MAX_FILES {
         return Err("ZIP 文件数量超过上限".to_string());
     }
-    let mut files = BTreeMap::new();
+    let mut extracted = Vec::new();
     let mut seen = BTreeSet::new();
     let mut path_kinds = BTreeMap::new();
     let mut total = 0u64;
+    let mut buf = vec![0u8; STREAM_BUF_SIZE];
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -554,47 +782,121 @@ fn parse_zip(bytes: &[u8]) -> Result<SkillFiles, String> {
         if mode & 0o170000 != 0 && !matches!(mode & 0o170000, 0o100000 | 0o040000) {
             return Err(format!("ZIP 不允许链接或特殊文件: {name}"));
         }
-        if entry.size() > MAX_BYTES.saturating_sub(total) {
-            return Err("ZIP 超过 50 MiB 总解压体积上限".to_string());
+        if entry.size() > max_bytes.saturating_sub(total) {
+            return Err(format!(
+                "ZIP 超过 {} MiB 总解压体积上限",
+                max_bytes / (1024 * 1024)
+            ));
         }
         total += entry.size();
-        if entry.is_dir() || segments.iter().any(|name| skipped(name)) {
+        if entry.is_dir() || segments.iter().any(|seg| skipped(seg)) {
             continue;
         }
         let expected = entry.size();
-        let mut content = Vec::new();
-        (&mut entry)
-            .take(expected + 1)
-            .read_to_end(&mut content)
-            .map_err(|e| format!("解压 ZIP 项 {name} 失败: {e}"))?;
-        if content.len() as u64 != expected {
+        let out_path = dest.join(&normalized);
+        if let Some(parent_dir) = out_path.parent() {
+            fs::create_dir_all(parent_dir)
+                .map_err(|e| format!("创建解压目录 {} 失败: {e}", parent_dir.display()))?;
+        }
+        let out_file = fs::File::create(&out_path)
+            .map_err(|e| format!("创建解压文件 {} 失败: {e}", out_path.display()))?;
+        let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, out_file);
+        let mut limited = (&mut entry).take(expected + 1);
+        let mut written = 0u64;
+        loop {
+            let read = limited
+                .read(&mut buf)
+                .map_err(|e| format!("解压 ZIP 项 {name} 失败: {e}"))?;
+            if read == 0 {
+                break;
+            }
+            written += read as u64;
+            if written > expected {
+                return Err(format!("ZIP 解压体积与声明不一致: {name}"));
+            }
+            writer
+                .write_all(&buf[..read])
+                .map_err(|e| format!("写入解压项 {name} 失败: {e}"))?;
+        }
+        writer
+            .flush()
+            .map_err(|e| format!("刷新解压项 {name} 失败: {e}"))?;
+        if written != expected {
             return Err(format!("ZIP 解压体积与声明不一致: {name}"));
         }
-        files.insert(
-            normalized,
-            SkillFile {
-                bytes: content,
-                executable: mode & 0o111 != 0,
-            },
+        #[cfg(unix)]
+        if mode & 0o111 != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&out_path, fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("保留 ZIP 脚本执行权限失败: {e}"))?;
+        }
+        extracted.push(normalized);
+    }
+    Ok(extracted)
+}
+
+fn hash_tree_streaming(tree: &LocalSkillTree) -> Result<String, String> {
+    let mut outer = Sha256::new();
+    let mut buf = vec![0u8; STREAM_BUF_SIZE];
+    for (path, entry) in &tree.files {
+        let mut file = fs::File::open(&entry.source)
+            .map_err(|e| format!("读取技能文件 {} 失败: {e}", entry.source.display()))?;
+        let mut inner = Sha256::new();
+        loop {
+            let read = file
+                .read(&mut buf)
+                .map_err(|e| format!("读取技能文件 {} 失败: {e}", entry.source.display()))?;
+            if read == 0 {
+                break;
+            }
+            inner.update(&buf[..read]);
+        }
+        outer.update((path.len() as u64).to_le_bytes());
+        outer.update(path.as_bytes());
+        outer.update(inner.finalize());
+    }
+    Ok(hex::encode(outer.finalize()))
+}
+
+fn hash_tree_cached(tree: &LocalSkillTree, force_rehash: bool) -> Result<String, String> {
+    if !force_rehash && tree.total_bytes >= HASH_CACHE_MIN_BYTES {
+        let guard = TREE_HASH_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cache) = guard.as_ref() {
+            if let Some((digest, hash)) = cache.get(&tree.canonical_root) {
+                if *digest == tree.meta_digest {
+                    return Ok(hash.clone());
+                }
+            }
+        }
+    }
+    let computed = hash_tree_streaming(tree)?;
+    if tree.total_bytes >= HASH_CACHE_MIN_BYTES {
+        let mut guard = TREE_HASH_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = guard.get_or_insert_with(BTreeMap::new);
+        if cache.len() >= HASH_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(
+            tree.canonical_root.clone(),
+            (tree.meta_digest, computed.clone()),
         );
     }
-    Ok(files)
+    Ok(computed)
 }
 
-fn hash_files(files: &SkillFiles) -> String {
-    let mut hasher = Sha256::new();
-    for (path, file) in files {
-        hasher.update((path.len() as u64).to_le_bytes());
-        hasher.update(path.as_bytes());
-        hasher.update(Sha256::digest(&file.bytes));
-    }
-    hex::encode(hasher.finalize())
-}
-
-fn archive_skills(
-    files: &SkillFiles,
+fn scan_archive_trees(
+    archive_root: &Path,
     max_depth: usize,
-) -> Result<Vec<(String, SkillFiles)>, String> {
+    max_bytes: u64,
+) -> Result<Vec<(String, LocalSkillTree)>, String> {
+    if !archive_root.exists() {
+        return Err("未找到包含 SKILL.md 的技能目录".to_string());
+    }
+    let (canonical, files) = collect_tree_entries(archive_root, max_bytes)?;
     let mut roots = Vec::new();
     for path in files.keys() {
         let root = if path == "SKILL.md" {
@@ -626,17 +928,29 @@ fn archive_skills(
             .filter(|other| *other != root && other.starts_with(&prefix))
             .map(|other| format!("{other}/"))
             .collect();
-        let subset = files
+        let subset: BTreeMap<String, LocalFileEntry> = files
             .iter()
             .filter_map(|(path, file)| {
-                if nested.iter().any(|nested| path.starts_with(nested)) {
+                if nested.iter().any(|nested_prefix| path.starts_with(nested_prefix)) {
                     return None;
                 }
-                path.strip_prefix(&prefix)
-                    .map(|relative| (relative.to_string(), file.clone()))
+                path.strip_prefix(&prefix).map(|relative| {
+                    let mut entry = file.clone();
+                    if !prefix.is_empty() {
+                        if let Ok(meta) = fs::metadata(&entry.source) {
+                            entry.meta_stamp = compute_file_meta_stamp(relative, &meta);
+                        }
+                    }
+                    (relative.to_string(), entry)
+                })
             })
             .collect();
-        result.push((root.clone(), subset));
+        let sub_root = if root.is_empty() {
+            canonical.clone()
+        } else {
+            canonical.join(root)
+        };
+        result.push((root.clone(), build_tree_from_entries(sub_root, subset)));
     }
     Ok(result)
 }
@@ -719,28 +1033,33 @@ impl<'a> DirectoryTransaction<'a> {
         Ok(staged)
     }
 
-    fn stage_files(&mut self, destination: &Path, files: &SkillFiles) -> Result<(), String> {
+    fn stage_tree(
+        &mut self,
+        destination: &Path,
+        tree: &LocalSkillTree,
+        max_bytes: u64,
+    ) -> Result<(), String> {
         let staged = self
             .reserve(destination, false)?
             .ok_or("缺少技能暂存路径")?;
-        write_files(&staged, files)
+        write_tree_streaming(&staged, tree, max_bytes)
     }
 
     fn stage_delivery(
         &mut self,
         master: &Path,
         destination: &Path,
-        files: &SkillFiles,
+        tree: Option<&LocalSkillTree>,
         method: SkillSyncMethod,
     ) -> Result<(), String> {
-        self.stage_delivery_with(master, destination, files, method, directory_link)
+        self.stage_delivery_with(master, destination, tree, method, directory_link)
     }
 
     fn stage_delivery_with<F>(
         &mut self,
         master: &Path,
         destination: &Path,
-        files: &SkillFiles,
+        tree: Option<&LocalSkillTree>,
         method: SkillSyncMethod,
         create_link: F,
     ) -> Result<(), String>
@@ -759,7 +1078,15 @@ impl<'a> DirectoryTransaction<'a> {
                 Err(_) => remove_path(&staged)?,
             }
         }
-        write_files(&staged, files)
+        let owned_tree;
+        let resolved_tree = match tree {
+            Some(existing) => existing,
+            None => {
+                owned_tree = scan_local_tree(master, MAX_LOCAL_SKILL_BYTES)?;
+                &owned_tree
+            }
+        };
+        write_tree_streaming(&staged, resolved_tree, MAX_LOCAL_SKILL_BYTES)
     }
 
     fn stage_remove(&mut self, destination: &Path) -> Result<(), String> {
@@ -822,19 +1149,55 @@ impl Drop for DirectoryTransaction<'_> {
     }
 }
 
-fn write_files(directory: &Path, files: &SkillFiles) -> Result<(), String> {
+fn write_tree_streaming(
+    directory: &Path,
+    tree: &LocalSkillTree,
+    max_bytes: u64,
+) -> Result<(), String> {
     fs::create_dir_all(directory).map_err(|e| format!("创建技能暂存目录失败: {e}"))?;
-    for (relative, file) in files {
+    let mut copied_total = 0u64;
+    let mut buf = vec![0u8; STREAM_BUF_SIZE];
+    for (relative, entry) in &tree.files {
         let target = directory.join(relative);
-        write_atomic(&target, &file.bytes, false)?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("创建技能子目录 {} 失败: {e}", parent.display()))?;
+        }
+        let src = fs::File::open(&entry.source)
+            .map_err(|e| format!("读取技能文件 {} 失败: {e}", entry.source.display()))?;
+        let dst = fs::File::create(&target)
+            .map_err(|e| format!("创建技能文件 {} 失败: {e}", target.display()))?;
+        let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, dst);
+        let mut limited = src.take(max_bytes.saturating_sub(copied_total) + 1);
+        loop {
+            let read = limited
+                .read(&mut buf)
+                .map_err(|e| format!("读取技能文件 {} 失败: {e}", entry.source.display()))?;
+            if read == 0 {
+                break;
+            }
+            copied_total += read as u64;
+            if copied_total > max_bytes {
+                return Err(format!(
+                    "技能超过 {} MiB 体积上限",
+                    max_bytes / (1024 * 1024)
+                ));
+            }
+            writer
+                .write_all(&buf[..read])
+                .map_err(|e| format!("写入技能文件 {} 失败: {e}", target.display()))?;
+        }
+        writer
+            .flush()
+            .map_err(|e| format!("刷新技能文件 {} 失败: {e}", target.display()))?;
         #[cfg(unix)]
-        if file.executable {
+        if entry.executable {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
                 .map_err(|e| format!("保留技能脚本执行权限失败: {e}"))?;
         }
         #[cfg(not(unix))]
-        let _ = file.executable;
+        let _ = entry.executable;
     }
     Ok(())
 }
@@ -853,8 +1216,8 @@ fn backup_target(
     if is_link(&meta) {
         return Ok(());
     }
-    let files = collect_local_files(target)?;
-    for relative in files.keys() {
+    let tree = scan_local_tree(target, MAX_LOCAL_SKILL_BYTES)?;
+    for relative in tree.files.keys() {
         let backup_key = format!(
             "{}/{id}/{index}/{relative}",
             platform.display_name().to_lowercase()
@@ -875,7 +1238,7 @@ fn stage_platforms(
     paths: &AppPaths,
     transaction: &mut DirectoryTransaction<'_>,
     skill: &SkillRecord,
-    files: &SkillFiles,
+    tree: Option<&LocalSkillTree>,
     targets: &[ExtPlatform],
     method: SkillSyncMethod,
 ) -> Result<(), String> {
@@ -889,7 +1252,7 @@ fn stage_platforms(
             let destination = root.join(&skill.id);
             backup_target(paths, platform, &skill.id, &destination, index)?;
             if targets.contains(&platform) {
-                transaction.stage_delivery(&master, &destination, files, method)?;
+                transaction.stage_delivery(&master, &destination, tree, method)?;
             } else {
                 transaction.stage_remove(&destination)?;
             }
@@ -898,12 +1261,18 @@ fn stage_platforms(
     Ok(())
 }
 
-fn scan_adopt(paths: &AppPaths, store: &mut SkillsStore) -> Result<(), String> {
+fn scan_adopt(
+    paths: &AppPaths,
+    store: &mut SkillsStore,
+    force_rehash: bool,
+) -> Result<Vec<String>, String> {
+    cleanup_stale_temp_artifacts(paths);
     let known: BTreeSet<_> = store
         .skills
         .iter()
         .map(|skill| skill.id.to_lowercase())
         .collect();
+    let mut warnings = Vec::new();
     let mut transaction = DirectoryTransaction::new(paths);
     let roots = std::iter::once((None, master_skills_dir(paths))).chain(
         ExtPlatform::all().iter().flat_map(|&platform| {
@@ -916,19 +1285,42 @@ fn scan_adopt(paths: &AppPaths, store: &mut SkillsStore) -> Result<(), String> {
         if !root.is_dir() {
             continue;
         }
-        ensure_plain_ancestors(paths, &root)?;
-        let mut entries = fs::read_dir(&root)
-            .map_err(|e| format!("扫描技能目录 {} 失败: {e}", root.display()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("读取技能目录项失败: {e}"))?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let id = entry.file_name().to_string_lossy().to_string();
-            if id.starts_with('.') || !entry.path().join("SKILL.md").is_file() {
+        if let Err(err) = ensure_plain_ancestors(paths, &root) {
+            warnings.push(err);
+            continue;
+        }
+        let mut entries = match fs::read_dir(&root)
+            .and_then(|rd| rd.collect::<Result<Vec<_>, _>>())
+        {
+            Ok(entries) => entries,
+            Err(e) => {
+                warnings.push(format!("扫描技能目录 {} 失败: {e}", root.display()));
                 continue;
             }
-            validate_identifier(&id)?;
+        };
+        entries.sort_by_key(|entry| entry.file_name());
+        let source_label = platform.map_or("主副本", ExtPlatform::display_name);
+        for entry in entries {
+            let id = entry.file_name().to_string_lossy().to_string();
+            if id.starts_with('.') {
+                continue;
+            }
+            let entry_path = entry.path();
             if known.contains(&id.to_lowercase()) {
+                continue;
+            }
+            if !entry_path.join("SKILL.md").is_file() {
+                if fs::symlink_metadata(&entry_path).is_ok_and(|meta| is_link(&meta))
+                    && fs::metadata(&entry_path).is_err()
+                {
+                    warnings.push(format!(
+                        "跳过 {source_label} 技能 {id}：目录软链目标不存在或已失效"
+                    ));
+                }
+                continue;
+            }
+            if let Err(err) = validate_identifier(&id) {
+                warnings.push(format!("跳过 {source_label} 技能 {id}：{err}"));
                 continue;
             }
             let position = store
@@ -938,25 +1330,47 @@ fn scan_adopt(paths: &AppPaths, store: &mut SkillsStore) -> Result<(), String> {
             let position = if let Some(position) = position {
                 position
             } else {
-                let files = collect_local_files(&entry.path())?;
-                let frontmatter = parse_frontmatter(&files["SKILL.md"].bytes, &id)?;
-                let master = master_skills_dir(paths).join(&id);
-                if platform.is_some() {
-                    transaction.stage_files(&master, &files)?;
-                } else if platform.is_none()
-                    && is_link(&fs::symlink_metadata(&master).map_err(|e| e.to_string())?)
-                {
-                    return Err(format!("主副本不能是外部链接: {id}"));
+                let adopt_res = (|| -> Result<(SkillRecord, Option<LocalSkillTree>), String> {
+                    if platform.is_none()
+                        && fs::symlink_metadata(&entry_path)
+                            .map_err(|e| e.to_string())?
+                            .pipe_is_link()
+                    {
+                        return Err(format!("主副本不能是外部链接: {id}"));
+                    }
+                    let tree = scan_local_tree(&entry_path, MAX_LOCAL_SKILL_BYTES)?;
+                    let skill_md = &tree.files["SKILL.md"].source;
+                    let frontmatter = read_frontmatter_file(skill_md, &id)?;
+                    let installed_hash = hash_tree_cached(&tree, force_rehash)?;
+                    let record = SkillRecord {
+                        id: id.clone(),
+                        name: frontmatter.name,
+                        description: frontmatter.description,
+                        source: SkillSource::Adopted,
+                        installed_hash,
+                        ..Default::default()
+                    };
+                    Ok((record, platform.map(|_| tree)))
+                })();
+                match adopt_res {
+                    Ok((record, maybe_tree)) => {
+                        if let Some(tree) = maybe_tree {
+                            let master = master_skills_dir(paths).join(&id);
+                            if let Err(err) =
+                                transaction.stage_tree(&master, &tree, MAX_LOCAL_SKILL_BYTES)
+                            {
+                                warnings.push(format!("跳过 {source_label} 技能 {id}：{err}"));
+                                continue;
+                            }
+                        }
+                        store.skills.push(record);
+                        store.skills.len() - 1
+                    }
+                    Err(err) => {
+                        warnings.push(format!("跳过 {source_label} 技能 {id}：{err}"));
+                        continue;
+                    }
                 }
-                store.skills.push(SkillRecord {
-                    id: id.clone(),
-                    name: frontmatter.name,
-                    description: frontmatter.description,
-                    source: SkillSource::Adopted,
-                    installed_hash: hash_files(&files),
-                    ..Default::default()
-                });
-                store.skills.len() - 1
             };
             if let Some(platform) = platform {
                 let skill = &mut store.skills[position];
@@ -980,15 +1394,39 @@ fn scan_adopt(paths: &AppPaths, store: &mut SkillsStore) -> Result<(), String> {
     }
     transaction.apply()?;
     save_store(paths, store)?;
-    transaction.finish()
+    transaction.finish()?;
+    Ok(warnings)
 }
 
-fn snapshot(paths: &AppPaths, store: &SkillsStore) -> Result<SkillsHubSnapshot, String> {
+trait MetadataLinkExt {
+    fn pipe_is_link(&self) -> bool;
+}
+
+impl MetadataLinkExt for fs::Metadata {
+    fn pipe_is_link(&self) -> bool {
+        is_link(self)
+    }
+}
+
+fn snapshot(
+    paths: &AppPaths,
+    store: &SkillsStore,
+    mut warnings: Vec<String>,
+    force_rehash: bool,
+) -> Result<SkillsHubSnapshot, String> {
     let mut skills = Vec::new();
     for skill in &store.skills {
         let master = master_skills_dir(paths).join(&skill.id);
         let master_hash = if master.join("SKILL.md").is_file() {
-            Some(hash_files(&collect_local_files(&master)?))
+            match scan_local_tree(&master, MAX_LOCAL_SKILL_BYTES)
+                .and_then(|tree| hash_tree_cached(&tree, force_rehash))
+            {
+                Ok(hash) => Some(hash),
+                Err(err) => {
+                    warnings.push(format!("主副本 {} 校验异常：{err}", skill.id));
+                    None
+                }
+            }
         } else {
             None
         };
@@ -997,7 +1435,7 @@ fn snapshot(paths: &AppPaths, store: &SkillsStore) -> Result<SkillsHubSnapshot, 
             let mut targets = Vec::new();
             for root in platform_skills_dirs(paths, platform) {
                 let target = root.join(&skill.id);
-                let exists = target.join("SKILL.md").is_file();
+                let exists = path_exists(&target)?;
                 let metadata = fs::symlink_metadata(&target).ok();
                 let actual_method = if exists {
                     Some(if metadata.as_ref().is_some_and(is_link) {
@@ -1013,7 +1451,19 @@ fn snapshot(paths: &AppPaths, store: &SkillsStore) -> Result<SkillsHubSnapshot, 
                 let has_diff = if matches_master_link {
                     false
                 } else if exists {
-                    Some(hash_files(&collect_local_files(&target)?)) != master_hash
+                    match scan_local_tree(&target, MAX_LOCAL_SKILL_BYTES)
+                        .and_then(|tree| hash_tree_cached(&tree, force_rehash))
+                    {
+                        Ok(target_hash) => Some(target_hash) != master_hash,
+                        Err(err) => {
+                            warnings.push(format!(
+                                "{} 技能 {} 校验异常：{err}",
+                                platform.display_name(),
+                                skill.id
+                            ));
+                            true
+                        }
+                    }
                 } else {
                     skill.enabled_platforms.contains(&platform)
                 };
@@ -1061,18 +1511,22 @@ fn snapshot(paths: &AppPaths, store: &SkillsStore) -> Result<SkillsHubSnapshot, 
         master_dir: master_skills_dir(paths).to_string_lossy().into_owned(),
         skills,
         repos: read_repos(paths)?.repos,
+        warnings,
     })
 }
 
 pub fn get_skills_hub_snapshot_for_paths(paths: &AppPaths) -> Result<SkillsHubSnapshot, String> {
     let _guard = lock_store()?;
     let mut store = read_store(paths)?;
-    scan_adopt(paths, &mut store)?;
-    snapshot(paths, &store)
+    let warnings = scan_adopt(paths, &mut store, false)?;
+    snapshot(paths, &store, warnings, false)
 }
 
 pub fn scan_adopt_local_skills_for_paths(paths: &AppPaths) -> Result<SkillsHubSnapshot, String> {
-    get_skills_hub_snapshot_for_paths(paths)
+    let _guard = lock_store()?;
+    let mut store = read_store(paths)?;
+    let warnings = scan_adopt(paths, &mut store, true)?;
+    snapshot(paths, &store, warnings, true)
 }
 
 fn align_platforms(
@@ -1087,14 +1541,17 @@ fn align_platforms(
         .iter()
         .position(|skill| skill.id == id)
         .ok_or_else(|| format!("未找到技能: {id}"))?;
-    let files = collect_local_files(&master_skills_dir(paths).join(id))?;
+    let master = master_skills_dir(paths).join(id);
+    let tree = (store.sync_method == SkillSyncMethod::Copy)
+        .then(|| scan_local_tree(&master, MAX_LOCAL_SKILL_BYTES))
+        .transpose()?;
     let targets = normalize_platforms(targets);
     let mut transaction = DirectoryTransaction::new(paths);
     stage_platforms(
         paths,
         &mut transaction,
         &store.skills[position],
-        &files,
+        tree.as_ref(),
         &targets,
         store.sync_method,
     )?;
@@ -1119,18 +1576,19 @@ pub fn toggle_skill_platform_for_paths(
         .position(|skill| skill.id == id)
         .ok_or_else(|| format!("未找到技能: {id}"))?;
     let master = master_skills_dir(paths).join(id);
-    let files = if enabled {
-        Some(collect_local_files(&master)?)
-    } else {
-        None
-    };
+    if enabled && !master.join("SKILL.md").is_file() {
+        return Err(format!("主副本缺少 SKILL.md: {}", master.display()));
+    }
+    let tree = (enabled && store.sync_method == SkillSyncMethod::Copy)
+        .then(|| scan_local_tree(&master, MAX_LOCAL_SKILL_BYTES))
+        .transpose()?;
     let mut transaction = DirectoryTransaction::new(paths);
     for (index, root) in platform_skills_dirs(paths, platform).iter().enumerate() {
         ensure_plain_ancestors(paths, root)?;
         let target = root.join(id);
         backup_target(paths, platform, id, &target, index)?;
-        if let Some(files) = &files {
-            transaction.stage_delivery(&master, &target, files, store.sync_method)?;
+        if enabled {
+            transaction.stage_delivery(&master, &target, tree.as_ref(), store.sync_method)?;
         } else {
             transaction.stage_remove(&target)?;
         }
@@ -1144,7 +1602,7 @@ pub fn toggle_skill_platform_for_paths(
     }
     save_store(paths, &store)?;
     transaction.finish()?;
-    snapshot(paths, &store)
+    snapshot(paths, &store, Vec::new(), false)
 }
 
 pub fn align_skill_platforms_for_paths(
@@ -1155,7 +1613,7 @@ pub fn align_skill_platforms_for_paths(
     let _guard = lock_store()?;
     let mut store = read_store(paths)?;
     align_platforms(paths, &mut store, id, targets)?;
-    snapshot(paths, &store)
+    snapshot(paths, &store, Vec::new(), true)
 }
 
 pub fn uninstall_skill_for_paths(paths: &AppPaths, id: &str) -> Result<SkillsHubSnapshot, String> {
@@ -1179,7 +1637,7 @@ pub fn uninstall_skill_for_paths(paths: &AppPaths, id: &str) -> Result<SkillsHub
     store.skills.retain(|skill| skill.id != id);
     save_store(paths, &store)?;
     transaction.finish()?;
-    snapshot(paths, &store)
+    snapshot(paths, &store, Vec::new(), false)
 }
 
 pub fn set_skill_sync_method_for_paths(
@@ -1190,12 +1648,15 @@ pub fn set_skill_sync_method_for_paths(
     let mut store = read_store(paths)?;
     let mut transaction = DirectoryTransaction::new(paths);
     for skill in &store.skills {
-        let files = collect_local_files(&master_skills_dir(paths).join(&skill.id))?;
+        let master = master_skills_dir(paths).join(&skill.id);
+        let tree = (method == SkillSyncMethod::Copy)
+            .then(|| scan_local_tree(&master, MAX_LOCAL_SKILL_BYTES))
+            .transpose()?;
         stage_platforms(
             paths,
             &mut transaction,
             skill,
-            &files,
+            tree.as_ref(),
             &skill.enabled_platforms,
             method,
         )?;
@@ -1204,7 +1665,7 @@ pub fn set_skill_sync_method_for_paths(
     store.sync_method = method;
     save_store(paths, &store)?;
     transaction.finish()?;
-    snapshot(paths, &store)
+    snapshot(paths, &store, Vec::new(), false)
 }
 
 pub fn set_skill_default_targets_for_paths(
@@ -1215,18 +1676,23 @@ pub fn set_skill_default_targets_for_paths(
     let mut store = read_store(paths)?;
     store.default_targets = normalize_platforms(targets);
     save_store(paths, &store)?;
-    snapshot(paths, &store)
+    snapshot(paths, &store, Vec::new(), false)
 }
 
-fn new_record(id: &str, files: &SkillFiles, source: SkillSource) -> Result<SkillRecord, String> {
+fn new_record_from_tree(
+    id: &str,
+    tree: &LocalSkillTree,
+    source: SkillSource,
+) -> Result<SkillRecord, String> {
     validate_identifier(id)?;
-    let frontmatter = parse_frontmatter(&files.get("SKILL.md").ok_or("缺少 SKILL.md")?.bytes, id)?;
+    let skill_md = tree.files.get("SKILL.md").ok_or("缺少 SKILL.md")?;
+    let frontmatter = read_frontmatter_file(&skill_md.source, id)?;
     Ok(SkillRecord {
         id: id.to_string(),
         name: frontmatter.name,
         description: frontmatter.description,
         source,
-        installed_hash: hash_files(files),
+        installed_hash: hash_tree_cached(tree, true)?,
         ..Default::default()
     })
 }
@@ -1234,8 +1700,9 @@ fn new_record(id: &str, files: &SkillFiles, source: SkillSource) -> Result<Skill
 fn install_batch(
     paths: &AppPaths,
     store: &mut SkillsStore,
-    incoming: Vec<(SkillRecord, SkillFiles)>,
+    incoming: Vec<(SkillRecord, LocalSkillTree)>,
     targets: &[ExtPlatform],
+    max_bytes: u64,
 ) -> Result<(), String> {
     let mut ids: BTreeSet<_> = store
         .skills
@@ -1262,13 +1729,13 @@ fn install_batch(
     }
     let mut transaction = DirectoryTransaction::new(paths);
     let targets = normalize_platforms(targets);
-    for (mut skill, files) in incoming {
-        transaction.stage_files(&master_skills_dir(paths).join(&skill.id), &files)?;
+    for (mut skill, tree) in incoming {
+        transaction.stage_tree(&master_skills_dir(paths).join(&skill.id), &tree, max_bytes)?;
         stage_platforms(
             paths,
             &mut transaction,
             &skill,
-            &files,
+            Some(&tree),
             &targets,
             store.sync_method,
         )?;
@@ -1281,6 +1748,63 @@ fn install_batch(
     transaction.finish()
 }
 
+pub fn stage_skill_zip_chunk_for_paths(
+    paths: &AppPaths,
+    upload_id: Option<&str>,
+    chunk_base64: &str,
+) -> Result<String, String> {
+    let _guard = lock_store()?;
+    cleanup_stale_temp_artifacts(paths);
+    let max_encoded = (MAX_UPLOAD_CHUNK_BYTES.div_ceil(3)) * 4 + 4;
+    if chunk_base64.len() > max_encoded {
+        return Err("单次分片超过 8 MiB 上限".to_string());
+    }
+    let chunk = base64::engine::general_purpose::STANDARD
+        .decode(chunk_base64)
+        .map_err(|e| format!("ZIP 分片 Base64 无效: {e}"))?;
+    let uploads_dir = temp_uploads_dir(paths);
+    ensure_plain_ancestors(paths, &uploads_dir)?;
+    fs::create_dir_all(&uploads_dir).map_err(|e| format!("创建分片上传目录失败: {e}"))?;
+    let id = match upload_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(existing) => {
+            validate_identifier(existing)?;
+            existing.to_string()
+        }
+        None => format!("zip-{}-{:016x}", std::process::id(), rand::random::<u64>()),
+    };
+    let file_path = uploads_dir.join(format!("{id}.zip"));
+    if upload_id.is_some() && !file_path.is_file() {
+        return Err("分片上传会话不存在或已过期".to_string());
+    }
+    let existing_len = fs::metadata(&file_path).map_or(0, |meta| meta.len());
+    if chunk.len() as u64 > MAX_ARCHIVE_BYTES.saturating_sub(existing_len) {
+        let _ = fs::remove_file(&file_path);
+        return Err("ZIP 文件超过 200 MiB 上限".to_string());
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&file_path)
+        .map_err(|e| format!("写入分片临时文件失败: {e}"))?;
+    file.write_all(&chunk)
+        .and_then(|()| file.flush())
+        .map_err(|e| format!("保存分片临时文件失败: {e}"))?;
+    Ok(id)
+}
+
+pub fn discard_skill_zip_upload_for_paths(paths: &AppPaths, upload_id: &str) -> Result<(), String> {
+    let _guard = lock_store()?;
+    let trimmed = upload_id.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    validate_identifier(trimmed)?;
+    let _cleanup = StagedUploadCleanup {
+        path: temp_uploads_dir(paths).join(format!("{trimmed}.zip")),
+    };
+    Ok(())
+}
+
 pub fn import_local_skill_for_paths(
     paths: &AppPaths,
     input: ImportLocalSkillRequest,
@@ -1290,60 +1814,97 @@ pub fn import_local_skill_for_paths(
     let targets = input
         .targets
         .unwrap_or_else(|| store.default_targets.clone());
-    let incoming = match (
-        input.path.filter(|path| !path.trim().is_empty()),
-        input.zip_base64,
-    ) {
-        (Some(path), None) => {
+    let path_opt = input.path.filter(|path| !path.trim().is_empty());
+    let base64_opt = input.zip_base64.filter(|encoded| !encoded.trim().is_empty());
+    let upload_opt = input.upload_id.filter(|id| !id.trim().is_empty());
+
+    let mut temp_extract: Option<TempExtractDir> = None;
+    let (incoming, max_bytes) = match (path_opt, base64_opt, upload_opt) {
+        (Some(path), None, None) => {
             let path = PathBuf::from(path.trim());
             if path.is_dir() {
-                let files = collect_local_files(&path)?;
+                let tree = scan_local_tree(&path, MAX_LOCAL_SKILL_BYTES)?;
                 let id = path
                     .file_name()
                     .and_then(|name| name.to_str())
                     .ok_or("技能目录名无效")?;
-                vec![(new_record(id, &files, SkillSource::Local)?, files)]
+                (
+                    vec![(new_record_from_tree(id, &tree, SkillSource::Local)?, tree)],
+                    MAX_LOCAL_SKILL_BYTES,
+                )
             } else if path
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
             {
-                let mut bytes = Vec::new();
-                fs::File::open(&path)
-                    .map_err(|e| format!("打开 ZIP 失败: {e}"))?
-                    .take(MAX_BYTES + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(|e| format!("读取 ZIP 失败: {e}"))?;
-                local_archive_records(&bytes)?
+                let meta = fs::metadata(&path).map_err(|e| format!("读取 ZIP 失败: {e}"))?;
+                if meta.len() > MAX_ARCHIVE_BYTES {
+                    return Err("ZIP 文件超过 200 MiB 上限".to_string());
+                }
+                let file = fs::File::open(&path).map_err(|e| format!("打开 ZIP 失败: {e}"))?;
+                let temp = TempExtractDir::new(paths)?;
+                let records = extract_local_archive_records(file, &temp.path)?;
+                temp_extract = Some(temp);
+                (records, MAX_ARCHIVE_BYTES)
             } else {
                 return Err("请选择包含 SKILL.md 的目录或 .zip 文件".to_string());
             }
         }
-        (None, Some(encoded)) => {
-            if encoded.len() as u64 > MAX_BYTES.div_ceil(3) * 4 + 4 {
-                return Err("ZIP Base64 超过体积上限".to_string());
+        (None, Some(encoded), None) => {
+            if encoded.len() as u64 > MAX_ARCHIVE_BYTES.div_ceil(3) * 4 + 4 {
+                return Err("ZIP Base64 超过 200 MiB 体积上限".to_string());
             }
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .map_err(|e| format!("ZIP Base64 无效: {e}"))?;
-            local_archive_records(&bytes)?
+            if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
+                return Err("ZIP 文件超过 200 MiB 上限".to_string());
+            }
+            let temp = TempExtractDir::new(paths)?;
+            let records = extract_local_archive_records(Cursor::new(bytes), &temp.path)?;
+            temp_extract = Some(temp);
+            (records, MAX_ARCHIVE_BYTES)
         }
-        _ => return Err("请只提供一个本地路径或 ZIP Base64 文件".to_string()),
+        (None, None, Some(upload_id)) => {
+            let trimmed = upload_id.trim();
+            validate_identifier(trimmed)?;
+            let staged_zip = temp_uploads_dir(paths).join(format!("{trimmed}.zip"));
+            let _upload_cleanup = StagedUploadCleanup {
+                path: staged_zip.clone(),
+            };
+            let meta = fs::metadata(&staged_zip)
+                .map_err(|_| "分片上传文件不存在或已过期".to_string())?;
+            if meta.len() > MAX_ARCHIVE_BYTES {
+                return Err("ZIP 文件超过 200 MiB 上限".to_string());
+            }
+            let file =
+                fs::File::open(&staged_zip).map_err(|e| format!("打开分片 ZIP 失败: {e}"))?;
+            let temp = TempExtractDir::new(paths)?;
+            let records = extract_local_archive_records(file, &temp.path)?;
+            temp_extract = Some(temp);
+            (records, MAX_ARCHIVE_BYTES)
+        }
+        _ => return Err("请只提供一个本地路径或 ZIP 文件".to_string()),
     };
-    install_batch(paths, &mut store, incoming, &targets)?;
-    snapshot(paths, &store)
+
+    install_batch(paths, &mut store, incoming, &targets, max_bytes)?;
+    drop(temp_extract);
+    snapshot(paths, &store, Vec::new(), false)
 }
 
-fn local_archive_records(bytes: &[u8]) -> Result<Vec<(SkillRecord, SkillFiles)>, String> {
-    let files = parse_zip(bytes)?;
-    archive_skills(&files, 2)?
+fn extract_local_archive_records<R: Read + Seek>(
+    reader: R,
+    extract_dir: &Path,
+) -> Result<Vec<(SkillRecord, LocalSkillTree)>, String> {
+    extract_zip_reader_to_dir(reader, extract_dir, MAX_ARCHIVE_BYTES)?;
+    scan_archive_trees(extract_dir, 2, MAX_ARCHIVE_BYTES)?
         .into_iter()
-        .map(|(root, files)| {
+        .map(|(root, tree)| {
             let id = if root.is_empty() {
-                parse_frontmatter(&files["SKILL.md"].bytes, "imported-skill")?.name
+                read_frontmatter_file(&tree.files["SKILL.md"].source, "imported-skill")?.name
             } else {
                 root.rsplit('/').next().unwrap_or_default().to_string()
             };
-            Ok((new_record(&id, &files, SkillSource::Zip)?, files))
+            Ok((new_record_from_tree(&id, &tree, SkillSource::Zip)?, tree))
         })
         .collect()
 }
@@ -1395,7 +1956,7 @@ pub fn upsert_skill_repo_for_paths(
     });
     repos.repos.push(repo);
     write_json_store(&repos_store_path(paths), &repos)?;
-    snapshot(paths, &read_store(paths)?)
+    snapshot(paths, &read_store(paths)?, Vec::new(), false)
 }
 
 pub fn remove_skill_repo_for_paths(
@@ -1409,7 +1970,7 @@ pub fn remove_skill_repo_for_paths(
         !(repo.owner.eq_ignore_ascii_case(owner) && repo.name.eq_ignore_ascii_case(name))
     });
     write_json_store(&repos_store_path(paths), &repos)?;
-    snapshot(paths, &read_store(paths)?)
+    snapshot(paths, &read_store(paths)?, Vec::new(), false)
 }
 
 fn find_repo(paths: &AppPaths, owner: &str, name: &str) -> Result<SkillRepo, String> {
@@ -1444,10 +2005,13 @@ fn archive_url(repo: &SkillRepo, branch: &str) -> Result<reqwest::Url, String> {
     Ok(url)
 }
 
-async fn fetch_repo_archive(
-    paths: &AppPaths,
-    repo: &SkillRepo,
-) -> Result<(String, Vec<(String, SkillFiles)>), String> {
+struct RepoArchive {
+    _temp: TempExtractDir,
+    branch: String,
+    skills: Vec<(String, LocalSkillTree)>,
+}
+
+async fn fetch_repo_archive(paths: &AppPaths, repo: &SkillRepo) -> Result<RepoArchive, String> {
     let client = build_http_client(paths, Duration::from_secs(45), true)?;
     let mut branch = repo.branch.clone();
     let mut response = client
@@ -1468,40 +2032,64 @@ async fn fetch_repo_archive(
     }
     if response
         .content_length()
-        .is_some_and(|size| size > MAX_BYTES)
+        .is_some_and(|size| size > MAX_ARCHIVE_BYTES)
     {
-        return Err("仓库 ZIP 超过 50 MiB 上限".to_string());
+        return Err("仓库 ZIP 超过 200 MiB 上限".to_string());
     }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| format!("读取仓库归档失败: {e}"))?
+
+    let temp = TempExtractDir::new(paths)?;
+    let zip_path = temp.path.join("repo.zip");
+    let extracted_dir = temp.path.join("extracted");
+    fs::create_dir_all(&extracted_dir)
+        .map_err(|e| format!("创建仓库解压目录失败: {e}"))?;
     {
-        if (bytes.len() + chunk.len()) as u64 > MAX_BYTES {
-            return Err("仓库 ZIP 超过 50 MiB 上限".to_string());
+        let zip_file =
+            fs::File::create(&zip_path).map_err(|e| format!("创建临时归档文件失败: {e}"))?;
+        let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, zip_file);
+        let mut downloaded = 0u64;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| format!("读取仓库归档失败: {e}"))?
+        {
+            downloaded += chunk.len() as u64;
+            if downloaded > MAX_ARCHIVE_BYTES {
+                return Err("仓库 ZIP 超过 200 MiB 上限".to_string());
+            }
+            writer
+                .write_all(&chunk)
+                .map_err(|e| format!("写入临时归档失败: {e}"))?;
         }
-        bytes.extend_from_slice(&chunk);
+        writer
+            .flush()
+            .map_err(|e| format!("刷新临时归档失败: {e}"))?;
     }
-    let mut files = parse_zip(&bytes)?;
-    // GitHub wraps archives in one repository directory; do not include that wrapper in source identity.
-    let first = files
-        .keys()
-        .next()
+
+    let zip_reader = fs::File::open(&zip_path).map_err(|e| format!("打开临时归档失败: {e}"))?;
+    let extracted_files = extract_zip_reader_to_dir(zip_reader, &extracted_dir, MAX_ARCHIVE_BYTES)?;
+    let _ = fs::remove_file(&zip_path);
+
+    // GitHub wraps archives in one repository directory; strip that wrapper without moving files.
+    let first = extracted_files
+        .first()
         .and_then(|path| path.split_once('/'))
         .map(|(prefix, _)| prefix.to_string());
-    if let Some(prefix) = first.filter(|prefix| {
-        files
-            .keys()
+    let repo_root = if let Some(prefix) = first.filter(|prefix| {
+        extracted_files
+            .iter()
             .all(|path| path.starts_with(&format!("{prefix}/")))
     }) {
-        let prefix = format!("{prefix}/");
-        files = files
-            .into_iter()
-            .map(|(path, file)| (path[prefix.len()..].to_string(), file))
-            .collect();
-    }
-    Ok((branch, archive_skills(&files, MAX_DEPTH)?))
+        extracted_dir.join(prefix)
+    } else {
+        extracted_dir
+    };
+
+    let skills = scan_archive_trees(&repo_root, MAX_DEPTH, MAX_ARCHIVE_BYTES)?;
+    Ok(RepoArchive {
+        _temp: temp,
+        branch,
+        skills,
+    })
 }
 
 fn same_source(skill: &SkillRecord, repo: &SkillRepo, branch: &str, subdir: &str) -> bool {
@@ -1524,13 +2112,13 @@ pub async fn discover_repo_skills_for_paths(
     name: &str,
 ) -> Result<Vec<DiscoverableSkill>, String> {
     let repo = find_repo(paths, owner, name)?;
-    let (branch, found) = fetch_repo_archive(paths, &repo).await?;
+    let archive = fetch_repo_archive(paths, &repo).await?;
     let _guard = lock_store()?;
     let mut store = read_store(paths)?;
     let mut discovered = Vec::new();
-    for (subdir, files) in found {
-        let metadata = parse_frontmatter(
-            &files["SKILL.md"].bytes,
+    for (subdir, tree) in archive.skills {
+        let metadata = read_frontmatter_file(
+            &tree.files["SKILL.md"].source,
             subdir.rsplit('/').next().unwrap_or(&repo.name),
         )?;
         let id = if subdir.is_empty() {
@@ -1539,11 +2127,11 @@ pub async fn discover_repo_skills_for_paths(
             subdir.rsplit('/').next().unwrap_or_default().to_string()
         };
         validate_identifier(&id)?;
-        let remote_hash = hash_files(&files);
+        let remote_hash = hash_tree_streaming(&tree)?;
         let installed = store
             .skills
             .iter_mut()
-            .find(|skill| same_source(skill, &repo, &branch, &subdir));
+            .find(|skill| same_source(skill, &repo, &archive.branch, &subdir));
         let (installed_id, update_available) = if let Some(installed) = installed {
             installed.remote_hash = Some(remote_hash.clone());
             installed.update_available = installed.installed_hash != remote_hash;
@@ -1557,7 +2145,7 @@ pub async fn discover_repo_skills_for_paths(
             description: metadata.description,
             repo_owner: repo.owner.clone(),
             repo_name: repo.name.clone(),
-            repo_branch: branch.clone(),
+            repo_branch: archive.branch.clone(),
             repo_subdir: subdir,
             remote_hash,
             installed_id,
@@ -1576,28 +2164,29 @@ pub async fn install_discovered_skill_for_paths(
     targets: Option<Vec<ExtPlatform>>,
 ) -> Result<SkillsHubSnapshot, String> {
     let repo = find_repo(paths, owner, name)?;
-    let (branch, found) = fetch_repo_archive(paths, &repo).await?;
-    let (_, files) = found
+    let archive = fetch_repo_archive(paths, &repo).await?;
+    let (_, tree) = archive
+        .skills
         .into_iter()
         .find(|(root, _)| root == subdir)
         .ok_or("仓库中未找到该技能，请刷新发现列表")?;
-    let metadata = parse_frontmatter(&files["SKILL.md"].bytes, &repo.name)?;
+    let metadata = read_frontmatter_file(&tree.files["SKILL.md"].source, &repo.name)?;
     let id = if subdir.is_empty() {
         metadata.name
     } else {
         subdir.rsplit('/').next().unwrap_or_default().to_string()
     };
-    let mut skill = new_record(&id, &files, SkillSource::Github)?;
+    let mut skill = new_record_from_tree(&id, &tree, SkillSource::Github)?;
     skill.repo_owner = Some(repo.owner.clone());
     skill.repo_name = Some(repo.name.clone());
-    skill.repo_branch = Some(branch);
+    skill.repo_branch = Some(archive.branch);
     skill.repo_subdir = Some(subdir.to_string());
     skill.remote_hash = Some(skill.installed_hash.clone());
     let _guard = lock_store()?;
     let mut store = read_store(paths)?;
     let targets = targets.unwrap_or_else(|| store.default_targets.clone());
-    install_batch(paths, &mut store, vec![(skill, files)], &targets)?;
-    snapshot(paths, &store)
+    install_batch(paths, &mut store, vec![(skill, tree)], &targets, MAX_ARCHIVE_BYTES)?;
+    snapshot(paths, &store, Vec::new(), false)
 }
 
 pub async fn update_installed_skill_for_paths(
@@ -1622,12 +2211,13 @@ pub async fn update_installed_skill_for_paths(
         original.repo_name.as_deref().ok_or("技能缺少仓库名称")?,
     )?;
     repo.branch = original.repo_branch.clone().ok_or("技能缺少仓库分支")?;
-    let (branch, found) = fetch_repo_archive(paths, &repo).await?;
+    let archive = fetch_repo_archive(paths, &repo).await?;
     let subdir = original
         .repo_subdir
         .as_deref()
         .ok_or("技能缺少仓库子目录")?;
-    let (_, files) = found
+    let (_, tree) = archive
+        .skills
         .into_iter()
         .find(|(root, _)| root == subdir)
         .ok_or("远端已移除该技能，未更改本地主副本")?;
@@ -1640,8 +2230,8 @@ pub async fn update_installed_skill_for_paths(
         .ok_or("技能来源已变化，请重新检查更新")?;
     let current = &store.skills[position];
     let master = master_skills_dir(paths).join(id);
-    let existing = collect_local_files(&master)?;
-    if hash_files(&existing) != current.installed_hash {
+    let existing = scan_local_tree(&master, MAX_LOCAL_SKILL_BYTES)?;
+    if hash_tree_cached(&existing, true)? != current.installed_hash {
         return Err("主副本包含本地修改，请先备份修改后再更新".to_string());
     }
     for &platform in &current.enabled_platforms {
@@ -1649,24 +2239,26 @@ pub async fn update_installed_skill_for_paths(
             .into_iter()
             .map(|root| root.join(id))
         {
-            if target.join("SKILL.md").is_file()
-                && hash_files(&collect_local_files(&target)?) != current.installed_hash
-            {
-                return Err(format!(
-                    "{} 副本包含本地修改，请先三端对齐或备份",
-                    platform.display_name()
-                ));
+            if target.join("SKILL.md").is_file() {
+                let target_tree = scan_local_tree(&target, MAX_LOCAL_SKILL_BYTES)?;
+                if hash_tree_cached(&target_tree, true)? != current.installed_hash {
+                    return Err(format!(
+                        "{} 副本包含本地修改，请先三端对齐或备份",
+                        platform.display_name()
+                    ));
+                }
             }
         }
     }
-    let metadata = parse_frontmatter(&files["SKILL.md"].bytes, id)?;
+    let metadata = read_frontmatter_file(&tree.files["SKILL.md"].source, id)?;
+    let new_hash = hash_tree_cached(&tree, true)?;
     let mut transaction = DirectoryTransaction::new(paths);
-    transaction.stage_files(&master, &files)?;
+    transaction.stage_tree(&master, &tree, MAX_ARCHIVE_BYTES)?;
     stage_platforms(
         paths,
         &mut transaction,
         current,
-        &files,
+        Some(&tree),
         &current.enabled_platforms,
         store.sync_method,
     )?;
@@ -1674,13 +2266,13 @@ pub async fn update_installed_skill_for_paths(
     let current = &mut store.skills[position];
     current.name = metadata.name;
     current.description = metadata.description;
-    current.installed_hash = hash_files(&files);
+    current.installed_hash = new_hash;
     current.remote_hash = Some(current.installed_hash.clone());
-    current.repo_branch = Some(branch);
+    current.repo_branch = Some(archive.branch);
     current.update_available = false;
     save_store(paths, &store)?;
     transaction.finish()?;
-    snapshot(paths, &store)
+    snapshot(paths, &store, Vec::new(), false)
 }
 
 #[tauri::command]
@@ -1729,6 +2321,22 @@ pub async fn set_skill_default_targets(
 }
 
 #[tauri::command]
+pub async fn stage_skill_zip_chunk(
+    upload_id: Option<String>,
+    chunk_base64: String,
+) -> Result<String, String> {
+    with_extension_paths(move |paths| {
+        stage_skill_zip_chunk_for_paths(paths, upload_id.as_deref(), &chunk_base64)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn discard_skill_zip_upload(upload_id: String) -> Result<(), String> {
+    with_extension_paths(move |paths| discard_skill_zip_upload_for_paths(paths, &upload_id)).await
+}
+
+#[tauri::command]
 pub async fn import_local_skill(
     input: ImportLocalSkillRequest,
 ) -> Result<SkillsHubSnapshot, String> {
@@ -1771,6 +2379,12 @@ pub async fn update_installed_skill(id: String) -> Result<SkillsHubSnapshot, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::write_atomic;
+
+    fn seed_skill_dir(dir: &Path, body: &[u8]) -> LocalSkillTree {
+        write_atomic(&dir.join("SKILL.md"), body, false).unwrap();
+        scan_local_tree(dir, MAX_LOCAL_SKILL_BYTES).unwrap()
+    }
 
     #[test]
     fn auto_falls_back_after_permission_denied_without_changing_master() {
@@ -1778,21 +2392,14 @@ mod tests {
         let paths = AppPaths::for_test(tmp.path());
         assert!(paths.is_test);
         let master = master_skills_dir(&paths).join("fallback");
-        let files = BTreeMap::from([(
-            "SKILL.md".to_string(),
-            SkillFile {
-                bytes: b"# fallback".to_vec(),
-                executable: false,
-            },
-        )]);
-        write_files(&master, &files).unwrap();
+        let tree = seed_skill_dir(&master, b"# fallback");
         let destination = paths.codex_dir.join("skills/fallback");
         let mut transaction = DirectoryTransaction::new(&paths);
         transaction
             .stage_delivery_with(
                 &master,
                 &destination,
-                &files,
+                Some(&tree),
                 SkillSyncMethod::Auto,
                 |_, _| Err(std::io::Error::from(ErrorKind::PermissionDenied)),
             )
@@ -1813,20 +2420,13 @@ mod tests {
         let paths = AppPaths::for_test(tmp.path());
         assert!(paths.is_test);
         let destination = paths.codex_dir.join("skills/rollback");
-        let files = |bytes: &[u8]| {
-            BTreeMap::from([(
-                "SKILL.md".to_string(),
-                SkillFile {
-                    bytes: bytes.to_vec(),
-                    executable: false,
-                },
-            )])
-        };
-        write_files(&destination, &files(b"original")).unwrap();
+        write_atomic(&destination.join("SKILL.md"), b"original", false).unwrap();
+        let source = paths.home.join("incoming/rollback");
+        let replacement = seed_skill_dir(&source, b"replacement");
         {
             let mut transaction = DirectoryTransaction::new(&paths);
             transaction
-                .stage_files(&destination, &files(b"replacement"))
+                .stage_tree(&destination, &replacement, MAX_LOCAL_SKILL_BYTES)
                 .unwrap();
             transaction.apply().unwrap();
             assert_eq!(
@@ -1839,5 +2439,26 @@ mod tests {
             fs::read_dir(destination.parent().unwrap()).unwrap().count(),
             1
         );
+    }
+
+    #[test]
+    fn large_tree_hash_cache_hits_and_invalidates_on_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("heavy-skill");
+        write_atomic(&dir.join("SKILL.md"), b"# heavy", false).unwrap();
+        let payload = vec![b'a'; 300 * 1024];
+        write_atomic(&dir.join("assets/bundle.bin"), &payload, false).unwrap();
+
+        let tree1 = scan_local_tree(&dir, MAX_LOCAL_SKILL_BYTES).unwrap();
+        let h1 = hash_tree_cached(&tree1, false).unwrap();
+        let h2 = hash_tree_cached(&tree1, false).unwrap();
+        assert_eq!(h1, h2);
+
+        let mut updated = payload;
+        updated[0] = b'z';
+        write_atomic(&dir.join("assets/bundle.bin"), &updated, false).unwrap();
+        let tree2 = scan_local_tree(&dir, MAX_LOCAL_SKILL_BYTES).unwrap();
+        let h3 = hash_tree_cached(&tree2, false).unwrap();
+        assert_ne!(h1, h3);
     }
 }

@@ -2537,6 +2537,8 @@ pub fn run() {
             extensions::skills::uninstall_skill,
             extensions::skills::set_skill_sync_method,
             extensions::skills::set_skill_default_targets,
+            extensions::skills::stage_skill_zip_chunk,
+            extensions::skills::discard_skill_zip_upload,
             extensions::skills::import_local_skill,
             extensions::skills::scan_adopt_local_skills,
             extensions::skills::upsert_skill_repo,

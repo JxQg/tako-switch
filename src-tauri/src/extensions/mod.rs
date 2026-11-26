@@ -305,24 +305,39 @@ pub struct ExtensionsSummary {
     #[serde(default)]
     pub skills_count: usize,
     #[serde(default)]
+    pub skills_updatable_count: usize,
+    #[serde(default)]
     pub plugins_count: usize,
     #[serde(default)]
     pub prompts_count: usize,
 }
 
 pub fn get_extensions_summary_for_paths(paths: &AppPaths) -> Result<ExtensionsSummary, String> {
-    let mcp_count = mcp::get_mcp_hub_snapshot_for_paths(paths)?.entries.len();
-    let skills_count = skills::get_skills_hub_snapshot_for_paths(paths)?.skills.len();
+    let mcp_count = match mcp::get_mcp_hub_snapshot_for_paths(paths) {
+        Ok(snap) => snap.entries.len(),
+        Err(err) => {
+            eprintln!("统计通用 MCP 数量失败: {err}");
+            0
+        }
+    };
+    let (skills_count, skills_updatable_count) = skills::skills_summary_counts_for_paths(paths);
     let plugins_count = plugins::count_local_installed_plugins_for_paths(paths);
-    let prompts = prompts::get_prompts_hub_snapshot_for_paths(paths)?;
-    Ok(ExtensionsSummary {
-        mcp_count,
-        skills_count,
-        plugins_count,
-        prompts_count: prompts
+    let prompts_count = match prompts::get_prompts_hub_snapshot_for_paths(paths) {
+        Ok(prompts) => prompts
             .platforms
             .values()
             .map(|platform| platform.presets.len())
             .sum(),
+        Err(err) => {
+            eprintln!("统计提示词预设数量失败: {err}");
+            0
+        }
+    };
+    Ok(ExtensionsSummary {
+        mcp_count,
+        skills_count,
+        skills_updatable_count,
+        plugins_count,
+        prompts_count,
     })
 }
