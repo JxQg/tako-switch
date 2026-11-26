@@ -84,3 +84,32 @@ python3 scripts/manage-releases.py verify-windows --app codex --update-baseline
 # 执行 Gate 4 实机安装 + 冷启动 + EventLog 崩溃复测
 python3 scripts/manage-releases.py verify-windows --app codex --smoke --hold-seconds 15
 ```
+
+## Antigravity CLI (`agy`) 独立受控发版与 Gate 5 联动
+
+为避免 `tako-cli` 硬编码锁定旧版（导致每次升 `agy` 都要重发 `tako-cli`），同时阻止上游 Google 自动更新绕过 `agy-gateway` 协议门禁，`agy` CLI 的版本同样由 [`manifest/pinned-versions.json`](../manifest/pinned-versions.json) 的 `cliTools.agy` 独立管控，并通过 `manifest/agy-cli/manifests/<platform>.json` 发布到国内 CDN（`https://dl.lven.asia/tako-switch/agy-cli/manifests/<platform>.json`，备源 GitHub raw）。
+
+### 标准 4 步独立推进流程（先网关扩窗，再放行客户端）
+
+1. **只读巡检上游候选版本**（同时检查 Desktop 5 款客户端与 `agy-cli` 8 个平台）：
+   ```bash
+   python3 scripts/manage-releases.py check \
+     --out-json /tmp/upstream-candidates.json \
+     --out-md /tmp/upstream-candidates.md
+   ```
+2. **先在 `agy-gateway` 完成 Gate 5 抓包并扩窗**：
+   在 `agy-gateway` 运行连续多轮 `capture-diff --gate` 产出 `/tmp/agy-diff-gate.json`，确认 0 字段级 diff 后把新版本写入 `agy-gateway/profiles/lock.json` 的滑动 `supported_window` 并灰度验证。
+3. **跑 CLI 门禁验收并单独 Promote `agy-cli`（不动任何 Desktop 版本）**：
+   ```bash
+   python3 scripts/manage-releases.py verify-agy-cli \
+     --candidate /tmp/upstream-candidates.json \
+     --gateway-lock /path/to/agy-gateway/profiles/lock.json \
+     --diff-report /tmp/agy-diff-gate.json \
+     --out-json /tmp/gate-agy-cli.json
+
+   python3 scripts/manage-releases.py promote-agy-cli \
+     --candidate /tmp/upstream-candidates.json \
+     --gate-report /tmp/gate-agy-cli.json
+   ```
+4. **独立镜像与秒级同步到 CDN（无需发新版 `tako-cli` / `tako-switch`）**：
+   提交 `manifest/pinned-versions.json` 和 `manifest/agy-cli/manifests/*.json` 到 `main` 后，在 GitHub Actions 运行 **Managed Desktop Release Pipeline** 并选择 **`mode = mirror-agy-cli`**，只镜像 `agy-cli` 二进制并刷新 CDN 清单。用户执行 `tako update agy` 或启动 `tako --agy` 收到提示后即可无缝升级。

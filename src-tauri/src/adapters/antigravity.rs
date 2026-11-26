@@ -30,6 +30,7 @@ const AGY_ENV_PLIST_LABEL: &str = "tech.shiroha.tako-switch.agy-env";
 const AGY_MACOS_BUNDLE_ID: &str = "com.google.antigravity";
 const AGY_TAKO_MCP_GRANT: &str = "mcp(tako/*)";
 const AGY_EDGEONE_MCP_GRANT: &str = "mcp(tako-web-page/*)";
+const AGY_AUTO_CHECK_UPDATES_KEY: &str = "autoCheckForUpdates";
 
 const AGY_CHINESE_AGENTS_BODY: &str = "\
 - 默认使用简体中文回复用户，思考摘要、任务清单、实现计划与验收说明等产物默认使用简体中文（除非用户明确指定其他语言）。\n\
@@ -44,6 +45,48 @@ impl AntigravityAdapter {
 
     fn config_path(paths: &AppPaths) -> PathBuf {
         paths.agy_gemini_config_dir.join("config.json")
+    }
+
+    pub fn app_storage_path(paths: &AppPaths) -> PathBuf {
+        paths.agy_user_data_dir.join("app_storage.json")
+    }
+
+    pub fn is_upstream_auto_update_disabled(paths: &AppPaths) -> bool {
+        let Ok(root) = read_json_object_or_empty(&Self::app_storage_path(paths)) else {
+            return false;
+        };
+        root.get(AGY_AUTO_CHECK_UPDATES_KEY)
+            .and_then(Value::as_str)
+            == Some("false")
+    }
+
+    /// Antigravity Desktop (`SettingsService`) stores `autoCheckForUpdates` as the string
+    /// `"true"` / `"false"` in `<userData>/app_storage.json` (defaulting to `true` when absent).
+    /// In Tako mode we pin it to `"false"` so upstream auto-updates cannot silently jump past
+    /// the gateway-verified version; updates flow through Tako Switch's controlled manifest instead.
+    fn set_upstream_auto_update_disabled(paths: &AppPaths, disable: bool) -> Result<(), String> {
+        let path = Self::app_storage_path(paths);
+        if !disable && !path.exists() {
+            return Ok(());
+        }
+        backup_file_once(paths, "antigravity", "app_storage.json", &path)?;
+        let mut root = read_json_object_or_empty(&path)?;
+        if disable {
+            if root.get(AGY_AUTO_CHECK_UPDATES_KEY).and_then(Value::as_str) == Some("false") {
+                return Ok(());
+            }
+            root.insert(
+                AGY_AUTO_CHECK_UPDATES_KEY.to_string(),
+                Value::String("false".to_string()),
+            );
+        } else if root.get(AGY_AUTO_CHECK_UPDATES_KEY).and_then(Value::as_str) == Some("false") {
+            root.remove(AGY_AUTO_CHECK_UPDATES_KEY);
+        } else {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec_pretty(&Value::Object(root))
+            .map_err(|e| format!("序列化 {} 失败: {e}", path.display()))?;
+        write_atomic(&path, &bytes, false)
     }
 
     pub fn gemini_agents_md_path(paths: &AppPaths) -> PathBuf {
@@ -182,6 +225,7 @@ impl AntigravityAdapter {
                 "AGY_LLM_GATEWAY_URL",
                 "AGY_LLM_GATEWAY_API_KEY",
                 "AGY_LLM_GATEWAY_WIRE_PROTOCOL",
+                "AGY_CLI_DISABLE_AUTO_UPDATE",
             ] {
                 if let Some(val) = extract_launchctl_setenv(&raw, key) {
                     map.insert(key.to_string(), val);
@@ -199,6 +243,7 @@ impl AntigravityAdapter {
                 map.insert("AGY_LLM_GATEWAY_URL".to_string(), base_url.to_string());
                 map.insert("AGY_LLM_GATEWAY_API_KEY".to_string(), api_key.to_string());
                 map.insert("AGY_LLM_GATEWAY_WIRE_PROTOCOL".to_string(), "genai".to_string());
+                map.insert("AGY_CLI_DISABLE_AUTO_UPDATE".to_string(), "1".to_string());
                 let bytes = serde_json::to_vec_pretty(&map)
                     .map_err(|e| format!("序列化测试环境失败: {e}"))?;
                 return write_atomic(&Self::windows_test_env_path(paths), &bytes, true);
@@ -388,6 +433,7 @@ impl DesktopAppAdapter for AntigravityAdapter {
                 merge_tako_mcp_server(&mcp_path, paths, false)?;
                 merge_edgeone_mcp_server(&mcp_path, &McpToolsConfig::default(), false)?;
                 Self::set_tako_mcp_permission(paths, false, false)?;
+                Self::set_upstream_auto_update_disabled(paths, false)?;
                 sync_managed_chinese_markdown(
                     paths,
                     "antigravity",
@@ -410,6 +456,7 @@ impl DesktopAppAdapter for AntigravityAdapter {
                 merge_tako_mcp_server(&mcp_path, paths, true)?;
                 merge_edgeone_mcp_server(&mcp_path, &state.mcp, state.mcp.web_page)?;
                 Self::set_tako_mcp_permission(paths, true, state.mcp.web_page)?;
+                Self::set_upstream_auto_update_disabled(paths, true)?;
                 sync_managed_chinese_markdown(
                     paths,
                     "antigravity",
@@ -466,6 +513,17 @@ impl DesktopAppAdapter for AntigravityAdapter {
                         .to_string(),
                 );
             }
+            if Self::is_upstream_auto_update_disabled(paths) {
+                notes.push(
+                    "上游自动更新管控: 已关闭 Antigravity 后台静默更新（统一走 Tako 受控更新清单）"
+                        .to_string(),
+                );
+            } else {
+                notes.push(
+                    "提示: 未检测到 Antigravity 禁上游自更新配置，重新点击 Tako 可自动锁定防静默升级"
+                        .to_string(),
+                );
+            }
             if has_edgeone_mcp_server(&Self::mcp_path(paths)) {
                 notes.push("网站上线 MCP (EdgeOne): 已启用 (tako-web-page)".to_string());
             }
@@ -509,7 +567,7 @@ fn render_launch_agent_plist(base_url: &str, api_key: &str) -> String {
     let sh_url = shell_single_quote(base_url);
     let sh_key = shell_single_quote(api_key);
     let cmd = format!(
-        "launchctl setenv AGY_LLM_GATEWAY_URL {sh_url} && launchctl setenv AGY_LLM_GATEWAY_API_KEY {sh_key} && launchctl setenv AGY_LLM_GATEWAY_WIRE_PROTOCOL genai"
+        "launchctl setenv AGY_LLM_GATEWAY_URL {sh_url} && launchctl setenv AGY_LLM_GATEWAY_API_KEY {sh_key} && launchctl setenv AGY_LLM_GATEWAY_WIRE_PROTOCOL genai && launchctl setenv AGY_CLI_DISABLE_AUTO_UPDATE 1"
     );
     let escaped_cmd = xml_escape(&cmd);
     format!(
@@ -585,6 +643,9 @@ fn apply_macos_launchctl_env(base_url: &str, api_key: &str) {
     let _ = std::process::Command::new("/bin/launchctl")
         .args(["setenv", "AGY_LLM_GATEWAY_WIRE_PROTOCOL", "genai"])
         .output();
+    let _ = std::process::Command::new("/bin/launchctl")
+        .args(["setenv", "AGY_CLI_DISABLE_AUTO_UPDATE", "1"])
+        .output();
     // Ensure LaunchAgent is active for future logins without failing if GUI session is absent.
     if let Ok(uid_out) = std::process::Command::new("/usr/bin/id").arg("-u").output() {
         let uid = String::from_utf8_lossy(&uid_out.stdout).trim().to_string();
@@ -612,6 +673,7 @@ fn clear_macos_launchctl_env() {
         "AGY_LLM_GATEWAY_URL",
         "AGY_LLM_GATEWAY_API_KEY",
         "AGY_LLM_GATEWAY_WIRE_PROTOCOL",
+        "AGY_CLI_DISABLE_AUTO_UPDATE",
     ] {
         let _ = std::process::Command::new("/bin/launchctl")
             .args(["unsetenv", key])
@@ -638,6 +700,7 @@ fn read_windows_hkcu_env() -> BTreeMap<String, String> {
             "AGY_LLM_GATEWAY_URL",
             "AGY_LLM_GATEWAY_API_KEY",
             "AGY_LLM_GATEWAY_WIRE_PROTOCOL",
+            "AGY_CLI_DISABLE_AUTO_UPDATE",
         ] {
             if let Ok(val) = env.get_value::<String, _>(key) {
                 map.insert(key.to_string(), val);
@@ -702,6 +765,8 @@ fn write_windows_hkcu_env(base_url: &str, api_key: &str) -> Result<(), String> {
         .map_err(|e| format!("写入 AGY_LLM_GATEWAY_API_KEY 失败: {e}"))?;
     env.set_value("AGY_LLM_GATEWAY_WIRE_PROTOCOL", &"genai")
         .map_err(|e| format!("写入 AGY_LLM_GATEWAY_WIRE_PROTOCOL 失败: {e}"))?;
+    env.set_value("AGY_CLI_DISABLE_AUTO_UPDATE", &"1")
+        .map_err(|e| format!("写入 AGY_CLI_DISABLE_AUTO_UPDATE 失败: {e}"))?;
 
     // Broadcast WM_SETTINGCHANGE via native Win32 API (no powershell.exe spawn, immune to AV blocks)
     // so Explorer / Start Menu / desktop shortcuts inherit the updated environment immediately.
@@ -719,6 +784,7 @@ fn clear_windows_hkcu_env() -> Result<(), String> {
             "AGY_LLM_GATEWAY_URL",
             "AGY_LLM_GATEWAY_API_KEY",
             "AGY_LLM_GATEWAY_WIRE_PROTOCOL",
+            "AGY_CLI_DISABLE_AUTO_UPDATE",
         ] {
             let _ = env.delete_value(key);
         }
@@ -790,6 +856,7 @@ fn launch_windows_antigravity(paths: &AppPaths) -> Result<(), String> {
             "AGY_LLM_GATEWAY_URL",
             "AGY_LLM_GATEWAY_API_KEY",
             "AGY_LLM_GATEWAY_WIRE_PROTOCOL",
+            "AGY_CLI_DISABLE_AUTO_UPDATE",
         ] {
             if let Some(val) = gw_env.get(key) {
                 cmd.env(key, val);
@@ -1067,5 +1134,58 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("other"));
+    }
+
+    #[test]
+    fn antigravity_tako_mode_disables_upstream_auto_updates_and_restores_on_official() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        fs::create_dir_all(&paths.agy_user_data_dir).unwrap();
+        let storage_path = AntigravityAdapter::app_storage_path(&paths);
+        fs::write(
+            &storage_path,
+            r#"{"sidebarWidth":"280","zoomLevel":"1.0"}"#,
+        )
+        .unwrap();
+
+        save_switch_auth(&paths, Some("cr_main_key"), Some("1"), Some("oauth")).unwrap();
+        let adapter = AntigravityAdapter;
+
+        assert!(!AntigravityAdapter::is_upstream_auto_update_disabled(&paths));
+
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        assert!(AntigravityAdapter::is_upstream_auto_update_disabled(&paths));
+        assert_eq!(
+            AntigravityAdapter::read_gateway_env(&paths)
+                .get("AGY_CLI_DISABLE_AUTO_UPDATE")
+                .map(String::as_str),
+            Some("1")
+        );
+        let stored = read_json_object_or_empty(&storage_path).unwrap();
+        assert_eq!(
+            stored.get(AGY_AUTO_CHECK_UPDATES_KEY).and_then(Value::as_str),
+            Some("false")
+        );
+        assert_eq!(stored.get("sidebarWidth").and_then(Value::as_str), Some("280"));
+        assert_eq!(stored.get("zoomLevel").and_then(Value::as_str), Some("1.0"));
+        let diag = adapter.diagnose(&paths);
+        assert!(diag
+            .notes
+            .iter()
+            .any(|n| n.contains("上游自动更新管控: 已关闭")));
+
+        // Idempotent reapply keeps existing keys intact
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        assert!(AntigravityAdapter::is_upstream_auto_update_disabled(&paths));
+
+        // Switching back to Official removes our override while keeping user keys
+        adapter.apply_mode(&paths, AppMode::Official).unwrap();
+        assert!(!AntigravityAdapter::is_upstream_auto_update_disabled(&paths));
+        assert!(AntigravityAdapter::read_gateway_env(&paths)
+            .get("AGY_CLI_DISABLE_AUTO_UPDATE")
+            .is_none());
+        let restored = read_json_object_or_empty(&storage_path).unwrap();
+        assert!(!restored.contains_key(AGY_AUTO_CHECK_UPDATES_KEY));
+        assert_eq!(restored.get("sidebarWidth").and_then(Value::as_str), Some("280"));
     }
 }

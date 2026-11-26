@@ -7,7 +7,7 @@
       "injection",
       "anomalyAudit"
     ],
-    "notes": "所有桌面客户端版本由此锁文件统一管控。上线新版前须先拉取官方 changelog 分析，并在 macOS 隔离环境中通过三门禁验收，再由人工 promote 更新此文件并生成 manifest/manifest.json。"
+    "notes": "所有桌面客户端与受控 CLI 工具（如 agy）版本由此锁文件统一管控。上线新版前须先拉取官方 changelog 分析并通过对应门禁验收（Desktop 三门禁 + Win-Lab；agy 须先通过 agy-gateway Gate 5 并扩窗），再由人工 promote 更新此文件并渲染 manifest/manifest.json 与 manifest/agy-cli/manifests/*.json。"
   },
   "updatedAt": "2026-11-25T23:06:56Z",
   "apps": {
@@ -215,6 +215,53 @@
           "silentArgs": [
             "/S"
           ]
+        }
+      }
+    }
+  },
+  "cliTools": {
+    "agy": {
+      "displayName": "Antigravity CLI (agy)",
+      "version": "1.5.17",
+      "status": "approved",
+      "approvedAt": "2026-11-25T16:00:00Z",
+      "minSupportedVersion": "1.5.16",
+      "supportedVersions": [
+        "1.5.16",
+        "1.5.17"
+      ],
+      "channel": "tako-managed",
+      "changelogSummary": "Antigravity CLI 1.5.17 (CL 1029496841)：已通过 agy-gateway 连续多轮 CCPA 双边抓包 Gate 5 验收（0 字段级 diff）。",
+      "gates": {
+        "checksumVerify": "pass",
+        "gatewayLock": "pass",
+        "protocolDiff": "pass"
+      },
+      "platforms": {
+        "darwin_arm64": {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/darwin-arm/cli_mac_arm64.tar.gz",
+          "sha512": "209e6d2e938f2c2eb908d6d4ffd6a130a058b32e97aa16cf4e7e29cc0cd3a08867c6af4522bd41eb762a7e505eee418409a8887c2ce2d24d8abd66e246b6b972",
+          "size": 85162736
+        },
+        "darwin_amd64": {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/darwin-x64/cli_mac_x64.tar.gz",
+          "sha512": "6206eaef8296920839769db7a842f959b7d58b4751929e80f27cfb087dd90ba4896ccfec4157a4e05e3b9de51e963f4c344cd00a77c7de31c08627dbb47a6308",
+          "size": 90729669
+        },
+        "linux_amd64": {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/linux-x64/cli_linux_x64.tar.gz",
+          "sha512": "71a967aa16e0ab5d87196bcd6772130bdab55b2fd768cd24d21b1da401ff9f60280b976cad3dc14a2d646233b0eaf8caf87c490eed73044d54550cbb3d8d67d2",
+          "size": 102886235
+        },
+        "linux_arm64": {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/linux-arm/cli_linux_arm64.tar.gz",
+          "sha512": "e4f086d0730b325cfd438ea90396ee78eb23a3110ef7f792824c8817b8d0432462b7b5f91b3d933fc1932a6f4ba73de505e2e96f44448c9fb2427292ead716f7",
+          "size": 93662528
+        },
+        "windows_amd64": {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/windows-x64/cli_windows_x64.exe",
+          "sha512": "7b468fb7b83f0dbd5be39afebc5ce71570de4d1020e248cf1d2461d338f5d0f6eb689500e0f68a36d26179be6632f74a2d96a34f37d6ef20f62b28b87d7c55b2",
+          "size": 243373976
         }
       }
     }
