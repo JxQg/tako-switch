@@ -62,6 +62,7 @@ pub struct AppPaths {
     pub claude_1p_dir: PathBuf,
     pub claude_3p_dir: PathBuf,
     pub agy_gemini_config_dir: PathBuf,
+    pub agy_user_data_dir: PathBuf,
     pub workbuddy_dir: PathBuf,
     pub launch_agents_dir: PathBuf,
     pub agy_app_override_dir: Option<PathBuf>,
@@ -94,6 +95,7 @@ impl AppPaths {
 
         let (claude_1p_dir, claude_3p_dir) = detect_claude_dirs(&home);
         let agy_gemini_config_dir = home.join(".gemini").join("config");
+        let agy_user_data_dir = detect_agy_user_data_dir(&home);
         let workbuddy_dir = std::env::var_os("WORKBUDDY_CONFIG_DIR")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
@@ -108,6 +110,7 @@ impl AppPaths {
             claude_1p_dir,
             claude_3p_dir,
             agy_gemini_config_dir,
+            agy_user_data_dir,
             workbuddy_dir,
             launch_agents_dir,
             agy_app_override_dir: None,
@@ -125,6 +128,7 @@ impl AppPaths {
             claude_1p_dir: root.join("claude_1p"),
             claude_3p_dir: root.join("claude_3p"),
             agy_gemini_config_dir: root.join(".gemini").join("config"),
+            agy_user_data_dir: root.join("antigravity_user_data"),
             workbuddy_dir: root.join(".workbuddy"),
             launch_agents_dir: root.join("LaunchAgents"),
             agy_app_override_dir: None,
@@ -163,6 +167,31 @@ impl AppPaths {
 
     pub fn mcp_server_exe(&self) -> PathBuf {
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tako-switch"))
+    }
+}
+
+fn detect_agy_user_data_dir(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library")
+            .join("Application Support")
+            .join("Antigravity")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let roaming_app_data = std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData").join("Roaming"));
+        roaming_app_data.join("Antigravity")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let cfg = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        cfg.join("Antigravity")
     }
 }
 

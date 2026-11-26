@@ -42,7 +42,28 @@ import zipfile
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PINNED_PATH = REPO_ROOT / "manifest" / "pinned-versions.json"
 DEFAULT_MANIFEST_PATH = REPO_ROOT / "manifest" / "manifest.json"
+DEFAULT_AGY_CLI_MANIFESTS_DIR = REPO_ROOT / "manifest" / "agy-cli" / "manifests"
 DEFAULT_BASELINES_DIR = REPO_ROOT / "manifest" / "baselines"
+
+AGY_CLI_UPSTREAM_BASE = "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests"
+AGY_CLI_PLATFORMS = (
+    "darwin_arm64",
+    "darwin_amd64",
+    "linux_amd64",
+    "linux_arm64",
+    "windows_amd64",
+    "linux_amd64_musl",
+    "linux_arm64_musl",
+    "windows_arm64",
+)
+AGY_CLI_REQUIRED_PLATFORMS = (
+    "darwin_arm64",
+    "darwin_amd64",
+    "linux_amd64",
+    "linux_arm64",
+    "windows_amd64",
+)
+SHA512_HEX_RE = re.compile(r"^[0-9a-f]{128}$")
 
 INSTALLED_MACOS_PATHS: dict[str, list[Path]] = {
     "claude": [Path("/Applications/Claude.app")],
@@ -301,7 +322,59 @@ def fetch_changelogs(upstream_apps: dict) -> dict[str, dict]:
     return notes
 
 
-def build_check_report(pinned: dict, upstream_manifest: dict, changelogs: dict) -> tuple[dict, str]:
+def fetch_upstream_agy_cli_manifests(
+    base_url: str = AGY_CLI_UPSTREAM_BASE,
+    platforms: tuple[str, ...] = AGY_CLI_PLATFORMS,
+) -> dict:
+    """Fetch upstream Antigravity CLI (agy) per-platform manifests (read-only)."""
+    clean_base = base_url.rstrip("/")
+    plats_out: dict[str, dict] = {}
+    errors: dict[str, str] = {}
+    versions_seen: list[str] = []
+
+    for plat in platforms:
+        url = f"{clean_base}/{plat}.json"
+        try:
+            payload = http_get_json(url, timeout=15)
+            if not isinstance(payload, dict):
+                errors[plat] = "manifest payload is not a JSON object"
+                continue
+            ver = str(payload.get("version") or "").strip()
+            dl_url = str(payload.get("url") or "").strip()
+            sha512 = str(payload.get("sha512") or "").strip().lower()
+            if not ver or not dl_url or not sha512:
+                errors[plat] = "manifest missing version/url/sha512"
+                continue
+            entry: dict[str, object] = {
+                "version": ver,
+                "url": dl_url,
+                "sha512": sha512,
+            }
+            if isinstance(payload.get("size"), int) and payload["size"] > 0:
+                entry["size"] = payload["size"]
+            plats_out[plat] = entry
+            if ver not in versions_seen:
+                versions_seen.append(ver)
+        except Exception as exc:
+            errors[plat] = str(exc)
+
+    primary_version = versions_seen[0] if versions_seen else ""
+    return {
+        "displayName": "Antigravity CLI (agy)",
+        "sourceBaseUrl": clean_base,
+        "version": primary_version,
+        "versionsSeen": versions_seen,
+        "platforms": plats_out,
+        "errors": errors,
+    }
+
+
+def build_check_report(
+    pinned: dict,
+    upstream_manifest: dict,
+    changelogs: dict,
+    upstream_cli_tools: dict | None = None,
+) -> tuple[dict, str]:
     pinned_apps = pinned.get("apps") or {}
     upstream_apps = upstream_manifest.get("apps") or {}
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -339,6 +412,42 @@ def build_check_report(pinned: dict, upstream_manifest: dict, changelogs: dict) 
             "upstreamEntry": u,
         }
 
+    cli_comparison: dict[str, dict] = {}
+    if upstream_cli_tools:
+        pinned_cli = pinned.get("cliTools") or {}
+        for cli_id, u_cli in upstream_cli_tools.items():
+            p_cli = pinned_cli.get(cli_id) or {}
+            p_ver = str(p_cli.get("version") or "")
+            u_ver = str((u_cli or {}).get("version") or "")
+            plat_diffs = {}
+            for plat, u_art in ((u_cli or {}).get("platforms") or {}).items():
+                p_art = (p_cli.get("platforms") or {}).get(plat) or {}
+                pv = str(p_art.get("version") or p_ver)
+                uv = str(u_art.get("version") or u_ver)
+                p_sha = str(p_art.get("sha512") or "").lower()
+                u_sha = str(u_art.get("sha512") or "").lower()
+                if pv != uv or (u_sha and p_sha != u_sha):
+                    plat_diffs[plat] = {
+                        "pinnedVersion": pv,
+                        "upstreamVersion": uv,
+                        "pinnedSha512Prefix": p_sha[:12],
+                        "upstreamSha512Prefix": u_sha[:12],
+                    }
+            changed = bool(u_ver) and ((p_ver != u_ver) or bool(plat_diffs))
+            if changed:
+                has_any_update = True
+            cli_comparison[cli_id] = {
+                "displayName": p_cli.get("displayName") or (u_cli or {}).get("displayName") or cli_id,
+                "pinnedVersion": p_ver,
+                "upstreamVersion": u_ver,
+                "pinnedStatus": p_cli.get("status") or "unknown",
+                "supportedVersions": p_cli.get("supportedVersions") or ([p_ver] if p_ver else []),
+                "minSupportedVersion": p_cli.get("minSupportedVersion") or p_ver,
+                "hasUpstreamUpdate": changed,
+                "platformDiffs": plat_diffs,
+                "upstreamEntry": u_cli,
+            }
+
     report_json = {
         "schemaVersion": 1,
         "checkedAt": now,
@@ -346,12 +455,14 @@ def build_check_report(pinned: dict, upstream_manifest: dict, changelogs: dict) 
         "hasAnyUpstreamUpdate": has_any_update,
         "apps": comparison,
     }
+    if cli_comparison:
+        report_json["cliTools"] = cli_comparison
 
     lines = [
         "# Tako Switch 上游版本巡检与 Changelog 风险分析报告",
         "",
         f"- 检查时间：`{now}`",
-        "- 版本策略：**受控锁版本（禁止自动盲跟上游）**，须先看更新日志并通过 macOS 三门禁验收后再 `promote`。",
+        "- 版本策略：**受控锁版本（禁止自动盲跟上游）**，须先看更新日志并通过对应门禁验收后再 `promote`。",
         "",
         "## 版本对比总览",
         "",
@@ -365,6 +476,11 @@ def build_check_report(pinned: dict, upstream_manifest: dict, changelogs: dict) 
         hint_str = ", ".join(hints) if hints else "无高危词命中"
         lines.append(
             f"| {c['displayName']} (`{app_id}`) | `{c['pinnedVersion']}` | `{c['upstreamVersion']}` | {status_label} | {hint_str} |"
+        )
+    for cli_id, c in cli_comparison.items():
+        status_label = "🆕 发现上游新版（待 Gate 5 验收）" if c["hasUpstreamUpdate"] else "✅ 与锁定版本一致"
+        lines.append(
+            f"| {c['displayName']} (`cli:{cli_id}`) | `{c['pinnedVersion']}` | `{c['upstreamVersion'] or '?'}` | {status_label} | 需先扩 agy-gateway 窗口 |"
         )
 
     lines.append("")
@@ -390,13 +506,30 @@ def build_check_report(pinned: dict, upstream_manifest: dict, changelogs: dict) 
             excerpt = " ".join(line.strip() for line in body[:5])[:360]
             lines.append(f"- **{ver}** ({pub}): {excerpt}")
 
+    if cli_comparison:
+        lines.append("")
+        lines.append("## 受控 CLI 工具差异详情")
+        for cli_id, c in cli_comparison.items():
+            lines.append("")
+            lines.append(f"### {c['displayName']} (`cli:{cli_id}`)")
+            lines.append(
+                f"- 锁定版本：`{c['pinnedVersion']}`（支持窗口：`{', '.join(c['supportedVersions'])}`） / 上游版本：`{c['upstreamVersion'] or '?'}`"
+            )
+            if c["platformDiffs"]:
+                lines.append("- 平台差异：")
+                for plat, diff in c["platformDiffs"].items():
+                    lines.append(
+                        f"  - `{plat}`: `{diff['pinnedVersion']}` ({diff['pinnedSha512Prefix'] or '-'}) -> `{diff['upstreamVersion']}` ({diff['upstreamSha512Prefix']})"
+                    )
+            errs = ((c.get("upstreamEntry") or {}).get("errors") or {})
+            if errs:
+                lines.append(f"- 平台抓取告警：`{', '.join(f'{k}: {v}' for k, v in sorted(errs.items()))}`")
+
     lines.append("")
     lines.append("## 下一步审批流程")
     lines.append("")
-    lines.append("1. 阅读上述更新日志，确认无破坏性认证/协议变更。")
-    lines.append("2. 在 macOS 环境运行三门禁验收：`python3 scripts/manage-releases.py verify-macos --app <app> --archive <pkg.zip|dmg> --out-json /tmp/gate-<app>.json`。")
-    lines.append("3. 门禁通过后人工提升版本：`python3 scripts/manage-releases.py promote --app <app> --candidate /tmp/upstream-candidates.json --gate-report /tmp/gate-<app>.json`。")
-    lines.append("4. 提交 `manifest/pinned-versions.json` 与 `manifest/manifest.json`，手动触发 `mirror-pinned` workflow 同步国内镜像与伴随二进制。")
+    lines.append("1. **Desktop 客户端**：阅读更新日志 → 跑 `verify-macos` / `verify-windows` → `promote --app <app>` → 手动触发 `mirror-pinned` workflow。")
+    lines.append("2. **Antigravity CLI (`agy`) 独立更新**：先在 `agy-gateway` 跑 Gate 5 并扩窗 → `verify-agy-cli` → `promote-agy-cli` → 手动触发 `mirror-agy-cli` workflow（无需发新版 `tako-cli`）。")
     lines.append("")
     return report_json, "\n".join(lines)
 
@@ -871,6 +1004,296 @@ def render_manifest_from_pinned(pinned: dict, generated_at: str | None = None) -
     }
 
 
+def render_agy_cli_manifests_from_pinned(
+    pinned: dict,
+    generated_at: str | None = None,
+) -> dict[str, dict]:
+    """Render deterministic per-platform agy-cli manifest files + index.json from pinned-versions.json.
+
+    Each `<platform>.json` stays 100% compatible with official `agy` updater format (`version`, `url`, `sha512`)
+    while attaching Tako managed metadata (`fallbackUrl`, `size`, `minSupportedVersion`, `supportedVersions`,
+    `channel`, `approvedAt`) for independent update checks in `tako-cli`.
+    """
+    agy = ((pinned.get("cliTools") or {}).get("agy")) or {}
+    version = str(agy.get("version") or "").strip()
+    platforms = agy.get("platforms") or {}
+    if not version or not platforms:
+        return {}
+
+    now = generated_at or str(agy.get("approvedAt") or "").strip() or datetime.now(timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    supported_versions = [
+        str(v).strip() for v in (agy.get("supportedVersions") or [version]) if str(v).strip()
+    ]
+    if version not in supported_versions:
+        supported_versions.append(version)
+    min_supported = str(agy.get("minSupportedVersion") or supported_versions[0]).strip()
+    channel = str(agy.get("channel") or "tako-managed").strip()
+    approved_at = str(agy.get("approvedAt") or now).strip()
+
+    files: dict[str, dict] = {}
+    index_platforms: dict[str, dict] = {}
+    for plat in sorted(platforms.keys()):
+        art = platforms[plat] or {}
+        url = str(art.get("url") or "").strip()
+        sha512 = str(art.get("sha512") or "").strip().lower()
+        if not url or not sha512:
+            continue
+        p_ver = str(art.get("version") or version).strip()
+        payload: dict[str, object] = {
+            "version": p_ver,
+            "url": url,
+            "sha512": sha512,
+        }
+        if art.get("fallbackUrl"):
+            payload["fallbackUrl"] = str(art["fallbackUrl"]).strip()
+        if isinstance(art.get("size"), int) and art["size"] > 0:
+            payload["size"] = art["size"]
+        payload["minSupportedVersion"] = min_supported
+        payload["supportedVersions"] = supported_versions
+        payload["channel"] = channel
+        payload["approvedAt"] = approved_at
+        files[f"{plat}.json"] = payload
+
+        idx_entry: dict[str, object] = {"url": url, "sha512": sha512}
+        if art.get("fallbackUrl"):
+            idx_entry["fallbackUrl"] = str(art["fallbackUrl"]).strip()
+        if isinstance(art.get("size"), int) and art["size"] > 0:
+            idx_entry["size"] = art["size"]
+        index_platforms[plat] = idx_entry
+
+    files["index.json"] = {
+        "schemaVersion": 1,
+        "tool": "agy",
+        "displayName": str(agy.get("displayName") or "Antigravity CLI (agy)"),
+        "version": version,
+        "status": str(agy.get("status") or "approved"),
+        "channel": channel,
+        "approvedAt": approved_at,
+        "generatedAt": now,
+        "minSupportedVersion": min_supported,
+        "supportedVersions": supported_versions,
+        "platforms": index_platforms,
+    }
+    return files
+
+
+def write_agy_cli_manifests(manifests: dict[str, dict], out_dir: Path) -> list[Path]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    expected_names = set(manifests.keys())
+    for existing in out_dir.glob("*.json"):
+        if existing.name not in expected_names:
+            existing.unlink()
+    for name, payload in sorted(manifests.items()):
+        target = out_dir / name
+        target.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        written.append(target)
+    return written
+
+
+def verify_agy_cli_candidate(
+    candidate_report: dict,
+    gateway_lock: dict | None = None,
+    diff_report: dict | None = None,
+    require_gateway_lock: bool = False,
+) -> dict:
+    """Verify an Antigravity CLI (`agy`) candidate before independent promotion.
+
+    Gates:
+      1. `checksumVerify`: all required platforms present, HTTPS URLs, valid 128-hex SHA-512, consistent version.
+      2. `gatewayLock`   : when `gateway_lock` (`agy-gateway/profiles/lock.json`) is supplied, verifies that
+                           `families.cli.versions[ver]` is already registered and inside `supported_window`.
+      3. `protocolDiff`  : when `diff_report` (`agy-gateway capture-diff --gate`) is supplied, verifies 0 blocking diffs.
+    """
+    cli_entry = ((candidate_report.get("cliTools") or {}).get("agy")) or {}
+    upstream = cli_entry.get("upstreamEntry") if "upstreamEntry" in cli_entry else cli_entry
+    if not isinstance(upstream, dict) or not upstream.get("platforms"):
+        raise ValueError("Candidate report missing cliTools.agy.upstreamEntry.platforms")
+
+    version = str(upstream.get("version") or "").strip()
+    platforms = upstream.get("platforms") or {}
+
+    # Gate 1: checksum & required platform completeness
+    ck_status = "pass"
+    ck_details: list[str] = []
+    missing_plats = [p for p in AGY_CLI_REQUIRED_PLATFORMS if p not in platforms]
+    if missing_plats:
+        ck_status = "fail"
+        ck_details.append(f"缺少必选平台: {', '.join(missing_plats)}")
+    if not version:
+        ck_status = "fail"
+        ck_details.append("缺少候选版本号")
+    for plat, art in sorted(platforms.items()):
+        p_ver = str((art or {}).get("version") or "").strip()
+        p_url = str((art or {}).get("url") or "").strip()
+        p_sha = str((art or {}).get("sha512") or "").strip().lower()
+        if version and p_ver and p_ver != version:
+            ck_status = "fail"
+            ck_details.append(f"{plat} 版本不一致: {p_ver} != {version}")
+        if not p_url.startswith("https://"):
+            ck_status = "fail"
+            ck_details.append(f"{plat} URL 非 HTTPS: {p_url}")
+        if not SHA512_HEX_RE.match(p_sha):
+            ck_status = "fail"
+            ck_details.append(f"{plat} sha512 非合法 128 位 hex")
+    if ck_status == "pass":
+        ck_details.append(f"已校验 {len(platforms)} 个平台（含 5 个必选平台），版本 {version} 与 SHA-512 格式均合法")
+
+    # Gate 2: agy-gateway lock window check (backend-first invariant)
+    gw_status = "pass"
+    gw_details: list[str] = []
+    if gateway_lock is None:
+        if require_gateway_lock:
+            gw_status = "fail"
+            gw_details.append("未提供 --gateway-lock (agy-gateway/profiles/lock.json)")
+        else:
+            gw_status = "warn"
+            gw_details.append("未传入 --gateway-lock；请人工确认 agy-gateway 已扩窗支持该版本")
+    else:
+        cli_fam = ((gateway_lock.get("families") or {}).get("cli")) or {}
+        window = [str(v) for v in (cli_fam.get("supported_window") or [])]
+        ver_entry = (cli_fam.get("versions") or {}).get(version)
+        if not isinstance(ver_entry, dict):
+            gw_status = "fail"
+            gw_details.append(f"agy-gateway profiles/lock.json 尚未登记 cli/{version}（须先扩窗再放行客户端）")
+        else:
+            v_status = str(ver_entry.get("status") or "").lower()
+            if v_status not in ("approved", "supported"):
+                gw_status = "fail"
+                gw_details.append(f"cli/{version} 在网关锁中的状态为 '{v_status}'（须为 approved/supported）")
+            if version not in window:
+                gw_status = "fail"
+                gw_details.append(f"cli/{version} 不在网关 supported_window ({', '.join(window)}) 内")
+            if gw_status == "pass":
+                gw_details.append(
+                    f"agy-gateway 已登记 cli/{version} (status={v_status}, window={','.join(window)})"
+                )
+
+    # Gate 3: Gate 5 protocol capture-diff check
+    diff_status = "pass"
+    diff_details: list[str] = []
+    if diff_report is None:
+        diff_status = "warn"
+        diff_details.append("未传入 --diff-report；建议附带 agy-gateway capture-diff --gate 报告")
+    else:
+        passed = diff_report.get("passed")
+        fail_count = diff_report.get("fail_count")
+        blocking = diff_report.get("blocking_diffs")
+        if passed is False or (isinstance(fail_count, int) and fail_count > 0) or (
+            isinstance(blocking, list) and len(blocking) > 0
+        ):
+            diff_status = "fail"
+            diff_details.append(
+                f"Gate 5 协议字段级 diff 未通过 (passed={passed}, fail_count={fail_count})"
+            )
+        else:
+            diff_details.append("Gate 5 协议字段级 diff 通过（无阻断性差异）")
+
+    statuses = (ck_status, gw_status, diff_status)
+    overall = "fail" if "fail" in statuses else ("warn" if "warn" in statuses else "pass")
+    return {
+        "toolId": "agy",
+        "version": version,
+        "verifiedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "overall": overall,
+        "gates": {
+            "checksumVerify": {"status": ck_status, "details": ck_details},
+            "gatewayLock": {"status": gw_status, "details": gw_details},
+            "protocolDiff": {"status": diff_status, "details": diff_details},
+        },
+    }
+
+
+def promote_agy_cli_candidate(
+    pinned: dict,
+    candidate_report: dict,
+    gate_report: dict | None,
+    force_skip_gate: bool = False,
+    reason: str = "",
+    supported_versions: list[str] | None = None,
+    min_supported_version: str | None = None,
+    changelog_summary: str = "",
+) -> dict:
+    """Independently promote `cliTools.agy` in `pinned-versions.json` without touching Desktop apps."""
+    cand_cli = ((candidate_report.get("cliTools") or {}).get("agy")) or {}
+    upstream_entry = cand_cli.get("upstreamEntry") or {}
+    if not upstream_entry or not upstream_entry.get("version") or not upstream_entry.get("platforms"):
+        raise ValueError("Candidate report missing cliTools.agy.upstreamEntry")
+
+    new_version = str(upstream_entry["version"]).strip()
+
+    if not force_skip_gate:
+        if not gate_report:
+            raise ValueError("Refusing to promote agy-cli without --gate-report (or explicit --force-skip-gate)")
+        if gate_report.get("toolId") != "agy":
+            raise ValueError("Gate report is not for toolId 'agy'")
+        if gate_report.get("version") and str(gate_report["version"]) != new_version:
+            raise ValueError(
+                f"Gate report version {gate_report['version']} does not match candidate version {new_version}"
+            )
+        if gate_report.get("overall") == "fail":
+            raise ValueError(f"Refusing to promote agy-cli {new_version}: gate verification FAILED")
+        gate_summary = {
+            k: v.get("status", "unknown") for k, v in (gate_report.get("gates") or {}).items()
+        }
+    else:
+        if not reason.strip():
+            raise ValueError("--force-skip-gate requires a non-empty --reason")
+        gate_summary = {
+            "checksumVerify": "skipped",
+            "gatewayLock": "skipped",
+            "protocolDiff": "skipped",
+            "skipReason": reason.strip(),
+        }
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    existing = ((pinned.get("cliTools") or {}).get("agy")) or {}
+    prev_version = str(existing.get("version") or "").strip()
+
+    if supported_versions:
+        window = [v.strip() for v in supported_versions if v.strip()]
+    else:
+        # Roll forward a 2-version compatibility window [previous, new] so existing users
+        # stay uninterrupted while new installs / `tako update agy` get the newly approved build.
+        window = [v for v in (prev_version, new_version) if v]
+        window = list(dict.fromkeys(window))
+    if new_version not in window:
+        window.append(new_version)
+    min_supported = (min_supported_version or "").strip() or window[0]
+
+    clean_platforms: dict[str, dict] = {}
+    for plat, art in sorted((upstream_entry.get("platforms") or {}).items()):
+        entry: dict[str, object] = {
+            "url": str(art["url"]).strip(),
+            "sha512": str(art["sha512"]).strip().lower(),
+        }
+        if isinstance(art.get("size"), int) and art["size"] > 0:
+            entry["size"] = art["size"]
+        clean_platforms[plat] = entry
+
+    updated_entry = dict(existing)
+    updated_entry["displayName"] = str(existing.get("displayName") or "Antigravity CLI (agy)")
+    updated_entry["version"] = new_version
+    updated_entry["status"] = "approved"
+    updated_entry["approvedAt"] = now
+    updated_entry["minSupportedVersion"] = min_supported
+    updated_entry["supportedVersions"] = window
+    updated_entry["channel"] = str(existing.get("channel") or "tako-managed")
+    updated_entry["changelogSummary"] = (
+        changelog_summary.strip()
+        or f"Promoted Antigravity CLI (agy) {new_version} after Gate 5 & checksum verification."
+    )
+    updated_entry["gates"] = gate_summary
+    updated_entry["platforms"] = clean_platforms
+
+    out = json.loads(json.dumps(pinned))
+    out["updatedAt"] = now
+    out.setdefault("cliTools", {})["agy"] = updated_entry
+    return out
+
+
 def promote_candidate(
     pinned: dict,
     app_id: str,
@@ -942,7 +1365,12 @@ def cmd_check(args: argparse.Namespace) -> int:
     sync_mod = load_sync_manifest_module()
     upstream_manifest = sync_mod.build_manifest(mirror_base=None)
     changelogs = fetch_changelogs(upstream_manifest.get("apps") or {})
-    report_json, report_md = build_check_report(pinned, upstream_manifest, changelogs)
+    upstream_cli_tools = None
+    if not getattr(args, "skip_cli", False):
+        upstream_cli_tools = {"agy": fetch_upstream_agy_cli_manifests()}
+    report_json, report_md = build_check_report(
+        pinned, upstream_manifest, changelogs, upstream_cli_tools=upstream_cli_tools
+    )
 
     if args.out_json:
         p = Path(args.out_json)
@@ -1110,19 +1538,94 @@ def cmd_verify_windows(args: argparse.Namespace) -> int:
 
 def cmd_render_manifest(args: argparse.Namespace) -> int:
     pinned = json.loads(Path(args.pinned).read_text(encoding="utf-8"))
-    out_path = Path(args.out)
-    prev_generated = None
-    if out_path.is_file():
-        try:
-            prev = json.loads(out_path.read_text(encoding="utf-8"))
-            rendered_preview = render_manifest_from_pinned(pinned, generated_at=prev.get("generatedAt"))
-            if prev.get("apps") == rendered_preview.get("apps"):
-                prev_generated = prev.get("generatedAt")
-        except Exception:
-            pass
-    manifest = render_manifest_from_pinned(pinned, generated_at=prev_generated)
-    out_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"Rendered {out_path} from {args.pinned} ({len(manifest['apps'])} apps)")
+    if not getattr(args, "agy_cli_only", False):
+        out_path = Path(args.out)
+        prev_generated = None
+        if out_path.is_file():
+            try:
+                prev = json.loads(out_path.read_text(encoding="utf-8"))
+                rendered_preview = render_manifest_from_pinned(pinned, generated_at=prev.get("generatedAt"))
+                if prev.get("apps") == rendered_preview.get("apps"):
+                    prev_generated = prev.get("generatedAt")
+            except Exception:
+                pass
+        manifest = render_manifest_from_pinned(pinned, generated_at=prev_generated)
+        out_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print(f"Rendered {out_path} from {args.pinned} ({len(manifest['apps'])} apps)")
+
+    agy_cli_out = getattr(args, "agy_cli_out_dir", "")
+    if agy_cli_out:
+        agy_files = render_agy_cli_manifests_from_pinned(pinned)
+        if agy_files:
+            written = write_agy_cli_manifests(agy_files, Path(agy_cli_out))
+            print(
+                f"Rendered {len(written)} agy-cli manifest file(s) into {agy_cli_out} "
+                f"(version={agy_files['index.json']['version']})"
+            )
+    return 0
+
+
+def cmd_verify_agy_cli(args: argparse.Namespace) -> int:
+    if args.candidate:
+        candidate = json.loads(Path(args.candidate).read_text(encoding="utf-8"))
+    else:
+        upstream = fetch_upstream_agy_cli_manifests(base_url=args.upstream_base)
+        candidate = {"cliTools": {"agy": {"upstreamEntry": upstream}}}
+    gateway_lock = (
+        json.loads(Path(args.gateway_lock).read_text(encoding="utf-8")) if args.gateway_lock else None
+    )
+    diff_report = (
+        json.loads(Path(args.diff_report).read_text(encoding="utf-8")) if args.diff_report else None
+    )
+    res = verify_agy_cli_candidate(
+        candidate_report=candidate,
+        gateway_lock=gateway_lock,
+        diff_report=diff_report,
+        require_gateway_lock=args.require_gateway_lock,
+    )
+    if args.out_json:
+        out_p = Path(args.out_json)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(json.dumps(res, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    icon = {"pass": "PASS", "warn": "WARN", "fail": "FAIL"}.get(res["overall"], "UNKNOWN")
+    print(f"[{icon}] agy-cli v{res.get('version', '?')}")
+    for gname, gdata in (res.get("gates") or {}).items():
+        print(f"  - {gname}: {gdata['status'].upper()} | {'; '.join(gdata.get('details') or [])}")
+    return 1 if res["overall"] == "fail" else 0
+
+
+def cmd_promote_agy_cli(args: argparse.Namespace) -> int:
+    pinned_path = Path(args.pinned)
+    pinned = json.loads(pinned_path.read_text(encoding="utf-8"))
+    candidate = json.loads(Path(args.candidate).read_text(encoding="utf-8"))
+    gate_report = (
+        json.loads(Path(args.gate_report).read_text(encoding="utf-8")) if args.gate_report else None
+    )
+    supported_list = (
+        [v.strip() for v in args.supported_versions.split(",") if v.strip()]
+        if args.supported_versions
+        else None
+    )
+    updated_pinned = promote_agy_cli_candidate(
+        pinned=pinned,
+        candidate_report=candidate,
+        gate_report=gate_report,
+        force_skip_gate=args.force_skip_gate,
+        reason=args.reason,
+        supported_versions=supported_list,
+        min_supported_version=args.min_supported_version or None,
+        changelog_summary=args.summary or "",
+    )
+    pinned_path.write_text(json.dumps(updated_pinned, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    agy_files = render_agy_cli_manifests_from_pinned(updated_pinned)
+    written = write_agy_cli_manifests(agy_files, Path(args.agy_cli_out_dir))
+    agy_entry = updated_pinned["cliTools"]["agy"]
+    print(
+        f"Promoted cliTools.agy -> {agy_entry['version']} "
+        f"(window={','.join(agy_entry['supportedVersions'])}) into {pinned_path} "
+        f"and rendered {len(written)} manifest file(s) in {args.agy_cli_out_dir}"
+    )
     return 0
 
 
@@ -1159,6 +1662,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_check = sub.add_parser("check", help="Check upstream releases & analyze changelogs (read-only)")
     p_check.add_argument("--pinned", default=str(DEFAULT_PINNED_PATH))
+    p_check.add_argument("--skip-cli", action="store_true", help="Skip checking upstream agy-cli manifests")
     p_check.add_argument("--out-json", default="")
     p_check.add_argument("--out-md", default="")
     p_check.set_defaults(func=cmd_check)
@@ -1187,12 +1691,26 @@ def main(argv: list[str] | None = None) -> int:
     p_verify_win.add_argument("--out-json", default="")
     p_verify_win.set_defaults(func=cmd_verify_windows)
 
-    p_render = sub.add_parser("render-manifest", help="Render manifest.json strictly from pinned-versions.json")
+    p_verify_cli = sub.add_parser(
+        "verify-agy-cli",
+        help="Verify Antigravity CLI (agy) candidate against checksums, agy-gateway lock, and Gate 5 diff report",
+    )
+    p_verify_cli.add_argument("--candidate", default="", help="JSON output from `check --out-json` (fetches live upstream if omitted)")
+    p_verify_cli.add_argument("--upstream-base", default=AGY_CLI_UPSTREAM_BASE)
+    p_verify_cli.add_argument("--gateway-lock", default="", help="Path to agy-gateway profiles/lock.json")
+    p_verify_cli.add_argument("--diff-report", default="", help="Path to agy-gateway capture-diff --gate JSON report")
+    p_verify_cli.add_argument("--require-gateway-lock", action="store_true")
+    p_verify_cli.add_argument("--out-json", default="")
+    p_verify_cli.set_defaults(func=cmd_verify_agy_cli)
+
+    p_render = sub.add_parser("render-manifest", help="Render manifest.json & agy-cli manifests from pinned-versions.json")
     p_render.add_argument("--pinned", default=str(DEFAULT_PINNED_PATH))
     p_render.add_argument("--out", default=str(DEFAULT_MANIFEST_PATH))
+    p_render.add_argument("--agy-cli-out-dir", default=str(DEFAULT_AGY_CLI_MANIFESTS_DIR))
+    p_render.add_argument("--agy-cli-only", action="store_true", help="Only render manifest/agy-cli/manifests/*.json")
     p_render.set_defaults(func=cmd_render_manifest)
 
-    p_promote = sub.add_parser("promote", help="Promote a gate-verified candidate into pinned-versions.json")
+    p_promote = sub.add_parser("promote", help="Promote a gate-verified Desktop candidate into pinned-versions.json")
     p_promote.add_argument("--app", choices=APP_ORDER, required=True)
     p_promote.add_argument("--candidate", required=True, help="JSON output from `check --out-json`")
     p_promote.add_argument("--gate-report", default="", help="JSON output from `verify-macos --out-json`")
@@ -1201,6 +1719,21 @@ def main(argv: list[str] | None = None) -> int:
     p_promote.add_argument("--force-skip-gate", action="store_true")
     p_promote.add_argument("--reason", default="")
     p_promote.set_defaults(func=cmd_promote)
+
+    p_promote_cli = sub.add_parser(
+        "promote-agy-cli",
+        help="Independently promote a gate-verified Antigravity CLI (agy) candidate without touching Desktop apps",
+    )
+    p_promote_cli.add_argument("--candidate", required=True, help="JSON output from `check --out-json`")
+    p_promote_cli.add_argument("--gate-report", default="", help="JSON output from `verify-agy-cli --out-json`")
+    p_promote_cli.add_argument("--pinned", default=str(DEFAULT_PINNED_PATH))
+    p_promote_cli.add_argument("--agy-cli-out-dir", default=str(DEFAULT_AGY_CLI_MANIFESTS_DIR))
+    p_promote_cli.add_argument("--supported-versions", default="", help="Optional comma-separated compatibility window")
+    p_promote_cli.add_argument("--min-supported-version", default="", help="Optional explicit minimum supported version")
+    p_promote_cli.add_argument("--summary", default="", help="Optional changelog summary")
+    p_promote_cli.add_argument("--force-skip-gate", action="store_true")
+    p_promote_cli.add_argument("--reason", default="")
+    p_promote_cli.set_defaults(func=cmd_promote_agy_cli)
 
     args = parser.parse_args(argv)
     return args.func(args)

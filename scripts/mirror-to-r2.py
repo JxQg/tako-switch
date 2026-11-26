@@ -604,6 +604,172 @@ def mirror_companion_artifacts_to_r2(
     return mirrored_keys
 
 
+def mirror_agy_cli_manifests_to_r2(
+    manifests_dir: Path,
+    s3: S3Client,
+    mirror_base: str | None = None,
+    key_prefix: str = DEFAULT_KEY_PREFIX,
+    manifest_s3_prefix: str = "tako-switch/agy-cli/manifests",
+    keep_versions: int = DEFAULT_KEEP_VERSIONS,
+    dry_run: bool = False,
+    doge_s3: S3Client | None = None,
+) -> list[str]:
+    """Mirror approved agy-cli archives referenced by `<manifests_dir>/<platform>.json` into S3/R2,
+    safely rewrite each platform manifest's `url` to the China CDN mirror (keeping the official
+    pinned GCS URL as `fallbackUrl`), update `index.json`, and upload all manifest JSON files.
+
+    Object layout:
+      - Binary archive : `<key_prefix>/agy-cli/<platform>/<version>/<filename>`
+      - Platform JSON  : `<manifest_s3_prefix>/<platform>.json` (e.g. `tako-switch/agy-cli/manifests/darwin_arm64.json`)
+      - Index JSON     : `<manifest_s3_prefix>/index.json`
+    """
+    if not manifests_dir.is_dir():
+        return []
+
+    mirrored_keys: list[str] = []
+    clean_prefix = key_prefix.strip("/")
+    clean_manifest_prefix = manifest_s3_prefix.strip("/")
+    mirror_prefix = mirror_base.rstrip("/") + "/" if mirror_base else None
+    updated_platforms: dict[str, dict] = {}
+    platform_files = sorted(
+        p for p in manifests_dir.glob("*.json") if p.name != "index.json"
+    )
+
+    for mf_path in platform_files:
+        plat = mf_path.stem
+        data = json.loads(mf_path.read_text(encoding="utf-8"))
+        version = str(data.get("version") or "").strip()
+        prev_url = str(data.get("url") or "").strip()
+        fallback_url = str(data.get("fallbackUrl") or "").strip()
+        official_url = (
+            fallback_url
+            if (mirror_prefix and prev_url.startswith(mirror_prefix) and fallback_url)
+            else prev_url
+        )
+        if not version or not official_url:
+            continue
+
+        key = build_object_key(key_prefix, "agy-cli", plat, version, official_url)
+        expected_size = data.get("size")
+        expected_sha512 = str(data.get("sha512") or "").strip().lower()
+        head = s3.head_object(key)
+        obj_ready = False
+        obj_size = expected_size
+
+        if head is not None:
+            remote_size = head.get("ContentLength")
+            if expected_size is None or remote_size == expected_size:
+                print(f"[skip] agy-cli {key} already exists in s3://{s3.bucket} ({remote_size} bytes)")
+                obj_ready = True
+                if isinstance(remote_size, int) and remote_size > 0:
+                    obj_size = remote_size
+
+        if not obj_ready:
+            if dry_run:
+                print(f"[dry-run] would mirror agy-cli {official_url} -> s3://{s3.bucket}/{key}")
+                obj_ready = True
+            else:
+                with tempfile.TemporaryDirectory(prefix="tako-mirror-agy-cli-") as tmpdir:
+                    local_file = Path(tmpdir) / os.path.basename(key)
+                    print(f"[download] agy-cli/{plat} {version} <- {official_url}")
+                    download_file(official_url, local_file)
+                    actual_size, actual_sha256, actual_sha512 = compute_file_hashes(local_file)
+                    if expected_sha512 and actual_sha512 != expected_sha512:
+                        raise RuntimeError(
+                            f"agy-cli SHA-512 mismatch for {official_url}: "
+                            f"expected {expected_sha512}, got {actual_sha512}"
+                        )
+                    if expected_size and actual_size != expected_size:
+                        raise RuntimeError(
+                            f"agy-cli size mismatch for {official_url}: "
+                            f"expected {expected_size}, got {actual_size}"
+                        )
+                    print(
+                        f"[upload] agy-cli s3://{s3.bucket}/{key} "
+                        f"({actual_size} bytes, sha512={actual_sha512[:12]}...)"
+                    )
+                    s3.upload_file(
+                        local_file,
+                        key,
+                        cache_control="public, max-age=31536000, immutable",
+                        content_type="application/octet-stream",
+                        metadata={"sha256": actual_sha256},
+                    )
+                    obj_ready = True
+                    obj_size = actual_size
+
+        if obj_ready:
+            mirrored_keys.append(key)
+            if obj_size:
+                data["size"] = obj_size
+            if mirror_base:
+                data["url"] = build_mirror_url(mirror_base, "agy-cli", plat, version, official_url)
+                if prev_url and not prev_url.startswith(mirror_prefix or ""):
+                    data["fallbackUrl"] = prev_url
+                else:
+                    data["fallbackUrl"] = official_url
+            updated_platforms[plat] = data
+            if not dry_run:
+                mf_path.write_text(
+                    json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+                list_prefix = (
+                    f"{clean_prefix}/agy-cli/{plat}/" if clean_prefix else f"agy-cli/{plat}/"
+                )
+                existing_objs = s3.list_objects(list_prefix)
+                stale_keys = select_keys_to_prune(existing_objs, version, keep_versions)
+                for stale in stale_keys:
+                    print(f"[prune] deleting stale agy-cli object s3://{s3.bucket}/{stale}")
+                    s3.delete_object(stale)
+
+    # Refresh index.json if present so it mirrors the updated URLs/sizes.
+    index_path = manifests_dir / "index.json"
+    if index_path.is_file() and updated_platforms:
+        index_data = json.loads(index_path.read_text(encoding="utf-8"))
+        idx_plats = index_data.setdefault("platforms", {})
+        for plat, pdata in updated_platforms.items():
+            entry = dict(idx_plats.get(plat) or {})
+            entry["url"] = pdata["url"]
+            if pdata.get("fallbackUrl"):
+                entry["fallbackUrl"] = pdata["fallbackUrl"]
+            if pdata.get("sha512"):
+                entry["sha512"] = pdata["sha512"]
+            if pdata.get("size"):
+                entry["size"] = pdata["size"]
+            idx_plats[plat] = entry
+        if not dry_run:
+            index_path.write_text(
+                json.dumps(index_data, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+    if not dry_run and clean_manifest_prefix:
+        all_manifest_files = sorted(manifests_dir.glob("*.json"))
+        for mf_path in all_manifest_files:
+            mf_key = f"{clean_manifest_prefix}/{mf_path.name}"
+            s3.upload_file(
+                mf_path,
+                mf_key,
+                cache_control="public, max-age=300",
+                content_type="application/json; charset=utf-8",
+            )
+            print(f"[upload] s3://{s3.bucket}/{mf_key}")
+            if doge_s3 is not None:
+                try:
+                    doge_s3.upload_file(
+                        mf_path,
+                        mf_key,
+                        cache_control="public, max-age=120",
+                        content_type="application/json; charset=utf-8",
+                    )
+                    print(f"[upload] synced agy-cli manifest directly to DogeCloud OSS s3://{doge_s3.bucket}/{mf_key}")
+                except Exception as exc:
+                    print(f"[warn] direct DogeCloud agy-cli manifest sync skipped for {mf_path.name}: {exc}", file=sys.stderr)
+
+    return mirrored_keys
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Mirror Tako Switch installers into Cloudflare R2")
     parser.add_argument("--manifest", default="manifest/manifest.json", help="Path to manifest.json")
@@ -646,6 +812,21 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional path to manifest/pinned-versions.json to also mirror companion binaries (e.g. claude-code)",
     )
     parser.add_argument(
+        "--agy-cli-manifests-dir",
+        default=os.environ.get("AGY_CLI_MANIFESTS_DIR", ""),
+        help="Optional path to manifest/agy-cli/manifests directory to mirror agy-cli binaries and upload platform manifests",
+    )
+    parser.add_argument(
+        "--agy-cli-manifest-prefix",
+        default=os.environ.get("R2_AGY_CLI_MANIFEST_PREFIX", "tako-switch/agy-cli/manifests"),
+        help="Bucket key prefix for agy-cli manifests (default: tako-switch/agy-cli/manifests)",
+    )
+    parser.add_argument(
+        "--only-agy-cli",
+        action="store_true",
+        help="Only mirror and sync agy-cli archives/manifests without touching desktop apps or manifest.json",
+    )
+    parser.add_argument(
         "--prefer-doge",
         action="store_true",
         help="Upload directly to DogeCloud OSS instead of R2 (only recommended from China-local runners)",
@@ -679,86 +860,108 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    manifest_path = Path(args.manifest)
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-
     s3 = S3Client(
         bucket=s3_bucket,
         endpoint_url=s3_endpoint,
         region=s3_region,
         env_overrides=env_overrides,
     )
-    apps_to_mirror = parse_app_filter(args.apps)
     mirror_base = args.mirror_base.strip() or None
 
-    updated = mirror_manifest_to_r2(
-        manifest=manifest,
-        s3=s3,
-        mirror_base=mirror_base,
-        apps_to_mirror=apps_to_mirror,
-        key_prefix=args.key_prefix,
-        keep_versions=args.keep_versions,
-        dry_run=args.dry_run,
-    )
-
-    if args.pinned:
-        pinned_path = Path(args.pinned)
-        if pinned_path.exists():
-            pinned_data = json.loads(pinned_path.read_text(encoding="utf-8"))
-            mirror_companion_artifacts_to_r2(
-                pinned=pinned_data,
-                s3=s3,
-                key_prefix=args.key_prefix,
-                keep_versions=args.keep_versions,
-                dry_run=args.dry_run,
+    doge_sync_client: S3Client | None = None
+    if not args.dry_run and not use_doge and doge_ak and doge_sk and doge_bucket:
+        try:
+            d_bucket, d_ep, d_reg, d_env = fetch_dogecloud_s3_credentials(
+                doge_ak, doge_sk, doge_bucket
             )
+            doge_sync_client = S3Client(
+                bucket=d_bucket,
+                endpoint_url=d_ep,
+                region=d_reg,
+                env_overrides=d_env,
+            )
+        except Exception as exc:
+            print(f"[warn] direct DogeCloud manifest sync skipped: {exc}", file=sys.stderr)
 
-    if args.prev_manifest:
-        prev_path = Path(args.prev_manifest)
-        if prev_path.exists():
-            try:
-                prev = json.loads(prev_path.read_text(encoding="utf-8"))
-                if prev.get("apps") == updated.get("apps") and prev.get("generatedAt"):
-                    updated["generatedAt"] = prev["generatedAt"]
-            except Exception:
-                pass
+    if not args.only_agy_cli:
+        manifest_path = Path(args.manifest)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        apps_to_mirror = parse_app_filter(args.apps)
 
-    if not args.dry_run:
-        manifest_path.write_text(
-            json.dumps(updated, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
+        updated = mirror_manifest_to_r2(
+            manifest=manifest,
+            s3=s3,
+            mirror_base=mirror_base,
+            apps_to_mirror=apps_to_mirror,
+            key_prefix=args.key_prefix,
+            keep_versions=args.keep_versions,
+            dry_run=args.dry_run,
         )
-        if args.upload_manifest_key:
-            manifest_key = args.upload_manifest_key.lstrip("/")
-            s3.upload_file(
-                manifest_path,
-                manifest_key,
-                cache_control="public, max-age=300",
-                content_type="application/json; charset=utf-8",
-            )
-            print(f"[upload] s3://{s3.bucket}/{manifest_key}")
-            # Also overwrite the tiny mutable manifest.json directly into DogeCloud Shanghai OSS
-            # so mirror-storage never serves a stale cached manifest after a new upstream release.
-            if not use_doge and doge_ak and doge_sk and doge_bucket:
+
+        if args.pinned:
+            pinned_path = Path(args.pinned)
+            if pinned_path.exists():
+                pinned_data = json.loads(pinned_path.read_text(encoding="utf-8"))
+                mirror_companion_artifacts_to_r2(
+                    pinned=pinned_data,
+                    s3=s3,
+                    key_prefix=args.key_prefix,
+                    keep_versions=args.keep_versions,
+                    dry_run=args.dry_run,
+                )
+
+        if args.prev_manifest:
+            prev_path = Path(args.prev_manifest)
+            if prev_path.exists():
                 try:
-                    d_bucket, d_ep, d_reg, d_env = fetch_dogecloud_s3_credentials(
-                        doge_ak, doge_sk, doge_bucket
-                    )
-                    doge_s3 = S3Client(
-                        bucket=d_bucket,
-                        endpoint_url=d_ep,
-                        region=d_reg,
-                        env_overrides=d_env,
-                    )
-                    doge_s3.upload_file(
-                        manifest_path,
-                        manifest_key,
-                        cache_control="public, max-age=120",
-                        content_type="application/json; charset=utf-8",
-                    )
-                    print(f"[upload] synced manifest directly to DogeCloud OSS s3://{d_bucket}/{manifest_key}")
-                except Exception as exc:
-                    print(f"[warn] direct DogeCloud manifest sync skipped: {exc}", file=sys.stderr)
+                    prev = json.loads(prev_path.read_text(encoding="utf-8"))
+                    if prev.get("apps") == updated.get("apps") and prev.get("generatedAt"):
+                        updated["generatedAt"] = prev["generatedAt"]
+                except Exception:
+                    pass
+
+        if not args.dry_run:
+            manifest_path.write_text(
+                json.dumps(updated, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            if args.upload_manifest_key:
+                manifest_key = args.upload_manifest_key.lstrip("/")
+                s3.upload_file(
+                    manifest_path,
+                    manifest_key,
+                    cache_control="public, max-age=300",
+                    content_type="application/json; charset=utf-8",
+                )
+                print(f"[upload] s3://{s3.bucket}/{manifest_key}")
+                # Also overwrite the tiny mutable manifest.json directly into DogeCloud Shanghai OSS
+                # so mirror-storage never serves a stale cached manifest after a new upstream release.
+                if doge_sync_client is not None:
+                    try:
+                        doge_sync_client.upload_file(
+                            manifest_path,
+                            manifest_key,
+                            cache_control="public, max-age=120",
+                            content_type="application/json; charset=utf-8",
+                        )
+                        print(
+                            f"[upload] synced manifest directly to DogeCloud OSS "
+                            f"s3://{doge_sync_client.bucket}/{manifest_key}"
+                        )
+                    except Exception as exc:
+                        print(f"[warn] direct DogeCloud manifest sync skipped: {exc}", file=sys.stderr)
+
+    if args.agy_cli_manifests_dir:
+        mirror_agy_cli_manifests_to_r2(
+            manifests_dir=Path(args.agy_cli_manifests_dir),
+            s3=s3,
+            mirror_base=mirror_base,
+            key_prefix=args.key_prefix,
+            manifest_s3_prefix=args.agy_cli_manifest_prefix,
+            keep_versions=args.keep_versions,
+            dry_run=args.dry_run,
+            doge_s3=doge_sync_client,
+        )
 
     return 0
 

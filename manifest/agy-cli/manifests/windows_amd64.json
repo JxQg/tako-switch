@@ -1,0 +1,13 @@
+{
+  "version": "1.5.17",
+  "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/windows-x64/cli_windows_x64.exe",
+  "sha512": "7b468fb7b83f0dbd5be39afebc5ce71570de4d1020e248cf1d2461d338f5d0f6eb689500e0f68a36d26179be6632f74a2d96a34f37d6ef20f62b28b87d7c55b2",
+  "size": 243373976,
+  "minSupportedVersion": "1.5.16",
+  "supportedVersions": [
+    "1.5.16",
+    "1.5.17"
+  ],
+  "channel": "tako-managed",
+  "approvedAt": "2026-11-25T16:00:00Z"
+}
