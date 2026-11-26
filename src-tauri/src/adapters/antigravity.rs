@@ -648,6 +648,47 @@ fn read_windows_hkcu_env() -> BTreeMap<String, String> {
 }
 
 #[cfg(target_os = "windows")]
+fn broadcast_windows_env_change() {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    const HWND_BROADCAST: *mut std::ffi::c_void = 0xffffusize as *mut std::ffi::c_void;
+    const WM_SETTINGCHANGE: u32 = 0x001A;
+    const SMTO_ABORTIFHUNG: u32 = 0x0002;
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn SendMessageTimeoutW(
+            hwnd: *mut std::ffi::c_void,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+            flags: u32,
+            timeout_ms: u32,
+            result: *mut usize,
+        ) -> isize;
+    }
+
+    let wide: Vec<u16> = OsStr::new("Environment")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let mut result: usize = 0;
+    // SAFETY: `wide` is NUL-terminated UTF-16 and lives across the synchronous call.
+    unsafe {
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            wide.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            3000,
+            &mut result,
+        );
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn write_windows_hkcu_env(base_url: &str, api_key: &str) -> Result<(), String> {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
@@ -662,15 +703,9 @@ fn write_windows_hkcu_env(base_url: &str, api_key: &str) -> Result<(), String> {
     env.set_value("AGY_LLM_GATEWAY_WIRE_PROTOCOL", &"genai")
         .map_err(|e| format!("写入 AGY_LLM_GATEWAY_WIRE_PROTOCOL 失败: {e}"))?;
 
-    // Also broadcast WM_SETTINGCHANGE via .NET SetEnvironmentVariable so Explorer picks up changes immediately.
-    let ps = format!(
-        "[Environment]::SetEnvironmentVariable('AGY_LLM_GATEWAY_URL','{}','User'); \
-         [Environment]::SetEnvironmentVariable('AGY_LLM_GATEWAY_API_KEY','{}','User'); \
-         [Environment]::SetEnvironmentVariable('AGY_LLM_GATEWAY_WIRE_PROTOCOL','genai','User')",
-        base_url.replace('\'', "''"),
-        api_key.replace('\'', "''")
-    );
-    let _ = ps_hidden(&ps);
+    // Broadcast WM_SETTINGCHANGE via native Win32 API (no powershell.exe spawn, immune to AV blocks)
+    // so Explorer / Start Menu / desktop shortcuts inherit the updated environment immediately.
+    broadcast_windows_env_change();
     Ok(())
 }
 
@@ -688,11 +723,7 @@ fn clear_windows_hkcu_env() -> Result<(), String> {
             let _ = env.delete_value(key);
         }
     }
-    let _ = ps_hidden(
-        "[Environment]::SetEnvironmentVariable('AGY_LLM_GATEWAY_URL',$null,'User'); \
-         [Environment]::SetEnvironmentVariable('AGY_LLM_GATEWAY_API_KEY',$null,'User'); \
-         [Environment]::SetEnvironmentVariable('AGY_LLM_GATEWAY_WIRE_PROTOCOL',$null,'User')",
-    );
+    broadcast_windows_env_change();
     Ok(())
 }
 
@@ -737,7 +768,12 @@ fn detect_windows_antigravity(paths: &AppPaths) -> Option<(Option<String>, Strin
 
 #[cfg(target_os = "windows")]
 fn quit_windows_process(name: &str) -> Result<(), String> {
-    let script = format!("Stop-Process -Name '{name}' -Force -ErrorAction SilentlyContinue");
+    let script = format!(
+        "Stop-Process -Name '{name}' -Force -ErrorAction SilentlyContinue; \
+         Get-CimInstance Win32_Process -Filter \"Name LIKE 'language_server%'\" -ErrorAction SilentlyContinue | \
+         Where-Object {{ $_.ExecutablePath -like '*Antigravity*' }} | \
+         ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+    );
     let _ = ps_hidden(&script);
     Ok(())
 }
@@ -745,8 +781,11 @@ fn quit_windows_process(name: &str) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 fn launch_windows_antigravity(paths: &AppPaths) -> Result<(), String> {
     if let Some((_, exe)) = detect_windows_antigravity(paths) {
-        let mut cmd = std::process::Command::new(exe);
         let gw_env = AntigravityAdapter::read_gateway_env(paths);
+        if gw_env.contains_key("AGY_LLM_GATEWAY_URL") {
+            let _ = ensure_gateway_service(paths);
+        }
+        let mut cmd = std::process::Command::new(exe);
         for key in [
             "AGY_LLM_GATEWAY_URL",
             "AGY_LLM_GATEWAY_API_KEY",

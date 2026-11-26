@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "generatedAt": "2026-11-23T23:02:06Z",
+  "generatedAt": "2026-11-25T23:06:56Z",
   "apps": {
     "dsh-tako": {
       "displayName": "DSH Tako",
@@ -30,94 +30,125 @@
     },
     "codex": {
       "displayName": "Codex Desktop",
-      "version": "26.1117.41037",
+      "version": "26.1120.50957",
       "platforms": {
         "macos-arm64": {
-          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-arm64-26.1117.41037.zip",
-          "version": "26.1117.41037",
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-arm64-26.1120.50957.zip",
+          "version": "26.1120.50957",
           "installType": "zip",
           "appBundleName": "ChatGPT.app",
-          "size": 724006681
+          "size": 662370089
         },
         "macos-x64": {
-          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-x64-26.1117.41037.zip",
-          "version": "26.1117.41037",
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-x64-26.1120.50957.zip",
+          "version": "26.1120.50957",
           "installType": "zip",
           "appBundleName": "ChatGPT.app",
-          "size": 754302240
+          "size": 690152572
         },
         "windows-x64": {
           "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix",
-          "version": "26.1117.4957.0",
+          "version": "26.1120.6357.0",
           "installType": "msix",
           "packageFamilyName": "OpenAI.Codex_2p2nqsd0c76g0",
-          "size": 796523063
+          "size": 770050306
         }
       }
     },
     "claude": {
       "displayName": "Claude Desktop",
-      "version": "6.28899.6",
+      "version": "7.37095.0",
       "platforms": {
         "macos-universal": {
-          "url": "https://dl.lven.asia/apps/claude/macos-universal/6.28899.6/Claude-2f5fc59b2d1c672dd9dced86720c50f48cca0cf9.zip",
-          "version": "6.28899.6",
+          "url": "https://dl.lven.asia/apps/claude/macos-universal/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.zip",
+          "version": "7.37095.0",
           "installType": "zip",
           "appBundleName": "Claude.app",
-          "size": 404693227,
-          "sha256": "ae58c31858b41dd2a3bca78da26433f4f17c044ce3c2486128fb82a82e457f16",
-          "fallbackUrl": "https://downloads.claude.ai/releases/darwin/universal/6.28899.6/Claude-2f5fc59b2d1c672dd9dced86720c50f48cca0cf9.zip"
+          "size": 407313465,
+          "sha256": "800806556cacece6bdacbb9f3aef1849a9ed8d6fc2ee0eb2ed881a098d094eab",
+          "fallbackUrl": "https://downloads.claude.ai/releases/darwin/universal/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.zip"
         },
         "windows-x64": {
-          "url": "https://dl.lven.asia/apps/claude/windows-x64/6.28899.6/Claude-2f5fc59b2d1c672dd9dced86720c50f48cca0cf9.exe",
-          "version": "6.28899.6",
+          "url": "https://dl.lven.asia/apps/claude/windows-x64/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.exe",
+          "version": "7.37095.0",
           "installType": "exe",
           "silentArgs": [
             "--silent"
           ],
-          "size": 279363744,
-          "sha256": "8dc26a3418d84959a831255ebbfb0fbb5ddaf2d908021a9433ae46f1222a6057",
-          "fallbackUrl": "https://downloads.claude.ai/releases/win32/x64/6.28899.6/Claude-2f5fc59b2d1c672dd9dced86720c50f48cca0cf9.exe"
+          "size": 281758368,
+          "sha256": "0c2921ba4c2f5bbe14a10e91770a0833305d475c6cf3eeeaaa08d4b90e5bd768",
+          "fallbackUrl": "https://downloads.claude.ai/releases/win32/x64/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.exe"
         }
       }
     },
     "antigravity": {
       "displayName": "Google Antigravity",
-      "version": "2.34.0",
+      "version": "2.35.2",
       "platforms": {
         "macos-arm64": {
-          "url": "https://dl.lven.asia/apps/antigravity/macos-arm64/2.34.0/Antigravity.zip",
-          "version": "2.34.0",
+          "url": "https://dl.lven.asia/apps/antigravity/macos-arm64/2.35.2/Antigravity.zip",
+          "version": "2.35.2",
           "installType": "zip",
-          "sha512": "e266374246e95b1babbb980fbc9ada6ddaf7b4c1ff9a7403b5a965700e66e9b650ea0dc00a5a94e4dea0af2b747a697b9ab2ed9bb5646fe88841d0d1077c0217",
-          "size": 211599326,
+          "sha512": "f41bee8916fea818853c8e6d5b8083114ebee908ba6aff7290910ea56c01414adeeda4da76348e00c9fdf96de1b4e8313b349fb50069cc325bf13056a5aacf83",
+          "size": 216133032,
           "appBundleName": "Antigravity.app",
-          "sha256": "bb564db95b79761e66a58605ddf4d67020ede8865f902b8b7412f87bd384cc91",
-          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.34.0-5887025308631040/darwin-arm/Antigravity.zip"
+          "sha256": "748ce2894e6a2651724606a1b917e9d695a037935f2fac666939abf7fd8c5a8d",
+          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/darwin-arm/Antigravity.zip"
         },
         "macos-x64": {
-          "url": "https://dl.lven.asia/apps/antigravity/macos-x64/2.34.0/Antigravity.zip",
-          "version": "2.34.0",
+          "url": "https://dl.lven.asia/apps/antigravity/macos-x64/2.35.2/Antigravity.zip",
+          "version": "2.35.2",
           "installType": "zip",
-          "sha512": "a2fae6eecf1818d511c3a9f8d43acbd8aea42191efc1a955156682495450cb4ae32c5e6e493c908a09b9c387443dbe18eee9c47038be15b978f63f4762b78293",
-          "size": 223410052,
+          "sha512": "caa043007f7c6b620a465fbd1160df6b48eced06ca3ead51fff84fd41896d3d490d6255dd7e556e4a742df87c405325bff51e412a1fa9604f48038a91766e724",
+          "size": 224099686,
           "appBundleName": "Antigravity.app",
-          "sha256": "9c0d2d8774038f4318b0dfc824afb72afa4e34c1786659a8e40a3a3fdf2891e5",
-          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.34.0-5887025308631040/darwin-x64/Antigravity.zip"
+          "sha256": "0dc4461fa05eb4fd9dde06d51eac6411ae03dd5265424d42946e2fb400e6b94d",
+          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/darwin-x64/Antigravity.zip"
         },
         "windows-x64": {
-          "url": "https://dl.lven.asia/apps/antigravity/windows-x64/2.34.0/Antigravity-x64.exe",
-          "version": "2.34.0",
+          "url": "https://dl.lven.asia/apps/antigravity/windows-x64/2.35.2/Antigravity-x64.exe",
+          "version": "2.35.2",
           "installType": "exe",
-          "sha512": "2a430f97a29643cb1751dbe46d29379c775f5b24983e413d64d6be49b2849cb304e19c30a45f500137f75a5421ad09d82dd7d1d4ed290c1c35be3d7fe13f0a6c",
-          "size": 169817280,
+          "sha512": "4c4ad1d13d44db1b0bb8b811d0a568cce96045e1c7ac89790ba7b02abb38d086d181fa7caf258d1479a709033038b51ae66cbe64728cc77803aeba74ff09cffc",
+          "size": 170273968,
           "silentArgs": [
-            "/VERYSILENT",
-            "/NORESTART",
-            "/CLOSEAPPLICATIONS"
+            "/S"
           ],
-          "sha256": "7c34f5aecbb269a182b12f63fd8f4f7e3bb4a893f23490d99735b137a7e881bd",
-          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.34.0-5887025308631040/windows-x64/Antigravity-x64.exe"
+          "sha256": "1c66f68fa45e9ebc55aec5479617a9eeaa305ba8b16a1bee8327b8bad9d10258",
+          "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/windows-x64/Antigravity-x64.exe"
+        }
+      }
+    },
+    "workbuddy": {
+      "displayName": "WorkBuddy",
+      "version": "5.11.3",
+      "platforms": {
+        "macos-arm64": {
+          "url": "https://acc-1258344699.cos.accelerate.myqcloud.com/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.11.3.43806934-ecace0f7.dmg",
+          "fallbackUrl": "https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.11.3.43806934-ecace0f7.dmg",
+          "version": "5.11.3",
+          "installType": "dmg",
+          "sha256": "f3b99997b0aebfe22af4f8c0070b37946b9f839b51cf9510eb6a97c9e45aa639",
+          "size": 375366665,
+          "appBundleName": "WorkBuddy.app"
+        },
+        "macos-x64": {
+          "url": "https://acc-1258344699.cos.accelerate.myqcloud.com/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.11.3.43806934-ecace0f7.dmg",
+          "fallbackUrl": "https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.11.3.43806934-ecace0f7.dmg",
+          "version": "5.11.3",
+          "installType": "dmg",
+          "size": 408506969,
+          "appBundleName": "WorkBuddy.app"
+        },
+        "windows-x64": {
+          "url": "https://acc-1258344699.cos.accelerate.myqcloud.com/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-5.11.3.43806934-ecace0f7.exe",
+          "fallbackUrl": "https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-5.11.3.43806934-ecace0f7.exe",
+          "version": "5.11.3",
+          "installType": "exe",
+          "size": 459823168,
+          "silentArgs": [
+            "/S"
+          ]
         }
       }
     }

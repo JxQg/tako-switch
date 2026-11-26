@@ -113,6 +113,25 @@ sha512: akGKBoAWOxZmddrQyvSHDxmnCtaaLnz7jaBTDg+8g8vG/lytBldvIkHRPxXA+WWsm6Xq2FP+
         self.assertEqual(win["sha256"], "bc5a39a7")
         self.assertEqual(win["size"], 313575106)
 
+    def test_parse_workbuddy_download_history(self) -> None:
+        html = """
+        <a href="https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.11.2.43614525-fe9da600.dmg">old</a>
+        <a href="https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.11.3.43806934-ecace0f7.dmg">arm64</a>
+        <a href="https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.11.3.43806934-ecace0f7.dmg">x64</a>
+        <a href="https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-5.11.3.43806934-ecace0f7.exe">win</a>
+        """
+        parsed = mod.parse_workbuddy_download_history(html)
+        self.assertEqual(parsed["version"], "5.11.3")
+        arm = parsed["platforms"]["macos-arm64"]
+        self.assertEqual(arm["installType"], "dmg")
+        self.assertEqual(arm["appBundleName"], "WorkBuddy.app")
+        self.assertIn("cos.accelerate.myqcloud.com", arm["url"])
+        self.assertIn("cos.ap-guangzhou.myqcloud.com", arm["fallbackUrl"])
+        win = parsed["platforms"]["windows-x64"]
+        self.assertEqual(win["installType"], "exe")
+        self.assertEqual(win["silentArgs"], ["/S"])
+        self.assertIn("WorkBuddy-win32-x64-user-5.11.3", win["url"])
+
 
 if __name__ == "__main__":
     unittest.main()

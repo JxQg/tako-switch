@@ -27,12 +27,14 @@ jobs:
       - name: Typecheck and build frontend
         run: npm run build
 
-      - name: Validate manifest sync and release notes unit tests
+      - name: Validate manifest sync, release gates, and win-lab unit tests
         run: |
           python3 -m unittest -v scripts/test_sync_manifest.py
           python3 -m unittest -v scripts/test_mirror_to_r2.py
           python3 -m unittest -v scripts/test_sync_release_cdn.py
           python3 -m unittest -v scripts/test_extract_release_notes.py
+          python3 -m unittest -v scripts/test_manage_releases.py
+          WIN_LAB_QUIET_LOG=1 python3 -m unittest discover -s services/win-lab/tests -p 'test_*.py' -v
           python3 scripts/extract_release_notes.py --changelog CHANGELOG.md --check-package-json package.json
 
       - name: Validate manifest.json structure
@@ -41,7 +43,7 @@ jobs:
           import json
           data = json.load(open("manifest/manifest.json", encoding="utf-8"))
           assert data["schemaVersion"] == 1
-          assert set(data["apps"].keys()) == {"dsh-tako", "codex", "claude", "antigravity"}
+          assert set(data["apps"].keys()) == {"dsh-tako", "codex", "claude", "antigravity", "workbuddy"}
           print("manifest.json OK:", list(data["apps"].keys()))
           '
 

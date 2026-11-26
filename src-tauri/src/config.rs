@@ -16,6 +16,7 @@ pub const DEFAULT_MANIFEST_URL: &str =
     "https://dl.lven.asia/tako-switch/manifest.json";
 pub const DEFAULT_FALLBACK_MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/tako-dev/tako-switch/main/manifest/manifest.json";
+pub const DEFAULT_TELEMETRY_URL: &str = "https://telemetry.lven.asia";
 
 pub const DEFAULT_CLAUDE_RECOMMENDED_MODELS: &[&str] = &[
     "claude-opus-5-5",
@@ -42,6 +43,14 @@ pub const DEFAULT_ANTIGRAVITY_RECOMMENDED_MODELS: &[&str] = &[
     "swe-2",
     "gemini-3.1-flash-image",
 ];
+pub const DEFAULT_WORKBUDDY_RECOMMENDED_MODELS: &[&str] = &[
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
+    "deepseek-v4.1-flash",
+    "swe-2",
+];
 
 #[derive(Debug, Clone)]
 pub struct AppPaths {
@@ -52,6 +61,7 @@ pub struct AppPaths {
     pub claude_1p_dir: PathBuf,
     pub claude_3p_dir: PathBuf,
     pub agy_gemini_config_dir: PathBuf,
+    pub workbuddy_dir: PathBuf,
     pub launch_agents_dir: PathBuf,
     pub agy_app_override_dir: Option<PathBuf>,
     pub claude_app_override_dir: Option<PathBuf>,
@@ -83,6 +93,10 @@ impl AppPaths {
 
         let (claude_1p_dir, claude_3p_dir) = detect_claude_dirs(&home);
         let agy_gemini_config_dir = home.join(".gemini").join("config");
+        let workbuddy_dir = std::env::var_os("WORKBUDDY_CONFIG_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".workbuddy"));
         let launch_agents_dir = home.join("Library").join("LaunchAgents");
 
         Ok(Self {
@@ -93,6 +107,7 @@ impl AppPaths {
             claude_1p_dir,
             claude_3p_dir,
             agy_gemini_config_dir,
+            workbuddy_dir,
             launch_agents_dir,
             agy_app_override_dir: None,
             claude_app_override_dir: None,
@@ -109,6 +124,7 @@ impl AppPaths {
             claude_1p_dir: root.join("claude_1p"),
             claude_3p_dir: root.join("claude_3p"),
             agy_gemini_config_dir: root.join(".gemini").join("config"),
+            workbuddy_dir: root.join(".workbuddy"),
             launch_agents_dir: root.join("LaunchAgents"),
             agy_app_override_dir: None,
             claude_app_override_dir: None,
@@ -312,6 +328,7 @@ impl ClientModelFilter {
             AppId::Claude => Self::default_claude(),
             AppId::Codex => Self::default_codex(),
             AppId::Antigravity => Self::default_antigravity(),
+            AppId::WorkBuddy => Self::default_workbuddy(),
         }
     }
 
@@ -352,12 +369,23 @@ impl ClientModelFilter {
         }
     }
 
+    pub fn default_workbuddy() -> Self {
+        Self {
+            mode: ModelFilterMode::Recommended,
+            enabled_ids: DEFAULT_WORKBUDDY_RECOMMENDED_MODELS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        }
+    }
+
     pub fn recommended_ids_for(app_id: AppId) -> &'static [&'static str] {
         match app_id {
             AppId::DshTako => &[],
             AppId::Claude => DEFAULT_CLAUDE_RECOMMENDED_MODELS,
             AppId::Codex => DEFAULT_CODEX_RECOMMENDED_MODELS,
             AppId::Antigravity => DEFAULT_ANTIGRAVITY_RECOMMENDED_MODELS,
+            AppId::WorkBuddy => DEFAULT_WORKBUDDY_RECOMMENDED_MODELS,
         }
     }
 
@@ -392,6 +420,8 @@ pub struct ModelFiltersConfig {
     pub codex: ClientModelFilter,
     #[serde(default = "ClientModelFilter::default_antigravity")]
     pub antigravity: ClientModelFilter,
+    #[serde(default = "ClientModelFilter::default_workbuddy")]
+    pub workbuddy: ClientModelFilter,
 }
 
 impl Default for ModelFiltersConfig {
@@ -401,6 +431,7 @@ impl Default for ModelFiltersConfig {
             claude: ClientModelFilter::default_claude(),
             codex: ClientModelFilter::default_codex(),
             antigravity: ClientModelFilter::default_antigravity(),
+            workbuddy: ClientModelFilter::default_workbuddy(),
         }
     }
 }
@@ -412,6 +443,7 @@ impl ModelFiltersConfig {
             AppId::Claude => &self.claude,
             AppId::Codex => &self.codex,
             AppId::Antigravity => &self.antigravity,
+            AppId::WorkBuddy => &self.workbuddy,
         }
     }
 
@@ -421,6 +453,7 @@ impl ModelFiltersConfig {
             AppId::Claude => &mut self.claude,
             AppId::Codex => &mut self.codex,
             AppId::Antigravity => &mut self.antigravity,
+            AppId::WorkBuddy => &mut self.workbuddy,
         }
     }
 }
@@ -463,6 +496,8 @@ pub struct SwitchState {
     pub show_tray_balance: bool,
     #[serde(default = "default_true")]
     pub bypass_system_proxy: bool,
+    #[serde(default = "default_true")]
+    pub telemetry_enabled: bool,
     #[serde(default)]
     pub ui_density: UiDensity,
     #[serde(default)]
@@ -476,6 +511,10 @@ pub struct SwitchState {
     /// and lazily switch to Tako right before launch/restart so active sessions are never disrupted.
     #[serde(default)]
     pub explicit_official_apps: Vec<AppId>,
+    /// Apps hidden from the home overview and tray menu by the user.
+    /// Empty by default so all tools are shown unless explicitly hidden in settings.
+    #[serde(default)]
+    pub hidden_apps: Vec<AppId>,
 }
 
 impl SwitchState {
@@ -492,12 +531,32 @@ impl SwitchState {
             prefer_chinese_ui: true,
             show_tray_balance: true,
             bypass_system_proxy: true,
+            telemetry_enabled: true,
             ui_density: UiDensity::Compact,
             theme_pref: ThemePref::System,
             mcp: McpToolsConfig::with_default_dir(paths),
             model_filters: ModelFiltersConfig::default(),
             explicit_official_apps: Vec::new(),
+            hidden_apps: Vec::new(),
         }
+    }
+
+    pub fn is_app_hidden(&self, app_id: AppId) -> bool {
+        self.hidden_apps.contains(&app_id)
+    }
+
+    pub fn normalize_hidden_apps(&mut self) {
+        let mut deduped = Vec::with_capacity(self.hidden_apps.len());
+        for &id in &self.hidden_apps {
+            if !deduped.contains(&id) {
+                deduped.push(id);
+            }
+        }
+        // Never allow every desktop client to disappear simultaneously.
+        if AppId::all().iter().all(|id| deduped.contains(id)) {
+            deduped.clear();
+        }
+        self.hidden_apps = deduped;
     }
 
     pub fn is_explicit_official(&self, app_id: AppId) -> bool {
@@ -759,12 +818,14 @@ pub fn read_switch_state(paths: &AppPaths) -> SwitchState {
         state.mcp.consult_model = default.mcp.consult_model;
     }
     state.mcp.normalize();
+    state.normalize_hidden_apps();
     state
 }
 
 pub fn save_switch_state(paths: &AppPaths, state: &SwitchState) -> Result<(), String> {
     let mut normalized = state.clone();
     normalized.mcp.normalize();
+    normalized.normalize_hidden_apps();
     let bytes = serde_json::to_vec_pretty(&normalized)
         .map_err(|e| format!("序列化 switch state 失败: {e}"))?;
     write_atomic(&paths.state_path(), &bytes, true)
@@ -1220,5 +1281,30 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(paths.state_path()).unwrap()).unwrap();
         assert_eq!(val["uiDensity"], "comfortable");
         assert_eq!(val["themePref"], "dark");
+    }
+
+    #[test]
+    fn hidden_apps_defaults_empty_dedupes_and_never_hides_all_tools() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+
+        let default_state = read_switch_state(&paths);
+        assert!(default_state.hidden_apps.is_empty());
+
+        let mut updated = default_state;
+        updated.hidden_apps = vec![AppId::Codex, AppId::Codex, AppId::DshTako];
+        save_switch_state(&paths, &updated).unwrap();
+
+        let reloaded = read_switch_state(&paths);
+        assert_eq!(reloaded.hidden_apps, vec![AppId::Codex, AppId::DshTako]);
+        assert!(reloaded.is_app_hidden(AppId::Codex));
+        assert!(!reloaded.is_app_hidden(AppId::Claude));
+
+        // Manually corrupted state hiding every client resets to all visible on load/save.
+        let mut all_hidden = reloaded;
+        all_hidden.hidden_apps = AppId::all().to_vec();
+        save_switch_state(&paths, &all_hidden).unwrap();
+        let recovered = read_switch_state(&paths);
+        assert!(recovered.hidden_apps.is_empty());
     }
 }

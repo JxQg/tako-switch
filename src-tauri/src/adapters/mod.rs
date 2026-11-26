@@ -6,6 +6,7 @@ pub mod claude_i18n;
 pub mod codex;
 pub mod dsh_tako;
 pub mod i18n_packs;
+pub mod workbuddy;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_process;
 
@@ -43,6 +44,8 @@ pub enum AppId {
     Claude,
     #[serde(rename = "antigravity")]
     Antigravity,
+    #[serde(rename = "workbuddy")]
+    WorkBuddy,
 }
 
 impl AppId {
@@ -52,6 +55,7 @@ impl AppId {
             AppId::Codex,
             AppId::Claude,
             AppId::Antigravity,
+            AppId::WorkBuddy,
         ]
     }
 
@@ -61,6 +65,7 @@ impl AppId {
             AppId::Codex => "codex",
             AppId::Claude => "claude",
             AppId::Antigravity => "antigravity",
+            AppId::WorkBuddy => "workbuddy",
         }
     }
 
@@ -70,6 +75,7 @@ impl AppId {
             AppId::Codex => "Codex Desktop",
             AppId::Claude => "Claude Desktop",
             AppId::Antigravity => "Google Antigravity",
+            AppId::WorkBuddy => "WorkBuddy",
         }
     }
 
@@ -135,6 +141,7 @@ pub fn get_adapter(id: AppId) -> Box<dyn DesktopAppAdapter> {
         AppId::Codex => Box::new(codex::CodexAdapter),
         AppId::Claude => Box::new(claude::ClaudeAdapter),
         AppId::Antigravity => Box::new(antigravity::AntigravityAdapter),
+        AppId::WorkBuddy => Box::new(workbuddy::WorkBuddyAdapter),
     }
 }
 
@@ -142,7 +149,7 @@ pub fn snapshot_app(paths: &AppPaths, id: AppId) -> AppSnapshot {
     let adapter = get_adapter(id);
     let mode = adapter.read_mode(paths);
     let chinese_configured = match id {
-        AppId::DshTako => true,
+        AppId::DshTako | AppId::WorkBuddy => true,
         AppId::Codex => codex::CodexAdapter::is_chinese_configured(paths),
         AppId::Claude => claude::ClaudeAdapter::is_chinese_configured(paths),
         AppId::Antigravity => antigravity::AntigravityAdapter::is_chinese_configured(paths),

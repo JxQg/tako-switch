@@ -1,11 +1,13 @@
 pub mod adapters;
 pub mod agy_proxy;
 pub mod auth;
+pub mod client_monitor;
 pub mod config;
 pub mod extensions;
 pub mod installer;
 pub mod manifest;
 pub mod mcp_server;
+pub mod telemetry;
 
 use adapters::{
     get_adapter, snapshot_app, AppId, AppMode, AppSnapshot, DesktopAppAdapter, DiagnosticResult,
@@ -96,6 +98,7 @@ fn ui_patch_app_label(app_id: AppId) -> &'static str {
         AppId::Codex => "Codex",
         AppId::Antigravity => "Antigravity",
         AppId::DshTako => "DSH Tako",
+        AppId::WorkBuddy => "WorkBuddy",
     }
 }
 
@@ -136,9 +139,11 @@ pub struct SettingsPatch {
     pub prefer_chinese_ui: Option<bool>,
     pub show_tray_balance: Option<bool>,
     pub bypass_system_proxy: Option<bool>,
+    pub telemetry_enabled: Option<bool>,
     pub ui_density: Option<config::UiDensity>,
     pub theme_pref: Option<config::ThemePref>,
     pub mcp: Option<McpToolsConfig>,
+    pub hidden_apps: Option<Vec<AppId>>,
 }
 
 fn current_cached_account(app: &AppHandle, paths: &AppPaths) -> Option<AccountStatus> {
@@ -271,6 +276,18 @@ async fn perform_self_update_check(app: &AppHandle) -> Result<SelfUpdateCheckRes
 
     if let Ok(paths) = AppPaths::detect() {
         refresh_tray(app, &paths);
+        telemetry::track_event(
+            &paths,
+            "self_update_check",
+            "tako-switch",
+            true,
+            0,
+            serde_json::json!({
+                "available": result.available,
+                "version": result.version,
+                "source": result.source,
+            }),
+        );
     }
 
     Ok(result)
@@ -341,8 +358,21 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
     let refresh_bal = MenuItem::with_id(app, "tray:refresh-balance", "刷新余额", true, None::<&str>)
         .map_err(|e| format!("创建刷新余额菜单失败: {e}"))?;
 
+    let switch_state = read_switch_state(paths);
+    let visible_tray_apps: Vec<AppId> = {
+        let filtered: Vec<AppId> = AppId::all()
+            .iter()
+            .copied()
+            .filter(|id| !switch_state.is_app_hidden(*id))
+            .collect();
+        if filtered.is_empty() {
+            AppId::all().to_vec()
+        } else {
+            filtered
+        }
+    };
     let mut submenus = Vec::new();
-    for &app_id in AppId::all() {
+    for app_id in visible_tray_apps {
         let mode = get_adapter(app_id).read_mode(paths);
         let mark = |m: AppMode| if mode == m { "● " } else { "○ " };
         let (off_label, tako_label) = if app_id == AppId::DshTako {
@@ -536,6 +566,7 @@ fn parse_tray_mode_id(id: &str) -> Option<(AppId, AppMode)> {
         "codex" => AppId::Codex,
         "claude" => AppId::Claude,
         "antigravity" => AppId::Antigravity,
+        "workbuddy" => AppId::WorkBuddy,
         _ => return None,
     };
     let mode = match parts.next()? {
@@ -549,54 +580,59 @@ fn parse_tray_mode_id(id: &str) -> Option<(AppId, AppMode)> {
 #[tauri::command]
 async fn get_dashboard(app: AppHandle, refresh_account: bool) -> Result<DashboardPayload, String> {
     let paths = AppPaths::detect()?;
-    let account = if refresh_account {
-        let status = fetch_account_status(&paths).await;
-        update_account_and_tray(&app, &paths, status.clone(), false);
-        status
-    } else {
-        let key_opt = config::read_main_api_key(&paths);
-        let st = read_switch_state(&paths);
-        let masked = key_opt.as_deref().map(auth::mask_api_key);
-        let cached = key_opt.as_ref().and_then(|_| {
-            current_cached_account(&app, &paths).filter(|c| c.logged_in && c.masked_key == masked)
-        });
-        if let Some(c) = cached {
-            AccountStatus {
-                base_url: st.normalized_base_url(),
-                wallet_remain_usd: c.wallet_remain_usd.or_else(|| c.wallet_remain.map(quota_units_to_usd)),
-                wallet_used_usd: c.wallet_used_usd.or_else(|| c.wallet_used.map(quota_units_to_usd)),
-                ..c
-            }
+    let paths_for_local = paths.clone();
+    let local_task = tauri::async_runtime::spawn_blocking(move || {
+        (
+            read_switch_state(&paths_for_local),
+            AppId::all()
+                .iter()
+                .map(|&id| snapshot_app(&paths_for_local, id))
+                .collect(),
+            load_cached_manifest(&paths_for_local),
+            agy_proxy::is_proxy_healthy(agy_proxy::LOCAL_GATEWAY_PORT),
+        )
+    });
+
+    let account_task = async {
+        if refresh_account {
+            let status = fetch_account_status(&paths).await;
+            update_account_and_tray(&app, &paths, status.clone(), false);
+            status
         } else {
-            AccountStatus {
-                logged_in: key_opt.is_some(),
-                base_url: st.normalized_base_url(),
-                masked_key: masked,
-                user_name: None,
-                plan_name: None,
-                wallet_remain: None,
-                wallet_used: None,
-                wallet_remain_usd: None,
-                wallet_used_usd: None,
-                quota: None,
-                error: None,
+            let key_opt = config::read_main_api_key(&paths);
+            let st = read_switch_state(&paths);
+            let masked = key_opt.as_deref().map(auth::mask_api_key);
+            let cached = key_opt.as_ref().and_then(|_| {
+                current_cached_account(&app, &paths).filter(|c| c.logged_in && c.masked_key == masked)
+            });
+            if let Some(c) = cached {
+                AccountStatus {
+                    base_url: st.normalized_base_url(),
+                    wallet_remain_usd: c.wallet_remain_usd.or_else(|| c.wallet_remain.map(quota_units_to_usd)),
+                    wallet_used_usd: c.wallet_used_usd.or_else(|| c.wallet_used.map(quota_units_to_usd)),
+                    ..c
+                }
+            } else {
+                AccountStatus {
+                    logged_in: key_opt.is_some(),
+                    base_url: st.normalized_base_url(),
+                    masked_key: masked,
+                    user_name: None,
+                    plan_name: None,
+                    wallet_remain: None,
+                    wallet_used: None,
+                    wallet_remain_usd: None,
+                    wallet_used_usd: None,
+                    quota: None,
+                    error: None,
+                }
             }
         }
     };
+
+    let (account, local_res) = tokio::join!(account_task, local_task);
     let (state, apps, cached_manifest, local_gateway_healthy) =
-        tauri::async_runtime::spawn_blocking(move || {
-            (
-                read_switch_state(&paths),
-                AppId::all()
-                    .iter()
-                    .map(|&id| snapshot_app(&paths, id))
-                    .collect(),
-                load_cached_manifest(&paths),
-                agy_proxy::is_proxy_healthy(agy_proxy::LOCAL_GATEWAY_PORT),
-            )
-        })
-        .await
-        .map_err(|err| format!("读取客户端状态失败: {err}"))?;
+        local_res.map_err(|err| format!("读取客户端状态失败: {err}"))?;
 
     Ok(DashboardPayload {
         account,
@@ -666,6 +702,14 @@ pub fn apply_settings_patch_for_paths(
     let prev_name = state.normalized_gateway_name();
     let prev_subtitle = state.normalized_gateway_subtitle();
     let prev_zh = state.prefer_chinese_ui;
+    let prev_mcp_flags = (
+        state.mcp.image,
+        state.mcp.video,
+        state.mcp.audio,
+        state.mcp.search,
+        state.mcp.consult,
+        state.mcp.web_page,
+    );
     let prev_edgeone = (
         state.mcp.web_page,
         state.mcp.normalized_edgeone_api_token().map(str::to_string),
@@ -721,6 +765,9 @@ pub fn apply_settings_patch_for_paths(
     if let Some(bypass_proxy) = input.bypass_system_proxy {
         state.bypass_system_proxy = bypass_proxy;
     }
+    if let Some(telemetry_on) = input.telemetry_enabled {
+        state.telemetry_enabled = telemetry_on;
+    }
     if let Some(density) = input.ui_density {
         state.ui_density = density;
     }
@@ -731,8 +778,42 @@ pub fn apply_settings_patch_for_paths(
         mcp.normalize();
         state.mcp = mcp;
     }
+    if let Some(raw_hidden) = input.hidden_apps {
+        let mut deduped = Vec::with_capacity(raw_hidden.len());
+        for id in raw_hidden {
+            if !deduped.contains(&id) {
+                deduped.push(id);
+            }
+        }
+        if AppId::all().iter().all(|id| deduped.contains(id)) {
+            return Err("至少需要保留一个可见的桌面工具".to_string());
+        }
+        state.hidden_apps = deduped;
+    }
 
     save_switch_state(paths, &state)?;
+
+    let next_mcp_flags = (
+        state.mcp.image,
+        state.mcp.video,
+        state.mcp.audio,
+        state.mcp.search,
+        state.mcp.consult,
+        state.mcp.web_page,
+    );
+    if prev_mcp_flags != next_mcp_flags {
+        telemetry::track_event(
+            paths,
+            "mcp_toggle",
+            "tako-switch",
+            true,
+            0,
+            serde_json::json!({
+                "enabled_mcps": telemetry::enabled_mcp_names(&state),
+                "web_page": state.mcp.web_page,
+            }),
+        );
+    }
 
     let next_edgeone = (
         state.mcp.web_page,
@@ -985,7 +1066,7 @@ fn should_sync_standalone_locale(paths: &AppPaths, app_id: AppId, enable: bool) 
         return true;
     }
     match app_id {
-        AppId::DshTako => false,
+        AppId::DshTako | AppId::WorkBuddy => false,
         AppId::Codex => paths.codex_dir.exists(),
         AppId::Claude => {
             paths.claude_1p_dir.exists()
@@ -1127,7 +1208,7 @@ fn execute_ui_patch_action_for_paths(
     };
 
     if quit_for_patch && !paths.is_test {
-        let _ = get_adapter(app_id).launch_app(paths);
+        let _ = client_monitor::launch_and_monitor(paths, app_id, "ui_patch_relaunch");
     }
     res
 }
@@ -1421,7 +1502,7 @@ where
             if adapter.is_running(paths) {
                 let _ = adapter.quit_app(paths);
                 std::thread::sleep(std::time::Duration::from_millis(450));
-                let _ = adapter.launch_app(paths);
+                let _ = client_monitor::launch_and_monitor(paths, app_id, "chinese_toggle_restart");
             }
         }
     }
@@ -1500,6 +1581,7 @@ async fn patch_app_ui(
     auto_restart: bool,
 ) -> Result<AppSnapshot, String> {
     let paths = AppPaths::detect()?;
+    let started_at = std::time::Instant::now();
     let paths_clone = paths.clone();
     let app_for_emit = app.clone();
     let scope = app_id.as_str().to_string();
@@ -1577,9 +1659,45 @@ async fn patch_app_ui(
                     current_app: Some(app_id),
                 },
             );
+            telemetry::track_event(
+                &paths,
+                "ui_patch_apply",
+                app_id.as_str(),
+                true,
+                started_at.elapsed().as_millis() as u64,
+                serde_json::json!({
+                    "auto_restart": auto_restart,
+                    "patch_version": snap.ui_patch.patch_version,
+                }),
+            );
             snap
         }
         Err(err) => {
+            telemetry::track_event(
+                &paths,
+                "ui_patch_apply",
+                app_id.as_str(),
+                false,
+                started_at.elapsed().as_millis() as u64,
+                serde_json::json!({
+                    "auto_restart": auto_restart,
+                    "permission_block": err.contains("[TAKO_UI_PATCH_BLOCK]"),
+                }),
+            );
+            if !err.contains("[TAKO_UI_PATCH_BLOCK]") {
+                telemetry::report_error(
+                    &paths,
+                    telemetry::ErrorReport {
+                        source: "rust_error",
+                        category: "ui_patch",
+                        error_type: "UiPatchApplyFailed",
+                        message: &err,
+                        location: "lib.rs:patch_app_ui",
+                        stack: "",
+                        context: serde_json::json!({"app_id": app_id.as_str()}),
+                    },
+                );
+            }
             let _ = app.emit(
                 "ui-patch-progress",
                 UiPatchProgressEvent {
@@ -1606,6 +1724,7 @@ async fn restore_app_ui(
     auto_restart: bool,
 ) -> Result<AppSnapshot, String> {
     let paths = AppPaths::detect()?;
+    let started_at = std::time::Instant::now();
     let paths_clone = paths.clone();
     let app_for_emit = app.clone();
     let scope = app_id.as_str().to_string();
@@ -1666,9 +1785,42 @@ async fn restore_app_ui(
                     current_app: Some(app_id),
                 },
             );
+            telemetry::track_event(
+                &paths,
+                "ui_patch_restore",
+                app_id.as_str(),
+                true,
+                started_at.elapsed().as_millis() as u64,
+                serde_json::json!({"auto_restart": auto_restart}),
+            );
             snap
         }
         Err(err) => {
+            telemetry::track_event(
+                &paths,
+                "ui_patch_restore",
+                app_id.as_str(),
+                false,
+                started_at.elapsed().as_millis() as u64,
+                serde_json::json!({
+                    "auto_restart": auto_restart,
+                    "permission_block": err.contains("[TAKO_UI_PATCH_BLOCK]"),
+                }),
+            );
+            if !err.contains("[TAKO_UI_PATCH_BLOCK]") {
+                telemetry::report_error(
+                    &paths,
+                    telemetry::ErrorReport {
+                        source: "rust_error",
+                        category: "ui_patch",
+                        error_type: "UiPatchRestoreFailed",
+                        message: &err,
+                        location: "lib.rs:restore_app_ui",
+                        stack: "",
+                        context: serde_json::json!({"app_id": app_id.as_str()}),
+                    },
+                );
+            }
             let _ = app.emit(
                 "ui-patch-progress",
                 UiPatchProgressEvent {
@@ -1750,7 +1902,11 @@ async fn run_elevated_ui_patch_worker(
             let quit_for_patch = quit_app_and_wait_for_ui_patch(&paths_clone, app_id, true, false)?;
             let elevated_ok = try_windows_elevated_ui_patch(&paths_clone, app_id, normalized_action)?;
             if quit_for_patch && !paths_clone.is_test {
-                let _ = get_adapter(app_id).launch_app(&paths_clone);
+                let _ = client_monitor::launch_and_monitor(
+                    &paths_clone,
+                    app_id,
+                    "elevated_ui_patch_relaunch",
+                );
             }
             if !elevated_ok {
                 return Err("管理员授权被取消或执行失败".to_string());
@@ -1771,9 +1927,12 @@ async fn run_elevated_ui_patch_worker(
 }
 
 #[tauri::command]
-async fn list_plaza_models() -> Result<agy_proxy::ClientModelsResponse, String> {
+async fn list_plaza_models(
+    force_refresh: Option<bool>,
+) -> Result<agy_proxy::ClientModelsResponse, String> {
     let paths = AppPaths::detect()?;
-    agy_proxy::fetch_plaza_models_for_ui(&paths).await
+    agy_proxy::fetch_plaza_models_for_ui_with_refresh(&paths, force_refresh.unwrap_or(false))
+        .await
 }
 
 #[tauri::command]
@@ -1813,6 +1972,8 @@ async fn ensure_default_tako_mode_before_launch(
     }
     if app_id == AppId::Claude {
         let _ = crate::agy_proxy::refresh_claude_catalog_cache(paths).await;
+    } else if app_id == AppId::WorkBuddy {
+        let _ = crate::agy_proxy::refresh_workbuddy_catalog_cache(paths).await;
     }
     get_adapter(app_id).apply_mode(paths, AppMode::Tako)?;
     Ok(true)
@@ -1829,15 +1990,62 @@ async fn set_app_mode(
     let mut state = read_switch_state(&paths);
     state.set_explicit_official(app_id, mode == AppMode::Official);
     save_switch_state(&paths, &state)?;
-    if app_id == AppId::Claude && mode == AppMode::Tako {
-        let _ = crate::agy_proxy::refresh_claude_catalog_cache(&paths).await;
+    if mode == AppMode::Tako {
+        if app_id == AppId::Claude {
+            let _ = crate::agy_proxy::refresh_claude_catalog_cache(&paths).await;
+        } else if app_id == AppId::WorkBuddy {
+            let _ = crate::agy_proxy::refresh_workbuddy_catalog_cache(&paths).await;
+        }
     }
     let adapter = get_adapter(app_id);
-    adapter.apply_mode(&paths, mode)?;
+    let mode_str = match mode {
+        AppMode::Tako => "tako",
+        AppMode::Official => "official",
+    };
+    if let Err(err) = adapter.apply_mode(&paths, mode) {
+        telemetry::track_event(
+            &paths,
+            "client_switch",
+            app_id.as_str(),
+            false,
+            0,
+            serde_json::json!({
+                "mode": mode_str,
+                "auto_restart": auto_restart,
+            }),
+        );
+        telemetry::report_error(
+            &paths,
+            telemetry::ErrorReport {
+                source: "rust_error",
+                category: "switch",
+                error_type: "ClientSwitchFailed",
+                message: &err,
+                location: "lib.rs:set_app_mode",
+                stack: "",
+                context: serde_json::json!({
+                    "app_id": app_id.as_str(),
+                    "mode": mode_str,
+                }),
+            },
+        );
+        return Err(err);
+    }
+    telemetry::track_event(
+        &paths,
+        "client_switch",
+        app_id.as_str(),
+        true,
+        0,
+        serde_json::json!({
+            "mode": mode_str,
+            "auto_restart": auto_restart,
+        }),
+    );
     if auto_restart && adapter.is_running(&paths) {
         adapter.quit_app(&paths)?;
         std::thread::sleep(std::time::Duration::from_millis(450));
-        adapter.launch_app(&paths)?;
+        client_monitor::launch_and_monitor(&paths, app_id, "mode_switch_restart")?;
     }
     refresh_tray(&app, &paths);
     Ok(snapshot_app(&paths, app_id))
@@ -1854,7 +2062,7 @@ async fn restart_app(app: AppHandle, app_id: AppId) -> Result<AppSnapshot, Strin
         }
     }
     let switched = ensure_default_tako_mode_before_launch(&paths, app_id).await?;
-    get_adapter(app_id).launch_app(&paths)?;
+    client_monitor::launch_and_monitor(&paths, app_id, "restart")?;
     if switched {
         refresh_tray(&app, &paths);
     }
@@ -1883,7 +2091,7 @@ async fn launch_app(app: AppHandle, app_id: AppId) -> Result<AppSnapshot, String
     } else {
         false
     };
-    get_adapter(app_id).launch_app(&paths)?;
+    client_monitor::launch_and_monitor(&paths, app_id, "launch")?;
     if switched {
         refresh_tray(&app, &paths);
     }
@@ -1897,9 +2105,17 @@ fn diagnose_app(app_id: AppId) -> Result<DiagnosticResult, String> {
 }
 
 #[tauri::command]
-async fn list_client_models(app_id: AppId) -> Result<agy_proxy::ClientModelsResponse, String> {
+async fn list_client_models(
+    app_id: AppId,
+    force_refresh: Option<bool>,
+) -> Result<agy_proxy::ClientModelsResponse, String> {
     let paths = AppPaths::detect()?;
-    agy_proxy::fetch_client_models_for_ui(&paths, app_id).await
+    agy_proxy::fetch_client_models_for_ui_with_refresh(
+        &paths,
+        app_id,
+        force_refresh.unwrap_or(false),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -1918,6 +2134,12 @@ async fn save_client_model_filter(
     save_switch_state(&paths, &state)?;
     if app_id == AppId::Claude {
         let _ = crate::agy_proxy::refresh_claude_catalog_cache(&paths).await;
+        let adapter = get_adapter(app_id);
+        if adapter.read_mode(&paths) == AppMode::Tako {
+            adapter.apply_mode(&paths, AppMode::Tako)?;
+        }
+    } else if app_id == AppId::WorkBuddy {
+        let _ = crate::agy_proxy::refresh_workbuddy_catalog_cache(&paths).await;
         let adapter = get_adapter(app_id);
         if adapter.read_mode(&paths) == AppMode::Tako {
             adapter.apply_mode(&paths, AppMode::Tako)?;
@@ -2294,7 +2516,8 @@ async fn install_or_upgrade_app(
     }
 
     let _lk = guard.lock.lock().await;
-    let outcome = async {
+    let started_at = std::time::Instant::now();
+    let outcome: Result<InstallOutcome, String> = async {
         let paths = AppPaths::detect()?;
         let manifest = match fetch_manifest(&paths).await {
             Ok((_, m)) => m,
@@ -2320,14 +2543,85 @@ async fn install_or_upgrade_app(
     }
     .await;
 
+    if let Ok(paths) = AppPaths::detect() {
+        let total_ms = started_at.elapsed().as_millis() as u64;
+        match &outcome {
+            Ok(res) => {
+                telemetry::track_event(
+                    &paths,
+                    "client_install_done",
+                    app_id.as_str(),
+                    true,
+                    res.download_duration_ms.unwrap_or(total_ms),
+                    serde_json::json!({
+                        "route": res.download_route,
+                        "bytes": res.download_bytes,
+                        "speed_kbps": res.download_speed_kbps,
+                        "total_duration_ms": total_ms,
+                    }),
+                );
+            }
+            Err(err) if err != "已取消下载" => {
+                telemetry::track_event(
+                    &paths,
+                    "client_install_done",
+                    app_id.as_str(),
+                    false,
+                    total_ms,
+                    serde_json::json!({
+                        "error": err,
+                    }),
+                );
+                telemetry::report_error(
+                    &paths,
+                    telemetry::ErrorReport {
+                        source: "rust_error",
+                        category: "installer",
+                        error_type: "ClientInstallFailed",
+                        message: err,
+                        location: "lib.rs:install_or_upgrade_app",
+                        stack: "",
+                        context: serde_json::json!({"app_id": app_id.as_str()}),
+                    },
+                );
+            }
+            Err(_) => {}
+        }
+    }
+
     if let Ok(mut map) = guard.cancels.lock() {
         map.remove(&app_id);
     }
     outcome
 }
 
+#[tauri::command]
+fn report_frontend_error(input: telemetry::FrontendErrorInput) -> Result<(), String> {
+    if let Ok(paths) = AppPaths::detect() {
+        telemetry::report_frontend_error(&paths, input);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn submit_user_feedback(
+    input: telemetry::FeedbackSubmission,
+) -> Result<telemetry::FeedbackReceipt, String> {
+    let paths = AppPaths::detect()?;
+    telemetry::submit_feedback(&paths, input).await
+}
+
+#[tauri::command]
+async fn get_sanitized_diagnostics_preview() -> Result<serde_json::Value, String> {
+    let paths = AppPaths::detect()?;
+    tauri::async_runtime::spawn_blocking(move || telemetry::build_sanitized_diagnostics(&paths))
+        .await
+        .map_err(|e| format!("生成脱敏诊断预览失败: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    telemetry::install_panic_hook();
     let initial_cache = AppPaths::detect()
         .ok()
         .and_then(|p| read_balance_cache(&p))
@@ -2378,6 +2672,21 @@ pub fn run() {
                             st.set_explicit_official(app_id, mode == AppMode::Official);
                             let _ = save_switch_state(&paths, &st);
                             if get_adapter(app_id).apply_mode(&paths, mode).is_ok() {
+                                let mode_str = match mode {
+                                    AppMode::Tako => "tako",
+                                    AppMode::Official => "official",
+                                };
+                                telemetry::track_event(
+                                    &paths,
+                                    "client_switch",
+                                    app_id.as_str(),
+                                    true,
+                                    0,
+                                    serde_json::json!({
+                                        "mode": mode_str,
+                                        "via": "tray",
+                                    }),
+                                );
                                 refresh_tray(app, &paths);
                                 let _ = app.emit("state-changed", ());
                             }
@@ -2459,6 +2768,17 @@ pub fn run() {
                     .await;
                     run_background_ui_patch_auto_sync(&i18n_handle, false).await;
                 }
+            });
+
+            // Startup anonymous launch heartbeat (runs once shortly after boot if telemetry is enabled).
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let _ = tauri::async_runtime::spawn_blocking(|| {
+                    if let Ok(hb_paths) = AppPaths::detect() {
+                        telemetry::track_launch_heartbeat(&hb_paths);
+                    }
+                })
+                .await;
             });
 
             if let Some(win) = app.get_webview_window("main") {
@@ -2553,6 +2873,9 @@ pub fn run() {
             uninstall_plugin_entry,
             add_plugin_marketplace,
             remove_plugin_marketplace,
+            report_frontend_error,
+            submit_user_feedback,
+            get_sanitized_diagnostics_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Tako Switch");
@@ -2747,5 +3070,45 @@ mod tests {
         // Codex config was not rewritten by pure UI appearance patch
         let after_toml = std::fs::read_to_string(&codex_cfg_path).unwrap();
         assert_eq!(after_toml, raw_toml);
+    }
+
+    #[test]
+    fn hidden_apps_settings_patch_persists_deduped_and_blocks_hiding_all() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+
+        let saved = apply_settings_patch_for_paths(
+            &paths,
+            SettingsPatch {
+                hidden_apps: Some(vec![AppId::Antigravity, AppId::Antigravity, AppId::DshTako]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(saved.hidden_apps, vec![AppId::Antigravity, AppId::DshTako]);
+        assert_eq!(
+            read_switch_state(&paths).hidden_apps,
+            vec![AppId::Antigravity, AppId::DshTako]
+        );
+
+        let err = apply_settings_patch_for_paths(
+            &paths,
+            SettingsPatch {
+                hidden_apps: Some(AppId::all().to_vec()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("至少需要保留一个"));
+
+        let restored = apply_settings_patch_for_paths(
+            &paths,
+            SettingsPatch {
+                hidden_apps: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(restored.hidden_apps.is_empty());
     }
 }

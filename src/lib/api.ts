@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type AppId = "dsh-tako" | "codex" | "claude" | "antigravity";
+export type AppId = "dsh-tako" | "codex" | "claude" | "antigravity" | "workbuddy";
 export type AppMode = "official" | "tako";
 export type UiDensity = "compact" | "comfortable";
 export type ThemePref = "system" | "light" | "dark";
@@ -63,6 +63,7 @@ export interface ModelFiltersConfig {
   claude: ClientModelFilter;
   codex: ClientModelFilter;
   antigravity: ClientModelFilter;
+  workbuddy?: ClientModelFilter;
 }
 
 export interface ModelChannelPrice {
@@ -124,11 +125,13 @@ export interface SwitchState {
   preferChineseUi?: boolean;
   showTrayBalance?: boolean;
   bypassSystemProxy?: boolean;
+  telemetryEnabled?: boolean;
   uiDensity?: UiDensity;
   themePref?: ThemePref;
   mcp: McpToolsConfig;
   modelFilters?: ModelFiltersConfig;
   explicitOfficialApps?: AppId[];
+  hiddenApps?: AppId[];
 }
 
 export interface InstallInfo {
@@ -334,6 +337,10 @@ export interface InstallOutcome {
   appId: AppId;
   modeReapplied: AppMode;
   snapshot: AppSnapshot;
+  downloadRoute?: string | null;
+  downloadBytes?: number | null;
+  downloadDurationMs?: number | null;
+  downloadSpeedKbps?: number | null;
 }
 
 export interface SelfUpdateCheckResult {
@@ -361,9 +368,42 @@ export interface SettingsPatch {
   preferChineseUi?: boolean;
   showTrayBalance?: boolean;
   bypassSystemProxy?: boolean;
+  telemetryEnabled?: boolean;
   uiDensity?: UiDensity;
   themePref?: ThemePref;
   mcp?: McpToolsConfig;
+  hiddenApps?: AppId[];
+}
+
+export interface FrontendErrorInput {
+  source: "frontend_error" | "unhandled_rejection" | "tauri_invoke";
+  category?: string;
+  errorType: string;
+  message: string;
+  location?: string;
+  stack?: string;
+  context?: Record<string, unknown>;
+}
+
+export type FeedbackCategory =
+  | "bug"
+  | "install"
+  | "i18n"
+  | "mcp"
+  | "feature"
+  | "other";
+
+export interface FeedbackSubmission {
+  category: FeedbackCategory;
+  title?: string;
+  description: string;
+  contact?: string;
+  includeDiagnostics: boolean;
+}
+
+export interface FeedbackReceipt {
+  ok: boolean;
+  id: number;
 }
 
 export interface LiveDemoRequest {
@@ -660,9 +700,10 @@ export const api = {
   closeApp: (appId: AppId) => invoke<AppSnapshot>("close_app", { appId }),
   launchApp: (appId: AppId) => invoke<AppSnapshot>("launch_app", { appId }),
   diagnoseApp: (appId: AppId) => invoke<DiagnosticResult>("diagnose_app", { appId }),
-  listClientModels: (appId: AppId) =>
-    invoke<ClientModelsResponse>("list_client_models", { appId }),
-  listPlazaModels: () => invoke<ClientModelsResponse>("list_plaza_models"),
+  listClientModels: (appId: AppId, forceRefresh = false) =>
+    invoke<ClientModelsResponse>("list_client_models", { appId, forceRefresh }),
+  listPlazaModels: (forceRefresh = false) =>
+    invoke<ClientModelsResponse>("list_plaza_models", { forceRefresh }),
   saveClientModelFilter: (appId: AppId, filter: ClientModelFilter) =>
     invoke<SwitchState>("save_client_model_filter", { appId, filter }),
   checkAppUpdates: () => invoke<ManifestCheckResult>("check_app_updates"),
@@ -713,4 +754,12 @@ export const api = {
     invoke<PluginActionOutcome>("add_plugin_marketplace", { platform, source }),
   removePluginMarketplace: (platform: ExtPlatform, name: string) =>
     invoke<PluginActionOutcome>("remove_plugin_marketplace", { platform, name }),
+  reportFrontendError: (input: FrontendErrorInput) =>
+    invoke<void>("report_frontend_error", { input }).catch(() => {
+      // Telemetry error capture must never disrupt the UI.
+    }),
+  submitUserFeedback: (input: FeedbackSubmission) =>
+    invoke<FeedbackReceipt>("submit_user_feedback", { input }),
+  getSanitizedDiagnosticsPreview: () =>
+    invoke<Record<string, unknown>>("get_sanitized_diagnostics_preview"),
 };

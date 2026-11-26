@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
+import packageJson from "../../package.json";
 import {
+  ArrowUpCircle,
   ChevronDown,
   ExternalLink,
   FileText,
@@ -16,15 +18,21 @@ import {
   TAKO_RELEASES_URL,
   type AppId,
   type AppSnapshot,
+  type AppUpdateStatus,
   type DashboardPayload,
+  type InstallProgressEvent,
   type SettingsPatch,
 } from "../lib/api";
+import { AppBrandIcon } from "./BrandIcons";
 import {
   APP_DISPLAY_NAMES,
+  CLIENT_ORDER,
   SegmentedControl,
   StatusPill,
   ToggleSwitch,
   calcPercent,
+  formatVersion,
+  installStageLabel,
   type NavRoute,
   type ThemePref,
   type UiDensity,
@@ -51,7 +59,9 @@ interface GeneralSettingsPanelProps {
   checkingUpdates: boolean;
   lastCheckedAt: string | null;
   updatableApps: AppSnapshot[];
-  batchUpdatingApps: boolean;
+  updatesMap: Partial<Record<AppId, AppUpdateStatus>>;
+  installProgress: Partial<Record<AppId, InstallProgressEvent>>;
+  cancellingApp: AppId | null;
   busyApp: AppId | null;
   selfUpdateView: SelfUpdateViewState;
   mcpEnabledCount: number;
@@ -64,8 +74,10 @@ interface GeneralSettingsPanelProps {
   onSavePatch: (patch: SettingsPatch, note?: string) => Promise<void>;
   onCheckUpdates: () => void;
   onInstallSelfUpdate: () => void;
-  onBatchUpgradeApps: () => void;
+  onInstallOrUpgrade: (appId: AppId) => void;
+  onCancelInstall: (appId: AppId) => void;
   onOpenChangelog: () => void;
+  onOpenFeedback: () => void;
   onNavigate: (route: NavRoute) => void;
 }
 
@@ -93,7 +105,9 @@ export function GeneralSettingsPanel({
   checkingUpdates,
   lastCheckedAt,
   updatableApps,
-  batchUpdatingApps,
+  updatesMap,
+  installProgress,
+  cancellingApp,
   busyApp,
   selfUpdateView,
   mcpEnabledCount,
@@ -106,8 +120,10 @@ export function GeneralSettingsPanel({
   onSavePatch,
   onCheckUpdates,
   onInstallSelfUpdate,
-  onBatchUpgradeApps,
+  onInstallOrUpgrade,
+  onCancelInstall,
   onOpenChangelog,
+  onOpenFeedback,
   onNavigate,
 }: GeneralSettingsPanelProps) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -148,6 +164,31 @@ export function GeneralSettingsPanel({
     (baseUrl.trim() !== dashboard.state.baseUrl.trim() ||
       manifestUrl.trim() !== dashboard.state.manifestUrl.trim() ||
       fallbackManifestUrl.trim() !== dashboard.state.fallbackManifestUrl.trim());
+
+  const appsById = new Map((dashboard?.apps ?? []).map((app) => [app.id, app]));
+  const rawHiddenApps = dashboard?.state.hiddenApps ?? [];
+  const hiddenAppsSet = new Set<AppId>(
+    CLIENT_ORDER.every((id) => rawHiddenApps.includes(id)) ? [] : rawHiddenApps,
+  );
+  const visibleAppsCount = CLIENT_ORDER.filter((id) => !hiddenAppsSet.has(id)).length;
+
+  const handleToggleVisibleApp = (appId: AppId, nextVisible: boolean) => {
+    if (!dashboard) return;
+    const nextHidden = new Set<AppId>(hiddenAppsSet);
+    if (nextVisible) {
+      nextHidden.delete(appId);
+    } else {
+      if (visibleAppsCount <= 1) return;
+      nextHidden.add(appId);
+    }
+    const orderedHidden = CLIENT_ORDER.filter((id) => nextHidden.has(id));
+    void onSavePatch(
+      { hiddenApps: orderedHidden },
+      nextVisible
+        ? `已在首页显示 ${APP_DISPLAY_NAMES[appId]}`
+        : `已隐藏 ${APP_DISPLAY_NAMES[appId]}`,
+    );
+  };
 
   return (
     <div className="tako-page-sub flex flex-col">
@@ -283,6 +324,78 @@ export function GeneralSettingsPanel({
         )}
       </section>
 
+      {/* Desktop Tools Visibility Card */}
+      <section
+        data-testid="settings-visible-tools-card"
+        className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] overflow-hidden flex flex-col"
+      >
+        <div className="tako-panel-head border-b border-[var(--border)] flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-[13.5px] font-semibold text-[var(--text-primary)]">
+              首页与托盘显示的工具
+            </h2>
+            <p className="text-[11px] text-[var(--text-muted)] mt-0.5">
+              默认展示全部工具；可按需隐藏暂不使用的客户端，仅保留常用软件（至少保留 1 个）。
+            </p>
+          </div>
+          {hiddenAppsSet.size > 0 && (
+            <button
+              type="button"
+              data-testid="settings-show-all-apps"
+              disabled={savingSettings || !dashboard}
+              onClick={() =>
+                void onSavePatch({ hiddenApps: [] }, "已恢复显示全部桌面工具")
+              }
+              className="h-7 px-2.5 rounded-[7px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[11.5px] font-medium text-[var(--accent)] cursor-pointer disabled:opacity-50 shrink-0"
+            >
+              恢复全部显示
+            </button>
+          )}
+        </div>
+        <div className="tako-panel-body py-3 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+          {CLIENT_ORDER.map((appId) => {
+            const app = appsById.get(appId);
+            const visible = !hiddenAppsSet.has(appId);
+            const isLastVisible = visible && visibleAppsCount <= 1;
+            const statusText = app?.install.installed
+              ? app.install.version
+                ? `已安装 ${formatVersion(app.install.version)}`
+                : "已安装"
+              : "未安装";
+            return (
+              <div
+                key={appId}
+                className={`rounded-[10px] border px-3 py-2.5 flex items-center justify-between gap-3 transition-colors ${
+                  visible
+                    ? "border-[var(--border)] bg-[var(--bg-canvas)]/45"
+                    : "border-[var(--border)] bg-[var(--bg-subtle)]/40 opacity-75"
+                }`}
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <AppBrandIcon appId={appId} className="h-7 w-7 shrink-0" />
+                  <div className="min-w-0">
+                    <div className="text-[12.5px] font-medium text-[var(--text-primary)] truncate">
+                      {APP_DISPLAY_NAMES[appId]}
+                    </div>
+                    <div className="text-[11px] text-[var(--text-muted)] truncate mt-0.5">
+                      {statusText}
+                      {!visible ? " · 已隐藏" : isLastVisible ? " · 至少保留 1 项" : ""}
+                    </div>
+                  </div>
+                </div>
+                <ToggleSwitch
+                  checked={visible}
+                  disabled={savingSettings || !dashboard || isLastVisible}
+                  ariaLabel={`显示 ${APP_DISPLAY_NAMES[appId]}`}
+                  data-testid={`settings-visible-app-${appId}`}
+                  onChange={(next) => handleToggleVisibleApp(appId, next)}
+                />
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
       {/* Two-Column Global Cards (stacks cleanly on narrow windows) */}
       <div className="grid grid-cols-1 min-[700px]:grid-cols-2 gap-[var(--density-section-gap)]">
         {/* Card 1: Gateway & Network */}
@@ -412,7 +525,7 @@ export function GeneralSettingsPanel({
                 <div className="min-w-0">
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <span className="text-[12.5px] font-medium text-[var(--text-primary)]">
-                      Tako Switch v{dashboard?.appVersion ?? "2.2.7"}
+                      Tako Switch v{dashboard?.appVersion ?? packageJson.version}
                     </span>
                     <button
                       type="button"
@@ -473,28 +586,76 @@ export function GeneralSettingsPanel({
               )}
             </div>
 
-            <div className="tako-setting-row flex items-center justify-between gap-2">
-              <div className="min-w-0">
-                <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
-                  桌面客户端集中更新
+            <div className="tako-setting-row flex flex-col gap-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
+                    桌面客户端按需更新
+                  </div>
+                  <div className="text-[11px] text-[var(--text-muted)] mt-0.5">
+                    {updatableApps.length > 0
+                      ? "仅单独更新需要的客户端，也可在首页各工具行直接点击更新。"
+                      : "已显示的客户端均为当前受控版本"}
+                  </div>
                 </div>
-                <div className="text-[11px] text-[var(--text-muted)] truncate mt-0.5">
-                  {updatableApps.length > 0
-                    ? `${updatableApps.map((a) => APP_DISPLAY_NAMES[a.id]).join(" · ")} 可升级`
-                    : "已安装客户端均为最新版本"}
-                </div>
+                {updatableApps.length === 0 && <StatusPill tone="ok">最新</StatusPill>}
               </div>
-              {updatableApps.length > 0 ? (
-                <button
-                  type="button"
-                  disabled={batchUpdatingApps || busyApp !== null}
-                  onClick={onBatchUpgradeApps}
-                  className="h-7 px-2.5 rounded-[7px] bg-[var(--accent-soft)] text-[var(--accent)] text-[11.5px] font-semibold cursor-pointer disabled:opacity-50 shrink-0"
-                >
-                  {batchUpdatingApps ? "更新中..." : `全部更新 (${updatableApps.length})`}
-                </button>
-              ) : (
-                <StatusPill tone="ok">最新</StatusPill>
+
+              {updatableApps.length > 0 && (
+                <div className="flex flex-col gap-1.5 pt-0.5">
+                  {updatableApps.map((app) => {
+                    const upd = updatesMap[app.id];
+                    const prog = installProgress[app.id];
+                    return (
+                      <div
+                        key={app.id}
+                        className="rounded-[8px] border border-[var(--border)] bg-[var(--bg-canvas)]/55 px-2.5 py-1.5 flex items-center justify-between gap-2"
+                      >
+                        <div className="min-w-0">
+                          <div className="text-[12px] font-medium text-[var(--text-primary)] truncate">
+                            {APP_DISPLAY_NAMES[app.id]}
+                          </div>
+                          <div className="text-[10.5px] text-[var(--text-muted)] tabular-nums truncate">
+                            {app.install.version ? formatVersion(app.install.version) : "当前版本"} →{" "}
+                            {upd?.remoteVersion ? formatVersion(upd.remoteVersion) : "新版"}
+                          </div>
+                        </div>
+                        {prog ? (
+                          prog.stage === "downloading" ? (
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <span className="text-[11px] font-medium text-[var(--accent)] tabular-nums">
+                                {Math.round(prog.percent)}%
+                              </span>
+                              <button
+                                type="button"
+                                disabled={cancellingApp === app.id}
+                                onClick={() => onCancelInstall(app.id)}
+                                className="h-6 px-2 rounded-[6px] border border-[var(--border)] bg-[var(--bg-card)] text-[10.5px] text-[var(--text-secondary)] hover:text-[var(--danger)] cursor-pointer disabled:opacity-50"
+                              >
+                                {cancellingApp === app.id ? "..." : "取消"}
+                              </button>
+                            </div>
+                          ) : (
+                            <span className="text-[11px] font-medium text-[var(--accent)] tabular-nums shrink-0">
+                              {installStageLabel(prog.stage)} {Math.round(prog.percent)}%
+                            </span>
+                          )
+                        ) : (
+                          <button
+                            type="button"
+                            data-testid={`settings-upgrade-${app.id}`}
+                            disabled={busyApp !== null}
+                            onClick={() => onInstallOrUpgrade(app.id)}
+                            className="h-7 px-2.5 rounded-[7px] bg-[var(--accent-soft)] hover:bg-[var(--accent-border)] text-[var(--accent)] border border-[var(--accent-border)] text-[11.5px] font-medium inline-flex items-center gap-1 cursor-pointer disabled:opacity-50 shrink-0"
+                          >
+                            <ArrowUpCircle className="h-3 w-3 shrink-0" />
+                            <span>更新</span>
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
               )}
             </div>
           </div>
@@ -576,6 +737,28 @@ export function GeneralSettingsPanel({
                   void onSavePatch(
                     { preferChineseUi: next },
                     next ? "已开启客户端简体中文偏好" : "已关闭客户端简体中文偏好",
+                  )
+                }
+              />
+            </div>
+
+            <div className="tako-setting-row flex items-center justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="text-[12.5px] font-medium text-[var(--text-primary)]">
+                  匿名使用诊断与故障上报
+                </div>
+                <div className="text-[11px] text-[var(--text-muted)] mt-0.5 leading-snug">
+                  上报安装成功率、下载线路速度与脱敏崩溃日志，不含对话、API Key 或账号原文。
+                </div>
+              </div>
+              <ToggleSwitch
+                checked={dashboard?.state.telemetryEnabled ?? true}
+                disabled={savingSettings || !dashboard}
+                ariaLabel="匿名使用诊断与故障上报"
+                onChange={(next) =>
+                  void onSavePatch(
+                    { telemetryEnabled: next },
+                    next ? "已开启匿名诊断与故障上报" : "已关闭匿名诊断与故障上报",
                   )
                 }
               />
@@ -712,11 +895,19 @@ export function GeneralSettingsPanel({
               <div className="flex items-center gap-4 text-[12px]">
                 <button
                   type="button"
+                  onClick={onOpenFeedback}
+                  className="inline-flex items-center gap-1.5 text-[var(--accent)] hover:underline font-medium cursor-pointer"
+                >
+                  <MessageSquare className="h-3.5 w-3.5" />
+                  <span>应用内问题反馈</span>
+                </button>
+                <button
+                  type="button"
                   onClick={() => void api.openUrl(TAKO_FEEDBACK_URL)}
                   className="inline-flex items-center gap-1.5 text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
                 >
-                  <MessageSquare className="h-3.5 w-3.5" />
-                  <span>GitHub 问题反馈</span>
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  <span>GitHub Issues</span>
                 </button>
                 <button
                   type="button"

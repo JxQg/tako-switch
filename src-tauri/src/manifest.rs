@@ -69,13 +69,47 @@ pub struct ManifestCheckResult {
     pub updates: Vec<AppUpdateStatus>,
 }
 
+const BUNDLED_MANIFEST_RAW: &str = include_str!("../../manifest/manifest.json");
+
+pub fn bundled_manifest() -> Option<Manifest> {
+    serde_json::from_str::<Manifest>(BUNDLED_MANIFEST_RAW).ok()
+}
+
+/// Fills in any apps or platform entries present in the binary's bundled manifest
+/// that are missing from a remote/cached manifest (e.g., when a new client like
+/// WorkBuddy is shipped before the remote CDN manifest is refreshed), without
+/// ever downgrading or overwriting entries already provided by the remote feed.
+pub fn merge_with_bundled_fallback(mut manifest: Manifest) -> Manifest {
+    let Some(bundled) = bundled_manifest() else {
+        return manifest;
+    };
+    for (app_id, bundled_entry) in bundled.apps {
+        match manifest.apps.get_mut(&app_id) {
+            None => {
+                manifest.apps.insert(app_id, bundled_entry);
+            }
+            Some(existing) => {
+                for (plat, art) in bundled_entry.platforms {
+                    existing.platforms.entry(plat).or_insert(art);
+                }
+            }
+        }
+    }
+    manifest
+}
+
 pub fn manifest_cache_path(paths: &AppPaths) -> PathBuf {
     paths.switch_dir().join("manifest-cache.json")
 }
 
 pub fn load_cached_manifest(paths: &AppPaths) -> Option<Manifest> {
-    let raw = fs::read_to_string(manifest_cache_path(paths)).ok()?;
-    serde_json::from_str(&raw).ok()
+    let cached = fs::read_to_string(manifest_cache_path(paths))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Manifest>(&raw).ok());
+    match cached {
+        Some(m) => Some(merge_with_bundled_fallback(m)),
+        None => bundled_manifest(),
+    }
 }
 
 pub fn host_platform_keys() -> &'static [&'static str] {
@@ -238,10 +272,11 @@ pub async fn fetch_manifest(paths: &AppPaths) -> Result<(String, Manifest), Stri
         match client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.json::<Manifest>().await {
                 Ok(manifest) => {
-                    if let Ok(bytes) = serde_json::to_vec_pretty(&manifest) {
+                    let merged = merge_with_bundled_fallback(manifest);
+                    if let Ok(bytes) = serde_json::to_vec_pretty(&merged) {
                         let _ = write_atomic(&manifest_cache_path(paths), &bytes, false);
                     }
-                    return Ok((url, manifest));
+                    return Ok((url, merged));
                 }
                 Err(err) => errors.push(format!("{url}: JSON 解析失败 ({err})")),
             },
@@ -250,12 +285,61 @@ pub async fn fetch_manifest(paths: &AppPaths) -> Result<(String, Manifest), Stri
         }
     }
 
+    if let Some(bundled) = bundled_manifest() {
+        return Ok(("bundled".to_string(), bundled));
+    }
+
     Err(format!("拉取软件清单失败: {}", errors.join("; ")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_fallback_fills_missing_workbuddy_without_overwriting_remote_versions() {
+        let mut remote = Manifest {
+            schema_version: 1,
+            generated_at: "2026-11-25T00:00:00Z".to_string(),
+            apps: HashMap::new(),
+        };
+        remote.apps.insert(
+            "claude".to_string(),
+            AppManifestEntry {
+                display_name: "Claude Desktop".to_string(),
+                version: "9.9.9".to_string(),
+                platforms: HashMap::from([(
+                    "macos-universal".to_string(),
+                    PlatformArtifact {
+                        url: "https://example.com/claude-9.9.9.zip".to_string(),
+                        fallback_url: None,
+                        version: Some("9.9.9".to_string()),
+                        sha256: None,
+                        sha512: None,
+                        size: Some(123),
+                        install_type: "zip".to_string(),
+                        app_bundle_name: Some("Claude.app".to_string()),
+                        silent_args: None,
+                        package_family_name: None,
+                    },
+                )]),
+            },
+        );
+
+        let merged = merge_with_bundled_fallback(remote);
+        assert!(merged.apps.contains_key("workbuddy"));
+        let wb_platforms = &merged.apps["workbuddy"].platforms;
+        assert!(wb_platforms.contains_key("macos-arm64"));
+        assert!(wb_platforms.contains_key("macos-x64"));
+        assert!(wb_platforms.contains_key("windows-x64"));
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        assert!(resolve_platform_artifact(&merged, AppId::WorkBuddy).is_some());
+        assert_eq!(merged.apps["claude"].version, "9.9.9");
+        assert_eq!(
+            merged.apps["claude"].platforms["macos-universal"].url,
+            "https://example.com/claude-9.9.9.zip"
+        );
+    }
 
     #[test]
     fn compares_semver_and_calver_formats() {

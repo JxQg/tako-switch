@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { AlertCircle, ExternalLink, FileText, Globe, MessageSquare, X } from "lucide-react";
+import packageJson from "../package.json";
 import {
   api,
   parseUiPatchBlockError,
-  TAKO_FEEDBACK_URL,
   TAKO_RELEASES_URL,
   type AccountStatus,
   type AppId,
@@ -23,6 +23,7 @@ import {
 } from "./lib/api";
 import { CHANGELOG_RELEASES, parseReleaseNotesLines } from "./lib/changelog";
 import { ClientSettingsPanel } from "./components/ClientSettingsPanel";
+import { FeedbackModal } from "./components/FeedbackModal";
 import { GeneralSettingsPanel } from "./components/GeneralSettingsPanel";
 import { ExtensionsHubPanel } from "./components/ExtensionsHubPanel";
 import type { ExtensionNavigationGuard } from "./components/extensions/ExtensionPrimitives";
@@ -103,7 +104,6 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [busyApp, setBusyApp] = useState<AppId | null>(null);
-  const [batchUpdatingApps, setBatchUpdatingApps] = useState(false);
   const [cancellingApp, setCancellingApp] = useState<AppId | null>(null);
   const [fixingGateway, setFixingGateway] = useState(false);
   const [savingMcp, setSavingMcp] = useState(false);
@@ -133,6 +133,7 @@ export default function App() {
   const [showKeyModal, setShowKeyModal] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [showChangelogModal, setShowChangelogModal] = useState(false);
+  const [showFeedbackModal, setShowFeedbackModal] = useState(false);
   const [mcpInitialTab, setMcpInitialTab] = useState<McpToolKey | null>(null);
   const [extensionTab, setExtensionTab] = useState<ExtensionTab>("mcp");
   const [extensionsSummary, setExtensionsSummary] = useState<ExtensionsSummary | null>(null);
@@ -421,8 +422,11 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
 
-    void loadDashboard(true).then((data) => {
+    void loadDashboard(false).then((data) => {
       if (disposed || !data) return;
+      if (data.account.loggedIn) {
+        void loadDashboard(true);
+      }
       if (!initialChinesePromptCheckedRef.current) {
         initialChinesePromptCheckedRef.current = true;
         const unpatchedIds = data.apps
@@ -897,23 +901,33 @@ export default function App() {
     }
   };
 
+  const hiddenAppsSet = useMemo(() => {
+    const raw = dashboard?.state.hiddenApps ?? [];
+    const set = new Set<AppId>(raw);
+    if (dashboard && dashboard.apps.length > 0 && dashboard.apps.every((a) => set.has(a.id))) {
+      return new Set<AppId>();
+    }
+    return set;
+  }, [dashboard]);
+
   const updatableApps = useMemo(() => {
     if (!dashboard) return [];
-    return dashboard.apps.filter((app) => Boolean(updatesMap[app.id]?.hasUpdate));
-  }, [dashboard, updatesMap]);
+    return dashboard.apps.filter(
+      (app) => !hiddenAppsSet.has(app.id) && Boolean(updatesMap[app.id]?.hasUpdate),
+    );
+  }, [dashboard, hiddenAppsSet, updatesMap]);
 
-  const handleBatchUpgradeApps = async () => {
-    if (batchUpdatingApps || busyApp !== null || updatableApps.length === 0) return;
-    setBatchUpdatingApps(true);
-    try {
-      for (const app of updatableApps) {
-        const ok = await handleInstallOrUpgrade(app.id);
-        if (!ok) break;
-      }
-    } finally {
-      setBatchUpdatingApps(false);
+  useEffect(() => {
+    if (
+      activeRoute !== "overview" &&
+      activeRoute !== "general" &&
+      activeRoute !== "mcp" &&
+      activeRoute !== "extensions" &&
+      hiddenAppsSet.has(activeRoute)
+    ) {
+      setActiveRoute("overview");
     }
-  };
+  }, [activeRoute, hiddenAppsSet]);
 
   const handleRediagnose = async (appId: AppId) => {
     try {
@@ -1011,7 +1025,11 @@ export default function App() {
           Boolean(a.uiPatch.updateAvailable)),
     );
     const anyInstalledMissingZh = dashboard.apps.some(
-      (a) => a.id !== "dsh-tako" && a.install.installed && !a.chineseConfigured,
+      (a) =>
+        a.id !== "dsh-tako" &&
+        a.id !== "workbuddy" &&
+        a.install.installed &&
+        !a.chineseConfigured,
     );
     const nextEnable =
       currentEnabled && (needsUiPatch || anyInstalledMissingZh) ? true : !currentEnabled;
@@ -1331,7 +1349,7 @@ export default function App() {
         scrolled={headerScrolled}
         windowFocused={nativeWindow.isFocused}
         isMaximized={nativeWindow.isMaximized}
-        appVersion={dashboard?.appVersion ?? "2.2.7"}
+        appVersion={dashboard?.appVersion ?? packageJson.version}
         activeRoute={activeRoute}
         account={dashboard?.account}
         isDark={isDark}
@@ -1399,8 +1417,6 @@ export default function App() {
             updatesMap={updatesMap}
             installProgress={installProgress}
             needsRestart={needsRestart}
-            updatableApps={updatableApps}
-            batchUpdatingApps={batchUpdatingApps}
             busyApp={busyApp}
             cancellingApp={cancellingApp}
             togglingChineseUi={togglingChineseUi}
@@ -1434,7 +1450,6 @@ export default function App() {
             onToggleCoreMcp={(key) => void handleToggleMcpTool(key)}
             onToggleWebPageMcp={(next) => void handleToggleWebPage(next)}
             onOpenModelSquare={() => setModelModalApp("dsh-tako")}
-            onBatchUpgradeApps={() => void handleBatchUpgradeApps()}
             onInstallSelfUpdate={() => void handleInstallSelfUpdate()}
             onOpenChangelog={() => setShowChangelogModal(true)}
           />
@@ -1454,7 +1469,9 @@ export default function App() {
             checkingUpdates={checkingUpdates}
             lastCheckedAt={lastCheckedAt}
             updatableApps={updatableApps}
-            batchUpdatingApps={batchUpdatingApps}
+            updatesMap={updatesMap}
+            installProgress={installProgress}
+            cancellingApp={cancellingApp}
             busyApp={busyApp}
             selfUpdateView={{
               status: selfUpdateStatus,
@@ -1473,8 +1490,10 @@ export default function App() {
             onSavePatch={handleSaveSettingsPatch}
             onCheckUpdates={() => void runUpdateChecks(false)}
             onInstallSelfUpdate={() => void handleInstallSelfUpdate()}
-            onBatchUpgradeApps={() => void handleBatchUpgradeApps()}
+            onInstallOrUpgrade={(id) => void handleInstallOrUpgrade(id)}
+            onCancelInstall={(id) => void handleCancelAppInstall(id)}
             onOpenChangelog={() => setShowChangelogModal(true)}
+            onOpenFeedback={() => setShowFeedbackModal(true)}
             onNavigate={navigate}
           />
         )}
@@ -1606,7 +1625,7 @@ export default function App() {
           <span className="h-3 w-px bg-[var(--border)]" />
           <button
             type="button"
-            onClick={() => void api.openUrl(TAKO_FEEDBACK_URL)}
+            onClick={() => setShowFeedbackModal(true)}
             className="inline-flex items-center gap-1 text-[var(--text-muted)] hover:text-[var(--text-primary)] transition cursor-pointer"
           >
             <MessageSquare className="h-3 w-3" />
@@ -1932,6 +1951,12 @@ export default function App() {
             showTransientNote(`${APP_DISPLAY_NAMES[savedAppId]} 模型设置已保存`);
           }
         }}
+      />
+
+      {/* In-App Problem Feedback Modal */}
+      <FeedbackModal
+        open={showFeedbackModal}
+        onClose={() => setShowFeedbackModal(false)}
       />
     </div>
   );

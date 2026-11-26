@@ -525,6 +525,14 @@ impl DesktopAppAdapter for ClaudeAdapter {
                     Value::String(Self::tako_deployment_logo_data_uri()),
                 );
                 profile.insert("inferenceModelPricingEnabled".to_string(), Value::Bool(true));
+                // Prevent Claude Desktop from auto-updating into an unverified release
+                // (which would overwrite the Chinese UI patch and bypass version pinning)
+                // and silence 403 region errors from nonessential telemetry flushes.
+                profile.insert("disableAutoUpdates".to_string(), Value::Bool(true));
+                profile.insert(
+                    "disableNonessentialTelemetry".to_string(),
+                    Value::Bool(true),
+                );
                 profile.insert("mcpToolTimeoutSec".to_string(), serde_json::json!(300));
                 profile.insert("isLocalDevMcpEnabled".to_string(), Value::Bool(true));
                 profile.insert(
@@ -855,6 +863,14 @@ mod tests {
             Some("Tako AI Gateway")
         );
         assert_eq!(prof.get("mcpToolTimeoutSec").and_then(Value::as_u64), Some(300));
+        assert_eq!(
+            prof.get("disableAutoUpdates").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            prof.get("disableNonessentialTelemetry").and_then(Value::as_bool),
+            Some(true)
+        );
         assert_eq!(
             prof.get("isLocalDevMcpEnabled").and_then(Value::as_bool),
             Some(true)

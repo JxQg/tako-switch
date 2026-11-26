@@ -17,6 +17,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub const PATCH_MARKER_FILE: &str = "__tako_i18n_patch.json";
@@ -193,6 +194,137 @@ fn resolve_antigravity_target(paths: &AppPaths) -> TargetResolution {
         path_buf
     };
     resolve_target_from_dir(&base_dir, install.version)
+}
+
+/// Lightweight header-only Electron ASAR v1 reader for fast status inspection.
+/// Reads only the 16-byte pickle prefix and JSON directory header (typically < 1 MB)
+/// instead of loading and cloning hundreds of MB of archive payloads into memory.
+#[derive(Debug, Clone)]
+pub struct AsarHeaderIndex {
+    path: PathBuf,
+    file_len: u64,
+    data_offset: u64,
+    header: Value,
+}
+
+impl AsarHeaderIndex {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let mut file = fs::File::open(path)
+            .map_err(|e| format!("打开 ASAR 文件 {} 失败: {e}", path.display()))?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| format!("读取 ASAR 文件元数据失败: {e}"))?
+            .len();
+        if file_len < 16 {
+            return Err("ASAR 文件过短，不足 16 字节头部".to_string());
+        }
+
+        let mut prefix = [0u8; 16];
+        file.read_exact(&mut prefix)
+            .map_err(|e| format!("读取 ASAR 头部失败: {e}"))?;
+
+        let u0 = u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
+        let u1 = u32::from_le_bytes([prefix[4], prefix[5], prefix[6], prefix[7]]);
+        let strlen = u32::from_le_bytes([prefix[12], prefix[13], prefix[14], prefix[15]]) as u64;
+
+        if u0 != 4 {
+            return Err(format!("不支持的 ASAR Pickle 头部标识: {u0}"));
+        }
+        let data_offset = 8u64
+            .checked_add(u1 as u64)
+            .ok_or_else(|| "ASAR 头部长度溢出".to_string())?;
+        let json_end = 16u64
+            .checked_add(strlen)
+            .ok_or_else(|| "ASAR JSON 长度溢出".to_string())?;
+        if json_end > data_offset || data_offset > file_len {
+            return Err("ASAR 头部偏移越界或文件已截断".to_string());
+        }
+        if strlen > 64 * 1024 * 1024 {
+            return Err("ASAR 头部 JSON 体积异常过大".to_string());
+        }
+
+        let mut header_bytes = vec![0u8; strlen as usize];
+        file.read_exact(&mut header_bytes)
+            .map_err(|e| format!("读取 ASAR 头部 JSON 失败: {e}"))?;
+        let header: Value = serde_json::from_slice(&header_bytes)
+            .map_err(|e| format!("解析 ASAR 头部 JSON 失败: {e}"))?;
+        if header.get("files").and_then(Value::as_object).is_none() {
+            return Err("ASAR 头部缺少根 files 对象".to_string());
+        }
+
+        Ok(Self {
+            path: path.to_path_buf(),
+            file_len,
+            data_offset,
+            header,
+        })
+    }
+
+    fn lookup_packed_range(&self, rel_path: &str) -> Option<(u64, u64)> {
+        let norm = rel_path.trim_matches('/');
+        if norm.is_empty() {
+            return None;
+        }
+        let mut cursor = &self.header;
+        for seg in norm.split('/') {
+            if seg.is_empty() {
+                continue;
+            }
+            cursor = cursor.get("files")?.as_object()?.get(seg)?;
+        }
+        if cursor.get("files").is_some()
+            || cursor.get("unpacked").and_then(Value::as_bool) == Some(true)
+            || cursor.get("link").is_some()
+        {
+            return None;
+        }
+        let size = cursor.get("size")?.as_u64()?;
+        let offset = match cursor.get("offset")? {
+            Value::String(s) => s.parse::<u64>().ok()?,
+            Value::Number(n) => n.as_u64()?,
+            _ => return None,
+        };
+        let start = self.data_offset.checked_add(offset)?;
+        let end = start.checked_add(size)?;
+        if end > self.file_len {
+            return None;
+        }
+        Some((start, size))
+    }
+
+    pub fn has_packed_file(&self, rel_path: &str) -> bool {
+        self.lookup_packed_range(rel_path).is_some()
+    }
+
+    pub fn read_file(&self, rel_path: &str) -> Result<Option<Vec<u8>>, String> {
+        let Some((start, size)) = self.lookup_packed_range(rel_path) else {
+            return Ok(None);
+        };
+        if size > 32 * 1024 * 1024 {
+            return Err(format!("ASAR 条目 {rel_path} 体积过大 ({size} bytes)"));
+        }
+        let mut file = fs::File::open(&self.path)
+            .map_err(|e| format!("打开 ASAR 文件 {} 失败: {e}", self.path.display()))?;
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| format!("定位 ASAR 条目 {rel_path} 失败: {e}"))?;
+        let mut buf = vec![0u8; size as usize];
+        file.read_exact(&mut buf)
+            .map_err(|e| format!("读取 ASAR 条目 {rel_path} 失败: {e}"))?;
+        Ok(Some(buf))
+    }
+}
+
+/// Fast read-only backup integrity check used during dashboard status inspection.
+/// Full cryptographic SHA-256 verification still runs inside `verify_clean_backup_*`
+/// whenever a patch or restore mutation is executed.
+pub fn quick_check_clean_backup_asar(orig_path: &Path, expected_sha256: &str) -> bool {
+    if expected_sha256.trim().is_empty() || !orig_path.is_file() {
+        return false;
+    }
+    match AsarHeaderIndex::open(orig_path) {
+        Ok(idx) => !idx.has_packed_file(PATCH_MARKER_FILE),
+        Err(_) => false,
+    }
 }
 
 /// Pure-Rust Electron ASAR v1 reader and writer with Chromium Pickle 4-byte alignment.
@@ -889,19 +1021,30 @@ fn build_preload_iife_with_dict(dict_json: &str) -> String {
       return false;
     }
 
+    function normalizeQuotes(str) {
+      return str
+        .replace(/\u2019|\u2018/g, "'")
+        .replace(/\u201c|\u201d/g, '"');
+    }
+
     function lookupDict(trimmed) {
       var direct = DICT[trimmed];
       if (direct) return direct;
+      var norm = normalizeQuotes(trimmed);
+      if (norm !== trimmed && DICT[norm]) return DICT[norm];
       if (trimmed.length > 2) {
         if (trimmed.endsWith(":") && !trimmed.endsWith("://")) {
           var baseColon = trimmed.slice(0, -1).trim();
-          if (baseColon && DICT[baseColon]) return DICT[baseColon] + "：";
+          var baseColonZh = baseColon && (DICT[baseColon] || DICT[normalizeQuotes(baseColon)]);
+          if (baseColonZh) return baseColonZh + "：";
         } else if (trimmed.endsWith("...")) {
           var baseDots = trimmed.slice(0, -3).trim();
-          if (baseDots && DICT[baseDots]) return DICT[baseDots] + "...";
+          var baseDotsZh = baseDots && (DICT[baseDots] || DICT[normalizeQuotes(baseDots)]);
+          if (baseDotsZh) return baseDotsZh + "...";
         } else if (trimmed.endsWith("…")) {
           var baseEllipsis = trimmed.slice(0, -1).trim();
-          if (baseEllipsis && DICT[baseEllipsis]) return DICT[baseEllipsis] + "…";
+          var baseEllipsisZh = baseEllipsis && (DICT[baseEllipsis] || DICT[normalizeQuotes(baseEllipsis)]);
+          if (baseEllipsisZh) return baseEllipsisZh + "…";
         }
       }
       return null;
@@ -1031,6 +1174,125 @@ fn build_preload_iife_with_dict(dict_json: &str) -> String {
       }],
       [/^Could\s+not\s+clear\s+site\s+data\s+for\s+([^\n]{1,80})$/i, function (m) {
         return "无法清除 " + m[1].trim() + " 的站点数据";
+      }],
+      // Antigravity 2.35+ settings, permissions, quota, schedule & status templates
+      [/^Inherits\s+your\s+Global\s+Permissions\s+when\s+working\s+([^\n]{1,80}?)\.?$/i, function (m) {
+        var rawPlace = m[1].trim();
+        var lower = rawPlace.toLowerCase();
+        if (lower === "on this computer") return "在本机工作时继承你的全局权限。";
+        if (lower === "remotely") return "在远程环境工作时继承你的全局权限。";
+        if (lower === "in this project") return "在此项目中工作时继承你的全局权限。";
+        if (lower === "in this workspace") return "在此工作区中工作时继承你的全局权限。";
+        if (lower === "in this conversation") return "在此对话中工作时继承你的全局权限。";
+        if (lower === "outside of projects") return "在项目之外工作时继承你的全局权限。";
+        var place = translateShortNoun(rawPlace);
+        return "在 " + place + " 工作时继承你的全局权限。";
+      }],
+      [/^Your\s+plan:\s*([^\n]{1,60})$/i, function (m) {
+        return "当前套餐：" + translateShortNoun(m[1].trim());
+      }],
+      [/^Available\s+AI\s+credits:\s*([^\n]{1,40})$/i, function (m) {
+        return "可用 AI 积分：" + m[1].trim();
+      }],
+      [/^Your\s+quota\s+for\s+([^\n]{1,80})\s+has\s+been\s+reached\.\s*Switch\s+to\s+another\s+available\s+model\s+to\s+continue\.$/i, function (m) {
+        return "你在 " + m[1].trim() + " 上的额度已用完，请切换到其他可用模型继续。";
+      }],
+      [/^Your\s+quota\s+for\s+([^\n]{1,80})\s+will\s+reset\s+on\s+([^\n]{1,80})\.\s*Switch\s+to\s+another\s+available\s+model\s+to\s+continue\.$/i, function (m) {
+        return "你在 " + m[1].trim() + " 上的额度将于 " + m[2].trim() + " 重置，请切换到其他可用模型继续。";
+      }],
+      [/^Welcome\s+back,\s*([^\n]{1,48})\.\s*Where\s+should\s+we\s+pick\s+up\?$/i, function (m) {
+        return "欢迎回来，" + m[1].trim() + "。要从哪里继续？";
+      }],
+      [/^Hey\s+([^\n]{1,48}),\s*what\s+should\s+we\s+build\s+today\?$/i, function (m) {
+        return "嗨 " + m[1].trim() + "，今天想做点什么？";
+      }],
+      [/^Good\s+to\s+see\s+you,\s*([^\n]{1,48})\.\s*What's\s+next\?$/i, function (m) {
+        return "很高兴见到你，" + m[1].trim() + "。接下来做什么？";
+      }],
+      [/^Every\s+(\d+)\s+minutes(.*)$/i, function (m) {
+        return "每 " + m[1] + " 分钟" + m[2];
+      }],
+      [/^Every\s+(\d+)\s+hours(.*)$/i, function (m) {
+        return "每 " + m[1] + " 小时" + m[2];
+      }],
+      [/^Daily\s+at\s+([^\n]{1,32})$/i, function (m) {
+        return "每天 " + m[1].trim();
+      }],
+      [/^Today\s+([0-9]{1,2}:[0-9]{2}(?:\s*[AP]M)?)$/i, function (m) {
+        return "今天 " + m[1];
+      }],
+      [/^Yesterday\s+([0-9]{1,2}:[0-9]{2}(?:\s*[AP]M)?)$/i, function (m) {
+        return "昨天 " + m[1];
+      }],
+      [/^Tomorrow\s+([0-9]{1,2}:[0-9]{2}(?:\s*[AP]M)?)$/i, function (m) {
+        return "明天 " + m[1];
+      }],
+      [/^(?:Process\s+)?[Ee]xited\s+with\s+code\s+(-?\d+)\.?$/, function (m) {
+        return "进程已退出，退出码 " + m[1];
+      }],
+      [/^Message\s+queued\.\s*(\d+)\s+messages?\s+in\s+queue\.?$/i, function (m) {
+        return "消息已排队，队列中共有 " + m[1] + " 条消息。";
+      }],
+      [/^You\s+have\s+(\d+)\s+conversations?\s+in\s+progress\.\s*Updating\s+will\s+cancel\s+them\s+and\s+you'll\s+need\s+to\s+manually\s+restart\s+them\.$/i, function (m) {
+        return "当前有 " + m[1] + " 个进行中的对话，更新会取消它们且需手动重新开始。";
+      }],
+      [/^You\s+have\s+(\d+)\s+conversations?\s+in\s+progress\.\s*Updating\s+will\s+interrupt\s+them,\s*and\s+they\s+will\s+automatically\s+resume\s+once\s+the\s+update\s+completes\.$/i, function (m) {
+        return "当前有 " + m[1] + " 个进行中的对话，更新会暂时中断并在完成后自动恢复。";
+      }],
+      [/^Using\s+browser\s+\((\d+)s\)$/i, function (m) {
+        return "正在使用浏览器（" + m[1] + " 秒）";
+      }],
+      [/^Waiting\s+for\s+command\s+completion\s+\(up\s+to\s+(\d+)\s+seconds\)$/i, function (m) {
+        return "等待命令完成（最多 " + m[1] + " 秒）";
+      }],
+      [/^Model\s+unavailable,\s*retrying\s+in\s+(\d+)s(.*)$/i, function (m) {
+        return "模型暂不可用，" + m[1] + " 秒后重试" + m[2];
+      }],
+      [/^Agent\s+finished:\s*([^\n]{1,80})$/i, function (m) {
+        return "智能体已完成：" + m[1].trim();
+      }],
+      [/^Save\s+rule\s+to\s+always\s+allow\s+([^\n]{1,80})\?$/i, function (m) {
+        return "保存规则以始终允许 " + m[1].trim() + "？";
+      }],
+      [/^This\s+(project|workspace)\s+overrides\s+your\s+global\s+permission\s+settings\.$/i, function (m) {
+        return "此" + (m[1].toLowerCase() === "project" ? "项目" : "工作区") + "已覆盖你的全局权限设置。";
+      }],
+      [/^Remove\s+this\s+conversation\s+from\s+its\s+(project|workspace)\?$/i, function (m) {
+        return "确定要将此对话从所属" + (m[1].toLowerCase() === "project" ? "项目" : "工作区") + "中移除吗？";
+      }],
+      [/^System\s+default\s+\(([^\n]{1,60})\)$/i, function (m) {
+        return "系统默认（" + translateShortNoun(m[1].trim()) + "）";
+      }],
+      [/^Playback\s+speed\s+([0-9.]+)x$/i, function (m) {
+        return "播放速度 " + m[1] + "x";
+      }],
+      [/^Voice\s+speed,\s*([0-9.]+)x$/i, function (m) {
+        return "语速 " + m[1] + "x";
+      }],
+      [/^Version\s+([0-9][0-9A-Za-z._+-]{0,32})$/, function (m) {
+        return "版本 " + m[1];
+      }],
+      [/^Credentials\s+expire\s+in\s+([^\n]{1,40})\.\s*Refresh\s+credentials\s+to\s+keep\s+this\s+automation\s+running$/i, function (m) {
+        return "凭据将在 " + m[1].trim() + " 后过期，请刷新凭据以保持此自动化继续运行";
+      }],
+      [/^Sort\s+and\s+filter\s+conversations\s+\((\d+)\s+active\)$/i, function (m) {
+        return "排序与筛选对话（已启用 " + m[1] + " 项）";
+      }],
+      [/^See\s+all\s+\((\d+)\)$/i, function (m) {
+        return "查看全部（" + m[1] + "）";
+      }],
+      [/^Send\s+all\s+\((\d+)\)$/i, function (m) {
+        return "全部发送（" + m[1] + "）";
+      }],
+      [/^Show\s+(\d+)\s+More$/i, function (m) {
+        return "展开另外 " + m[1] + " 项";
+      }]
+    ];
+
+    // Rules safe to match even if an interpolated inner noun was already translated into CJK
+    var MIXED_CJK_RULES = [
+      [/^Learn\s+more\s+about\s+([^\n]{1,48})$/i, function (m) {
+        return "详细了解 " + translateShortNoun(m[1].trim());
       }]
     ];
 
@@ -1038,8 +1300,18 @@ fn build_preload_iife_with_dict(dict_json: &str) -> String {
       if (!trimmed || trimmed.length > MAX_TRIMMED_LEN) return null;
       var exact = lookupDict(trimmed);
       if (exact) return exact;
-      if (hasCjk(trimmed)) return null;
       if (looksLikeCodeOrPath(trimmed)) return null;
+      if (hasCjk(trimmed)) {
+        for (var k = 0; k < MIXED_CJK_RULES.length; k++) {
+          var mr = MIXED_CJK_RULES[k];
+          var mm = mr[0].exec(trimmed);
+          if (mm) {
+            var mout = mr[1](mm);
+            if (mout) return mout;
+          }
+        }
+        return null;
+      }
       for (var i = 0; i < DYNAMIC_RULES.length; i++) {
         var rule = DYNAMIC_RULES[i];
         var m = rule[0].exec(trimmed);
@@ -1618,6 +1890,13 @@ fn is_patchable_asar(archive: &AsarArchive) -> bool {
         || archive.get_file("dist/updater.js").is_some()
 }
 
+fn is_patchable_asar_index(index: &AsarHeaderIndex) -> bool {
+    index.has_packed_file("dist/preload.js")
+        || index.has_packed_file("dist/menu.js")
+        || index.has_packed_file("dist/tray.js")
+        || index.has_packed_file("dist/updater.js")
+}
+
 pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
     let target_patch_version = effective_ui_patch_version(paths, AppId::Antigravity);
     let target = match resolve_antigravity_target(paths) {
@@ -1650,20 +1929,8 @@ pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
     };
 
     let asar_path_str = target.asar_path.to_string_lossy().to_string();
-    let Ok(asar_bytes) = fs::read(&target.asar_path) else {
-        return UiPatchInfo {
-            status: UiPatchStatus::Unsupported,
-            patch_version: None,
-            target_patch_version: Some(target_patch_version),
-            update_available: false,
-            has_valid_backup: false,
-            target_asar_path: Some(asar_path_str),
-            note: Some("无法读取 app.asar 文件".to_string()),
-        };
-    };
-
-    let archive = match AsarArchive::parse(&asar_bytes) {
-        Ok(a) => a,
+    let index = match AsarHeaderIndex::open(&target.asar_path) {
+        Ok(idx) => idx,
         Err(err) => {
             return UiPatchInfo {
                 status: UiPatchStatus::Unsupported,
@@ -1678,8 +1945,8 @@ pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
     };
 
     let meta = read_patch_meta(paths);
-    if let Some(marker_bytes) = archive.get_file(PATCH_MARKER_FILE) {
-        let marker = serde_json::from_slice::<PatchMarkerPayload>(marker_bytes).ok();
+    if let Ok(Some(marker_bytes)) = index.read_file(PATCH_MARKER_FILE) {
+        let marker = serde_json::from_slice::<PatchMarkerPayload>(&marker_bytes).ok();
         let patch_version = marker
             .as_ref()
             .map(|m| m.patch_version.clone())
@@ -1689,7 +1956,8 @@ pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
             .map(|m| m.original_asar_sha256.as_str())
             .or_else(|| marker.as_ref().map(|m| m.original_asar_sha256.as_str()))
             .unwrap_or("");
-        let has_valid_backup = verify_clean_backup_asar(paths, expected_sha).is_ok();
+        let backup_path = ui_patch_backup_dir(paths).join("app.asar.orig");
+        let has_valid_backup = quick_check_clean_backup_asar(&backup_path, expected_sha);
         let update_available = patch_version.as_deref() != Some(target_patch_version.as_str());
         let note = if update_available {
             format!(
@@ -1710,7 +1978,7 @@ pub fn inspect_antigravity_ui_patch(paths: &AppPaths) -> UiPatchInfo {
         };
     }
 
-    if !is_patchable_asar(&archive) {
+    if !is_patchable_asar_index(&index) {
         return UiPatchInfo {
             status: UiPatchStatus::Unsupported,
             patch_version: None,
@@ -2389,6 +2657,13 @@ addItemToSubmenu(menu, 'Help', { label: 'Check for Updates...', click: (item) =>
         assert!(once.contains("\"New Conversation\": \"新建对话\""));
         assert!(once.contains("\"Create with Prompt\": \"用提示词创建\""));
         assert!(once.contains("\"No automations yet\": \"暂无自动化任务\""));
+        assert!(once.contains("\"Knowledge Work\": \"知识工作\""));
+        assert!(once.contains("\"Software Engineering\": \"软件工程\""));
+        assert!(once.contains("\"Downloading Update\": \"正在下载更新\""));
+        assert!(once.contains("\"Learn more about\": \"详细了解\""));
+        assert!(once.contains("normalizeQuotes"));
+        assert!(once.contains("MIXED_CJK_RULES"));
+        assert!(once.contains("Inherits\\s+your\\s+Global\\s+Permissions"));
         assert!(once.contains("AMBIGUOUS_SINGLE_WORDS"));
         assert!(once.contains("translateCombinedTextNodes"));
         assert!(once.contains("hasNonEmptySibling"));

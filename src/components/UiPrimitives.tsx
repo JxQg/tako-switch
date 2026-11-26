@@ -10,12 +10,19 @@ export type NavRoute = "overview" | "general" | "mcp" | "extensions" | AppId;
 export type ExtensionTab = "mcp" | "skills" | "plugins" | "prompts";
 export type { ThemePref, UiDensity };
 
-export const CLIENT_ORDER: AppId[] = ["claude", "codex", "antigravity", "dsh-tako"];
+export const CLIENT_ORDER: AppId[] = [
+  "claude",
+  "codex",
+  "antigravity",
+  "workbuddy",
+  "dsh-tako",
+];
 
 export const APP_DISPLAY_NAMES: Record<AppId, string> = {
   claude: "Claude Desktop",
   codex: "Codex",
   antigravity: "Antigravity",
+  workbuddy: "WorkBuddy",
   "dsh-tako": "DSH Tako",
 };
 
@@ -23,6 +30,7 @@ export const APP_FULL_NAMES: Record<AppId, string> = {
   claude: "Claude Desktop",
   codex: "Codex Desktop",
   antigravity: "Google Antigravity",
+  workbuddy: "WorkBuddy",
   "dsh-tako": "DSH Tako",
 };
 
@@ -30,6 +38,7 @@ export const APP_SUBTITLES: Record<AppId, string> = {
   claude: "模型、运行模式与界面简体中文，仅影响 Claude Desktop。",
   codex: "模型目录、官方登录保留与运行模式，仅影响 Codex。",
   antigravity: "32 个自定义模型槽位、专用 Key 与界面简体中文，仅影响 Antigravity。",
+  workbuddy: "国内 COS 源一键安装、Tako 自定义模型网关与 MCP 注入，仅影响 WorkBuddy。",
   "dsh-tako": "密钥同步与独立登录，仅影响 DSH Tako 原生客户端。",
 };
 

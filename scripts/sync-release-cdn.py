@@ -52,12 +52,19 @@ def iter_release_files(release_dir: Path) -> list[Path]:
     return files
 
 
-def sync_release_to_bucket(s3, *, tag: str, files: list[Path], latest_cn: Path) -> list[str]:
+def sync_release_to_bucket(
+    s3,
+    *,
+    tag: str,
+    files: list[Path],
+    latest_cn: Path,
+    binary_optional: bool = False,
+) -> list[str]:
+    """latest.json goes FIRST: the mutable 2KB pointer must land even when a cross-border
+    binary PUT dies mid-run (missing objects still serve via bucket origin-pull). Binaries
+    are idempotent — an existing object with matching size is skipped. Returns keys that
+    are now present in the bucket."""
     uploaded: list[str] = []
-    for local in files:
-        key = f"{RELEASES_PREFIX}/{tag}/{local.name}"
-        s3.upload_file(local, key, cache_control=BINARY_CACHE_CONTROL)
-        uploaded.append(key)
     s3.upload_file(
         latest_cn,
         LATEST_JSON_KEY,
@@ -65,6 +72,22 @@ def sync_release_to_bucket(s3, *, tag: str, files: list[Path], latest_cn: Path) 
         content_type=LATEST_CONTENT_TYPE,
     )
     uploaded.append(LATEST_JSON_KEY)
+    for local in files:
+        key = f"{RELEASES_PREFIX}/{tag}/{local.name}"
+        local_size = local.stat().st_size
+        head = s3.head_object(key)
+        if head is not None and head.get("ContentLength") == local_size:
+            print(f"  [skip] {key} already present ({local_size} bytes)")
+            uploaded.append(key)
+            continue
+        try:
+            s3.upload_file(local, key, cache_control=BINARY_CACHE_CONTROL)
+        except Exception as exc:
+            if not binary_optional:
+                raise
+            print(f"[warn] binary upload failed for {key}: {exc}", file=sys.stderr)
+            continue
+        uploaded.append(key)
     return uploaded
 
 
@@ -184,8 +207,15 @@ def main(argv: list[str] | None = None) -> int:
 
     for name, s3 in targets:
         print(f"=== [{name}] uploading {len(files)} release files for {args.tag} to s3://{s3.bucket}")
-        for key in sync_release_to_bucket(s3, tag=args.tag, files=files, latest_cn=latest_cn):
-            print(f"  [{name}] uploaded {key}")
+        synced = sync_release_to_bucket(
+            s3,
+            tag=args.tag,
+            files=files,
+            latest_cn=latest_cn,
+            binary_optional=(name == "dogecloud"),
+        )
+        for key in synced:
+            print(f"  [{name}] synced {key}")
 
     if args.verify:
         urls = verify_platform_urls(latest_cn, retries=args.verify_retries, delay=args.verify_delay)

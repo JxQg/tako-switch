@@ -1,0 +1,41 @@
+{
+  "appId": "codex",
+  "capturedAt": "2026-11-25T12:58:08Z",
+  "profile": {
+    "bundleName": "ChatGPT.app",
+    "bundleId": "com.openai.codex",
+    "shortVersion": "26.1117.41037",
+    "bundleVersion": "29803",
+    "minSystemVersion": "13.0",
+    "urlSchemes": [
+      "codex",
+      "http",
+      "https"
+    ],
+    "usageDescriptions": [
+      "NSAppleEventsUsageDescription",
+      "NSAudioCaptureUsageDescription",
+      "NSCalendarsFullAccessUsageDescription",
+      "NSCalendarsUsageDescription",
+      "NSCameraUsageDescription",
+      "NSDesktopFolderUsageDescription",
+      "NSLocationUsageDescription",
+      "NSMicrophoneUsageDescription",
+      "NSRemindersFullAccessUsageDescription",
+      "NSRemindersUsageDescription"
+    ],
+    "executables": [
+      "ChatGPT"
+    ],
+    "helpers": [],
+    "loginItems": [],
+    "electronAsarIntegrityKeys": [
+      "Resources/app.asar"
+    ]
+  },
+  "extraAudit": {
+    "owlAppIni": "[Owl]\nUserDataDirectoryName=Codex\nAppVersion=26.1117.41037",
+    "codexCliVersion": "0.171.0-alpha.13",
+    "masqueProxyOrigins": "https://codex-portals.api.openai.com"
+  }
+}

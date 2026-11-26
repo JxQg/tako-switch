@@ -1,16 +1,27 @@
-name: Sync App Manifest
+name: Managed Desktop Release Pipeline
 
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    # Twice daily candidate inspection ONLY — NEVER auto-pushes manifest/manifest.json.
+    - cron: "0 2,14 * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "check-candidates (read-only changelog report) | mirror-pinned (mirror approved pinned-versions.json)"
+        required: true
+        default: "check-candidates"
+        type: choice
+        options:
+          - check-candidates
+          - mirror-pinned
 
 permissions:
   contents: write
 
 jobs:
-  sync:
-    name: Refresh manifest/manifest.json
+  check-candidates:
+    name: Inspect Upstream Candidates & Changelogs (Read-Only)
+    if: github.event_name == 'schedule' || inputs.mode == 'check-candidates'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,12 +30,42 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Fetch latest official upstream releases
+      - name: Check upstream releases and analyze changelogs
+        run: |
+          python3 scripts/manage-releases.py check \
+            --pinned manifest/pinned-versions.json \
+            --out-json /tmp/upstream-candidates.json \
+            --out-md /tmp/upstream-candidates.md
+          cat /tmp/upstream-candidates.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload candidate changelog report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-candidates-report
+          path: |
+            /tmp/upstream-candidates.json
+            /tmp/upstream-candidates.md
+          retention-days: 14
+
+  mirror-pinned:
+    name: Mirror Approved Pinned Versions & Companion Binaries
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'mirror-pinned'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Render manifest/manifest.json from manifest/pinned-versions.json
         run: |
           cp manifest/manifest.json /tmp/prev-manifest.json
-          python3 scripts/sync-manifest.py --out manifest/manifest.json
+          python3 scripts/manage-releases.py render-manifest \
+            --pinned manifest/pinned-versions.json \
+            --out manifest/manifest.json
 
-      - name: Mirror installers to China OSS / R2 and rewrite manifest mirror URLs (optional)
+      - name: Mirror approved installers and companion binaries (e.g. claude-code) to China OSS / R2
         env:
           DOGE_ACCESS_KEY: ${{ secrets.DOGE_ACCESS_KEY }}
           DOGE_SECRET_KEY: ${{ secrets.DOGE_SECRET_KEY }}
@@ -37,18 +78,21 @@ jobs:
           MIRROR_APPS_BASE: ${{ vars.MIRROR_APPS_BASE }}
           MIRROR_APPS: ${{ vars.MIRROR_APPS }}
         run: |
-          python3 scripts/mirror-to-r2.py --manifest manifest/manifest.json --prev-manifest /tmp/prev-manifest.json
+          python3 scripts/mirror-to-r2.py \
+            --manifest manifest/manifest.json \
+            --pinned manifest/pinned-versions.json \
+            --prev-manifest /tmp/prev-manifest.json
 
       - name: Commit updated manifest if changed
         run: |
           if git diff --quiet manifest/manifest.json; then
-            echo "No upstream changes detected."
+            echo "No manifest changes after mirroring pinned versions."
             exit 0
           fi
           git config user.name "tako-bot"
           git config user.email "bot@shiroha.tech"
           git add manifest/manifest.json
-          git commit -m "chore(manifest): sync desktop app versions [skip ci]"
+          git commit -m "chore(manifest): mirror approved pinned versions [skip ci]"
           git push
 
       - name: Sync manifest.json to China mirror bucket (optional)

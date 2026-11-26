@@ -180,7 +180,9 @@ export function ClientSettingsPanel({
         ? dashboard.state.modelFilters?.codex
         : app.id === "antigravity"
           ? dashboard.state.modelFilters?.antigravity
-          : undefined;
+          : app.id === "workbuddy"
+            ? dashboard.state.modelFilters?.workbuddy
+            : undefined;
 
   const modeOptions: { id: AppMode; label: string }[] = isDsh
     ? [
@@ -206,7 +208,9 @@ export function ClientSettingsPanel({
         ? "Tako 接管时自动配置本地网关；可按需保留官方 ChatGPT 登录。"
         : app.id === "antigravity"
           ? "模型按你的选择过滤后映射到 32 个自定义槽位，自动同步本地网关。"
-          : "同步模式自动写入当前 Tako 账号密钥；独立模式保留应用内独立登录。";
+          : app.id === "workbuddy"
+            ? "自动将 Tako 网关模型写入 ~/.workbuddy/models.json（保留你原有的自定义模型与官方连接器），在 WorkBuddy 模型选择器「自定义模型」分组中即可选用。"
+            : "同步模式自动写入当前 Tako 账号密钥；独立模式保留应用内独立登录。";
 
   const patchInfo = getUiPatchPresentation(app);
   const artifactSize = formatBytes(update?.artifact?.size);
@@ -512,7 +516,9 @@ export function ClientSettingsPanel({
                   {app.mode === "tako"
                     ? app.id === "antigravity"
                       ? "从全量目录精简勾选，确保主力模型优先占满 32 个槽位。"
-                      : "自定义该客户端在 Tako 模式下展示的模型列表。"
+                      : app.id === "workbuddy"
+                        ? "勾选的模型会自动写入 ~/.workbuddy/models.json 并实时热生效，无需重启。"
+                        : "自定义该客户端在 Tako 模式下展示的模型列表。"
                     : "切至 Tako 模式后，此处选择的模型列表将自动生效。"}
                 </p>
               </div>

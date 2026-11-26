@@ -1,0 +1,222 @@
+{
+  "schemaVersion": 1,
+  "policy": {
+    "autoFollowUpstream": false,
+    "requiredGates": [
+      "localization",
+      "injection",
+      "anomalyAudit"
+    ],
+    "notes": "所有桌面客户端版本由此锁文件统一管控。上线新版前须先拉取官方 changelog 分析，并在 macOS 隔离环境中通过三门禁验收，再由人工 promote 更新此文件并生成 manifest/manifest.json。"
+  },
+  "updatedAt": "2026-11-25T23:06:56Z",
+  "apps": {
+    "dsh-tako": {
+      "displayName": "DSH Tako",
+      "version": "0.1.59",
+      "status": "approved",
+      "approvedAt": "2026-11-25T03:14:43Z",
+      "changelogSummary": "DSH Tako 原生桌面端当前稳定版本。",
+      "gates": {
+        "localization": "pass",
+        "injection": "pass",
+        "anomalyAudit": "pass"
+      },
+      "platforms": {
+        "macos-arm64": {
+          "url": "https://dl.lven.asia/apps/dsh-tako/macos-arm64/0.1.59/DSH-Tako-0.1.59-mac-arm64.dmg",
+          "version": "0.1.59",
+          "installType": "dmg",
+          "fallbackUrl": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.59/DSH-Tako-0.1.59-mac-arm64.dmg",
+          "sha256": "4ab43649bc6113b682d4dc5202d64464a6282e9348d358fc23ef928991fe533b",
+          "size": 285926628,
+          "appBundleName": "DSH Tako.app"
+        },
+        "windows-x64": {
+          "url": "https://dl.lven.asia/apps/dsh-tako/windows-x64/0.1.59/DSH-Tako-0.1.59-win-x64.exe",
+          "version": "0.1.59",
+          "installType": "exe",
+          "fallbackUrl": "https://dsh-tako-dl.oss-cn-shanghai.aliyuncs.com/releases/v0.1.59/DSH-Tako-0.1.59-win-x64.exe",
+          "sha256": "b446ff9c0e2009fa4acef553731726610db8edbcc6908d2dc1fcc9e3683547f1",
+          "size": 329545599,
+          "silentArgs": [
+            "/S"
+          ]
+        }
+      }
+    },
+    "codex": {
+      "displayName": "Codex Desktop",
+      "version": "26.1120.50957",
+      "status": "pinned_review_windows",
+      "approvedAt": "2026-11-25T03:14:43Z",
+      "changelogSummary": "上游 2026-11-25 自动同步版本（macOS 26.1120.50957 / Windows MSIX 26.1120.6357.0）。已冻结不再自动跟进；Windows 26.1120.6357.0 收到 Win10 闪退反馈，待收集 Windows 崩溃日志复核。",
+      "gates": {
+        "localization": "pending_verify",
+        "injection": "pending_verify",
+        "anomalyAudit": "pending_verify"
+      },
+      "platforms": {
+        "macos-arm64": {
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-arm64-26.1120.50957.zip",
+          "version": "26.1120.50957",
+          "installType": "zip",
+          "appBundleName": "ChatGPT.app",
+          "size": 662370089
+        },
+        "macos-x64": {
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-darwin-x64-26.1120.50957.zip",
+          "version": "26.1120.50957",
+          "installType": "zip",
+          "appBundleName": "ChatGPT.app",
+          "size": 690152572
+        },
+        "windows-x64": {
+          "url": "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix",
+          "version": "26.1120.6357.0",
+          "installType": "msix",
+          "packageFamilyName": "OpenAI.Codex_2p2nqsd0c76g0",
+          "size": 770050306
+        }
+      }
+    },
+    "claude": {
+      "displayName": "Claude Desktop",
+      "version": "7.37095.0",
+      "status": "approved",
+      "approvedAt": "2026-11-25T03:14:43Z",
+      "changelogSummary": "Claude Desktop 7.37095.0（内嵌 Claude Code CLI 2.1.331）；已配套 Tako 本地网关 /claude-code-releases 镜像加速与 3P 禁自更新配置。",
+      "gates": {
+        "localization": "pass",
+        "injection": "pass",
+        "anomalyAudit": "pass"
+      },
+      "platforms": {
+        "macos-universal": {
+          "url": "https://dl.lven.asia/apps/claude/macos-universal/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.zip",
+          "version": "7.37095.0",
+          "installType": "zip",
+          "appBundleName": "Claude.app",
+          "size": 407313465,
+          "sha256": "800806556cacece6bdacbb9f3aef1849a9ed8d6fc2ee0eb2ed881a098d094eab",
+          "fallbackUrl": "https://downloads.claude.ai/releases/darwin/universal/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.zip"
+        },
+        "windows-x64": {
+          "url": "https://dl.lven.asia/apps/claude/windows-x64/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.exe",
+          "version": "7.37095.0",
+          "installType": "exe",
+          "silentArgs": [
+            "--silent"
+          ],
+          "size": 281758368,
+          "sha256": "0c2921ba4c2f5bbe14a10e91770a0833305d475c6cf3eeeaaa08d4b90e5bd768",
+          "fallbackUrl": "https://downloads.claude.ai/releases/win32/x64/7.37095.0/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.exe"
+        }
+      },
+      "companionArtifacts": {
+        "claude-code": {
+          "version": "2.1.331",
+          "notes": "Claude Desktop 7.37095.0 Code 模式内嵌要求的 Claude Code CLI 二进制；镜像至 dl.lven.asia/apps/claude-code/<version>/<platform>/<file> 供国内免翻墙秒下。",
+          "platforms": {
+            "win32-x64": {
+              "url": "https://downloads.claude.ai/claude-code-releases/2.1.331/win32-x64/claude.exe.zst",
+              "sha256": "8ceec14ae60c52df90923a0a8d7ffd93b43ed0b392866920aac8d561d45734c8",
+              "size": 146095455
+            },
+            "darwin-arm64": {
+              "url": "https://downloads.claude.ai/claude-code-releases/2.1.331/darwin-arm64/claude.app.tar.zst",
+              "sha256": "5cdc5c10ac5c5038e87da4cf2511b1ca38b1697cd6298b653f1ae43de57e25d4",
+              "size": 130690599
+            },
+            "darwin-x64": {
+              "url": "https://downloads.claude.ai/claude-code-releases/2.1.331/darwin-x64/claude.app.tar.zst",
+              "sha256": "5864df22ce05cb199764549973927a0a69c2d44a35e0adf349323a1d674d4aef",
+              "size": 138813330
+            }
+          }
+        }
+      }
+    },
+    "antigravity": {
+      "displayName": "Google Antigravity",
+      "version": "2.35.2",
+      "status": "approved",
+      "approvedAt": "2026-11-25T23:06:56Z",
+      "changelogSummary": "2.35.2: (updater yml 未附 releaseNotes，请通过 verify-macos 三门禁对比 app.asar 变更)",
+      "gates": {
+        "localization": "pass",
+        "injection": "pass",
+        "anomalyAudit": "pass"
+      },
+      "platforms": {
+        "macos-arm64": {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/darwin-arm/Antigravity.zip",
+          "version": "2.35.2",
+          "installType": "zip",
+          "sha512": "f41bee8916fea818853c8e6d5b8083114ebee908ba6aff7290910ea56c01414adeeda4da76348e00c9fdf96de1b4e8313b349fb50069cc325bf13056a5aacf83",
+          "size": 216133032,
+          "appBundleName": "Antigravity.app"
+        },
+        "macos-x64": {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/darwin-x64/Antigravity.zip",
+          "version": "2.35.2",
+          "installType": "zip",
+          "sha512": "caa043007f7c6b620a465fbd1160df6b48eced06ca3ead51fff84fd41896d3d490d6255dd7e556e4a742df87c405325bff51e412a1fa9604f48038a91766e724",
+          "size": 224099686,
+          "appBundleName": "Antigravity.app"
+        },
+        "windows-x64": {
+          "url": "https://storage.googleapis.com/antigravity-public/antigravity-hub/2.35.2-4585983447007232/windows-x64/Antigravity-x64.exe",
+          "version": "2.35.2",
+          "installType": "exe",
+          "sha512": "4c4ad1d13d44db1b0bb8b811d0a568cce96045e1c7ac89790ba7b02abb38d086d181fa7caf258d1479a709033038b51ae66cbe64728cc77803aeba74ff09cffc",
+          "size": 170273968,
+          "silentArgs": [
+            "/S"
+          ]
+        }
+      }
+    },
+    "workbuddy": {
+      "displayName": "WorkBuddy",
+      "version": "5.11.3",
+      "status": "approved",
+      "approvedAt": "2026-11-25T16:30:00Z",
+      "changelogSummary": "WorkBuddy 5.11.3（2026-11-15）：腾讯官方国内 COS 加速直链分发，原生简体中文，支持 ~/.workbuddy/models.json 本地自定义模型接入 Tako 网关与 ~/.workbuddy/mcp.json 超级 MCP 注入。",
+      "gates": {
+        "localization": "pass",
+        "injection": "pass",
+        "anomalyAudit": "pass"
+      },
+      "platforms": {
+        "macos-arm64": {
+          "url": "https://acc-1258344699.cos.accelerate.myqcloud.com/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.11.3.43806934-ecace0f7.dmg",
+          "fallbackUrl": "https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/darwin-arm64/WorkBuddy-darwin-arm64-5.11.3.43806934-ecace0f7.dmg",
+          "version": "5.11.3",
+          "installType": "dmg",
+          "sha256": "f3b99997b0aebfe22af4f8c0070b37946b9f839b51cf9510eb6a97c9e45aa639",
+          "size": 375366665,
+          "appBundleName": "WorkBuddy.app"
+        },
+        "macos-x64": {
+          "url": "https://acc-1258344699.cos.accelerate.myqcloud.com/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.11.3.43806934-ecace0f7.dmg",
+          "fallbackUrl": "https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/darwin-x64/WorkBuddy-darwin-x64-5.11.3.43806934-ecace0f7.dmg",
+          "version": "5.11.3",
+          "installType": "dmg",
+          "size": 408506969,
+          "appBundleName": "WorkBuddy.app"
+        },
+        "windows-x64": {
+          "url": "https://acc-1258344699.cos.accelerate.myqcloud.com/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-5.11.3.43806934-ecace0f7.exe",
+          "fallbackUrl": "https://acc-1258344699.cos.ap-guangzhou.myqcloud.com/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-5.11.3.43806934-ecace0f7.exe",
+          "version": "5.11.3",
+          "installType": "exe",
+          "size": 459823168,
+          "silentArgs": [
+            "/S"
+          ]
+        }
+      }
+    }
+  }
+}
