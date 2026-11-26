@@ -584,10 +584,133 @@ fn identifiers_and_failed_distribution_preserve_source_and_master() {
         },
     )
     .unwrap_err();
-    assert!(error.contains("目录"));
+    assert!(
+        error.contains("技能父路径不是目录"),
+        "unexpected error: {error}"
+    );
     assert!(!master(&paths, "blocked").exists());
     assert!(!target(&paths, ExtPlatform::Claude, "blocked").exists());
+    assert!(!target(&paths, ExtPlatform::Codex, "blocked").exists());
+    assert!(!target(&paths, ExtPlatform::Antigravity, "blocked").exists());
     assert!(source.join("SKILL.md").is_file());
+    let codex_skills = paths.codex_dir.join("skills");
+    assert!(codex_skills.is_file());
+    assert_eq!(fs::read(codex_skills).unwrap(), b"not a directory");
+    assert_no_staging(&paths.home);
+    assert_no_staging(&paths.codex_dir);
+    assert_no_staging(&paths.tako_dir);
+}
+
+#[test]
+fn non_directory_client_paths_allow_reads_and_cleanup_but_reject_distribution() {
+    let (_directory, paths) = sandbox();
+    let codex_skills = paths.codex_dir.join("skills");
+    let gemini = paths.home.join(".gemini");
+    seed(&paths.codex_dir, "skills", b"blocked Codex");
+    fs::write(&gemini, b"blocked Antigravity").unwrap();
+    let assert_blockers_unchanged = || {
+        assert_eq!(fs::read(&codex_skills).unwrap(), b"blocked Codex");
+        assert_eq!(fs::read(&gemini).unwrap(), b"blocked Antigravity");
+    };
+
+    let empty_summary = get_extensions_summary_for_paths(&paths).unwrap();
+    assert_eq!(empty_summary.skills_count, 0);
+    assert_eq!(empty_summary.skills_updatable_count, 0);
+    let empty_snapshot = get_skills_hub_snapshot_for_paths(&paths).unwrap();
+    assert!(empty_snapshot.skills.is_empty());
+    assert_blockers_unchanged();
+
+    let blocked_source = paths.home.join("imports/blocked");
+    skill(&blocked_source, "blocked", "Keep this source");
+    let blocked_content = fs::read(blocked_source.join("SKILL.md")).unwrap();
+    let expected_error = format!("技能父路径不是目录: {}", gemini.display());
+    let error = import_local_skill_for_paths(
+        &paths,
+        ImportLocalSkillRequest {
+            path: Some(blocked_source.to_string_lossy().into_owned()),
+            targets: Some(vec![ExtPlatform::Antigravity]),
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error, expected_error);
+    assert!(!master(&paths, "blocked").exists());
+    assert!(!target(&paths, ExtPlatform::Antigravity, "blocked").exists());
+    assert_eq!(
+        fs::read(blocked_source.join("SKILL.md")).unwrap(),
+        blocked_content
+    );
+    assert_blockers_unchanged();
+    assert_no_staging(&paths.home);
+
+    let source = paths.home.join("imports/retained");
+    let master_dir = master(&paths, "retained");
+    let claude_target = target(&paths, ExtPlatform::Claude, "retained");
+    skill(&source, "retained", "Keep this managed skill");
+    let source_content = fs::read(source.join("SKILL.md")).unwrap();
+    set_skill_sync_method_for_paths(&paths, SkillSyncMethod::Copy).unwrap();
+    import_directory(&paths, &source, vec![ExtPlatform::Claude]);
+
+    let summary = get_extensions_summary_for_paths(&paths).unwrap();
+    assert_eq!(summary.skills_count, 1);
+    assert_eq!(summary.skills_updatable_count, 0);
+    let snapshot = get_skills_hub_snapshot_for_paths(&paths).unwrap();
+    assert_eq!(snapshot.skills.len(), 1);
+    let retained = managed(&snapshot, "retained");
+    assert_eq!(retained.skill.enabled_platforms, [ExtPlatform::Claude]);
+    assert!(!retained.locally_modified);
+    assert!(retained.platforms[&ExtPlatform::Claude].enabled);
+    assert!(!retained.platforms[&ExtPlatform::Claude].has_diff);
+    for platform in [ExtPlatform::Codex, ExtPlatform::Antigravity] {
+        let status = &retained.platforms[&platform];
+        assert!(!status.enabled);
+        assert!(!status.has_diff);
+    }
+    assert_blockers_unchanged();
+
+    let error = toggle_skill_platform_for_paths(&paths, "retained", ExtPlatform::Antigravity, true)
+        .unwrap_err();
+    assert_eq!(error, expected_error);
+    assert!(!target(&paths, ExtPlatform::Antigravity, "retained").exists());
+    assert_eq!(fs::read(source.join("SKILL.md")).unwrap(), source_content);
+    assert_eq!(
+        fs::read(master_dir.join("SKILL.md")).unwrap(),
+        source_content
+    );
+    assert_eq!(
+        fs::read(claude_target.join("SKILL.md")).unwrap(),
+        source_content
+    );
+    assert_blockers_unchanged();
+    assert_no_staging(&paths.home);
+
+    toggle_skill_platform_for_paths(&paths, "retained", ExtPlatform::Antigravity, false).unwrap();
+    let uninstalled = uninstall_skill_for_paths(&paths, "retained").unwrap();
+    assert!(uninstalled.skills.is_empty());
+    assert!(!master_dir.exists());
+    assert!(!claude_target.exists());
+    assert_eq!(fs::read(source.join("SKILL.md")).unwrap(), source_content);
+    assert_blockers_unchanged();
+    assert_no_staging(&paths.home);
+}
+
+#[test]
+fn alignment_drops_a_missing_target_beneath_a_file() {
+    let (_directory, paths) = sandbox();
+    let source = paths.home.join("imports/retained");
+    skill(&source, "retained", "Keep this managed skill");
+    set_skill_sync_method_for_paths(&paths, SkillSyncMethod::Copy).unwrap();
+    import_directory(&paths, &source, vec![ExtPlatform::Codex]);
+    let codex_skills = paths.codex_dir.join("skills");
+    fs::rename(&codex_skills, paths.codex_dir.join("old-skills")).unwrap();
+    fs::write(&codex_skills, b"blocked Codex").unwrap();
+
+    let aligned = align_skill_platforms_for_paths(&paths, "retained", &[]).unwrap();
+    let retained = managed(&aligned, "retained");
+    assert!(retained.skill.enabled_platforms.is_empty());
+    assert!(!retained.platforms[&ExtPlatform::Codex].enabled);
+    assert!(master(&paths, "retained").join("SKILL.md").is_file());
+    assert_eq!(fs::read(codex_skills).unwrap(), b"blocked Codex");
     assert_no_staging(&paths.home);
 }
 

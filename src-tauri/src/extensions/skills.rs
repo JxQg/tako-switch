@@ -320,7 +320,7 @@ fn is_link(metadata: &fs::Metadata) -> bool {
 fn path_exists(path: &Path) -> Result<bool, String> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => Ok(false),
         Err(e) => Err(format!("检查技能路径 {} 失败: {e}", path.display())),
     }
 }
@@ -345,6 +345,11 @@ fn ensure_plain_ancestors(paths: &AppPaths, path: &Path) -> Result<(), String> {
             }
             Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) if e.kind() == ErrorKind::NotADirectory => {
+                if ancestor == anchor {
+                    return Err(format!("技能父路径不是目录: {}", ancestor.display()));
+                }
+            }
             Err(e) => return Err(format!("检查目录 {} 失败: {e}", ancestor.display())),
         }
         // Trust system aliases above the supplied home, including macOS temporary directories.
@@ -958,7 +963,9 @@ fn scan_archive_trees(
 fn remove_path(path: &Path) -> Result<(), String> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            return Ok(());
+        }
         Err(e) => return Err(format!("检查待清理路径 {} 失败: {e}", path.display())),
     };
     if is_link(&metadata) {
@@ -1244,14 +1251,18 @@ fn stage_platforms(
 ) -> Result<(), String> {
     let master = master_skills_dir(paths).join(&skill.id);
     for &platform in ExtPlatform::all() {
-        if !targets.contains(&platform) && !skill.enabled_platforms.contains(&platform) {
+        let enabled = targets.contains(&platform);
+        if !enabled && !skill.enabled_platforms.contains(&platform) {
             continue;
         }
         for (index, root) in platform_skills_dirs(paths, platform).iter().enumerate() {
-            ensure_plain_ancestors(paths, root)?;
             let destination = root.join(&skill.id);
+            if !enabled && !path_exists(&destination)? {
+                continue;
+            }
+            ensure_plain_ancestors(paths, root)?;
             backup_target(paths, platform, &skill.id, &destination, index)?;
-            if targets.contains(&platform) {
+            if enabled {
                 transaction.stage_delivery(&master, &destination, tree, method)?;
             } else {
                 transaction.stage_remove(&destination)?;
@@ -1584,8 +1595,11 @@ pub fn toggle_skill_platform_for_paths(
         .transpose()?;
     let mut transaction = DirectoryTransaction::new(paths);
     for (index, root) in platform_skills_dirs(paths, platform).iter().enumerate() {
-        ensure_plain_ancestors(paths, root)?;
         let target = root.join(id);
+        if !enabled && !path_exists(&target)? {
+            continue;
+        }
+        ensure_plain_ancestors(paths, root)?;
         backup_target(paths, platform, id, &target, index)?;
         if enabled {
             transaction.stage_delivery(&master, &target, tree.as_ref(), store.sync_method)?;
@@ -1626,8 +1640,11 @@ pub fn uninstall_skill_for_paths(paths: &AppPaths, id: &str) -> Result<SkillsHub
     let mut transaction = DirectoryTransaction::new(paths);
     for &platform in ExtPlatform::all() {
         for (index, root) in platform_skills_dirs(paths, platform).iter().enumerate() {
-            ensure_plain_ancestors(paths, root)?;
             let target = root.join(id);
+            if !path_exists(&target)? {
+                continue;
+            }
+            ensure_plain_ancestors(paths, root)?;
             backup_target(paths, platform, id, &target, index)?;
             transaction.stage_remove(&target)?;
         }
@@ -2384,6 +2401,56 @@ mod tests {
     fn seed_skill_dir(dir: &Path, body: &[u8]) -> LocalSkillTree {
         write_atomic(&dir.join("SKILL.md"), body, false).unwrap();
         scan_local_tree(dir, MAX_LOCAL_SKILL_BYTES).unwrap()
+    }
+
+    #[test]
+    fn paths_beneath_a_file_are_absent_but_invalid_for_writes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let file = paths.home.join("blocked");
+        fs::write(&file, b"preserve").unwrap();
+        assert!(path_exists(&file).unwrap());
+
+        for child in [file.join("skills"), file.join("config/skills")] {
+            assert!(!path_exists(&child).unwrap());
+            remove_path(&child).unwrap();
+            assert_eq!(
+                ensure_plain_ancestors(&paths, &child).unwrap_err(),
+                format!("技能父路径不是目录: {}", file.display())
+            );
+        }
+        assert_eq!(fs::read(&file).unwrap(), b"preserve");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_directory_above_anchor_is_reported_at_anchor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let file = temp.path().join("blocked");
+        fs::write(&file, b"preserve").unwrap();
+        let paths = AppPaths::for_test(&file.join("home"));
+        let target = paths.agy_gemini_config_dir.join("skills");
+
+        assert_eq!(
+            ensure_plain_ancestors(&paths, &target).unwrap_err(),
+            format!("技能父路径不是目录: {}", paths.home.display())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_link_ancestor_is_rejected_for_nested_writes() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(temp.path());
+        let file = paths.home.join("blocked");
+        let link = paths.home.join(".gemini");
+        fs::write(&file, b"preserve").unwrap();
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+
+        assert_eq!(
+            ensure_plain_ancestors(&paths, &link.join("config/skills")).unwrap_err(),
+            format!("拒绝通过链接目录写入技能: {}", link.display())
+        );
     }
 
     #[test]
