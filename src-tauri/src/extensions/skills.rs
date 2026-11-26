@@ -450,28 +450,44 @@ pub fn count_skills_for_summary_for_paths(paths: &AppPaths) -> usize {
 }
 
 fn cleanup_stale_temp_artifacts(paths: &AppPaths) {
-    let now = SystemTime::now();
-    let is_stale = |path: &Path| -> bool {
-        fs::symlink_metadata(path)
-            .and_then(|meta| meta.modified())
+    cleanup_temp_artifacts_at(paths, SystemTime::now());
+}
+
+fn cleanup_temp_artifacts_at(paths: &AppPaths, now: SystemTime) {
+    let is_stale_meta = |meta: &fs::Metadata| -> bool {
+        meta.modified()
             .ok()
             .and_then(|mtime| now.duration_since(mtime).ok())
             .is_some_and(|age| age > STALE_TEMP_TTL)
     };
     let ext_dir = extensions_dir(paths);
-    if let Ok(entries) = fs::read_dir(&ext_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(".tako-archive-") && is_stale(&entry.path()) {
-                let _ = remove_path(&entry.path());
+    if ensure_plain_ancestors(paths, &ext_dir).is_ok() {
+        if let Ok(entries) = fs::read_dir(&ext_dir) {
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(".tako-archive-")
+                    && fs::symlink_metadata(&entry_path)
+                        .is_ok_and(|meta| !is_link(&meta) && is_stale_meta(&meta))
+                {
+                    let _ = remove_path(&entry_path);
+                }
             }
         }
     }
     let uploads = temp_uploads_dir(paths);
-    if let Ok(entries) = fs::read_dir(&uploads) {
-        for entry in entries.flatten() {
-            if is_stale(&entry.path()) {
-                let _ = remove_path(&entry.path());
+    if ensure_plain_ancestors(paths, &uploads).is_ok() {
+        if let Ok(entries) = fs::read_dir(&uploads) {
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".zip")
+                    && fs::symlink_metadata(&entry_path).is_ok_and(|meta| {
+                        !is_link(&meta) && meta.is_file() && is_stale_meta(&meta)
+                    })
+                {
+                    let _ = fs::remove_file(&entry_path);
+                }
             }
         }
     }
@@ -714,11 +730,14 @@ struct StagedUploadCleanup {
 
 impl Drop for StagedUploadCleanup {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if fs::symlink_metadata(&self.path).is_ok_and(|meta| !is_link(&meta) && meta.is_file()) {
+            let _ = fs::remove_file(&self.path);
+        }
         if let Some(parent) = self.path.parent() {
-            if fs::read_dir(parent)
-                .ok()
-                .is_some_and(|mut entries| entries.next().is_none())
+            if fs::symlink_metadata(parent).is_ok_and(|meta| !is_link(&meta) && meta.is_dir())
+                && fs::read_dir(parent)
+                    .ok()
+                    .is_some_and(|mut entries| entries.next().is_none())
             {
                 let _ = fs::remove_dir(parent);
             }
@@ -1771,6 +1790,8 @@ pub fn stage_skill_zip_chunk_for_paths(
     chunk_base64: &str,
 ) -> Result<String, String> {
     let _guard = lock_store()?;
+    let uploads_dir = temp_uploads_dir(paths);
+    ensure_plain_ancestors(paths, &uploads_dir)?;
     cleanup_stale_temp_artifacts(paths);
     let max_encoded = (MAX_UPLOAD_CHUNK_BYTES.div_ceil(3)) * 4 + 4;
     if chunk_base64.len() > max_encoded {
@@ -1779,8 +1800,6 @@ pub fn stage_skill_zip_chunk_for_paths(
     let chunk = base64::engine::general_purpose::STANDARD
         .decode(chunk_base64)
         .map_err(|e| format!("ZIP 分片 Base64 无效: {e}"))?;
-    let uploads_dir = temp_uploads_dir(paths);
-    ensure_plain_ancestors(paths, &uploads_dir)?;
     fs::create_dir_all(&uploads_dir).map_err(|e| format!("创建分片上传目录失败: {e}"))?;
     let id = match upload_id.map(str::trim).filter(|s| !s.is_empty()) {
         Some(existing) => {
@@ -1790,8 +1809,17 @@ pub fn stage_skill_zip_chunk_for_paths(
         None => format!("zip-{}-{:016x}", std::process::id(), rand::random::<u64>()),
     };
     let file_path = uploads_dir.join(format!("{id}.zip"));
-    if upload_id.is_some() && !file_path.is_file() {
-        return Err("分片上传会话不存在或已过期".to_string());
+    match fs::symlink_metadata(&file_path) {
+        Ok(meta) if is_link(&meta) || !meta.is_file() => {
+            return Err("分片上传临时文件不是普通文件".to_string());
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            if upload_id.is_some() {
+                return Err("分片上传会话不存在或已过期".to_string());
+            }
+        }
+        Err(e) => return Err(format!("检查分片临时文件失败: {e}")),
     }
     let existing_len = fs::metadata(&file_path).map_or(0, |meta| meta.len());
     if chunk.len() as u64 > MAX_ARCHIVE_BYTES.saturating_sub(existing_len) {
@@ -1816,8 +1844,10 @@ pub fn discard_skill_zip_upload_for_paths(paths: &AppPaths, upload_id: &str) -> 
         return Ok(());
     }
     validate_identifier(trimmed)?;
+    let uploads_dir = temp_uploads_dir(paths);
+    ensure_plain_ancestors(paths, &uploads_dir)?;
     let _cleanup = StagedUploadCleanup {
-        path: temp_uploads_dir(paths).join(format!("{trimmed}.zip")),
+        path: uploads_dir.join(format!("{trimmed}.zip")),
     };
     Ok(())
 }
@@ -1884,12 +1914,17 @@ pub fn import_local_skill_for_paths(
         (None, None, Some(upload_id)) => {
             let trimmed = upload_id.trim();
             validate_identifier(trimmed)?;
-            let staged_zip = temp_uploads_dir(paths).join(format!("{trimmed}.zip"));
+            let uploads_dir = temp_uploads_dir(paths);
+            ensure_plain_ancestors(paths, &uploads_dir)?;
+            let staged_zip = uploads_dir.join(format!("{trimmed}.zip"));
             let _upload_cleanup = StagedUploadCleanup {
                 path: staged_zip.clone(),
             };
-            let meta = fs::metadata(&staged_zip)
+            let meta = fs::symlink_metadata(&staged_zip)
                 .map_err(|_| "分片上传文件不存在或已过期".to_string())?;
+            if is_link(&meta) || !meta.is_file() {
+                return Err("分片上传临时文件不是普通文件".to_string());
+            }
             if meta.len() > MAX_ARCHIVE_BYTES {
                 return Err("ZIP 文件超过 200 MiB 上限".to_string());
             }
@@ -2527,5 +2562,88 @@ mod tests {
         let tree2 = scan_local_tree(&dir, MAX_LOCAL_SKILL_BYTES).unwrap();
         let h3 = hash_tree_cached(&tree2, false).unwrap();
         assert_ne!(h1, h3);
+    }
+
+    fn create_test_dir_link(source: &Path, link: &Path) {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(source, link).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    &link.to_string_lossy(),
+                    &source.to_string_lossy(),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "mklink /J failed");
+        }
+    }
+
+    #[test]
+    fn temp_upload_cleanup_and_staging_never_traverse_directory_links() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let external = tmp.path().join("external-target");
+        write_atomic(&external.join("stale-upload.zip"), b"keep-zip", false).unwrap();
+        write_atomic(&external.join("notes.txt"), b"keep-notes", false).unwrap();
+        write_atomic(&external.join("nested/doc.md"), b"keep-nested", false).unwrap();
+
+        let ext_dir = extensions_dir(&paths);
+        fs::create_dir_all(&ext_dir).unwrap();
+        let uploads_link = temp_uploads_dir(&paths);
+        create_test_dir_link(&external, &uploads_link);
+        assert!(is_link(&fs::symlink_metadata(&uploads_link).unwrap()));
+
+        let future_now = SystemTime::now() + STALE_TEMP_TTL + Duration::from_secs(60);
+        cleanup_temp_artifacts_at(&paths, future_now);
+        let _snapshot = get_skills_hub_snapshot_for_paths(&paths).unwrap();
+
+        let err_stage = stage_skill_zip_chunk_for_paths(&paths, None, "UEsD").unwrap_err();
+        assert!(err_stage.contains("拒绝通过链接目录写入技能"), "{err_stage}");
+        let err_discard = discard_skill_zip_upload_for_paths(&paths, "stale-upload").unwrap_err();
+        assert!(
+            err_discard.contains("拒绝通过链接目录写入技能"),
+            "{err_discard}"
+        );
+        let err_import = import_local_skill_for_paths(
+            &paths,
+            ImportLocalSkillRequest {
+                upload_id: Some("stale-upload".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err_import.contains("拒绝通过链接目录写入技能"),
+            "{err_import}"
+        );
+
+        assert_eq!(fs::read(external.join("stale-upload.zip")).unwrap(), b"keep-zip");
+        assert_eq!(fs::read(external.join("notes.txt")).unwrap(), b"keep-notes");
+        assert_eq!(
+            fs::read(external.join("nested/doc.md")).unwrap(),
+            b"keep-nested"
+        );
+
+        remove_path(&uploads_link).unwrap();
+        write_atomic(&uploads_link.join("expired.zip"), b"expired", false).unwrap();
+        write_atomic(&uploads_link.join("keep.txt"), b"keep", false).unwrap();
+        write_atomic(&uploads_link.join("dir.zip/inner.txt"), b"keep-dir", false).unwrap();
+
+        cleanup_temp_artifacts_at(&paths, future_now);
+        assert!(!uploads_link.join("expired.zip").exists());
+        assert_eq!(fs::read(uploads_link.join("keep.txt")).unwrap(), b"keep");
+        assert_eq!(
+            fs::read(uploads_link.join("dir.zip/inner.txt")).unwrap(),
+            b"keep-dir"
+        );
     }
 }
