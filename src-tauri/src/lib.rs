@@ -13,9 +13,11 @@ use adapters::{
     get_adapter, snapshot_app, AppId, AppMode, AppSnapshot, DesktopAppAdapter, DiagnosticResult,
 };
 use auth::{
-    fetch_account_status, format_usd, login_with_key as auth_login_with_key,
-    logout as auth_logout, open_external_url, quota_units_to_usd, read_balance_cache,
-    start_oauth_login, AccountStatus,
+    add_saved_key as auth_add_saved_key, build_local_account_status, fetch_account_status,
+    format_usd, list_saved_key_summaries, login_with_key as auth_login_with_key,
+    logout as auth_logout, open_external_url, read_balance_cache,
+    remove_saved_key as auth_remove_saved_key, rename_saved_key_alias as auth_rename_saved_key_alias,
+    start_oauth_login, switch_saved_key as auth_switch_saved_key, AccountStatus,
 };
 use config::{
     read_switch_state, save_switch_state, AppPaths, McpToolsConfig, SwitchState,
@@ -303,14 +305,21 @@ fn pct_round(used: f64, limit: f64) -> u64 {
 
 fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>, String> {
     let cached_acc = current_cached_account(app, paths);
-    let has_key = config::read_main_api_key(paths).is_some();
-    let acc_opt = if has_key {
-        cached_acc.filter(|a| a.logged_in)
-    } else {
-        None
-    };
+    let local_acc = build_local_account_status(paths, cached_acc);
+    let has_key = local_acc.logged_in;
+    let acc_opt = if has_key { Some(&local_acc) } else { None };
 
-    let summary_text = if let Some(ref acc) = acc_opt {
+    let active_key_item = acc_opt
+        .and_then(|acc| acc.display_label.as_deref())
+        .and_then(|label| {
+            let text = match acc_opt.and_then(|a| a.active_key_alias.as_deref()) {
+                Some(alias) if !alias.trim().is_empty() => format!("当前密钥: {label} [{alias}]"),
+                _ => format!("当前密钥: {label}"),
+            };
+            MenuItem::with_id(app, "tray:active-key", text, false, None::<&str>).ok()
+        });
+
+    let summary_text = if let Some(acc) = acc_opt {
         if let Some(rem) = acc.wallet_remain_usd {
             if let Some(used) = acc.wallet_used_usd {
                 format!("Tako 余额: {}  (已用 {})", format_usd(rem), format_usd(used))
@@ -320,8 +329,6 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
         } else {
             "Tako: 已登录 (刷新获取余额)".to_string()
         }
-    } else if has_key {
-        "Tako: 已登录 (刷新获取余额)".to_string()
     } else {
         "Tako: 未登录 (点击打开登录)".to_string()
     };
@@ -329,7 +336,7 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
     let acct_summary = MenuItem::with_id(app, "tray:account-summary", summary_text, false, None::<&str>)
         .map_err(|e| format!("创建账户摘要项失败: {e}"))?;
 
-    let plan_summary = acc_opt.as_ref().and_then(|acc| {
+    let plan_summary = acc_opt.and_then(|acc| {
         acc.quota
             .as_ref()
             .filter(|q| q.window_cost_limit > 0.0 || q.weekly_cost_limit > 0.0)
@@ -352,6 +359,44 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
                 .ok()
             })
     });
+
+    let saved_keys = list_saved_key_summaries(paths);
+    let key_switch_submenu = if saved_keys.len() >= 2 || (!has_key && !saved_keys.is_empty()) {
+        let mut key_items = Vec::with_capacity(saved_keys.len());
+        for item in &saved_keys {
+            let mark = if item.active { "● " } else { "○ " };
+            let label = match item.alias.as_deref() {
+                Some(alias) if !alias.trim().is_empty() => {
+                    format!("{mark}{} [{alias}]", item.display_label)
+                }
+                _ => format!("{mark}{}", item.display_label),
+            };
+            let menu_item = MenuItem::with_id(
+                app,
+                format!("key:{}", item.id),
+                label,
+                true,
+                None::<&str>,
+            )
+            .map_err(|e| format!("创建密钥切换菜单项失败: {e}"))?;
+            key_items.push(menu_item);
+        }
+        let refs: Vec<&dyn IsMenuItem<tauri::Wry>> = key_items
+            .iter()
+            .map(|m| m as &dyn IsMenuItem<tauri::Wry>)
+            .collect();
+        Some(
+            Submenu::with_items(
+                app,
+                format!("切换密钥 ({})", saved_keys.len()),
+                true,
+                &refs,
+            )
+            .map_err(|e| format!("创建密钥切换子菜单失败: {e}"))?,
+        )
+    } else {
+        None
+    };
 
     let sep0 = PredefinedMenuItem::separator(app).map_err(|e| e.to_string())?;
     let show = MenuItem::with_id(app, "tray:show", "打开 Tako Switch", true, None::<&str>)
@@ -432,6 +477,9 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
     let sep2 = PredefinedMenuItem::separator(app).map_err(|e| e.to_string())?;
 
     let mut items: Vec<&dyn IsMenuItem<tauri::Wry>> = Vec::new();
+    if let Some(ref key_item) = active_key_item {
+        items.push(key_item);
+    }
     items.push(&acct_summary);
     if let Some(ref p_item) = plan_summary {
         items.push(p_item);
@@ -442,6 +490,9 @@ fn build_tray_menu(app: &AppHandle, paths: &AppPaths) -> Result<Menu<tauri::Wry>
     }
     items.push(&show);
     items.push(&refresh_bal);
+    if let Some(ref ks_sub) = key_switch_submenu {
+        items.push(ks_sub);
+    }
     items.push(&sep1);
     for sub in &submenus {
         items.push(sub);
@@ -600,34 +651,7 @@ async fn get_dashboard(app: AppHandle, refresh_account: bool) -> Result<Dashboar
             update_account_and_tray(&app, &paths, status.clone(), false);
             status
         } else {
-            let key_opt = config::read_main_api_key(&paths);
-            let st = read_switch_state(&paths);
-            let masked = key_opt.as_deref().map(auth::mask_api_key);
-            let cached = key_opt.as_ref().and_then(|_| {
-                current_cached_account(&app, &paths).filter(|c| c.logged_in && c.masked_key == masked)
-            });
-            if let Some(c) = cached {
-                AccountStatus {
-                    base_url: st.normalized_base_url(),
-                    wallet_remain_usd: c.wallet_remain_usd.or_else(|| c.wallet_remain.map(quota_units_to_usd)),
-                    wallet_used_usd: c.wallet_used_usd.or_else(|| c.wallet_used.map(quota_units_to_usd)),
-                    ..c
-                }
-            } else {
-                AccountStatus {
-                    logged_in: key_opt.is_some(),
-                    base_url: st.normalized_base_url(),
-                    masked_key: masked,
-                    user_name: None,
-                    plan_name: None,
-                    wallet_remain: None,
-                    wallet_used: None,
-                    wallet_remain_usd: None,
-                    wallet_used_usd: None,
-                    quota: None,
-                    error: None,
-                }
-            }
+            build_local_account_status(&paths, current_cached_account(&app, &paths))
         }
     };
 
@@ -661,11 +685,29 @@ fn sync_after_account_login(paths: &AppPaths) {
     }
 }
 
+async fn sync_after_key_change(paths: &AppPaths) {
+    if config::read_main_api_key(paths).is_some() {
+        let claude_tako = get_adapter(AppId::Claude).read_mode(paths) == AppMode::Tako;
+        let wb_tako = get_adapter(AppId::WorkBuddy).read_mode(paths) == AppMode::Tako;
+        if claude_tako && wb_tako {
+            let _ = tokio::join!(
+                agy_proxy::refresh_claude_catalog_cache(paths),
+                agy_proxy::refresh_workbuddy_catalog_cache(paths),
+            );
+        } else if claude_tako {
+            let _ = agy_proxy::refresh_claude_catalog_cache(paths).await;
+        } else if wb_tako {
+            let _ = agy_proxy::refresh_workbuddy_catalog_cache(paths).await;
+        }
+        sync_after_account_login(paths);
+    }
+}
+
 #[tauri::command]
 async fn login_oauth(app: AppHandle) -> Result<AccountStatus, String> {
     let paths = AppPaths::detect()?;
     let status = start_oauth_login(&paths).await?;
-    sync_after_account_login(&paths);
+    sync_after_key_change(&paths).await;
     update_account_and_tray(&app, &paths, status.clone(), false);
     Ok(status)
 }
@@ -674,8 +716,90 @@ async fn login_oauth(app: AppHandle) -> Result<AccountStatus, String> {
 async fn login_with_key(app: AppHandle, key: String) -> Result<AccountStatus, String> {
     let paths = AppPaths::detect()?;
     let status = auth_login_with_key(&paths, &key).await?;
-    sync_after_account_login(&paths);
+    sync_after_key_change(&paths).await;
     update_account_and_tray(&app, &paths, status.clone(), false);
+    Ok(status)
+}
+
+#[tauri::command]
+async fn add_saved_key(
+    app: AppHandle,
+    key: String,
+    alias: Option<String>,
+    activate: Option<bool>,
+) -> Result<AccountStatus, String> {
+    let paths = AppPaths::detect()?;
+    let should_activate = activate.unwrap_or(true);
+    let status = auth_add_saved_key(&paths, &key, alias.as_deref(), should_activate).await?;
+    if should_activate || status.logged_in {
+        sync_after_key_change(&paths).await;
+    }
+    telemetry::track_event(
+        &paths,
+        "key_added",
+        "tako-switch",
+        true,
+        0,
+        serde_json::json!({
+            "saved_keys_count": status.saved_keys.len(),
+            "activated": should_activate,
+        }),
+    );
+    update_account_and_tray(&app, &paths, status.clone(), true);
+    Ok(status)
+}
+
+#[tauri::command]
+async fn switch_saved_key(app: AppHandle, key_id: String) -> Result<AccountStatus, String> {
+    let paths = AppPaths::detect()?;
+    let status = auth_switch_saved_key(&paths, &key_id).await?;
+    sync_after_key_change(&paths).await;
+    telemetry::track_event(
+        &paths,
+        "key_switch",
+        "tako-switch",
+        true,
+        0,
+        serde_json::json!({
+            "saved_keys_count": status.saved_keys.len(),
+            "via": "ui",
+        }),
+    );
+    update_account_and_tray(&app, &paths, status.clone(), true);
+    Ok(status)
+}
+
+#[tauri::command]
+async fn remove_saved_key(app: AppHandle, key_id: String) -> Result<AccountStatus, String> {
+    let paths = AppPaths::detect()?;
+    let prev_active = config::read_switch_auth(&paths).active_key_id;
+    let status = auth_remove_saved_key(&paths, &key_id).await?;
+    if prev_active.as_deref() == Some(key_id.trim()) && status.logged_in {
+        sync_after_key_change(&paths).await;
+    }
+    telemetry::track_event(
+        &paths,
+        "key_removed",
+        "tako-switch",
+        true,
+        0,
+        serde_json::json!({
+            "saved_keys_count": status.saved_keys.len(),
+        }),
+    );
+    update_account_and_tray(&app, &paths, status.clone(), true);
+    Ok(status)
+}
+
+#[tauri::command]
+async fn rename_saved_key_alias(
+    app: AppHandle,
+    key_id: String,
+    alias: Option<String>,
+) -> Result<AccountStatus, String> {
+    let paths = AppPaths::detect()?;
+    let status = auth_rename_saved_key_alias(&paths, &key_id, alias.as_deref()).await?;
+    update_account_and_tray(&app, &paths, status.clone(), true);
     Ok(status)
 }
 
@@ -683,7 +807,7 @@ async fn login_with_key(app: AppHandle, key: String) -> Result<AccountStatus, St
 async fn logout_account(app: AppHandle) -> Result<AccountStatus, String> {
     let paths = AppPaths::detect()?;
     let status = auth_logout(&paths).await?;
-    update_account_and_tray(&app, &paths, status.clone(), false);
+    update_account_and_tray(&app, &paths, status.clone(), true);
     Ok(status)
 }
 
@@ -2554,6 +2678,31 @@ pub fn run() {
                         let _ = app.emit("request-check-updates", ());
                     } else if id == "tray:quit" {
                         app.exit(0);
+                    } else if let Some(key_id) = id.strip_prefix("key:") {
+                        let key_id_owned = key_id.to_string();
+                        let handle = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Ok(paths) = AppPaths::detect() {
+                                if let Ok(status) =
+                                    auth_switch_saved_key(&paths, &key_id_owned).await
+                                {
+                                    sync_after_key_change(&paths).await;
+                                    telemetry::track_event(
+                                        &paths,
+                                        "key_switch",
+                                        "tako-switch",
+                                        true,
+                                        0,
+                                        serde_json::json!({
+                                            "saved_keys_count": status.saved_keys.len(),
+                                            "via": "tray",
+                                        }),
+                                    );
+                                    update_account_and_tray(&handle, &paths, status, true);
+                                    let _ = handle.emit("state-changed", ());
+                                }
+                            }
+                        });
                     } else if let Some((app_id, mode)) = parse_tray_mode_id(id) {
                         if let Ok(paths) = AppPaths::detect() {
                             let mut st = read_switch_state(&paths);
@@ -2694,6 +2843,10 @@ pub fn run() {
             get_running_states,
             login_oauth,
             login_with_key,
+            add_saved_key,
+            switch_saved_key,
+            remove_saved_key,
+            rename_saved_key_alias,
             logout_account,
             open_url,
             save_settings,

@@ -2,13 +2,19 @@ import { useEffect, useState } from "react";
 import packageJson from "../../package.json";
 import {
   ArrowUpCircle,
+  Check,
   ChevronDown,
   ExternalLink,
   FileText,
   KeyRound,
+  Loader2,
   LogOut,
   MessageSquare,
+  Pencil,
+  Plus,
   RefreshCw,
+  Trash2,
+  X,
 } from "lucide-react";
 import {
   api,
@@ -55,6 +61,7 @@ interface GeneralSettingsPanelProps {
   anyTakoMode: boolean;
   fixingGateway: boolean;
   loggingIn: boolean;
+  switchingKeyId: string | null;
   savingSettings: boolean;
   checkingUpdates: boolean;
   lastCheckedAt: string | null;
@@ -69,6 +76,9 @@ interface GeneralSettingsPanelProps {
   onEnsureGateway: () => void;
   onOAuthLogin: () => void;
   onOpenKeyModal: () => void;
+  onSwitchKey: (keyId: string) => void;
+  onRemoveKey: (keyId: string) => void;
+  onRenameKeyAlias: (keyId: string, alias: string | null) => Promise<void>;
   onLogout: () => void;
   onRefreshAccount: () => void;
   onSavePatch: (patch: SettingsPatch, note?: string) => Promise<void>;
@@ -92,6 +102,25 @@ const DENSITY_OPTIONS: { id: UiDensity; label: string }[] = [
   { id: "comfortable", label: "舒适" },
 ];
 
+const DEFAULT_TAKO_ORIGIN = "https://tako.shiroha.tech";
+
+function normalizeTakoOrigin(baseUrl?: string | null): string {
+  const trimmed = (baseUrl ?? "").trim().replace(/\/+$/, "");
+  if (!trimmed) return DEFAULT_TAKO_ORIGIN;
+  return trimmed.endsWith("/v1") ? trimmed.slice(0, -3) : trimmed;
+}
+
+function resolveAccountKeyLabel(account?: DashboardPayload["account"]): string {
+  if (!account) return "Tako 用户";
+  const direct = account.displayLabel?.trim();
+  if (direct) return direct;
+  const user = account.userName?.trim();
+  const key = account.keyName?.trim();
+  if (user && key) return `${user} - ${key}`;
+  if (user && account.maskedKey) return `${user} - ${account.maskedKey}`;
+  return user || key || account.maskedKey || "Tako 用户";
+}
+
 export function GeneralSettingsPanel({
   dashboard,
   themePref,
@@ -101,6 +130,7 @@ export function GeneralSettingsPanel({
   anyTakoMode,
   fixingGateway,
   loggingIn,
+  switchingKeyId,
   savingSettings,
   checkingUpdates,
   lastCheckedAt,
@@ -115,6 +145,9 @@ export function GeneralSettingsPanel({
   onEnsureGateway,
   onOAuthLogin,
   onOpenKeyModal,
+  onSwitchKey,
+  onRemoveKey,
+  onRenameKeyAlias,
   onLogout,
   onRefreshAccount,
   onSavePatch,
@@ -127,6 +160,9 @@ export function GeneralSettingsPanel({
   onNavigate,
 }: GeneralSettingsPanelProps) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [editingAliasId, setEditingAliasId] = useState<string | null>(null);
+  const [editingAliasDraft, setEditingAliasDraft] = useState("");
+  const [savingAlias, setSavingAlias] = useState(false);
 
   const [gatewayDisplayName, setGatewayDisplayName] = useState("Tako");
   const [outputDir, setOutputDir] = useState("");
@@ -144,6 +180,10 @@ export function GeneralSettingsPanel({
   }, [dashboard]);
 
   const account = dashboard?.account;
+  const savedKeys = account?.savedKeys ?? [];
+  const takoOrigin = normalizeTakoOrigin(account?.baseUrl ?? dashboard?.state.baseUrl);
+  const keysManageUrl = `${takoOrigin}/keys`;
+  const primaryKeyLabel = resolveAccountKeyLabel(account);
   const remainUsd = account?.walletRemainUsd;
   const usedUsd = account?.walletUsedUsd;
   const pct5h = calcPercent(account?.quota?.windowUsed, account?.quota?.windowCostLimit);
@@ -153,6 +193,18 @@ export function GeneralSettingsPanel({
       (account.quota.windowCostLimit > 0 || account.quota.weeklyCostLimit > 0),
   );
   const avatarChar = (account?.userName?.trim()?.[0] ?? "T").toUpperCase();
+
+  const submitAliasEdit = async (keyId: string) => {
+    if (savingAlias) return;
+    setSavingAlias(true);
+    try {
+      await onRenameKeyAlias(keyId, editingAliasDraft.trim() || null);
+      setEditingAliasId(null);
+      setEditingAliasDraft("");
+    } finally {
+      setSavingAlias(false);
+    }
+  };
 
   const nameDirty =
     dashboard != null &&
@@ -205,8 +257,11 @@ export function GeneralSettingsPanel({
         </p>
       </div>
 
-      {/* Account & Balance Card */}
-      <section className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] tako-panel-pad">
+      {/* Account, Active Key & Local Keys Switcher Card */}
+      <section
+        data-testid="settings-account-keys-card"
+        className="tako-card-surface border border-[var(--border)] bg-[var(--bg-card)] tako-panel-pad flex flex-col gap-3.5"
+      >
         {account?.loggedIn ? (
           <div className="flex flex-col gap-3.5">
             <div className="flex flex-wrap items-center justify-between gap-4">
@@ -216,11 +271,14 @@ export function GeneralSettingsPanel({
                 </span>
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <span className="text-[14px] font-semibold text-[var(--text-primary)] truncate">
-                      {account.userName ?? "Tako 用户"}
+                    <span className="text-[14px] font-semibold text-[var(--text-primary)] break-all">
+                      {primaryKeyLabel}
                     </span>
+                    {account.activeKeyAlias && (
+                      <StatusPill tone="accent">{account.activeKeyAlias}</StatusPill>
+                    )}
                     {account.planName && (
-                      <StatusPill tone="accent">{account.planName}</StatusPill>
+                      <StatusPill tone="neutral">{account.planName}</StatusPill>
                     )}
                   </div>
                   <div className="text-[11.5px] text-[var(--text-muted)] font-mono truncate mt-0.5">
@@ -258,7 +316,7 @@ export function GeneralSettingsPanel({
                   className="h-8 px-2.5 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--danger-soft)] text-[12px] text-[var(--danger)] inline-flex items-center gap-1.5 cursor-pointer"
                 >
                   <LogOut className="h-3.5 w-3.5" />
-                  <span>退出登录</span>
+                  <span>退出当前</span>
                 </button>
               </div>
             </div>
@@ -296,10 +354,12 @@ export function GeneralSettingsPanel({
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div className="min-w-0 flex-1">
               <div className="text-[14px] font-semibold text-[var(--text-primary)]">
-                尚未登录 Tako 账号
+                {savedKeys.length > 0 ? "当前未启用任何密钥" : "尚未登录 Tako 账号"}
               </div>
               <p className="text-[12px] text-[var(--text-muted)] mt-0.5">
-                登录后统一同步全部客户端与 MCP 能力；无需登录也可先浏览模型广场。
+                {savedKeys.length > 0
+                  ? "可在下方一键重新启用本地已保存的密钥，或添加新的 API Key / OAuth 登录。"
+                  : "登录后统一同步全部客户端与 MCP 能力；无需登录也可先浏览模型广场。"}
               </p>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -319,6 +379,178 @@ export function GeneralSettingsPanel({
               >
                 {loggingIn ? "登录中..." : "OAuth 一键登录"}
               </button>
+            </div>
+          </div>
+        )}
+
+        {/* Local Saved Keys List (key-centric switching, supports multiple keys under the same account) */}
+        {(account?.loggedIn || savedKeys.length > 0) && (
+          <div className="pt-3 border-t border-[var(--border)] flex flex-col gap-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-[12.5px] font-semibold text-[var(--text-primary)]">
+                  本地密钥列表 ({savedKeys.length})
+                </div>
+                <p className="text-[11px] text-[var(--text-muted)] mt-0.5">
+                  以密钥为主体切换（同一账号可保存多把不同配置的 Key），切换后本地网关即时生效；新增或调整配额请在平台管理。
+                </p>
+              </div>
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => void api.openUrl(keysManageUrl)}
+                  className="h-7 px-2.5 rounded-[7px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[11.5px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] inline-flex items-center gap-1 cursor-pointer"
+                >
+                  <ExternalLink className="h-3 w-3" />
+                  <span>平台密钥管理</span>
+                </button>
+                <button
+                  type="button"
+                  data-testid="settings-add-key"
+                  onClick={onOpenKeyModal}
+                  className="h-7 px-2.5 rounded-[7px] bg-[var(--accent-soft)] hover:bg-[var(--accent)] text-[var(--accent)] hover:text-white border border-[var(--accent)]/30 text-[11.5px] font-medium inline-flex items-center gap-1 transition cursor-pointer"
+                >
+                  <Plus className="h-3 w-3" />
+                  <span>添加密钥</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-1.5">
+              {savedKeys.map((item) => {
+                const isSwitching = switchingKeyId === item.id;
+                const isEditing = editingAliasId === item.id;
+                return (
+                  <div
+                    key={item.id}
+                    data-testid={`saved-key-row-${item.id}`}
+                    className={`rounded-[10px] border px-3 py-2 flex flex-wrap items-center justify-between gap-2.5 transition-colors ${
+                      item.active
+                        ? "border-[var(--accent)]/40 bg-[var(--accent-soft)]/50"
+                        : "border-[var(--border)] bg-[var(--bg-canvas)]/45 hover:bg-[var(--bg-subtle)]/60"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                      <span
+                        className={`h-5 w-5 rounded-full inline-flex items-center justify-center shrink-0 ${
+                          item.active
+                            ? "bg-[var(--accent)] text-white"
+                            : "border border-[var(--border-strong)] text-transparent"
+                        }`}
+                      >
+                        <Check className="h-3 w-3" />
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="text-[12.5px] font-semibold text-[var(--text-primary)] break-all">
+                            {item.displayLabel}
+                          </span>
+                          {item.alias && !isEditing && (
+                            <span className="text-[10.5px] font-medium px-1.5 py-0.5 rounded bg-[var(--bg-card)] border border-[var(--border)] text-[var(--accent)] shrink-0">
+                              {item.alias}
+                            </span>
+                          )}
+                          {item.authSource === "oauth" && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] text-[var(--text-muted)] shrink-0">
+                              OAuth
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[11px] font-mono text-[var(--text-muted)] truncate mt-0.5">
+                          {item.maskedKey}
+                        </div>
+                        {isEditing && (
+                          <form
+                            onSubmit={(e) => {
+                              e.preventDefault();
+                              void submitAliasEdit(item.id);
+                            }}
+                            className="mt-1.5 flex items-center gap-1.5 max-w-[300px]"
+                          >
+                            <input
+                              type="text"
+                              autoFocus
+                              maxLength={40}
+                              value={editingAliasDraft}
+                              onChange={(e) => setEditingAliasDraft(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Escape") {
+                                  setEditingAliasId(null);
+                                  setEditingAliasDraft("");
+                                }
+                              }}
+                              placeholder="输入备注标签（留空清除）"
+                              className="h-7 flex-1 min-w-0 px-2 rounded-[6px] border border-[var(--accent)] bg-[var(--bg-card)] text-[11.5px] text-[var(--text-primary)] focus:outline-none"
+                            />
+                            <button
+                              type="submit"
+                              disabled={savingAlias}
+                              className="h-7 px-2 rounded-[6px] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[11px] font-medium cursor-pointer disabled:opacity-50"
+                            >
+                              保存
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEditingAliasId(null);
+                                setEditingAliasDraft("");
+                              }}
+                              aria-label="取消编辑备注"
+                              className="h-7 w-7 rounded-[6px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-muted)] inline-flex items-center justify-center cursor-pointer"
+                            >
+                              <X className="h-3 w-3" />
+                            </button>
+                          </form>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {item.active ? (
+                        <StatusPill tone="accent">使用中</StatusPill>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={Boolean(switchingKeyId)}
+                          onClick={() => onSwitchKey(item.id)}
+                          className="h-7 px-2.5 rounded-[7px] border border-[var(--border)] bg-[var(--bg-card)] hover:border-[var(--accent)] hover:text-[var(--accent)] text-[11.5px] font-medium text-[var(--text-primary)] inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                        >
+                          {isSwitching && <Loader2 className="h-3 w-3 animate-spin" />}
+                          <span>{isSwitching ? "切换中..." : "切换"}</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        disabled={Boolean(switchingKeyId)}
+                        onClick={() => {
+                          if (isEditing) {
+                            setEditingAliasId(null);
+                            setEditingAliasDraft("");
+                          } else {
+                            setEditingAliasId(item.id);
+                            setEditingAliasDraft(item.alias ?? "");
+                          }
+                        }}
+                        title="设置本地备注标签"
+                        aria-label={`编辑备注 ${item.displayLabel}`}
+                        className="h-7 w-7 rounded-[7px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] inline-flex items-center justify-center cursor-pointer disabled:opacity-40"
+                      >
+                        <Pencil className="h-3 w-3" />
+                      </button>
+                      <button
+                        type="button"
+                        disabled={Boolean(switchingKeyId)}
+                        onClick={() => onRemoveKey(item.id)}
+                        title="仅从本地列表移除（不会删除平台密钥）"
+                        aria-label={`移除密钥 ${item.displayLabel}`}
+                        className="h-7 w-7 rounded-[7px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--danger-soft)] hover:border-[var(--danger)]/30 text-[var(--text-muted)] hover:text-[var(--danger)] inline-flex items-center justify-center cursor-pointer disabled:opacity-40"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}
