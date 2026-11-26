@@ -1,5 +1,10 @@
+use hyper::header::{HeaderName, HeaderValue, CONTENT_LENGTH, TRANSFER_ENCODING};
+use hyper::{HeaderMap, StatusCode};
 use serde_json::{json, Value};
+use std::ffi::OsString;
+use std::future::Future;
 use std::io::ErrorKind;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,9 +13,70 @@ use tako_switch_lib::config::{
     read_switch_state, save_switch_auth, save_switch_state, write_atomic, AppPaths, SwitchState,
 };
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, watch, Notify};
+use tokio::runtime::{Builder, Runtime};
+use tokio::sync::{oneshot, watch, Mutex, MutexGuard, Notify};
+use tokio::task::JoinSet;
+
+const PROXY_ENV_KEYS: [&str; 9] = [
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "REQUEST_METHOD", // The proxy matcher ignores proxy settings in CGI environments.
+];
+// All tests in this binary hold this lock before any environment-dependent work.
+static ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+struct ProxyEnvGuard {
+    saved: [Option<OsString>; PROXY_ENV_KEYS.len()],
+    runtime: Option<Runtime>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl ProxyEnvGuard {
+    fn new(lock: MutexGuard<'static, ()>) -> Self {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+        let guard = Self {
+            saved: PROXY_ENV_KEYS.map(std::env::var_os),
+            runtime: Some(runtime),
+            _lock: lock,
+        };
+        for key in PROXY_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+        guard
+    }
+
+    fn set_http_proxy(&mut self, address: SocketAddr) {
+        std::env::set_var("HTTP_PROXY", format!("http://{address}"));
+        // A nonmatching entry also keeps OS proxy exceptions out of the fixture.
+        std::env::set_var("NO_PROXY", "example.invalid");
+    }
+
+    fn run<T>(&self, test: impl Future<Output = T>) -> T {
+        self.runtime.as_ref().unwrap().block_on(test)
+    }
+}
+
+impl Drop for ProxyEnvGuard {
+    fn drop(&mut self) {
+        // The listener spawns untracked connection tasks; shutting down the runtime stops them too.
+        drop(self.runtime.take());
+        for (key, value) in PROXY_ENV_KEYS.into_iter().zip(&self.saved) {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+    }
+}
 
 fn setup_sandbox() -> (TempDir, AppPaths) {
     let tmp = TempDir::new().expect("create tempdir");
@@ -29,123 +95,151 @@ fn setup_sandbox() -> (TempDir, AppPaths) {
     (tmp, paths)
 }
 
-async fn read_http_headers(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
-    let mut buf = Vec::with_capacity(4096);
-    let mut chunk = [0u8; 2048];
+fn loopback_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+}
+
+fn is_chunked(headers: &HeaderMap) -> bool {
+    headers.get_all(TRANSFER_ENCODING).iter().any(|value| {
+        value
+            .as_bytes()
+            .split(|byte| *byte == b',')
+            .any(|coding| coding.trim_ascii().eq_ignore_ascii_case(b"chunked"))
+    })
+}
+
+async fn write_mock_response(
+    stream: &mut BufReader<TcpStream>,
+    status: StatusCode,
+    content_type: &str,
+    body: &str,
+) {
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        status.as_u16(),
+        status.canonical_reason().unwrap(),
+        body.len(),
+    );
+    stream.write_all(response.as_bytes()).await.unwrap();
+}
+
+async fn read_http_line(stream: &mut BufReader<TcpStream>) -> Result<String, String> {
+    let mut line = String::new();
+    stream
+        .read_line(&mut line)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !line.ends_with("\r\n") {
+        return Err(format!("expected CRLF-terminated HTTP line, got {line:?}"));
+    }
+    line.truncate(line.len() - 2);
+    Ok(line)
+}
+
+fn parse_header_line(line: &str) -> Result<(HeaderName, HeaderValue), String> {
+    let (name, value) = line
+        .split_once(':')
+        .ok_or_else(|| format!("invalid HTTP header: {line:?}"))?;
+    let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| e.to_string())?;
+    let value = HeaderValue::from_str(value.trim()).map_err(|e| e.to_string())?;
+    Ok((name, value))
+}
+
+async fn read_http_headers(
+    stream: &mut BufReader<TcpStream>,
+) -> Result<(String, HeaderMap), String> {
+    let request_line = read_http_line(stream).await?;
+    let mut headers = HeaderMap::new();
     loop {
-        let n = stream
-            .read(&mut chunk)
-            .await
-            .map_err(|e| format!("read headers err: {e}"))?;
-        if n == 0 {
-            return Err("eof before end of headers".to_string());
+        let line = read_http_line(stream).await?;
+        if line.is_empty() {
+            return Ok((request_line, headers));
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let head = String::from_utf8_lossy(&buf[..pos + 4]).into_owned();
-            let remainder = buf[pos + 4..].to_vec();
-            return Ok((head, remainder));
-        }
+        let (name, value) = parse_header_line(&line)?;
+        headers.append(name, value);
     }
 }
 
 async fn read_chunked_or_fixed_body(
-    stream: &mut TcpStream,
-    headers: &str,
-    mut remainder: Vec<u8>,
+    stream: &mut BufReader<TcpStream>,
+    headers: &HeaderMap,
     mut first_chunk: Option<oneshot::Sender<()>>,
 ) -> Result<Vec<u8>, String> {
-    let lower = headers.to_ascii_lowercase();
-    if lower.contains("transfer-encoding: chunked") {
+    if let Some(encoding) = headers.get(TRANSFER_ENCODING) {
+        if !encoding.as_bytes().eq_ignore_ascii_case(b"chunked") {
+            return Err(format!("unexpected transfer encoding: {encoding:?}"));
+        }
+        if headers.contains_key(CONTENT_LENGTH) {
+            return Err("chunked upload must not include Content-Length".to_string());
+        }
+
         let mut decoded = Vec::new();
         loop {
-            while !remainder.windows(2).any(|w| w == b"\r\n") {
-                let mut tmp = [0u8; 4096];
-                let n = stream
-                    .read(&mut tmp)
-                    .await
-                    .map_err(|e| format!("chunk size read err: {e}"))?;
-                if n == 0 {
-                    return Err("unexpected eof in chunked size".to_string());
-                }
-                remainder.extend_from_slice(&tmp[..n]);
+            let line = read_http_line(stream).await?;
+            let size_hex = line.split_once(';').map_or(line.as_str(), |(size, _)| size);
+            if size_hex.is_empty() || !size_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(format!("invalid chunk size: {line:?}"));
             }
-            let crlf = remainder.windows(2).position(|w| w == b"\r\n").unwrap();
-            let size_hex = String::from_utf8_lossy(&remainder[..crlf])
-                .split(';')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let chunk_len = usize::from_str_radix(&size_hex, 16)
+            let len = usize::from_str_radix(size_hex, 16)
                 .map_err(|e| format!("bad chunk size {size_hex:?}: {e}"))?;
-            remainder.drain(..crlf + 2);
-            if chunk_len == 0 {
-                while remainder.len() < 2 {
-                    let mut tmp = [0u8; 64];
-                    let n = stream
-                        .read(&mut tmp)
-                        .await
-                        .map_err(|e| format!("trailer read err: {e}"))?;
-                    if n == 0 {
-                        break;
+            if len == 0 {
+                loop {
+                    let trailer = read_http_line(stream).await?;
+                    if trailer.is_empty() {
+                        return Ok(decoded);
                     }
-                    remainder.extend_from_slice(&tmp[..n]);
+                    parse_header_line(&trailer)?;
                 }
-                return Ok(decoded);
             }
-            while remainder.len() < chunk_len + 2 {
-                let mut tmp = [0u8; 16384];
-                let n = stream
-                    .read(&mut tmp)
-                    .await
-                    .map_err(|e| format!("chunk data read err: {e}"))?;
-                if n == 0 {
-                    return Err("unexpected eof in chunk data".to_string());
-                }
-                remainder.extend_from_slice(&tmp[..n]);
+
+            let start = decoded.len();
+            let end = start.checked_add(len).ok_or("chunk length overflow")?;
+            decoded.resize(end, 0);
+            stream
+                .read_exact(&mut decoded[start..])
+                .await
+                .map_err(|e| format!("incomplete chunk data: {e}"))?;
+            let mut crlf = [0; 2];
+            stream
+                .read_exact(&mut crlf)
+                .await
+                .map_err(|e| format!("incomplete chunk terminator: {e}"))?;
+            if &crlf != b"\r\n" {
+                return Err("invalid chunk terminator".to_string());
             }
-            decoded.extend_from_slice(&remainder[..chunk_len]);
-            remainder.drain(..chunk_len + 2);
             if let Some(tx) = first_chunk.take() {
                 let _ = tx.send(());
             }
         }
     }
 
-    let content_len = headers
-        .lines()
-        .find_map(|line| {
-            let (k, v) = line.split_once(':')?;
-            if k.trim().eq_ignore_ascii_case("content-length") {
-                v.trim().parse::<usize>().ok()
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
-
-    while remainder.len() < content_len {
-        let mut tmp = [0u8; 16384];
-        let n = stream
-            .read(&mut tmp)
-            .await
-            .map_err(|e| format!("fixed body read err: {e}"))?;
-        if n == 0 {
-            return Err(format!(
-                "unexpected eof reading fixed body ({}/{})",
-                remainder.len(),
-                content_len
-            ));
-        }
-        remainder.extend_from_slice(&tmp[..n]);
+    if first_chunk.is_some() {
+        return Err("native upload must be chunked".to_string());
     }
-    remainder.truncate(content_len);
-    Ok(remainder)
+    let len = match headers.get(CONTENT_LENGTH) {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .ok_or("invalid Content-Length")?,
+        None => 0,
+    };
+    let mut body = vec![0; len];
+    stream
+        .read_exact(&mut body)
+        .await
+        .map_err(|e| format!("incomplete fixed body: {e}"))?;
+    Ok(body)
 }
 
 #[test]
 fn switch_state_bypass_system_proxy_defaults_true_and_roundtrips_false() {
+    let _environment = ENV_LOCK.blocking_lock();
     let (_tmp, paths) = setup_sandbox();
 
     let fresh = SwitchState::default_for(&paths);
@@ -181,56 +275,58 @@ fn switch_state_bypass_system_proxy_defaults_true_and_roundtrips_false() {
     assert!(!read_switch_state(&paths).bypass_system_proxy);
 }
 
-#[tokio::test]
-async fn gateway_honors_bypass_system_proxy_toggle_live_without_restart() {
+#[test]
+fn gateway_honors_bypass_system_proxy_toggle_live_without_restart() {
+    let lock = ENV_LOCK.blocking_lock();
     let (_tmp, paths) = setup_sandbox();
+    let mut environment = ProxyEnvGuard::new(lock);
+    let proxy_listener = environment.run(TcpListener::bind("127.0.0.1:0")).unwrap();
+    environment.set_http_proxy(proxy_listener.local_addr().unwrap());
+    environment.run(check_live_proxy_toggle(paths, proxy_listener));
+}
 
-    // Start a mock HTTP forward proxy on 127.0.0.1:<ephemeral>
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = proxy_listener.local_addr().unwrap();
+async fn check_live_proxy_toggle(paths: AppPaths, proxy_listener: TcpListener) {
+    let mut tasks = JoinSet::new();
     let proxy_hits = Arc::new(AtomicUsize::new(0));
     let proxy_hits_clone = proxy_hits.clone();
-
-    tokio::spawn(async move {
-        while let Ok((mut sock, _)) = proxy_listener.accept().await {
-            let hits = proxy_hits_clone.clone();
-            tokio::spawn(async move {
-                if let Ok((head, _rem)) = read_http_headers(&mut sock).await {
-                    hits.fetch_add(1, Ordering::SeqCst);
-                    let body = json!({
-                        "models": [{
-                            "name": "models/gemini-4-carbon",
-                            "displayName": "Gemini 4 Carbon",
-                            "description": head.lines().next().unwrap_or("")
-                        }]
-                    })
-                    .to_string();
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = sock.write_all(resp.as_bytes()).await;
-                }
+    tasks.spawn(async move {
+        loop {
+            let (sock, _) = proxy_listener.accept().await.unwrap();
+            let mut sock = BufReader::new(sock);
+            let (request_line, _) = read_http_headers(&mut sock).await.unwrap();
+            proxy_hits_clone.fetch_add(1, Ordering::SeqCst);
+            let body = json!({
+                "models": [{
+                    "name": "models/gemini-4-carbon",
+                    "displayName": "Gemini 4 Carbon",
+                    "description": request_line
+                }]
             });
+            write_mock_response(
+                &mut sock,
+                StatusCode::OK,
+                "application/json",
+                &body.to_string(),
+            )
+            .await;
         }
     });
-
-    // The other tests use direct clients and do not route through this mock proxy.
-    std::env::set_var("HTTP_PROXY", format!("http://{proxy_addr}"));
-    std::env::remove_var("NO_PROXY");
-    std::env::remove_var("no_proxy");
 
     // Keep the direct origin bound: a refused loopback connect can take seconds on Windows.
     let direct_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let direct_upstream_addr = direct_upstream.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((mut sock, _)) = direct_upstream.accept().await {
-            if read_http_headers(&mut sock).await.is_ok() {
-                let _ = sock
-                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                    .await;
-            }
+    tasks.spawn(async move {
+        loop {
+            let (sock, _) = direct_upstream.accept().await.unwrap();
+            let mut sock = BufReader::new(sock);
+            read_http_headers(&mut sock).await.unwrap();
+            write_mock_response(
+                &mut sock,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "application/json",
+                "",
+            )
+            .await;
         }
     });
     let mut state = read_switch_state(&paths);
@@ -241,15 +337,13 @@ async fn gateway_honors_bypass_system_proxy_toggle_live_without_restart() {
     let gw_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gw_addr = gw_listener.local_addr().unwrap();
     let paths_for_gw = paths.clone();
-    tokio::spawn(async move {
-        let _ = serve_proxy_on_listener(gw_listener, paths_for_gw).await;
+    tasks.spawn(async move {
+        serve_proxy_on_listener(gw_listener, paths_for_gw)
+            .await
+            .unwrap();
     });
 
-    let test_client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let test_client = loopback_client();
 
     // 1) Default `bypass_system_proxy = true`: must NOT touch `HTTP_PROXY`.
     let resp_direct = test_client
@@ -258,6 +352,7 @@ async fn gateway_honors_bypass_system_proxy_toggle_live_without_restart() {
         .await
         .unwrap();
     assert_eq!(resp_direct.status().as_u16(), 503);
+    resp_direct.bytes().await.unwrap();
     assert_eq!(
         proxy_hits.load(Ordering::SeqCst),
         0,
@@ -274,6 +369,7 @@ async fn gateway_honors_bypass_system_proxy_toggle_live_without_restart() {
         .await
         .unwrap();
     assert_eq!(resp_via_proxy.status().as_u16(), 200);
+    resp_via_proxy.bytes().await.unwrap();
     assert!(
         proxy_hits.load(Ordering::SeqCst) >= 1,
         "bypass_system_proxy=false must route through HTTP_PROXY"
@@ -290,16 +386,25 @@ async fn gateway_honors_bypass_system_proxy_toggle_live_without_restart() {
         .await
         .unwrap();
     assert_eq!(resp_direct_again.status().as_u16(), 503);
+    resp_direct_again.bytes().await.unwrap();
     assert_eq!(
         proxy_hits.load(Ordering::SeqCst),
         hits_before,
         "re-enabling bypass_system_proxy=true must stop hitting HTTP_PROXY immediately"
     );
+    tasks.shutdown().await;
 }
 
-#[tokio::test]
-async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_large_body() {
+#[test]
+fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_large_body() {
+    let lock = ENV_LOCK.blocking_lock();
     let (_tmp, paths) = setup_sandbox();
+    let environment = ProxyEnvGuard::new(lock);
+    environment.run(check_streaming_abort(paths));
+}
+
+async fn check_streaming_abort(paths: AppPaths) {
+    let mut tasks = JoinSet::new();
 
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
@@ -321,8 +426,16 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
     let get_had_chunked = Arc::new(AtomicUsize::new(0));
     let get_had_chunked_clone = get_had_chunked.clone();
 
-    tokio::spawn(async move {
-        while let Ok((mut sock, _)) = upstream_listener.accept().await {
+    tasks.spawn(async move {
+        let mut connections = JoinSet::new();
+        loop {
+            let (sock, _) = tokio::select! {
+                connection = upstream_listener.accept() => connection.unwrap(),
+                finished = connections.join_next(), if !connections.is_empty() => {
+                    finished.unwrap().unwrap();
+                    continue;
+                }
+            };
             let pricing_started = pricing_started_upstream.clone();
             let mut pricing_released = pricing_released.clone();
             let h1_streamed = hang1_streamed.clone();
@@ -332,20 +445,14 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
             let h2_c = hang2_closed.clone();
             let get_chunked = get_had_chunked_clone.clone();
 
-            tokio::spawn(async move {
-                let Ok((head, rem)) = read_http_headers(&mut sock).await else {
-                    return;
-                };
-                let req_line = head.lines().next().unwrap_or("").to_string();
+            connections.spawn(async move {
+                let mut sock = BufReader::new(sock);
+                let (req_line, headers) = read_http_headers(&mut sock).await.unwrap();
 
                 if req_line.starts_with("GET /v1beta/models ") {
                     // Leave the synthetic route unset so its request exercises the pricing fallback.
                     let body = r#"{"models":[]}"#;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = sock.write_all(response.as_bytes()).await;
+                    write_mock_response(&mut sock, StatusCode::OK, "application/json", body).await;
                     return;
                 }
 
@@ -365,29 +472,16 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
                         }]
                     })
                     .to_string();
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = sock.write_all(resp.as_bytes()).await;
+                    write_mock_response(&mut sock, StatusCode::OK, "application/json", &body).await;
                     return;
                 }
 
                 if req_line.starts_with("GET /codex/ping ") || req_line.starts_with("GET /ping ") {
-                    if head
-                        .to_ascii_lowercase()
-                        .contains("transfer-encoding: chunked")
-                    {
+                    if is_chunked(&headers) {
                         get_chunked.fetch_add(1, Ordering::SeqCst);
                     }
                     let body = r#"{"pong":true}"#;
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = sock.write_all(resp.as_bytes()).await;
+                    write_mock_response(&mut sock, StatusCode::OK, "application/json", body).await;
                     return;
                 }
 
@@ -398,18 +492,7 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
                 } else {
                     None
                 };
-                if first_chunk.is_some() {
-                    assert!(
-                        !head.lines().any(|line| {
-                            line.split_once(':').is_some_and(|(name, _)| {
-                                name.eq_ignore_ascii_case("content-length")
-                            })
-                        }),
-                        "chunked native upload must not include Content-Length"
-                    );
-                }
-
-                let body_bytes = read_chunked_or_fixed_body(&mut sock, &head, rem, first_chunk)
+                let body_bytes = read_chunked_or_fixed_body(&mut sock, &headers, first_chunk)
                     .await
                     .unwrap_or_else(|err| {
                         panic!("cannot read upstream body for {req_line}: {err}")
@@ -422,16 +505,17 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
                         "data: {{\"received_bytes\":{}}}\n\ndata: [DONE]\n\n",
                         body_bytes.len()
                     );
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        sse.len(),
-                        sse
-                    );
-                    let _ = sock.write_all(resp.as_bytes()).await;
+                    write_mock_response(&mut sock, StatusCode::OK, "text/event-stream", &sse).await;
                     return;
                 }
 
                 // Hanging streamGenerateContent endpoint: hold response headers until downstream aborts us.
+                assert!(
+                    req_line.starts_with(
+                        "POST /v1beta/models/gemini-4-carbon:streamGenerateContent?alt=sse "
+                    ),
+                    "unexpected request: {req_line}"
+                );
                 let body_json: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
                 let has_injected_effort = body_json
                     .pointer("/generationConfig/thinkingConfig/thinkingLevel")
@@ -477,15 +561,13 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
     let gw_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gw_addr = gw_listener.local_addr().unwrap();
     let paths_for_gw = paths.clone();
-    tokio::spawn(async move {
-        let _ = serve_proxy_on_listener(gw_listener, paths_for_gw).await;
+    tasks.spawn(async move {
+        serve_proxy_on_listener(gw_listener, paths_for_gw)
+            .await
+            .unwrap();
     });
 
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .unwrap();
+    let client = loopback_client();
 
     // A) Empty GET request must NOT emit Transfer-Encoding: chunked.
     let ping_resp = client
@@ -494,6 +576,7 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
         .await
         .unwrap();
     assert_eq!(ping_resp.status().as_u16(), 200);
+    ping_resp.bytes().await.unwrap();
     assert_eq!(
         get_had_chunked.load(Ordering::SeqCst),
         0,
@@ -524,11 +607,19 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
 
     // Hold the pricing fetch open while the native model streams its request.
     let catalog_client = client.clone();
-    let catalog = tokio::spawn(async move {
-        catalog_client
-            .get(format!("http://{gw_addr}/v1beta/models"))
-            .send()
-            .await
+    let (catalog_done, catalog) = oneshot::channel();
+    tasks.spawn(async move {
+        let result = async {
+            let response = catalog_client
+                .get(format!("http://{gw_addr}/v1beta/models"))
+                .send()
+                .await?;
+            let status = response.status();
+            response.bytes().await?;
+            Ok::<_, reqwest::Error>(status)
+        }
+        .await;
+        let _ = catalog_done.send(result);
     });
     tokio::time::timeout(Duration::from_secs(2), pricing_started.notified())
         .await
@@ -562,7 +653,7 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
         .unwrap();
     assert!(arrived_body == body1.as_bytes(), "native body was modified");
 
-    // Simulate Antigravity 60s ResponseHeaderTimeout closing the local socket.
+    // Drop the whole downstream socket only after the upstream consumes the body.
     let disconnect_started = Instant::now();
     drop(raw_client1);
 
@@ -577,7 +668,7 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
     );
 
     release_pricing.send(true).unwrap();
-    assert_eq!(catalog.await.unwrap().unwrap().status().as_u16(), 200);
+    assert_eq!(catalog.await.unwrap().unwrap(), StatusCode::OK);
 
     // D) Synthetic rewritten POST: client disconnects while awaiting response headers.
     let mut raw_client2 = TcpStream::connect(gw_addr).await.unwrap();
@@ -613,4 +704,5 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
         .unwrap()
         .unwrap();
     assert!(disconnect_started2.elapsed() < Duration::from_millis(600));
+    tasks.shutdown().await;
 }

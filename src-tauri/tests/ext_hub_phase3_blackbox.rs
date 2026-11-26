@@ -1113,55 +1113,65 @@ async fn tc_p3_04_readonly_duplicate_scope_cannot_modify_user_or_project_plugin(
 
 #[tokio::test]
 async fn tc_p3_04_child_stdin_is_closed_and_json_failures_are_not_success() {
+    fn write_claude_script(directory: &Path, script: &str) -> PathBuf {
+        let cli = directory.join(if cfg!(windows) {
+            "claude.cmd"
+        } else {
+            "claude"
+        });
+        write(&cli, script);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        cli
+    }
+
     let (_temporary, paths) = sandbox();
-    let cli = fake_cli(&paths.home.join("stdin"), "claude", &json!([]));
-    #[cfg(windows)]
-    write(
-        &cli,
-        "@echo off\r\nset /p answer=\r\nif defined answer exit /b 9\r\necho []\r\n",
-    );
-    #[cfg(not(windows))]
-    write(
-        &cli,
-        "#!/bin/sh\nif read -r answer; then exit 9; fi\nprintf '[]'\n",
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    let options = PluginTestOverrides {
-        short_timeout: Some(Duration::from_secs(2)),
-        ..overrides(cli.clone())
+    let timeout = Some(Duration::from_secs(15));
+    let stdin_script = if cfg!(windows) {
+        "@echo off\r\nset /p answer=\r\nif defined answer exit /b 9\r\necho []\r\nexit /b 0\r\n"
+    } else {
+        "#!/bin/sh\nif read -r answer; then exit 9; fi\nprintf '[]'\n"
     };
-    assert!(
-        get_plugins_hub_snapshot_with_overrides(&paths, ExtPlatform::Claude, false, &options)
-            .await
-            .unwrap()
-            .installed
-            .is_empty()
-    );
-    #[cfg(windows)]
-    write(
-        &cli,
-        "@echo off\r\necho {\"success\":false,\"error\":\"EBUSY locked\"}\r\n",
-    );
-    #[cfg(not(windows))]
-    write(
-        &cli,
-        "#!/bin/sh\nprintf '%s' '{\"success\":false,\"error\":\"EBUSY locked\"}'\n",
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    let stdin_options = PluginTestOverrides {
+        short_timeout: timeout,
+        ..overrides(write_claude_script(
+            &paths.home.join("stdin-eof"),
+            stdin_script,
+        ))
+    };
+    assert!(get_plugins_hub_snapshot_with_overrides(
+        &paths,
+        ExtPlatform::Claude,
+        false,
+        &stdin_options
+    )
+    .await
+    .unwrap()
+    .installed
+    .is_empty());
+
+    let ebusy_script = if cfg!(windows) {
+        "@echo off\r\necho {\"success\":false,\"error\":\"EBUSY locked\"}\r\nexit /b 0\r\n"
+    } else {
+        "#!/bin/sh\nprintf '%s' '{\"success\":false,\"error\":\"EBUSY locked\"}'\n"
+    };
+    let ebusy_options = PluginTestOverrides {
+        short_timeout: timeout,
+        long_timeout: timeout,
+        ..overrides(write_claude_script(
+            &paths.home.join("ebusy-json"),
+            ebusy_script,
+        ))
+    };
     let error = execute_plugin_action_with_overrides(
         &paths,
         ExtPlatform::Claude,
         PluginAction::Install,
         "alpha@official",
-        &options,
+        &ebusy_options,
     )
     .await
     .unwrap_err();
