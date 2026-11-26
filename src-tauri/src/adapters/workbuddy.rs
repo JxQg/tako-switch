@@ -728,10 +728,8 @@ fn decode_chromium_ls_string(raw: &[u8]) -> Option<String> {
     match tag {
         0x01 => Some(String::from_utf8_lossy(rest).into_owned()),
         0x00 if rest.len() % 2 == 0 => {
-            let units: Vec<u16> = rest
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
+            let (chunks, _) = rest.as_chunks::<2>();
+            let units: Vec<u16> = chunks.iter().copied().map(u16::from_le_bytes).collect();
             String::from_utf16(&units).ok()
         }
         _ => None,

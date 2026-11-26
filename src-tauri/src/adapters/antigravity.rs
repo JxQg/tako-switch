@@ -1181,9 +1181,8 @@ mod tests {
         // Switching back to Official removes our override while keeping user keys
         adapter.apply_mode(&paths, AppMode::Official).unwrap();
         assert!(!AntigravityAdapter::is_upstream_auto_update_disabled(&paths));
-        assert!(AntigravityAdapter::read_gateway_env(&paths)
-            .get("AGY_CLI_DISABLE_AUTO_UPDATE")
-            .is_none());
+        assert!(!AntigravityAdapter::read_gateway_env(&paths)
+            .contains_key("AGY_CLI_DISABLE_AUTO_UPDATE"));
         let restored = read_json_object_or_empty(&storage_path).unwrap();
         assert!(!restored.contains_key(AGY_AUTO_CHECK_UPDATES_KEY));
         assert_eq!(restored.get("sidebarWidth").and_then(Value::as_str), Some("280"));
