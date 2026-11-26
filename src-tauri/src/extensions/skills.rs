@@ -45,8 +45,16 @@ struct StagedUpload {
     updated_at: Instant,
 }
 
-static STAGED_UPLOADS: Mutex<Option<BTreeMap<String, StagedUpload>>> = Mutex::new(None);
-static STAGED_UPLOAD_REAPER_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[derive(Default)]
+struct StagedUploadRegistry {
+    uploads: BTreeMap<String, StagedUpload>,
+    reaper_running: bool,
+}
+
+static STAGED_UPLOADS: Mutex<StagedUploadRegistry> = Mutex::new(StagedUploadRegistry {
+    uploads: BTreeMap::new(),
+    reaper_running: false,
+});
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -304,8 +312,189 @@ impl Seek for ArchiveBacking {
     }
 }
 
+#[derive(Debug)]
+struct ConstrainedZipReader {
+    backing: ArchiveBacking,
+    cd_offset: u64,
+    cd_bytes: Vec<u8>,
+    canonical_eocd: [u8; 22],
+    pos: u64,
+    metadata_locked: Arc<AtomicBool>,
+    eocd_parsed: bool,
+    cd_offset_seeks: u8,
+    cd_reading_started: bool,
+    metadata_bytes_read: u64,
+    metadata_read_budget: u64,
+}
+
+impl ConstrainedZipReader {
+    fn new(
+        backing: ArchiveBacking,
+        preflight: PreflightedCentralDirectory,
+        metadata_locked: Arc<AtomicBool>,
+    ) -> Result<Self, String> {
+        let canonical_eocd = build_canonical_eocd(
+            preflight.parsed_entries,
+            preflight.cd_bytes.len(),
+            preflight.cd_offset,
+        )?;
+        let virtual_len = preflight
+            .cd_offset
+            .checked_add(preflight.cd_bytes.len() as u64)
+            .and_then(|v| v.checked_add(canonical_eocd.len() as u64))
+            .ok_or_else(|| "ZIP 归档长度溢出".to_string())?;
+        // Single-pass metadata read budget: initial backward EOCD window (<= 8 KiB) + 22-byte EOCD
+        // + 4-byte mandatory CDFH probe + exact central directory length.
+        let metadata_read_budget = virtual_len
+            .min(8192)
+            .saturating_add(canonical_eocd.len() as u64)
+            .saturating_add(4)
+            .saturating_add(preflight.cd_bytes.len() as u64);
+        Ok(Self {
+            backing,
+            cd_offset: preflight.cd_offset,
+            cd_bytes: preflight.cd_bytes,
+            canonical_eocd,
+            pos: 0,
+            metadata_locked,
+            eocd_parsed: false,
+            cd_offset_seeks: 0,
+            cd_reading_started: false,
+            metadata_bytes_read: 0,
+            metadata_read_budget,
+        })
+    }
+
+    fn eocd_pos(&self) -> u64 {
+        self.cd_offset + self.cd_bytes.len() as u64
+    }
+
+    fn virtual_len(&self) -> u64 {
+        self.eocd_pos() + self.canonical_eocd.len() as u64
+    }
+
+    fn release_metadata_buffer(&mut self) {
+        if !self.cd_bytes.is_empty() {
+            self.cd_bytes = Vec::new();
+            self.cd_bytes.shrink_to_fit();
+        }
+    }
+}
+
+impl Read for ConstrainedZipReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.metadata_locked.load(Ordering::Acquire) {
+            self.release_metadata_buffer();
+            return self.backing.read(buf);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let eocd_pos = self.eocd_pos();
+        let virtual_len = self.virtual_len();
+        if self.cd_reading_started && (self.pos < self.cd_offset || self.pos >= eocd_pos) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "ZIP 中央目录读取越界",
+            ));
+        }
+        if self.pos >= virtual_len {
+            return Ok(0);
+        }
+        let avail = (virtual_len - self.pos).min(buf.len() as u64) as usize;
+        let next_total = self.metadata_bytes_read.saturating_add(avail as u64);
+        if next_total > self.metadata_read_budget {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "ZIP 中央目录元数据读取超限",
+            ));
+        }
+
+        let start_pos = self.pos;
+        let mut cursor = start_pos;
+        let mut written = 0usize;
+        while written < avail {
+            let remaining = avail - written;
+            if cursor < self.cd_offset {
+                let n = ((self.cd_offset - cursor) as usize).min(remaining);
+                buf[written..written + n].fill(0);
+                cursor += n as u64;
+                written += n;
+            } else if cursor < eocd_pos {
+                let off = (cursor - self.cd_offset) as usize;
+                let n = (self.cd_bytes.len() - off).min(remaining);
+                buf[written..written + n].copy_from_slice(&self.cd_bytes[off..off + n]);
+                cursor += n as u64;
+                written += n;
+            } else {
+                let off = (cursor - eocd_pos) as usize;
+                let n = (self.canonical_eocd.len() - off).min(remaining);
+                buf[written..written + n].copy_from_slice(&self.canonical_eocd[off..off + n]);
+                cursor += n as u64;
+                written += n;
+            }
+        }
+
+        self.pos = cursor;
+        self.metadata_bytes_read = next_total;
+        if start_pos == eocd_pos && self.pos == virtual_len {
+            self.eocd_parsed = true;
+        } else if self.eocd_parsed
+            && start_pos >= self.cd_offset
+            && self.pos > self.cd_offset.saturating_add(4)
+            && self.pos <= eocd_pos
+        {
+            self.cd_reading_started = true;
+        }
+        Ok(avail)
+    }
+}
+
+impl Seek for ConstrainedZipReader {
+    fn seek(&mut self, style: SeekFrom) -> std::io::Result<u64> {
+        if !self.metadata_locked.load(Ordering::Acquire) {
+            self.release_metadata_buffer();
+            return self.backing.seek(style);
+        }
+        let virtual_len = self.virtual_len();
+        let target_i128 = match style {
+            SeekFrom::Start(offset) => i128::from(offset),
+            SeekFrom::End(delta) => i128::from(virtual_len) + i128::from(delta),
+            SeekFrom::Current(delta) => i128::from(self.pos) + i128::from(delta),
+        };
+        if target_i128 < 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "invalid seek to a negative or overflowing position",
+            ));
+        }
+        let target = u64::try_from(target_i128).map_err(|_| {
+            std::io::Error::new(ErrorKind::InvalidInput, "seek position overflow")
+        })?;
+        if self.cd_reading_started {
+            if target != self.pos {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "ZIP 中央目录解析禁止回溯",
+                ));
+            }
+        } else if self.eocd_parsed {
+            if target == self.cd_offset && self.cd_offset_seeks < 2 {
+                self.cd_offset_seeks += 1;
+            } else if target != self.pos {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "ZIP 中央目录解析禁止回溯",
+                ));
+            }
+        }
+        self.pos = target;
+        Ok(self.pos)
+    }
+}
+
 struct ArchiveHandle {
-    archive: Mutex<zip::ZipArchive<ArchiveBacking>>,
+    archive: Mutex<zip::ZipArchive<ConstrainedZipReader>>,
 }
 
 impl std::fmt::Debug for ArchiveHandle {
@@ -519,23 +708,17 @@ fn evict_expired_staged_uploads_at(now: Instant) {
     let mut guard = STAGED_UPLOADS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(map) = guard.as_mut() {
-        map.retain(|_, upload| now.saturating_duration_since(upload.updated_at) <= STALE_TEMP_TTL);
-    }
+    guard
+        .uploads
+        .retain(|_, upload| now.saturating_duration_since(upload.updated_at) <= STALE_TEMP_TTL);
 }
 
 fn evict_expired_staged_uploads() {
     evict_expired_staged_uploads_at(Instant::now());
 }
 
-fn ensure_staged_upload_reaper() {
-    if STAGED_UPLOAD_REAPER_ACTIVE
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-    if std::thread::Builder::new()
+fn spawn_staged_upload_reaper() -> std::io::Result<()> {
+    std::thread::Builder::new()
         .name("tako-staged-upload-reaper".to_string())
         .spawn(|| loop {
             std::thread::sleep(STAGED_REAPER_POLL_INTERVAL);
@@ -543,32 +726,15 @@ fn ensure_staged_upload_reaper() {
             let mut guard = STAGED_UPLOADS
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let empty = if let Some(map) = guard.as_mut() {
-                map.retain(|_, upload| {
-                    now.saturating_duration_since(upload.updated_at) <= STALE_TEMP_TTL
-                });
-                map.is_empty()
-            } else {
-                true
-            };
-            if empty {
-                STAGED_UPLOAD_REAPER_ACTIVE.store(false, Ordering::Release);
-                let still_empty = guard.as_ref().is_none_or(BTreeMap::is_empty);
-                if still_empty {
-                    break;
-                }
-                if STAGED_UPLOAD_REAPER_ACTIVE
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    break;
-                }
+            guard.uploads.retain(|_, upload| {
+                now.saturating_duration_since(upload.updated_at) <= STALE_TEMP_TTL
+            });
+            if guard.uploads.is_empty() {
+                guard.reaper_running = false;
+                break;
             }
         })
-        .is_err()
-    {
-        STAGED_UPLOAD_REAPER_ACTIVE.store(false, Ordering::Release);
-    }
+        .map(|_| ())
 }
 
 fn parse_frontmatter(bytes: &[u8], fallback: &str) -> Result<Frontmatter, String> {
@@ -836,13 +1002,49 @@ fn read_u64_le(slice: &[u8], offset: usize) -> Option<u64> {
         .map(u64::from_le_bytes)
 }
 
+struct PreflightedCentralDirectory {
+    cd_offset: u64,
+    cd_bytes: Vec<u8>,
+    parsed_entries: usize,
+}
+
+fn build_canonical_eocd(
+    parsed_entries: usize,
+    cd_size: usize,
+    cd_offset: u64,
+) -> Result<[u8; 22], String> {
+    let entries_u16 = u16::try_from(parsed_entries)
+        .ok()
+        .filter(|&n| n < u16::MAX)
+        .ok_or_else(|| "ZIP 文件数量超过上限".to_string())?;
+    let cd_size_u32 = u32::try_from(cd_size)
+        .ok()
+        .filter(|&n| n < u32::MAX)
+        .ok_or_else(|| "ZIP 中央目录元数据超过上限".to_string())?;
+    let cd_offset_u32 = u32::try_from(cd_offset)
+        .ok()
+        .filter(|&n| n < u32::MAX)
+        .ok_or_else(|| "ZIP 中央目录偏移超过上限".to_string())?;
+
+    let mut eocd = [0u8; 22];
+    eocd[0..4].copy_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+    eocd[4..6].copy_from_slice(&0u16.to_le_bytes());
+    eocd[6..8].copy_from_slice(&0u16.to_le_bytes());
+    eocd[8..10].copy_from_slice(&entries_u16.to_le_bytes());
+    eocd[10..12].copy_from_slice(&entries_u16.to_le_bytes());
+    eocd[12..16].copy_from_slice(&cd_size_u32.to_le_bytes());
+    eocd[16..20].copy_from_slice(&cd_offset_u32.to_le_bytes());
+    eocd[20..22].copy_from_slice(&0u16.to_le_bytes());
+    Ok(eocd)
+}
+
 /// Pre-validates a ZIP archive's Central Directory before constructing `zip::ZipArchive`.
-/// Bounds entry count and metadata allocations and rejects exact duplicate raw entry names
-/// that `zip 2.6.1` would otherwise overwrite silently in its index.
+/// Captures the exact validated Central Directory bytes into memory so `ConstrainedZipReader`
+/// feeds `zip::ZipArchive::with_config` the identical single-EOCD view with zero backtracking.
 fn preflight_zip_central_directory<R: Read + Seek>(
     reader: &mut R,
     max_archive_bytes: u64,
-) -> Result<usize, String> {
+) -> Result<PreflightedCentralDirectory, String> {
     const EOCD_SIG: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
     const ZIP64_EOCD_SIG: [u8; 4] = [0x50, 0x4b, 0x06, 0x06];
     const ZIP64_LOCATOR_SIG: [u8; 4] = [0x50, 0x4b, 0x06, 0x07];
@@ -885,7 +1087,12 @@ fn preflight_zip_central_directory<R: Read + Seek>(
             }
         }
     }
-    let eocd_rel = eocd_rel.ok_or_else(|| "读取 ZIP 失败: 未找到有效的中央目录结束标记".to_string())?;
+    let eocd_rel =
+        eocd_rel.ok_or_else(|| "读取 ZIP 失败: 未找到有效的中央目录结束标记".to_string())?;
+    let eocd_comment = &tail[eocd_rel + EOCD_MIN_LEN as usize..];
+    if eocd_comment.windows(4).any(|window| window == EOCD_SIG) {
+        return Err("读取 ZIP 失败: 注释中包含嵌套的中央目录结束标记".to_string());
+    }
     let eocd_pos = tail_start + eocd_rel as u64;
     let eocd = &tail[eocd_rel..eocd_rel + EOCD_MIN_LEN as usize];
 
@@ -947,6 +1154,11 @@ fn preflight_zip_central_directory<R: Read + Seek>(
             if record_size < 44 || record_size.checked_add(12) != Some(eocd64_span) {
                 return Err("读取 ZIP64 失败: EOCD64 长度不一致".to_string());
             }
+            let z64_version_made = read_u16_le(&eocd64, 12).ok_or("读取 ZIP64 失败")?;
+            let z64_version_needed = read_u16_le(&eocd64, 14).ok_or("读取 ZIP64 失败")?;
+            if z64_version_needed > z64_version_made {
+                return Err("读取 ZIP64 失败: EOCD64 版本字段无效".to_string());
+            }
             let z64_disk = read_u32_le(&eocd64, 16).ok_or("读取 ZIP64 失败")?;
             let z64_cd_disk = read_u32_le(&eocd64, 20).ok_or("读取 ZIP64 失败")?;
             let z64_disk_entries = read_u64_le(&eocd64, 24).ok_or("读取 ZIP64 失败")?;
@@ -972,6 +1184,9 @@ fn preflight_zip_central_directory<R: Read + Seek>(
             )
         };
 
+    if declared_entries == 0 {
+        return Err("未找到包含 SKILL.md 的技能目录".to_string());
+    }
     if declared_entries > MAX_FILES as u64 {
         return Err("ZIP 文件数量超过上限".to_string());
     }
@@ -1004,6 +1219,14 @@ fn preflight_zip_central_directory<R: Read + Seek>(
         let name_len = read_u16_le(&cd_bytes, pos + 28).ok_or("读取 ZIP 失败")? as usize;
         let extra_len = read_u16_le(&cd_bytes, pos + 30).ok_or("读取 ZIP 失败")? as usize;
         let comment_len = read_u16_le(&cd_bytes, pos + 32).ok_or("读取 ZIP 失败")? as usize;
+        let disk_start = read_u16_le(&cd_bytes, pos + 34).ok_or("读取 ZIP 失败")?;
+        if disk_start != 0 {
+            return Err("不支持分卷 ZIP 归档".to_string());
+        }
+        let local_header_offset = read_u32_le(&cd_bytes, pos + 42).ok_or("读取 ZIP 失败")?;
+        if local_header_offset != u32::MAX && u64::from(local_header_offset) >= cd_offset {
+            return Err("读取 ZIP 失败: 本地文件头偏移无效".to_string());
+        }
         if name_len > MAX_ZIP_NAME_BYTES {
             return Err("ZIP 路径长度超过上限".to_string());
         }
@@ -1029,7 +1252,11 @@ fn preflight_zip_central_directory<R: Read + Seek>(
     reader
         .seek(SeekFrom::Start(0))
         .map_err(|e| format!("重置 ZIP 游标失败: {e}"))?;
-    Ok(parsed_entries)
+    Ok(PreflightedCentralDirectory {
+        cd_offset,
+        cd_bytes,
+        parsed_entries,
+    })
 }
 
 struct ScannedZipEntry {
@@ -1045,10 +1272,23 @@ fn scan_zip_archive_trees(
     max_depth: usize,
     max_bytes: u64,
 ) -> Result<Vec<(String, LocalSkillTree)>, String> {
-    let preflight_entries = preflight_zip_central_directory(&mut backing, max_bytes)?;
-    let mut archive =
-        zip::ZipArchive::new(backing).map_err(|e| format!("读取 ZIP 失败: {e}"))?;
-    if archive.len() != preflight_entries {
+    let preflight = preflight_zip_central_directory(&mut backing, max_bytes)?;
+    let expected_cd_offset = preflight.cd_offset;
+    let preflight_entries = preflight.parsed_entries;
+    let metadata_locked = Arc::new(AtomicBool::new(true));
+    let constrained = ConstrainedZipReader::new(backing, preflight, Arc::clone(&metadata_locked))?;
+    let mut archive = zip::ZipArchive::with_config(
+        zip::read::Config {
+            archive_offset: zip::read::ArchiveOffset::Known(0),
+        },
+        constrained,
+    )
+    .map_err(|e| format!("读取 ZIP 失败: {e}"))?;
+    metadata_locked.store(false, Ordering::Release);
+    if archive.central_directory_start() != expected_cd_offset
+        || archive.offset() != 0
+        || archive.len() != preflight_entries
+    {
         return Err("ZIP 存在重复路径或中央目录条目异常".to_string());
     }
     if archive.len() > MAX_FILES {
@@ -1413,11 +1653,17 @@ impl<'a> DirectoryTransaction<'a> {
         destination: &Path,
         tree: &LocalSkillTree,
         max_bytes: u64,
+        expected_hash: Option<&str>,
     ) -> Result<(), String> {
         let staged = self
             .reserve(destination, false)?
             .ok_or("缺少技能暂存路径")?;
-        write_tree_streaming(&staged, tree, max_bytes)
+        if let Err(err) = write_tree_streaming(&staged, tree, max_bytes, expected_hash) {
+            self.changes.pop();
+            let _ = remove_path(&staged);
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn stage_delivery(
@@ -1426,8 +1672,16 @@ impl<'a> DirectoryTransaction<'a> {
         destination: &Path,
         tree: Option<&LocalSkillTree>,
         method: SkillSyncMethod,
+        expected_hash: Option<&str>,
     ) -> Result<(), String> {
-        self.stage_delivery_with(master, destination, tree, method, directory_link)
+        self.stage_delivery_with(
+            master,
+            destination,
+            tree,
+            method,
+            expected_hash,
+            directory_link,
+        )
     }
 
     fn stage_delivery_with<F>(
@@ -1436,6 +1690,7 @@ impl<'a> DirectoryTransaction<'a> {
         destination: &Path,
         tree: Option<&LocalSkillTree>,
         method: SkillSyncMethod,
+        expected_hash: Option<&str>,
         create_link: F,
     ) -> Result<(), String>
     where
@@ -1448,6 +1703,8 @@ impl<'a> DirectoryTransaction<'a> {
             match create_link(master, &staged) {
                 Ok(()) => return Ok(()),
                 Err(e) if method == SkillSyncMethod::Symlink => {
+                    self.changes.pop();
+                    let _ = remove_path(&staged);
                     return Err(format!("创建技能软链失败，请改用自动或复制模式: {e}"));
                 }
                 Err(_) => remove_path(&staged)?,
@@ -1461,7 +1718,14 @@ impl<'a> DirectoryTransaction<'a> {
                 &owned_tree
             }
         };
-        write_tree_streaming(&staged, resolved_tree, MAX_LOCAL_SKILL_BYTES)
+        if let Err(err) =
+            write_tree_streaming(&staged, resolved_tree, MAX_LOCAL_SKILL_BYTES, expected_hash)
+        {
+            self.changes.pop();
+            let _ = remove_path(&staged);
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn stage_remove(&mut self, destination: &Path) -> Result<(), String> {
@@ -1528,25 +1792,59 @@ fn write_tree_streaming(
     directory: &Path,
     tree: &LocalSkillTree,
     max_bytes: u64,
-) -> Result<(), String> {
-    fs::create_dir_all(directory).map_err(|e| format!("创建技能暂存目录失败: {e}"))?;
+    expected_hash: Option<&str>,
+) -> Result<String, String> {
+    fs::create_dir(directory).map_err(|e| format!("创建技能暂存目录失败: {e}"))?;
+    let mut created_dirs: BTreeSet<String> = BTreeSet::new();
+    let mut expected_outer_hash = Sha256::new();
     let mut copied_total = 0u64;
     let mut buf = vec![0u8; STREAM_BUF_SIZE];
     for (relative, entry) in &tree.files {
-        let target = directory.join(relative);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("创建技能子目录 {} 失败: {e}", parent.display()))?;
+        let segments: Vec<&str> = relative.split('/').collect();
+        let mut dir_prefix = String::new();
+        let mut dir_path = directory.to_path_buf();
+        for segment in &segments[..segments.len().saturating_sub(1)] {
+            if !dir_prefix.is_empty() {
+                dir_prefix.push('/');
+            }
+            dir_prefix.push_str(segment);
+            dir_path.push(segment);
+            if !created_dirs.contains(&dir_prefix) {
+                match fs::create_dir(&dir_path) {
+                    Ok(()) => {
+                        created_dirs.insert(dir_prefix.clone());
+                    }
+                    Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                        return Err(format!(
+                            "技能目录在当前文件系统上存在名称别名冲突: {dir_prefix}"
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(format!("创建技能子目录 {} 失败: {e}", dir_path.display()));
+                    }
+                }
+            }
         }
-        let dst = fs::File::create(&target)
-            .map_err(|e| format!("创建技能文件 {} 失败: {e}", target.display()))?;
+        let target = directory.join(relative);
+        let dst = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|e| {
+                if e.kind() == ErrorKind::AlreadyExists {
+                    format!("技能文件在当前文件系统上存在名称别名冲突: {relative}")
+                } else {
+                    format!("创建技能文件 {} 失败: {e}", target.display())
+                }
+            })?;
         let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, dst);
-        match &entry.source {
+        let file_sha: [u8; 32] = match &entry.source {
             FileSource::Disk(source_path) => {
                 let src = fs::File::open(source_path).map_err(|e| {
                     format!("读取技能文件 {} 失败: {e}", source_path.display())
                 })?;
                 let mut limited = src.take(max_bytes.saturating_sub(copied_total) + 1);
+                let mut file_hash = Sha256::new();
                 loop {
                     let read = limited.read(&mut buf).map_err(|e| {
                         format!("读取技能文件 {} 失败: {e}", source_path.display())
@@ -1561,10 +1859,12 @@ fn write_tree_streaming(
                             max_bytes / (1024 * 1024)
                         ));
                     }
+                    file_hash.update(&buf[..read]);
                     writer
                         .write_all(&buf[..read])
                         .map_err(|e| format!("写入技能文件 {} 失败: {e}", target.display()))?;
                 }
+                file_hash.finalize().into()
             }
             FileSource::Archive {
                 handle,
@@ -1608,21 +1908,45 @@ fn write_tree_streaming(
                 if entry_written != entry.size || actual_sha != *expected_sha256 {
                     return Err("归档内容校验失败，源文件可能已被修改".to_string());
                 }
+                actual_sha
             }
-        }
-        writer
-            .flush()
-            .map_err(|e| format!("刷新技能文件 {} 失败: {e}", target.display()))?;
+        };
+        let dst_file = writer
+            .into_inner()
+            .map_err(|e| format!("刷新技能文件 {} 失败: {}", target.display(), e.error()))?;
         #[cfg(unix)]
         if entry.executable {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o755))
+            dst_file
+                .set_permissions(fs::Permissions::from_mode(0o755))
                 .map_err(|e| format!("保留技能脚本执行权限失败: {e}"))?;
         }
         #[cfg(not(unix))]
-        let _ = entry.executable;
+        let _ = (entry.executable, dst_file);
+        expected_outer_hash.update((relative.len() as u64).to_le_bytes());
+        expected_outer_hash.update(relative.as_bytes());
+        expected_outer_hash.update(file_sha);
     }
-    Ok(())
+
+    let written_hash = hex::encode(expected_outer_hash.finalize());
+    if expected_hash.is_some_and(|expected| written_hash != expected) {
+        return Err("技能写入内容与登记哈希不一致，已回滚".to_string());
+    }
+    let (staged_canonical, staged_files) = collect_tree_entries(directory, max_bytes)?;
+    if staged_files.len() != tree.files.len() || !staged_files.keys().eq(tree.files.keys()) {
+        return Err(
+            "技能落盘后的文件路径与源内容不一致（可能触发文件系统名称合并或规范化），已回滚"
+                .to_string(),
+        );
+    }
+    let staged_tree = build_tree_from_entries(staged_canonical, false, staged_files);
+    let staged_hash = hash_tree_streaming(&staged_tree)?;
+    if staged_hash != written_hash
+        || expected_hash.is_some_and(|expected| staged_hash != expected)
+    {
+        return Err("技能落盘后文件树哈希与登记哈希不一致，已回滚".to_string());
+    }
+    Ok(staged_hash)
 }
 
 fn backup_target(
@@ -1662,6 +1986,7 @@ fn stage_platforms(
     transaction: &mut DirectoryTransaction<'_>,
     skill: &SkillRecord,
     tree: Option<&LocalSkillTree>,
+    expected_hash: Option<&str>,
     targets: &[ExtPlatform],
     method: SkillSyncMethod,
 ) -> Result<(), String> {
@@ -1679,7 +2004,7 @@ fn stage_platforms(
             ensure_plain_ancestors(paths, root)?;
             backup_target(paths, platform, &skill.id, &destination, index)?;
             if enabled {
-                transaction.stage_delivery(&master, &destination, tree, method)?;
+                transaction.stage_delivery(&master, &destination, tree, method, expected_hash)?;
             } else {
                 transaction.stage_remove(&destination)?;
             }
@@ -1782,9 +2107,12 @@ fn scan_adopt(
                     Ok((record, maybe_tree)) => {
                         if let Some(tree) = maybe_tree {
                             let master = master_skills_dir(paths).join(&id);
-                            if let Err(err) =
-                                transaction.stage_tree(&master, &tree, MAX_LOCAL_SKILL_BYTES)
-                            {
+                            if let Err(err) = transaction.stage_tree(
+                                &master,
+                                &tree,
+                                MAX_LOCAL_SKILL_BYTES,
+                                Some(record.installed_hash.as_str()),
+                            ) {
                                 warnings.push(format!("跳过 {source_label} 技能 {id}：{err}"));
                                 continue;
                             }
@@ -1978,6 +2306,7 @@ fn align_platforms(
         &mut transaction,
         &store.skills[position],
         tree.as_ref(),
+        None,
         &targets,
         store.sync_method,
     )?;
@@ -2017,7 +2346,13 @@ pub fn toggle_skill_platform_for_paths(
         ensure_plain_ancestors(paths, root)?;
         backup_target(paths, platform, id, &target, index)?;
         if enabled {
-            transaction.stage_delivery(&master, &target, tree.as_ref(), store.sync_method)?;
+            transaction.stage_delivery(
+                &master,
+                &target,
+                tree.as_ref(),
+                store.sync_method,
+                None,
+            )?;
         } else {
             transaction.stage_remove(&target)?;
         }
@@ -2089,6 +2424,7 @@ pub fn set_skill_sync_method_for_paths(
             &mut transaction,
             skill,
             tree.as_ref(),
+            None,
             &skill.enabled_platforms,
             method,
         )?;
@@ -2161,12 +2497,19 @@ fn install_batch(
     let mut transaction = DirectoryTransaction::new(paths);
     let targets = normalize_platforms(targets);
     for (mut skill, tree) in incoming {
-        transaction.stage_tree(&master_skills_dir(paths).join(&skill.id), &tree, max_bytes)?;
+        let expected_hash = skill.installed_hash.clone();
+        transaction.stage_tree(
+            &master_skills_dir(paths).join(&skill.id),
+            &tree,
+            max_bytes,
+            Some(expected_hash.as_str()),
+        )?;
         stage_platforms(
             paths,
             &mut transaction,
             &skill,
             Some(&tree),
+            Some(expected_hash.as_str()),
             &targets,
             store.sync_method,
         )?;
@@ -2184,6 +2527,25 @@ pub fn stage_skill_zip_chunk_for_paths(
     upload_id: Option<&str>,
     chunk_base64: &str,
 ) -> Result<String, String> {
+    stage_skill_zip_chunk_in_registry(
+        &STAGED_UPLOADS,
+        paths,
+        upload_id,
+        chunk_base64,
+        spawn_staged_upload_reaper,
+    )
+}
+
+fn stage_skill_zip_chunk_in_registry<F>(
+    registry: &Mutex<StagedUploadRegistry>,
+    paths: &AppPaths,
+    upload_id: Option<&str>,
+    chunk_base64: &str,
+    spawn_reaper: F,
+) -> Result<String, String>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
     let now = Instant::now();
     let max_encoded = (MAX_UPLOAD_CHUNK_BYTES.div_ceil(3)) * 4 + 4;
     if chunk_base64.len() > max_encoded {
@@ -2193,38 +2555,46 @@ pub fn stage_skill_zip_chunk_for_paths(
         .decode(chunk_base64)
         .map_err(|e| format!("ZIP 分片 Base64 无效: {e}"))?;
     let switch_dir = paths.switch_dir();
-    let mut guard = STAGED_UPLOADS
+    let mut guard = registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let map = guard.get_or_insert_with(BTreeMap::new);
-    map.retain(|_, upload| now.saturating_duration_since(upload.updated_at) <= STALE_TEMP_TTL);
+    guard
+        .uploads
+        .retain(|_, upload| now.saturating_duration_since(upload.updated_at) <= STALE_TEMP_TTL);
 
     match upload_id.map(str::trim).filter(|s| !s.is_empty()) {
         Some(existing) => {
             validate_identifier(existing)?;
-            let Some(upload) = map.get_mut(existing) else {
+            let Some(upload) = guard.uploads.get_mut(existing) else {
                 return Err("分片上传会话不存在或已过期".to_string());
             };
             if upload.switch_dir != switch_dir {
                 return Err("分片上传会话不存在或已过期".to_string());
             }
             if chunk.len() as u64 > MAX_ARCHIVE_BYTES.saturating_sub(upload.size) {
-                map.remove(existing);
+                guard.uploads.remove(existing);
                 return Err("ZIP 文件超过 200 MiB 上限".to_string());
             }
             if let Err(e) = upload.file.write_all(&chunk).and_then(|()| upload.file.flush()) {
-                map.remove(existing);
+                guard.uploads.remove(existing);
                 return Err(format!("保存分片临时文件失败: {e}"));
             }
             upload.size += chunk.len() as u64;
             upload.updated_at = now;
+            if !guard.reaper_running {
+                if let Err(err) = spawn_reaper() {
+                    guard.uploads.remove(existing);
+                    return Err(format!("启动分片清理线程失败: {err}"));
+                }
+                guard.reaper_running = true;
+            }
             Ok(existing.to_string())
         }
         None => {
             if chunk.len() as u64 > MAX_ARCHIVE_BYTES {
                 return Err("ZIP 文件超过 200 MiB 上限".to_string());
             }
-            if map.len() >= MAX_STAGED_UPLOADS {
+            if guard.uploads.len() >= MAX_STAGED_UPLOADS {
                 return Err("同时进行中的分片上传过多，请稍后重试".to_string());
             }
             let id = format!("zip-{}-{:016x}", std::process::id(), rand::random::<u64>());
@@ -2232,7 +2602,13 @@ pub fn stage_skill_zip_chunk_for_paths(
             file.write_all(&chunk)
                 .and_then(|()| file.flush())
                 .map_err(|e| format!("保存分片临时文件失败: {e}"))?;
-            map.insert(
+            if !guard.reaper_running {
+                if let Err(err) = spawn_reaper() {
+                    return Err(format!("启动分片清理线程失败: {err}"));
+                }
+                guard.reaper_running = true;
+            }
+            guard.uploads.insert(
                 id.clone(),
                 StagedUpload {
                     switch_dir,
@@ -2241,8 +2617,6 @@ pub fn stage_skill_zip_chunk_for_paths(
                     updated_at: now,
                 },
             );
-            drop(guard);
-            ensure_staged_upload_reaper();
             Ok(id)
         }
     }
@@ -2258,13 +2632,12 @@ pub fn discard_skill_zip_upload_for_paths(paths: &AppPaths, upload_id: &str) -> 
     let mut guard = STAGED_UPLOADS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(map) = guard.as_mut() {
-        if map
-            .get(trimmed)
-            .is_some_and(|upload| upload.switch_dir == switch_dir)
-        {
-            map.remove(trimmed);
-        }
+    if guard
+        .uploads
+        .get(trimmed)
+        .is_some_and(|upload| upload.switch_dir == switch_dir)
+    {
+        guard.uploads.remove(trimmed);
     }
     Ok(())
 }
@@ -2276,17 +2649,18 @@ fn take_staged_upload(paths: &AppPaths, upload_id: &str) -> Result<(fs::File, u6
     let mut guard = STAGED_UPLOADS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(map) = guard.as_mut() else {
-        return Err("分片上传文件不存在或已过期".to_string());
-    };
-    map.retain(|_, upload| now.saturating_duration_since(upload.updated_at) <= STALE_TEMP_TTL);
-    if map
+    guard
+        .uploads
+        .retain(|_, upload| now.saturating_duration_since(upload.updated_at) <= STALE_TEMP_TTL);
+    if guard
+        .uploads
         .get(upload_id)
         .is_none_or(|upload| upload.switch_dir != switch_dir)
     {
         return Err("分片上传文件不存在或已过期".to_string());
     }
-    let mut upload = map
+    let mut upload = guard
+        .uploads
         .remove(upload_id)
         .ok_or_else(|| "分片上传文件不存在或已过期".to_string())?;
     upload
@@ -2327,15 +2701,8 @@ pub fn import_local_skill_for_paths(
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
             {
-                let file = fs::File::open(&path).map_err(|e| format!("打开 ZIP 失败: {e}"))?;
-                let meta = file.metadata().map_err(|e| format!("读取 ZIP 失败: {e}"))?;
-                if !meta.is_file() {
-                    return Err("请选择包含 SKILL.md 的目录或 .zip 文件".to_string());
-                }
-                if meta.len() > MAX_ARCHIVE_BYTES {
-                    return Err("ZIP 文件超过 200 MiB 上限".to_string());
-                }
-                let records = extract_local_archive_records(ArchiveBacking::File(file))?;
+                let snapshot = snapshot_local_zip_to_anonymous_file(&path, MAX_ARCHIVE_BYTES)?;
+                let records = extract_local_archive_records(ArchiveBacking::File(snapshot))?;
                 (records, MAX_ARCHIVE_BYTES)
             } else {
                 return Err("请选择包含 SKILL.md 的目录或 .zip 文件".to_string());
@@ -2369,6 +2736,50 @@ pub fn import_local_skill_for_paths(
 
     install_batch(paths, &mut store, incoming, &targets, max_bytes)?;
     snapshot(paths, &store, Vec::new(), false)
+}
+
+fn snapshot_local_zip_to_anonymous_file(path: &Path, max_bytes: u64) -> Result<fs::File, String> {
+    let file = fs::File::open(path).map_err(|e| format!("打开 ZIP 失败: {e}"))?;
+    let meta = file.metadata().map_err(|e| format!("读取 ZIP 失败: {e}"))?;
+    if !meta.is_file() {
+        return Err("请选择包含 SKILL.md 的目录或 .zip 文件".to_string());
+    }
+    if meta.len() > max_bytes {
+        return Err(format!(
+            "ZIP 文件超过 {} MiB 上限",
+            max_bytes / (1024 * 1024)
+        ));
+    }
+    let temp = create_anonymous_temp_file()?;
+    let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, temp);
+    let mut limited = file.take(max_bytes.saturating_add(1));
+    let mut buf = vec![0u8; STREAM_BUF_SIZE];
+    let mut copied = 0u64;
+    loop {
+        let read = limited
+            .read(&mut buf)
+            .map_err(|e| format!("读取 ZIP 失败: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        copied += read as u64;
+        if copied > max_bytes {
+            return Err(format!(
+                "ZIP 文件超过 {} MiB 上限",
+                max_bytes / (1024 * 1024)
+            ));
+        }
+        writer
+            .write_all(&buf[..read])
+            .map_err(|e| format!("写入临时归档失败: {e}"))?;
+    }
+    let mut snapshot = writer
+        .into_inner()
+        .map_err(|e| format!("刷新临时归档失败: {}", e.error()))?;
+    snapshot
+        .rewind()
+        .map_err(|e| format!("重置临时归档游标失败: {e}"))?;
+    Ok(snapshot)
 }
 
 fn extract_local_archive_records(
@@ -2709,12 +3120,18 @@ pub async fn update_installed_skill_for_paths(
     let metadata = read_frontmatter_in_tree(&tree, id)?;
     let new_hash = hash_tree_cached(&tree, true)?;
     let mut transaction = DirectoryTransaction::new(paths);
-    transaction.stage_tree(&master, &tree, MAX_ARCHIVE_BYTES)?;
+    transaction.stage_tree(
+        &master,
+        &tree,
+        MAX_ARCHIVE_BYTES,
+        Some(new_hash.as_str()),
+    )?;
     stage_platforms(
         paths,
         &mut transaction,
         current,
         Some(&tree),
+        Some(new_hash.as_str()),
         &current.enabled_platforms,
         store.sync_method,
     )?;
@@ -2907,6 +3324,7 @@ mod tests {
                 &destination,
                 Some(&tree),
                 SkillSyncMethod::Auto,
+                None,
                 |_, _| Err(std::io::Error::from(ErrorKind::PermissionDenied)),
             )
             .unwrap();
@@ -2932,7 +3350,7 @@ mod tests {
         {
             let mut transaction = DirectoryTransaction::new(&paths);
             transaction
-                .stage_tree(&destination, &replacement, MAX_LOCAL_SKILL_BYTES)
+                .stage_tree(&destination, &replacement, MAX_LOCAL_SKILL_BYTES, None)
                 .unwrap();
             transaction.apply().unwrap();
             assert_eq!(
@@ -3127,7 +3545,8 @@ mod tests {
             "{fm_err}"
         );
         let stage_dir = tmp.path().join("staged-out");
-        let write_err = write_tree_streaming(&stage_dir, tree, MAX_ARCHIVE_BYTES).unwrap_err();
+        let write_err =
+            write_tree_streaming(&stage_dir, tree, MAX_ARCHIVE_BYTES, None).unwrap_err();
         assert!(
             write_err.contains("校验失败") || write_err.contains("读取归档文件"),
             "{write_err}"
@@ -3165,8 +3584,8 @@ mod tests {
         // Repeated streaming writes (e.g. master + multiple platforms) must succeed identically.
         let copy1 = tmp.path().join("copy-1");
         let copy2 = tmp.path().join("copy-2");
-        write_tree_streaming(&copy1, archive_tree, MAX_ARCHIVE_BYTES).unwrap();
-        write_tree_streaming(&copy2, archive_tree, MAX_ARCHIVE_BYTES).unwrap();
+        write_tree_streaming(&copy1, archive_tree, MAX_ARCHIVE_BYTES, Some(&disk_hash)).unwrap();
+        write_tree_streaming(&copy2, archive_tree, MAX_ARCHIVE_BYTES, Some(&disk_hash)).unwrap();
         assert_eq!(fs::read(copy1.join("sub/data.txt")).unwrap(), asset);
         assert_eq!(fs::read(copy2.join("sub/data.txt")).unwrap(), asset);
     }
@@ -3304,5 +3723,268 @@ mod tests {
         )
         .unwrap_err();
         assert!(case_err2.contains("大小写冲突"), "{case_err2}");
+    }
+
+    #[test]
+    fn constrained_zip_reader_blocks_trailing_garbage_nested_eocd_and_backtracking() {
+        let valid_zip = build_test_zip_bytes(&[
+            ("demo/SKILL.md", b"---\nname: demo\n---\nbody\n"),
+            ("demo/data.txt", b"ok"),
+        ]);
+
+        // 1. Trailing garbage after EOCD must be rejected before ZipArchive is constructed.
+        let mut with_trailing = valid_zip.clone();
+        with_trailing.extend_from_slice(b"trailing-bytes");
+        let trailing_err = scan_zip_archive_trees(
+            ArchiveBacking::Bytes(Cursor::new(with_trailing)),
+            false,
+            2,
+            MAX_ARCHIVE_BYTES,
+        )
+        .unwrap_err();
+        assert!(trailing_err.contains("中央目录结束标记"), "{trailing_err}");
+
+        // 2. Nested EOCD signature inside EOCD comment must be rejected.
+        let mut nested_comment = valid_zip.clone();
+        let eocd_pos = nested_comment.len() - 22;
+        let fake_comment = b"abcPK\x05\x06def";
+        nested_comment[eocd_pos + 20..eocd_pos + 22]
+            .copy_from_slice(&(fake_comment.len() as u16).to_le_bytes());
+        nested_comment.extend_from_slice(fake_comment);
+        let nested_err = scan_zip_archive_trees(
+            ArchiveBacking::Bytes(Cursor::new(nested_comment)),
+            false,
+            2,
+            MAX_ARCHIVE_BYTES,
+        )
+        .unwrap_err();
+        assert!(nested_err.contains("嵌套的中央目录结束标记"), "{nested_err}");
+
+        // 3. Normal archive comment (e.g. 40-char git SHA from GitHub codeload) succeeds.
+        let mut sha_comment = valid_zip.clone();
+        let eocd_pos = sha_comment.len() - 22;
+        let git_sha = b"0123456789abcdef0123456789abcdef01234567";
+        sha_comment[eocd_pos + 20..eocd_pos + 22]
+            .copy_from_slice(&(git_sha.len() as u16).to_le_bytes());
+        sha_comment.extend_from_slice(git_sha);
+        let ok_trees = scan_zip_archive_trees(
+            ArchiveBacking::Bytes(Cursor::new(sha_comment)),
+            false,
+            2,
+            MAX_ARCHIVE_BYTES,
+        )
+        .unwrap();
+        assert_eq!(ok_trees.len(), 1);
+
+        // 4. Polyglot archive: valid ZIP at offset 0 followed by a second CD whose entry uses
+        // AES compression without an AES extra field (causing zip::ZipArchive::read_central_header
+        // to fail). ConstrainedZipReader must forbid backtracking to the earlier EOCD.
+        let mut polyglot = valid_zip.clone();
+        let fake_local_offset = polyglot.len() as u32;
+        polyglot.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]);
+        polyglot.extend_from_slice(&[0u8; 26]);
+        polyglot.extend_from_slice(b"x");
+        let cd_offset = polyglot.len() as u32;
+        let name = b"evil/SKILL.md";
+        let mut cd = Vec::new();
+        cd.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]);
+        cd.extend_from_slice(&20u16.to_le_bytes());
+        cd.extend_from_slice(&20u16.to_le_bytes());
+        cd.extend_from_slice(&0u16.to_le_bytes());
+        cd.extend_from_slice(&99u16.to_le_bytes()); // AES method (99) without AES extra field
+        cd.extend_from_slice(&0u16.to_le_bytes());
+        cd.extend_from_slice(&0u16.to_le_bytes());
+        cd.extend_from_slice(&0u32.to_le_bytes());
+        cd.extend_from_slice(&0u32.to_le_bytes());
+        cd.extend_from_slice(&0u32.to_le_bytes());
+        cd.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        cd.extend_from_slice(&0u16.to_le_bytes());
+        cd.extend_from_slice(&0u16.to_le_bytes());
+        cd.extend_from_slice(&0u16.to_le_bytes());
+        cd.extend_from_slice(&0u16.to_le_bytes());
+        cd.extend_from_slice(&0u32.to_le_bytes());
+        cd.extend_from_slice(&fake_local_offset.to_le_bytes());
+        cd.extend_from_slice(name);
+        let cd_size = cd.len() as u32;
+        polyglot.extend_from_slice(&cd);
+        polyglot.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+        polyglot.extend_from_slice(&0u16.to_le_bytes());
+        polyglot.extend_from_slice(&0u16.to_le_bytes());
+        polyglot.extend_from_slice(&1u16.to_le_bytes());
+        polyglot.extend_from_slice(&1u16.to_le_bytes());
+        polyglot.extend_from_slice(&cd_size.to_le_bytes());
+        polyglot.extend_from_slice(&cd_offset.to_le_bytes());
+        polyglot.extend_from_slice(&0u16.to_le_bytes());
+
+        let backtrack_err = scan_zip_archive_trees(
+            ArchiveBacking::Bytes(Cursor::new(polyglot)),
+            false,
+            2,
+            MAX_ARCHIVE_BYTES,
+        )
+        .unwrap_err();
+        assert!(
+            backtrack_err.contains("禁止回溯") || backtrack_err.contains("读取 ZIP 失败"),
+            "{backtrack_err}"
+        );
+
+        // 5. Local ZIP snapshot isolates scan/import from subsequent in-place disk mutations.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let zip_path = tmp.path().join("mutable.zip");
+        fs::write(&zip_path, &valid_zip).unwrap();
+        let snapshot = snapshot_local_zip_to_anonymous_file(&zip_path, MAX_ARCHIVE_BYTES).unwrap();
+        fs::write(&zip_path, b"corrupted-after-snapshot").unwrap();
+        let records = extract_local_archive_records(ArchiveBacking::File(snapshot)).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0.id, "demo");
+    }
+
+    #[test]
+    fn write_tree_streaming_rejects_hash_mismatch_and_volume_aliases_with_rollback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let src_dir = tmp.path().join("src-skill");
+        write_atomic(&src_dir.join("SKILL.md"), b"---\nname: safe\n---\nbody\n", false).unwrap();
+        write_atomic(&src_dir.join("a.txt"), b"hello", false).unwrap();
+        let tree = scan_local_tree(&src_dir, MAX_LOCAL_SKILL_BYTES).unwrap();
+        let expected_hash = hash_tree_streaming(&tree).unwrap();
+
+        // 1. Hash mismatch aborts before commit, cleans staging dir, and preserves existing destination.
+        let destination = master_skills_dir(&paths).join("safe");
+        write_atomic(&destination.join("SKILL.md"), b"original-master", false).unwrap();
+        {
+            let mut tx = DirectoryTransaction::new(&paths);
+            let err = tx
+                .stage_tree(
+                    &destination,
+                    &tree,
+                    MAX_LOCAL_SKILL_BYTES,
+                    Some("0000000000000000000000000000000000000000000000000000000000000000"),
+                )
+                .unwrap_err();
+            assert!(err.contains("不一致，已回滚"), "{err}");
+        }
+        assert_eq!(
+            fs::read(destination.join("SKILL.md")).unwrap(),
+            b"original-master"
+        );
+        assert_eq!(
+            fs::read_dir(destination.parent().unwrap()).unwrap().count(),
+            1
+        );
+
+        // 2. Matching expected_hash succeeds and returns the verified on-disk hash.
+        let verified_dir = tmp.path().join("verified-out");
+        let landed_hash = write_tree_streaming(
+            &verified_dir,
+            &tree,
+            MAX_LOCAL_SKILL_BYTES,
+            Some(&expected_hash),
+        )
+        .unwrap();
+        assert_eq!(landed_hash, expected_hash);
+
+        // 3. On case-insensitive volumes (Windows / default macOS), synthetic trees with
+        // volume-level name aliases are rejected via exclusive creation and rolled back cleanly.
+        let probe_lower = tmp.path().join("case_probe_a");
+        let probe_upper = tmp.path().join("CASE_PROBE_A");
+        fs::write(&probe_lower, b"1").unwrap();
+        let volume_case_insensitive = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_upper)
+            .is_err_and(|e| e.kind() == ErrorKind::AlreadyExists);
+        if volume_case_insensitive {
+            let mut alias_files = BTreeMap::new();
+            let skill_src = src_dir.join("SKILL.md");
+            let file_src = src_dir.join("a.txt");
+            let skill_meta = fs::metadata(&skill_src).unwrap();
+            let file_meta = fs::metadata(&file_src).unwrap();
+            alias_files.insert(
+                "SKILL.md".to_string(),
+                LocalFileEntry {
+                    source: FileSource::Disk(skill_src.clone()),
+                    display: skill_src,
+                    size: skill_meta.len(),
+                    executable: false,
+                    meta_stamp: [1u8; 32],
+                },
+            );
+            alias_files.insert(
+                "Assets/a.txt".to_string(),
+                LocalFileEntry {
+                    source: FileSource::Disk(file_src.clone()),
+                    display: file_src.clone(),
+                    size: file_meta.len(),
+                    executable: false,
+                    meta_stamp: [2u8; 32],
+                },
+            );
+            alias_files.insert(
+                "assets/b.txt".to_string(),
+                LocalFileEntry {
+                    source: FileSource::Disk(file_src.clone()),
+                    display: file_src,
+                    size: file_meta.len(),
+                    executable: false,
+                    meta_stamp: [3u8; 32],
+                },
+            );
+            let alias_tree = build_tree_from_entries(src_dir.clone(), false, alias_files);
+            let alias_dest = master_skills_dir(&paths).join("alias-skill");
+            let mut tx = DirectoryTransaction::new(&paths);
+            let alias_err = tx
+                .stage_tree(&alias_dest, &alias_tree, MAX_LOCAL_SKILL_BYTES, None)
+                .unwrap_err();
+            assert!(alias_err.contains("名称别名冲突"), "{alias_err}");
+            assert!(!alias_dest.exists());
+            assert_eq!(
+                fs::read_dir(master_skills_dir(&paths)).unwrap().count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn staged_upload_reaper_spawn_failure_is_visible_rolls_back_and_allows_retry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let registry = Mutex::new(StagedUploadRegistry::default());
+        let chunk = base64::engine::general_purpose::STANDARD.encode(b"zip-chunk");
+
+        // 1. Reaper spawn failure surfaces an error and leaves zero registered uploads.
+        let err = stage_skill_zip_chunk_in_registry(&registry, &paths, None, &chunk, || {
+            Err(std::io::Error::new(ErrorKind::WouldBlock, "EAGAIN"))
+        })
+        .unwrap_err();
+        assert!(err.contains("启动分片清理线程失败"), "{err}");
+        {
+            let guard = registry.lock().unwrap();
+            assert!(guard.uploads.is_empty());
+            assert!(!guard.reaper_running);
+        }
+
+        // 2. Subsequent retry spawns the reaper once and registers the upload.
+        let mut spawn_calls = 0usize;
+        let id1 = stage_skill_zip_chunk_in_registry(&registry, &paths, None, &chunk, || {
+            spawn_calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(spawn_calls, 1);
+
+        // 3. Another upload while reaper is active does not re-spawn.
+        let id2 = stage_skill_zip_chunk_in_registry(&registry, &paths, None, &chunk, || {
+            spawn_calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(spawn_calls, 1);
+        assert_ne!(id1, id2);
+        {
+            let guard = registry.lock().unwrap();
+            assert_eq!(guard.uploads.len(), 2);
+            assert!(guard.reaper_running);
+        }
     }
 }
