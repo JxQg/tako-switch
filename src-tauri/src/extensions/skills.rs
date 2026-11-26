@@ -325,16 +325,20 @@ fn path_exists(path: &Path) -> Result<bool, String> {
     }
 }
 
-fn ensure_plain_ancestors(paths: &AppPaths, path: &Path) -> Result<(), String> {
-    let anchor = if path.starts_with(&paths.home) {
-        &paths.home
+fn anchor_for_path<'a>(paths: &'a AppPaths, path: &Path) -> Result<&'a Path, String> {
+    if path.starts_with(&paths.home) {
+        Ok(&paths.home)
     } else if path.starts_with(&paths.codex_dir) {
-        &paths.codex_dir
+        Ok(&paths.codex_dir)
     } else if path.starts_with(&paths.tako_dir) {
-        &paths.tako_dir
+        Ok(&paths.tako_dir)
     } else {
-        return Err(format!("技能写入路径不在应用目录内: {}", path.display()));
-    };
+        Err(format!("技能写入路径不在应用目录内: {}", path.display()))
+    }
+}
+
+fn ensure_plain_ancestors(paths: &AppPaths, path: &Path) -> Result<(), String> {
+    let anchor = anchor_for_path(paths, path)?;
     for ancestor in path.ancestors() {
         match fs::symlink_metadata(ancestor) {
             Ok(meta) if is_link(&meta) => {
@@ -358,6 +362,1111 @@ fn ensure_plain_ancestors(paths: &AppPaths, path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_single_entry_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\\', '\0']) {
+        return Err(format!("不安全的临时目录项名称: {name}"));
+    }
+    Ok(())
+}
+
+fn is_stale_meta(meta: &fs::Metadata, now: SystemTime) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|mtime| now.duration_since(mtime).ok())
+        .is_some_and(|age| age > STALE_TEMP_TTL)
+}
+
+#[cfg(unix)]
+mod verified_fs {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    const O_RDONLY: std::ffi::c_int = 0;
+    const O_WRONLY: std::ffi::c_int = 1;
+    const F_GETFL: std::ffi::c_int = 3;
+    const F_SETFL: std::ffi::c_int = 4;
+
+    #[cfg(target_os = "macos")]
+    type ModeT = u16;
+    #[cfg(not(target_os = "macos"))]
+    type ModeT = u32;
+
+    #[cfg(target_os = "macos")]
+    const O_NONBLOCK: std::ffi::c_int = 0x0004;
+    #[cfg(target_os = "macos")]
+    const O_APPEND: std::ffi::c_int = 0x0008;
+    #[cfg(target_os = "macos")]
+    const O_NOFOLLOW: std::ffi::c_int = 0x0100;
+    #[cfg(target_os = "macos")]
+    const O_CREAT: std::ffi::c_int = 0x0200;
+    #[cfg(target_os = "macos")]
+    const O_DIRECTORY: std::ffi::c_int = 0x0010_0000;
+    #[cfg(target_os = "macos")]
+    const O_CLOEXEC: std::ffi::c_int = 0x0100_0000;
+    #[cfg(target_os = "macos")]
+    const AT_REMOVEDIR: std::ffi::c_int = 0x0080;
+    #[cfg(target_os = "macos")]
+    const ELOOP_ERRNO: i32 = 62;
+
+    #[cfg(not(target_os = "macos"))]
+    const O_CREAT: std::ffi::c_int = 0o100;
+    #[cfg(not(target_os = "macos"))]
+    const O_APPEND: std::ffi::c_int = 0o2000;
+    #[cfg(not(target_os = "macos"))]
+    const O_NONBLOCK: std::ffi::c_int = 0o4000;
+    #[cfg(not(target_os = "macos"))]
+    const O_CLOEXEC: std::ffi::c_int = 0o2000000;
+    #[cfg(not(target_os = "macos"))]
+    const AT_REMOVEDIR: std::ffi::c_int = 0x200;
+    #[cfg(not(target_os = "macos"))]
+    const ELOOP_ERRNO: i32 = 40;
+    #[cfg(all(
+        not(target_os = "macos"),
+        any(target_arch = "aarch64", target_arch = "arm")
+    ))]
+    const O_DIRECTORY: std::ffi::c_int = 0o40000;
+    #[cfg(all(
+        not(target_os = "macos"),
+        any(target_arch = "aarch64", target_arch = "arm")
+    ))]
+    const O_NOFOLLOW: std::ffi::c_int = 0o100000;
+    #[cfg(all(
+        not(target_os = "macos"),
+        not(any(target_arch = "aarch64", target_arch = "arm"))
+    ))]
+    const O_DIRECTORY: std::ffi::c_int = 0o200000;
+    #[cfg(all(
+        not(target_os = "macos"),
+        not(any(target_arch = "aarch64", target_arch = "arm"))
+    ))]
+    const O_NOFOLLOW: std::ffi::c_int = 0o400000;
+
+    extern "C" {
+        fn openat(
+            dirfd: std::ffi::c_int,
+            pathname: *const std::ffi::c_char,
+            flags: std::ffi::c_int,
+            ...
+        ) -> std::ffi::c_int;
+        fn mkdirat(
+            dirfd: std::ffi::c_int,
+            pathname: *const std::ffi::c_char,
+            mode: ModeT,
+        ) -> std::ffi::c_int;
+        fn unlinkat(
+            dirfd: std::ffi::c_int,
+            pathname: *const std::ffi::c_char,
+            flags: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+        fn fcntl(fd: std::ffi::c_int, cmd: std::ffi::c_int, ...) -> std::ffi::c_int;
+    }
+
+    fn c_segment(name: &str) -> Result<CString, String> {
+        validate_single_entry_name(name)?;
+        CString::new(name.as_bytes()).map_err(|_| format!("不安全的临时目录项名称: {name}"))
+    }
+
+    fn clear_nonblock(file: &fs::File) {
+        let fd = file.as_raw_fd();
+        let flags = unsafe { fcntl(fd, F_GETFL) };
+        if flags >= 0 && (flags & O_NONBLOCK) != 0 {
+            unsafe {
+                let _ = fcntl(fd, F_SETFL, flags & !O_NONBLOCK);
+            }
+        }
+    }
+
+    pub(super) struct RawDir {
+        pub(super) file: fs::File,
+        dev: u64,
+        ino: u64,
+    }
+
+    impl RawDir {
+        fn from_file(file: fs::File, display_path: &Path) -> Result<Self, String> {
+            let meta = file
+                .metadata()
+                .map_err(|e| format!("检查目录 {} 失败: {e}", display_path.display()))?;
+            if is_link(&meta) {
+                return Err(format!("拒绝通过链接目录写入技能: {}", display_path.display()));
+            }
+            if !meta.is_dir() {
+                return Err(format!("技能父路径不是目录: {}", display_path.display()));
+            }
+            Ok(Self {
+                dev: meta.dev(),
+                ino: meta.ino(),
+                file,
+            })
+        }
+
+        pub(super) fn open_anchor(anchor: &Path, create: bool) -> Result<Option<Self>, String> {
+            if create && !path_exists(anchor)? {
+                fs::create_dir_all(anchor)
+                    .map_err(|e| format!("创建目录 {} 失败: {e}", anchor.display()))?;
+            }
+            match OpenOptions::new()
+                .read(true)
+                .custom_flags(O_DIRECTORY | O_NOFOLLOW)
+                .open(anchor)
+            {
+                Ok(file) => Self::from_file(file, anchor).map(Some),
+                Err(e) if !create && matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                    Ok(None)
+                }
+                Err(e) => {
+                    if e.raw_os_error() == Some(ELOOP_ERRNO)
+                        || fs::symlink_metadata(anchor).is_ok_and(|m| is_link(&m))
+                    {
+                        Err(format!("拒绝通过链接目录写入技能: {}", anchor.display()))
+                    } else if e.kind() == ErrorKind::NotADirectory {
+                        Err(format!("技能父路径不是目录: {}", anchor.display()))
+                    } else {
+                        Err(format!("打开目录 {} 失败: {e}", anchor.display()))
+                    }
+                }
+            }
+        }
+
+        pub(super) fn open_or_create_subdir(
+            &self,
+            name: &str,
+            step_path: &Path,
+            create: bool,
+        ) -> Result<Option<Self>, String> {
+            let cname = c_segment(name)?;
+            if create {
+                let rc = unsafe { mkdirat(self.file.as_raw_fd(), cname.as_ptr(), 0o755) };
+                if rc < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != ErrorKind::AlreadyExists {
+                        return Err(format!("创建目录 {} 失败: {err}", step_path.display()));
+                    }
+                }
+            }
+            let raw = unsafe {
+                openat(
+                    self.file.as_raw_fd(),
+                    cname.as_ptr(),
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                )
+            };
+            if raw < 0 {
+                let err = std::io::Error::last_os_error();
+                if !create && err.kind() == ErrorKind::NotFound {
+                    return Ok(None);
+                }
+                if err.raw_os_error() == Some(ELOOP_ERRNO)
+                    || fs::symlink_metadata(step_path).is_ok_and(|m| is_link(&m))
+                {
+                    return Err(format!("拒绝通过链接目录写入技能: {}", step_path.display()));
+                }
+                if err.kind() == ErrorKind::NotADirectory {
+                    return Err(format!("技能父路径不是目录: {}", step_path.display()));
+                }
+                return Err(format!("打开目录 {} 失败: {err}", step_path.display()));
+            }
+            let file = unsafe { fs::File::from_raw_fd(raw) };
+            Self::from_file(file, step_path).map(Some)
+        }
+
+        pub(super) fn open_regular_read(&self, name: &str) -> Result<Option<fs::File>, String> {
+            let cname = c_segment(name)?;
+            let raw = unsafe {
+                openat(
+                    self.file.as_raw_fd(),
+                    cname.as_ptr(),
+                    O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK,
+                )
+            };
+            if raw < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == ErrorKind::NotFound {
+                    return Ok(None);
+                }
+                if err.raw_os_error() == Some(ELOOP_ERRNO) || err.kind() == ErrorKind::IsADirectory {
+                    return Err("分片上传临时文件不是普通文件".to_string());
+                }
+                return Err(format!("检查分片临时文件失败: {err}"));
+            }
+            let file = unsafe { fs::File::from_raw_fd(raw) };
+            let meta = file
+                .metadata()
+                .map_err(|e| format!("检查分片临时文件失败: {e}"))?;
+            if is_link(&meta) || !meta.is_file() {
+                return Err("分片上传临时文件不是普通文件".to_string());
+            }
+            clear_nonblock(&file);
+            Ok(Some(file))
+        }
+
+        pub(super) fn open_regular_append(
+            &self,
+            name: &str,
+            create: bool,
+        ) -> Result<fs::File, String> {
+            let cname = c_segment(name)?;
+            let base_flags = O_WRONLY | O_APPEND | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK;
+            let create_mode: std::ffi::c_uint = 0o600;
+            let raw = if create {
+                unsafe {
+                    openat(
+                        self.file.as_raw_fd(),
+                        cname.as_ptr(),
+                        base_flags | O_CREAT,
+                        create_mode,
+                    )
+                }
+            } else {
+                unsafe { openat(self.file.as_raw_fd(), cname.as_ptr(), base_flags) }
+            };
+            if raw < 0 {
+                let err = std::io::Error::last_os_error();
+                if !create && err.kind() == ErrorKind::NotFound {
+                    return Err("分片上传会话不存在或已过期".to_string());
+                }
+                if err.raw_os_error() == Some(ELOOP_ERRNO) || err.kind() == ErrorKind::IsADirectory {
+                    return Err("分片上传临时文件不是普通文件".to_string());
+                }
+                return Err(format!("写入分片临时文件失败: {err}"));
+            }
+            let file = unsafe { fs::File::from_raw_fd(raw) };
+            let meta = file
+                .metadata()
+                .map_err(|e| format!("检查分片临时文件失败: {e}"))?;
+            if is_link(&meta) || !meta.is_file() {
+                return Err("分片上传临时文件不是普通文件".to_string());
+            }
+            clear_nonblock(&file);
+            Ok(file)
+        }
+
+        pub(super) fn unlink_regular_file(&self, name: &str) -> Result<bool, String> {
+            let Some(verified) = self.open_regular_read(name)? else {
+                return Ok(false);
+            };
+            drop(verified);
+            let cname = c_segment(name)?;
+            let rc = unsafe { unlinkat(self.file.as_raw_fd(), cname.as_ptr(), 0) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == ErrorKind::NotFound {
+                    return Ok(false);
+                }
+                return Err(format!("清理分片临时文件失败: {err}"));
+            }
+            Ok(true)
+        }
+
+        pub(super) fn unlink_stale_regular_file(&self, name: &str, now: SystemTime) -> bool {
+            let Ok(Some(file)) = self.open_regular_read(name) else {
+                return false;
+            };
+            let is_stale = file
+                .metadata()
+                .is_ok_and(|meta| !is_link(&meta) && meta.is_file() && is_stale_meta(&meta, now));
+            drop(file);
+            if !is_stale {
+                return false;
+            }
+            let Ok(cname) = c_segment(name) else {
+                return false;
+            };
+            unsafe { unlinkat(self.file.as_raw_fd(), cname.as_ptr(), 0) == 0 }
+        }
+
+        pub(super) fn unlink_non_dir_entry(&self, name: &str) -> Result<(), String> {
+            let cname = c_segment(name)?;
+            let rc = unsafe { unlinkat(self.file.as_raw_fd(), cname.as_ptr(), 0) };
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == ErrorKind::NotFound {
+                    return Ok(());
+                }
+                return Err(format!("清理临时文件失败: {err}"));
+            }
+            Ok(())
+        }
+
+        pub(super) fn list_entry_names(&self, fallback_path: &Path) -> Vec<String> {
+            let live_dir: Option<PathBuf> = {
+                #[cfg(target_os = "macos")]
+                {
+                    use std::ffi::OsStr;
+                    use std::os::unix::ffi::OsStrExt;
+                    const F_GETPATH: std::ffi::c_int = 50;
+                    let mut buf = vec![0u8; 1024];
+                    let rc = unsafe { fcntl(self.file.as_raw_fd(), F_GETPATH, buf.as_mut_ptr()) };
+                    if rc == 0 {
+                        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                        Some(PathBuf::from(OsStr::from_bytes(&buf[..len])))
+                    } else {
+                        None
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Some(PathBuf::from(format!(
+                        "/proc/self/fd/{}",
+                        self.file.as_raw_fd()
+                    )))
+                }
+            };
+            let read_target = live_dir.as_deref().unwrap_or(fallback_path);
+            fs::read_dir(read_target)
+                .or_else(|_| fs::read_dir(fallback_path))
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        pub(super) fn try_remove_empty_subdir(&self, name: &str, child: &mut Option<RawDir>) {
+            let Some(ref child_ref) = child else {
+                return;
+            };
+            let Ok(cname) = c_segment(name) else {
+                return;
+            };
+            let reopened = unsafe {
+                openat(
+                    self.file.as_raw_fd(),
+                    cname.as_ptr(),
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+                )
+            };
+            if reopened < 0 {
+                return;
+            }
+            let reopened_file = unsafe { fs::File::from_raw_fd(reopened) };
+            let same = reopened_file.metadata().is_ok_and(|meta| {
+                !is_link(&meta)
+                    && meta.is_dir()
+                    && meta.dev() == child_ref.dev
+                    && meta.ino() == child_ref.ino
+            });
+            drop(reopened_file);
+            if same {
+                let _ = child.take();
+                unsafe {
+                    let _ = unlinkat(self.file.as_raw_fd(), cname.as_ptr(), AT_REMOVEDIR);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+mod verified_fs {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+
+    type NtStatus = i32;
+
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+    const FILE_LIST_DIRECTORY_ACCESS: u32 = 0x0000_0001;
+    const FILE_APPEND_DATA_ACCESS: u32 = 0x0000_0004;
+    const FILE_READ_ATTRIBUTES_ACCESS: u32 = 0x0000_0080;
+    const FILE_GENERIC_READ_ACCESS: u32 = 0x0012_0089;
+
+    const FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+    const FILE_ATTRIBUTE_NORMAL_VAL: u32 = 0x0000_0080;
+    const FILE_FLAG_OPEN_REPARSE_POINT_VAL: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS_VAL: u32 = 0x0200_0000;
+
+    const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
+    const FILE_OPEN: u32 = 1;
+    const FILE_OPEN_IF: u32 = 3;
+    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+    const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+    const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    const STATUS_OBJECT_NAME_INVALID: NtStatus = 0xC000_0033_u32 as i32;
+    const STATUS_OBJECT_NAME_NOT_FOUND: NtStatus = 0xC000_0034_u32 as i32;
+    const STATUS_OBJECT_PATH_NOT_FOUND: NtStatus = 0xC000_003A_u32 as i32;
+    const STATUS_FILE_IS_A_DIRECTORY: NtStatus = 0xC000_00BA_u32 as i32;
+    const STATUS_NOT_A_DIRECTORY: NtStatus = 0xC000_0103_u32 as i32;
+
+    const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
+    const FILE_DISPOSITION_INFO_EX_CLASS: i32 = 21;
+    const FILE_DISPOSITION_DELETE_POSIX: u32 = 0x0000_0001 | 0x0000_0002;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct ObjectAttributes {
+        length: u32,
+        root_directory: RawHandle,
+        object_name: *const UnicodeString,
+        attributes: u32,
+        security_descriptor: *const std::ffi::c_void,
+        security_quality_of_service: *const std::ffi::c_void,
+    }
+
+    #[repr(C)]
+    struct IoStatusBlock {
+        status_or_pointer: *mut std::ffi::c_void,
+        information: usize,
+    }
+
+    #[repr(C)]
+    struct FileDispositionInfo {
+        delete_file: u8,
+    }
+
+    #[repr(C)]
+    struct FileDispositionInfoEx {
+        flags: u32,
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtCreateFile(
+            file_handle: *mut RawHandle,
+            desired_access: u32,
+            object_attributes: *const ObjectAttributes,
+            io_status_block: *mut IoStatusBlock,
+            allocation_size: *const i64,
+            file_attributes: u32,
+            share_access: u32,
+            create_disposition: u32,
+            create_options: u32,
+            ea_buffer: *const std::ffi::c_void,
+            ea_length: u32,
+        ) -> NtStatus;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            file: RawHandle,
+            file_information: *mut ByHandleFileInformation,
+        ) -> i32;
+        fn GetFinalPathNameByHandleW(
+            file: RawHandle,
+            file_path: *mut u16,
+            cch_file_path: u32,
+            flags: u32,
+        ) -> u32;
+        fn SetFileInformationByHandle(
+            file: RawHandle,
+            file_information_class: i32,
+            file_information: *const std::ffi::c_void,
+            buffer_size: u32,
+        ) -> i32;
+    }
+
+    fn live_path_by_handle(file: &fs::File) -> Option<PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        let needed =
+            unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), std::ptr::null_mut(), 0, 0) };
+        if needed == 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; needed as usize + 1];
+        let written = unsafe {
+            GetFinalPathNameByHandleW(file.as_raw_handle(), buf.as_mut_ptr(), buf.len() as u32, 0)
+        };
+        if written == 0 || written as usize >= buf.len() {
+            return None;
+        }
+        Some(PathBuf::from(std::ffi::OsString::from_wide(
+            &buf[..written as usize],
+        )))
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct WinFileId {
+        vol: u32,
+        idx_high: u32,
+        idx_low: u32,
+    }
+
+    fn file_id_by_handle(file: &fs::File) -> Result<WinFileId, String> {
+        let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
+        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
+        if ok == 0 {
+            return Err(format!(
+                "读取目录句柄标识失败: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(WinFileId {
+            vol: info.volume_serial_number,
+            idx_high: info.file_index_high,
+            idx_low: info.file_index_low,
+        })
+    }
+
+    fn mark_handle_deleted(file: &fs::File) -> bool {
+        let info_ex = FileDispositionInfoEx {
+            flags: FILE_DISPOSITION_DELETE_POSIX,
+        };
+        let ok_ex = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FILE_DISPOSITION_INFO_EX_CLASS,
+                (&raw const info_ex).cast(),
+                std::mem::size_of::<FileDispositionInfoEx>() as u32,
+            )
+        };
+        if ok_ex != 0 {
+            return true;
+        }
+        let info = FileDispositionInfo { delete_file: 1 };
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FILE_DISPOSITION_INFO_CLASS,
+                (&raw const info).cast(),
+                std::mem::size_of::<FileDispositionInfo>() as u32,
+            )
+        };
+        ok != 0
+    }
+
+    fn nt_open_relative(
+        root: RawHandle,
+        name: &str,
+        desired_access: u32,
+        disposition: u32,
+        create_options: u32,
+    ) -> Result<fs::File, NtStatus> {
+        let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+        let byte_len = wide
+            .len()
+            .checked_mul(2)
+            .and_then(|n| u16::try_from(n).ok())
+            .ok_or(STATUS_OBJECT_NAME_INVALID)?;
+        let ustr = UnicodeString {
+            length: byte_len,
+            maximum_length: byte_len,
+            buffer: wide.as_mut_ptr(),
+        };
+        let attrs = ObjectAttributes {
+            length: std::mem::size_of::<ObjectAttributes>() as u32,
+            root_directory: root,
+            object_name: &ustr,
+            attributes: OBJ_CASE_INSENSITIVE,
+            security_descriptor: std::ptr::null(),
+            security_quality_of_service: std::ptr::null(),
+        };
+        let mut iosb = IoStatusBlock {
+            status_or_pointer: std::ptr::null_mut(),
+            information: 0,
+        };
+        let mut out_handle: RawHandle = std::ptr::null_mut();
+        let status = unsafe {
+            NtCreateFile(
+                &mut out_handle,
+                desired_access,
+                &attrs,
+                &mut iosb,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL_VAL,
+                FILE_SHARE_ALL,
+                disposition,
+                create_options,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            return Err(status);
+        }
+        Ok(unsafe { fs::File::from_raw_handle(out_handle) })
+    }
+
+    pub(super) struct RawDir {
+        pub(super) file: fs::File,
+        id: WinFileId,
+    }
+
+    impl RawDir {
+        fn from_file(file: fs::File, display_path: &Path) -> Result<Self, String> {
+            let meta = file
+                .metadata()
+                .map_err(|e| format!("检查目录 {} 失败: {e}", display_path.display()))?;
+            if is_link(&meta) {
+                return Err(format!("拒绝通过链接目录写入技能: {}", display_path.display()));
+            }
+            if !meta.is_dir() {
+                return Err(format!("技能父路径不是目录: {}", display_path.display()));
+            }
+            let id = file_id_by_handle(&file)?;
+            Ok(Self { file, id })
+        }
+
+        pub(super) fn open_anchor(anchor: &Path, create: bool) -> Result<Option<Self>, String> {
+            if create && !path_exists(anchor)? {
+                fs::create_dir_all(anchor)
+                    .map_err(|e| format!("创建目录 {} 失败: {e}", anchor.display()))?;
+            }
+            match OpenOptions::new()
+                .read(true)
+                .access_mode(
+                    FILE_LIST_DIRECTORY_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
+                )
+                .share_mode(FILE_SHARE_ALL)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS_VAL | FILE_FLAG_OPEN_REPARSE_POINT_VAL)
+                .open(anchor)
+            {
+                Ok(file) => Self::from_file(file, anchor).map(Some),
+                Err(e) if !create && matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+                    Ok(None)
+                }
+                Err(e) => {
+                    if fs::symlink_metadata(anchor).is_ok_and(|m| is_link(&m)) {
+                        Err(format!("拒绝通过链接目录写入技能: {}", anchor.display()))
+                    } else if e.kind() == ErrorKind::NotADirectory {
+                        Err(format!("技能父路径不是目录: {}", anchor.display()))
+                    } else {
+                        Err(format!("打开目录 {} 失败: {e}", anchor.display()))
+                    }
+                }
+            }
+        }
+
+        pub(super) fn open_or_create_subdir(
+            &self,
+            name: &str,
+            step_path: &Path,
+            create: bool,
+        ) -> Result<Option<Self>, String> {
+            validate_single_entry_name(name)?;
+            let disposition = if create { FILE_OPEN_IF } else { FILE_OPEN };
+            match nt_open_relative(
+                self.file.as_raw_handle(),
+                name,
+                FILE_LIST_DIRECTORY_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
+                disposition,
+                FILE_DIRECTORY_FILE
+                    | FILE_OPEN_REPARSE_POINT
+                    | FILE_SYNCHRONOUS_IO_NONALERT
+                    | FILE_OPEN_FOR_BACKUP_INTENT,
+            ) {
+                Ok(file) => Self::from_file(file, step_path).map(Some),
+                Err(s)
+                    if !create
+                        && matches!(
+                            s,
+                            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND
+                        ) =>
+                {
+                    Ok(None)
+                }
+                Err(s) => {
+                    if fs::symlink_metadata(step_path).is_ok_and(|m| is_link(&m)) {
+                        Err(format!("拒绝通过链接目录写入技能: {}", step_path.display()))
+                    } else if s == STATUS_NOT_A_DIRECTORY {
+                        Err(format!("技能父路径不是目录: {}", step_path.display()))
+                    } else {
+                        Err(format!(
+                            "打开目录 {} 失败 (NTSTATUS 0x{:08X})",
+                            step_path.display(),
+                            s as u32
+                        ))
+                    }
+                }
+            }
+        }
+
+        pub(super) fn open_regular_read(&self, name: &str) -> Result<Option<fs::File>, String> {
+            validate_single_entry_name(name)?;
+            match nt_open_relative(
+                self.file.as_raw_handle(),
+                name,
+                FILE_GENERIC_READ_ACCESS,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            ) {
+                Ok(file) => {
+                    let meta = file
+                        .metadata()
+                        .map_err(|e| format!("检查分片临时文件失败: {e}"))?;
+                    if is_link(&meta) || !meta.is_file() {
+                        return Err("分片上传临时文件不是普通文件".to_string());
+                    }
+                    Ok(Some(file))
+                }
+                Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND) => {
+                    Ok(None)
+                }
+                Err(STATUS_FILE_IS_A_DIRECTORY) => {
+                    Err("分片上传临时文件不是普通文件".to_string())
+                }
+                Err(s) => Err(format!("检查分片临时文件失败 (NTSTATUS 0x{:08X})", s as u32)),
+            }
+        }
+
+        pub(super) fn open_regular_append(
+            &self,
+            name: &str,
+            create: bool,
+        ) -> Result<fs::File, String> {
+            validate_single_entry_name(name)?;
+            let disposition = if create { FILE_OPEN_IF } else { FILE_OPEN };
+            match nt_open_relative(
+                self.file.as_raw_handle(),
+                name,
+                FILE_APPEND_DATA_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
+                disposition,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            ) {
+                Ok(file) => {
+                    let meta = file
+                        .metadata()
+                        .map_err(|e| format!("检查分片临时文件失败: {e}"))?;
+                    if is_link(&meta) || !meta.is_file() {
+                        return Err("分片上传临时文件不是普通文件".to_string());
+                    }
+                    Ok(file)
+                }
+                Err(s)
+                    if !create
+                        && matches!(
+                            s,
+                            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND
+                        ) =>
+                {
+                    Err("分片上传会话不存在或已过期".to_string())
+                }
+                Err(STATUS_FILE_IS_A_DIRECTORY) => {
+                    Err("分片上传临时文件不是普通文件".to_string())
+                }
+                Err(s) => Err(format!("写入分片临时文件失败 (NTSTATUS 0x{:08X})", s as u32)),
+            }
+        }
+
+        pub(super) fn unlink_regular_file(&self, name: &str) -> Result<bool, String> {
+            validate_single_entry_name(name)?;
+            let file = match nt_open_relative(
+                self.file.as_raw_handle(),
+                name,
+                DELETE_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            ) {
+                Ok(file) => file,
+                Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND) => {
+                    return Ok(false);
+                }
+                Err(STATUS_FILE_IS_A_DIRECTORY) => {
+                    return Err("分片上传临时文件不是普通文件".to_string());
+                }
+                Err(s) => {
+                    return Err(format!("清理分片临时文件失败 (NTSTATUS 0x{:08X})", s as u32));
+                }
+            };
+            let meta = file
+                .metadata()
+                .map_err(|e| format!("检查分片临时文件失败: {e}"))?;
+            if is_link(&meta) || !meta.is_file() {
+                return Err("分片上传临时文件不是普通文件".to_string());
+            }
+            if !mark_handle_deleted(&file) {
+                return Err("标记删除分片临时文件失败".to_string());
+            }
+            Ok(true)
+        }
+
+        pub(super) fn unlink_stale_regular_file(&self, name: &str, now: SystemTime) -> bool {
+            if validate_single_entry_name(name).is_err() {
+                return false;
+            }
+            let Ok(file) = nt_open_relative(
+                self.file.as_raw_handle(),
+                name,
+                DELETE_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            ) else {
+                return false;
+            };
+            let is_stale = file
+                .metadata()
+                .is_ok_and(|meta| !is_link(&meta) && meta.is_file() && is_stale_meta(&meta, now));
+            if !is_stale {
+                return false;
+            }
+            mark_handle_deleted(&file)
+        }
+
+        pub(super) fn unlink_non_dir_entry(&self, name: &str) -> Result<(), String> {
+            validate_single_entry_name(name)?;
+            match nt_open_relative(
+                self.file.as_raw_handle(),
+                name,
+                DELETE_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            ) {
+                Ok(file) => {
+                    let _ = mark_handle_deleted(&file);
+                    Ok(())
+                }
+                Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND) => {
+                    Ok(())
+                }
+                Err(STATUS_FILE_IS_A_DIRECTORY) => {
+                    if let Ok(link_dir) = nt_open_relative(
+                        self.file.as_raw_handle(),
+                        name,
+                        DELETE_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
+                        FILE_OPEN,
+                        FILE_DIRECTORY_FILE
+                            | FILE_OPEN_REPARSE_POINT
+                            | FILE_SYNCHRONOUS_IO_NONALERT
+                            | FILE_OPEN_FOR_BACKUP_INTENT,
+                    ) {
+                        if link_dir.metadata().is_ok_and(|m| is_link(&m)) {
+                            let _ = mark_handle_deleted(&link_dir);
+                        }
+                    }
+                    Ok(())
+                }
+                Err(s) => Err(format!("清理临时文件失败 (NTSTATUS 0x{:08X})", s as u32)),
+            }
+        }
+
+        pub(super) fn list_entry_names(&self, fallback_path: &Path) -> Vec<String> {
+            let live_dir = live_path_by_handle(&self.file);
+            let read_target = live_dir.as_deref().unwrap_or(fallback_path);
+            fs::read_dir(read_target)
+                .or_else(|_| fs::read_dir(fallback_path))
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        pub(super) fn try_remove_empty_subdir(&self, name: &str, child: &mut Option<RawDir>) {
+            let Some(ref child_ref) = child else {
+                return;
+            };
+            if validate_single_entry_name(name).is_err() {
+                return;
+            }
+            let Ok(del_dir) = nt_open_relative(
+                self.file.as_raw_handle(),
+                name,
+                DELETE_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE
+                    | FILE_OPEN_REPARSE_POINT
+                    | FILE_SYNCHRONOUS_IO_NONALERT
+                    | FILE_OPEN_FOR_BACKUP_INTENT,
+            ) else {
+                return;
+            };
+            let same = del_dir
+                .metadata()
+                .is_ok_and(|meta| !is_link(&meta) && meta.is_dir())
+                && file_id_by_handle(&del_dir).is_ok_and(|id| id == child_ref.id);
+            if same {
+                let _ = child.take();
+                let _ = mark_handle_deleted(&del_dir);
+            }
+        }
+    }
+}
+
+struct VerifiedDir {
+    parent: Option<verified_fs::RawDir>,
+    leaf_name: Option<String>,
+    dir: Option<verified_fs::RawDir>,
+}
+
+impl VerifiedDir {
+    fn open_internal(
+        paths: &AppPaths,
+        dir_path: &Path,
+        create: bool,
+    ) -> Result<Option<Self>, String> {
+        ensure_plain_ancestors(paths, dir_path)?;
+        let anchor = anchor_for_path(paths, dir_path)?;
+        let rel = dir_path
+            .strip_prefix(anchor)
+            .map_err(|_| format!("技能写入路径不在应用目录内: {}", dir_path.display()))?;
+        let mut segments = Vec::new();
+        for comp in rel.components() {
+            match comp {
+                Component::Normal(seg) => {
+                    let s = seg
+                        .to_str()
+                        .ok_or_else(|| format!("技能目录路径包含非 UTF-8 字符: {}", dir_path.display()))?;
+                    validate_single_entry_name(s)?;
+                    segments.push(s);
+                }
+                Component::CurDir => {}
+                _ => return Err(format!("不安全的技能目录路径: {}", dir_path.display())),
+            }
+        }
+        let Some(mut cur) = verified_fs::RawDir::open_anchor(anchor, create)? else {
+            return Ok(None);
+        };
+        if segments.is_empty() {
+            return Ok(Some(Self {
+                parent: None,
+                leaf_name: None,
+                dir: Some(cur),
+            }));
+        }
+        let mut step_path = anchor.to_path_buf();
+        let last_idx = segments.len() - 1;
+        for (idx, seg) in segments.into_iter().enumerate() {
+            step_path.push(seg);
+            let Some(next) = cur.open_or_create_subdir(seg, &step_path, create)? else {
+                return Ok(None);
+            };
+            if idx == last_idx {
+                return Ok(Some(Self {
+                    parent: Some(cur),
+                    leaf_name: Some(seg.to_string()),
+                    dir: Some(next),
+                }));
+            }
+            cur = next;
+        }
+        Ok(None)
+    }
+
+    fn open_existing(paths: &AppPaths, dir_path: &Path) -> Result<Option<Self>, String> {
+        Self::open_internal(paths, dir_path, false)
+    }
+
+    fn open_or_create(paths: &AppPaths, dir_path: &Path) -> Result<Self, String> {
+        Self::open_internal(paths, dir_path, true)?
+            .ok_or_else(|| format!("无法打开技能目录: {}", dir_path.display()))
+    }
+
+    fn raw(&self) -> Result<&verified_fs::RawDir, String> {
+        self.dir
+            .as_ref()
+            .ok_or_else(|| "已释放的目录句柄".to_string())
+    }
+
+    fn metadata(&self) -> Result<fs::Metadata, String> {
+        self.raw()?
+            .file
+            .metadata()
+            .map_err(|e| format!("读取目录元数据失败: {e}"))
+    }
+
+    fn open_child_dir(&self, name: &str, child_path: &Path) -> Result<Option<Self>, String> {
+        let Some(sub) = self.raw()?.open_or_create_subdir(name, child_path, false)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            parent: None,
+            leaf_name: Some(name.to_string()),
+            dir: Some(sub),
+        }))
+    }
+
+    fn create_child_dir(&self, name: &str, child_path: &Path) -> Result<Self, String> {
+        let sub = self
+            .raw()?
+            .open_or_create_subdir(name, child_path, true)?
+            .ok_or_else(|| format!("创建临时目录 {} 失败", child_path.display()))?;
+        Ok(Self {
+            parent: None,
+            leaf_name: Some(name.to_string()),
+            dir: Some(sub),
+        })
+    }
+
+    fn open_regular_read(&self, name: &str) -> Result<Option<fs::File>, String> {
+        self.raw()?.open_regular_read(name)
+    }
+
+    fn open_regular_append(&self, name: &str, create: bool) -> Result<fs::File, String> {
+        self.raw()?.open_regular_append(name, create)
+    }
+
+    fn unlink_regular_file(&self, name: &str) -> Result<bool, String> {
+        self.raw()?.unlink_regular_file(name)
+    }
+
+    fn unlink_stale_regular_file(&self, name: &str, now: SystemTime) -> bool {
+        self.dir
+            .as_ref()
+            .is_some_and(|raw| raw.unlink_stale_regular_file(name, now))
+    }
+
+    fn list_entry_names(&self, fallback_path: &Path) -> Vec<String> {
+        self.dir
+            .as_ref()
+            .map(|raw| raw.list_entry_names(fallback_path))
+            .unwrap_or_default()
+    }
+
+    fn try_remove_self_if_empty(&mut self) {
+        if let (Some(ref parent), Some(ref name)) = (&self.parent, &self.leaf_name) {
+            parent.try_remove_empty_subdir(name, &mut self.dir);
+        }
+    }
+
+    fn remove_child_tree(&self, name: &str, hint_path: &Path) -> Result<(), String> {
+        validate_single_entry_name(name)?;
+        let parent_raw = self.raw()?;
+        match self.open_child_dir(name, hint_path) {
+            Ok(Some(mut sub)) => {
+                for child_name in sub.list_entry_names(hint_path) {
+                    if validate_single_entry_name(&child_name).is_err() {
+                        continue;
+                    }
+                    let _ = sub.remove_child_tree(&child_name, &hint_path.join(&child_name));
+                }
+                parent_raw.try_remove_empty_subdir(name, &mut sub.dir);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(_) => parent_raw.unlink_non_dir_entry(name),
+        }
+    }
 }
 
 fn read_store(paths: &AppPaths) -> Result<SkillsStore, String> {
@@ -453,43 +1562,54 @@ fn cleanup_stale_temp_artifacts(paths: &AppPaths) {
     cleanup_temp_artifacts_at(paths, SystemTime::now());
 }
 
-fn cleanup_temp_artifacts_at(paths: &AppPaths, now: SystemTime) {
-    let is_stale_meta = |meta: &fs::Metadata| -> bool {
-        meta.modified()
+fn sweep_stale_archives_in_verified_dir<I>(
+    ext_verified: &VerifiedDir,
+    ext_dir: &Path,
+    names: I,
+    now: SystemTime,
+) where
+    I: IntoIterator<Item = String>,
+{
+    for name in names {
+        if !name.starts_with(".tako-archive-") || validate_single_entry_name(&name).is_err() {
+            continue;
+        }
+        let hint_path = ext_dir.join(&name);
+        let stale_dir = ext_verified
+            .open_child_dir(&name, &hint_path)
             .ok()
-            .and_then(|mtime| now.duration_since(mtime).ok())
-            .is_some_and(|age| age > STALE_TEMP_TTL)
-    };
-    let ext_dir = extensions_dir(paths);
-    if ensure_plain_ancestors(paths, &ext_dir).is_ok() {
-        if let Ok(entries) = fs::read_dir(&ext_dir) {
-            for entry in entries.flatten() {
-                let entry_path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(".tako-archive-")
-                    && fs::symlink_metadata(&entry_path)
-                        .is_ok_and(|meta| !is_link(&meta) && is_stale_meta(&meta))
-                {
-                    let _ = remove_path(&entry_path);
-                }
-            }
+            .flatten()
+            .and_then(|sub| sub.metadata().ok())
+            .is_some_and(|meta| is_stale_meta(&meta, now));
+        if stale_dir {
+            let _ = ext_verified.remove_child_tree(&name, &hint_path);
+        } else {
+            let _ = ext_verified.unlink_stale_regular_file(&name, now);
         }
     }
-    let uploads = temp_uploads_dir(paths);
-    if ensure_plain_ancestors(paths, &uploads).is_ok() {
-        if let Ok(entries) = fs::read_dir(&uploads) {
-            for entry in entries.flatten() {
-                let entry_path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".zip")
-                    && fs::symlink_metadata(&entry_path).is_ok_and(|meta| {
-                        !is_link(&meta) && meta.is_file() && is_stale_meta(&meta)
-                    })
-                {
-                    let _ = fs::remove_file(&entry_path);
-                }
-            }
+}
+
+fn sweep_stale_uploads_in_verified_dir<I>(uploads_verified: &VerifiedDir, names: I, now: SystemTime)
+where
+    I: IntoIterator<Item = String>,
+{
+    for name in names {
+        if name.ends_with(".zip") && validate_single_entry_name(&name).is_ok() {
+            let _ = uploads_verified.unlink_stale_regular_file(&name, now);
         }
+    }
+}
+
+fn cleanup_temp_artifacts_at(paths: &AppPaths, now: SystemTime) {
+    let ext_dir = extensions_dir(paths);
+    if let Ok(Some(ext_verified)) = VerifiedDir::open_existing(paths, &ext_dir) {
+        let names = ext_verified.list_entry_names(&ext_dir);
+        sweep_stale_archives_in_verified_dir(&ext_verified, &ext_dir, names, now);
+    }
+    let uploads = temp_uploads_dir(paths);
+    if let Ok(Some(uploads_verified)) = VerifiedDir::open_existing(paths, &uploads) {
+        let names = uploads_verified.list_entry_names(&uploads);
+        sweep_stale_uploads_in_verified_dir(&uploads_verified, names, now);
     }
 }
 
@@ -703,45 +1823,56 @@ fn validate_path_segment(segment: &str) -> Result<(), String> {
 }
 
 struct TempExtractDir {
+    parent: VerifiedDir,
+    dir_name: String,
     path: PathBuf,
 }
 
 impl TempExtractDir {
     fn new(paths: &AppPaths) -> Result<Self, String> {
         let base = extensions_dir(paths);
-        ensure_plain_ancestors(paths, &base)?;
-        fs::create_dir_all(&base).map_err(|e| format!("创建扩展目录失败: {e}"))?;
+        let parent = VerifiedDir::open_or_create(paths, &base)?;
         let nonce = format!("{}-{:016x}", std::process::id(), rand::random::<u64>());
-        let path = base.join(format!(".tako-archive-{nonce}"));
-        fs::create_dir_all(&path).map_err(|e| format!("创建技能解压临时目录失败: {e}"))?;
-        Ok(Self { path })
+        let dir_name = format!(".tako-archive-{nonce}");
+        let path = base.join(&dir_name);
+        let _created = parent.create_child_dir(&dir_name, &path)?;
+        Ok(Self {
+            parent,
+            dir_name,
+            path,
+        })
     }
 }
 
 impl Drop for TempExtractDir {
     fn drop(&mut self) {
-        let _ = remove_path(&self.path);
+        let _ = self.parent.remove_child_tree(&self.dir_name, &self.path);
     }
 }
 
 struct StagedUploadCleanup {
-    path: PathBuf,
+    dir: VerifiedDir,
+    file_name: String,
+}
+
+impl StagedUploadCleanup {
+    fn open(paths: &AppPaths, upload_id: &str) -> Result<Option<Self>, String> {
+        validate_identifier(upload_id)?;
+        let uploads_dir = temp_uploads_dir(paths);
+        let Some(dir) = VerifiedDir::open_existing(paths, &uploads_dir)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            dir,
+            file_name: format!("{upload_id}.zip"),
+        }))
+    }
 }
 
 impl Drop for StagedUploadCleanup {
     fn drop(&mut self) {
-        if fs::symlink_metadata(&self.path).is_ok_and(|meta| !is_link(&meta) && meta.is_file()) {
-            let _ = fs::remove_file(&self.path);
-        }
-        if let Some(parent) = self.path.parent() {
-            if fs::symlink_metadata(parent).is_ok_and(|meta| !is_link(&meta) && meta.is_dir())
-                && fs::read_dir(parent)
-                    .ok()
-                    .is_some_and(|mut entries| entries.next().is_none())
-            {
-                let _ = fs::remove_dir(parent);
-            }
-        }
+        let _ = self.dir.unlink_regular_file(&self.file_name);
+        self.dir.try_remove_self_if_empty();
     }
 }
 
@@ -1800,37 +2931,26 @@ pub fn stage_skill_zip_chunk_for_paths(
     let chunk = base64::engine::general_purpose::STANDARD
         .decode(chunk_base64)
         .map_err(|e| format!("ZIP 分片 Base64 无效: {e}"))?;
-    fs::create_dir_all(&uploads_dir).map_err(|e| format!("创建分片上传目录失败: {e}"))?;
-    let id = match upload_id.map(str::trim).filter(|s| !s.is_empty()) {
+    let mut uploads_verified = VerifiedDir::open_or_create(paths, &uploads_dir)?;
+    let (id, create_new) = match upload_id.map(str::trim).filter(|s| !s.is_empty()) {
         Some(existing) => {
             validate_identifier(existing)?;
-            existing.to_string()
+            (existing.to_string(), false)
         }
-        None => format!("zip-{}-{:016x}", std::process::id(), rand::random::<u64>()),
+        None => (
+            format!("zip-{}-{:016x}", std::process::id(), rand::random::<u64>()),
+            true,
+        ),
     };
-    let file_path = uploads_dir.join(format!("{id}.zip"));
-    match fs::symlink_metadata(&file_path) {
-        Ok(meta) if is_link(&meta) || !meta.is_file() => {
-            return Err("分片上传临时文件不是普通文件".to_string());
-        }
-        Ok(_) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            if upload_id.is_some() {
-                return Err("分片上传会话不存在或已过期".to_string());
-            }
-        }
-        Err(e) => return Err(format!("检查分片临时文件失败: {e}")),
-    }
-    let existing_len = fs::metadata(&file_path).map_or(0, |meta| meta.len());
+    let file_name = format!("{id}.zip");
+    let mut file = uploads_verified.open_regular_append(&file_name, create_new)?;
+    let existing_len = file.metadata().map_or(0, |meta| meta.len());
     if chunk.len() as u64 > MAX_ARCHIVE_BYTES.saturating_sub(existing_len) {
-        let _ = fs::remove_file(&file_path);
+        drop(file);
+        let _ = uploads_verified.unlink_regular_file(&file_name);
+        uploads_verified.try_remove_self_if_empty();
         return Err("ZIP 文件超过 200 MiB 上限".to_string());
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&file_path)
-        .map_err(|e| format!("写入分片临时文件失败: {e}"))?;
     file.write_all(&chunk)
         .and_then(|()| file.flush())
         .map_err(|e| format!("保存分片临时文件失败: {e}"))?;
@@ -1843,12 +2963,7 @@ pub fn discard_skill_zip_upload_for_paths(paths: &AppPaths, upload_id: &str) -> 
     if trimmed.is_empty() {
         return Ok(());
     }
-    validate_identifier(trimmed)?;
-    let uploads_dir = temp_uploads_dir(paths);
-    ensure_plain_ancestors(paths, &uploads_dir)?;
-    let _cleanup = StagedUploadCleanup {
-        path: uploads_dir.join(format!("{trimmed}.zip")),
-    };
+    let _cleanup = StagedUploadCleanup::open(paths, trimmed)?;
     Ok(())
 }
 
@@ -1913,23 +3028,18 @@ pub fn import_local_skill_for_paths(
         }
         (None, None, Some(upload_id)) => {
             let trimmed = upload_id.trim();
-            validate_identifier(trimmed)?;
-            let uploads_dir = temp_uploads_dir(paths);
-            ensure_plain_ancestors(paths, &uploads_dir)?;
-            let staged_zip = uploads_dir.join(format!("{trimmed}.zip"));
-            let _upload_cleanup = StagedUploadCleanup {
-                path: staged_zip.clone(),
-            };
-            let meta = fs::symlink_metadata(&staged_zip)
-                .map_err(|_| "分片上传文件不存在或已过期".to_string())?;
-            if is_link(&meta) || !meta.is_file() {
-                return Err("分片上传临时文件不是普通文件".to_string());
-            }
+            let cleanup = StagedUploadCleanup::open(paths, trimmed)?
+                .ok_or_else(|| "分片上传文件不存在或已过期".to_string())?;
+            let file = cleanup
+                .dir
+                .open_regular_read(&cleanup.file_name)?
+                .ok_or_else(|| "分片上传文件不存在或已过期".to_string())?;
+            let meta = file
+                .metadata()
+                .map_err(|e| format!("读取分片 ZIP 失败: {e}"))?;
             if meta.len() > MAX_ARCHIVE_BYTES {
                 return Err("ZIP 文件超过 200 MiB 上限".to_string());
             }
-            let file =
-                fs::File::open(&staged_zip).map_err(|e| format!("打开分片 ZIP 失败: {e}"))?;
             let temp = TempExtractDir::new(paths)?;
             let records = extract_local_archive_records(file, &temp.path)?;
             temp_extract = Some(temp);
@@ -2645,5 +3755,102 @@ mod tests {
             fs::read(uploads_link.join("dir.zip/inner.txt")).unwrap(),
             b"keep-dir"
         );
+    }
+
+    #[test]
+    fn upload_cleanup_and_stale_sweep_survive_post_validation_directory_swap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let uploads = temp_uploads_dir(&paths);
+        let external = tmp.path().join("external-swap-target");
+
+        // 1. StagedUploadCleanup Drop after .tmp-uploads is displaced and replaced by a directory link
+        let upload_id = stage_skill_zip_chunk_for_paths(&paths, None, "UEsD").unwrap();
+        let zip_name = format!("{upload_id}.zip");
+        write_atomic(&external.join(&zip_name), b"external-must-survive", false).unwrap();
+
+        let cleanup = StagedUploadCleanup::open(&paths, &upload_id)
+            .unwrap()
+            .unwrap();
+        let displaced = tmp.path().join("displaced-uploads-1");
+        fs::rename(&uploads, &displaced).unwrap();
+        create_test_dir_link(&external, &uploads);
+        assert!(is_link(&fs::symlink_metadata(&uploads).unwrap()));
+
+        drop(cleanup);
+
+        assert_eq!(
+            fs::read(external.join(&zip_name)).unwrap(),
+            b"external-must-survive"
+        );
+        assert!(
+            !displaced.join(&zip_name).exists(),
+            "staged file in original verified directory handle should be unlinked"
+        );
+        assert!(is_link(&fs::symlink_metadata(&uploads).unwrap()));
+
+        // 2. Stale sweep after VerifiedDir open and before unlink
+        remove_path(&uploads).unwrap();
+        write_atomic(&uploads.join("expired.zip"), b"stale-internal", false).unwrap();
+        write_atomic(
+            &external.join("expired.zip"),
+            b"external-expired-must-survive",
+            false,
+        )
+        .unwrap();
+
+        let verified_uploads = VerifiedDir::open_existing(&paths, &uploads)
+            .unwrap()
+            .unwrap();
+        let displaced_stale = tmp.path().join("displaced-uploads-2");
+        fs::rename(&uploads, &displaced_stale).unwrap();
+        create_test_dir_link(&external, &uploads);
+
+        let future_now = SystemTime::now() + STALE_TEMP_TTL + Duration::from_secs(60);
+        sweep_stale_uploads_in_verified_dir(
+            &verified_uploads,
+            vec!["expired.zip".to_string()],
+            future_now,
+        );
+        drop(verified_uploads);
+
+        assert_eq!(
+            fs::read(external.join("expired.zip")).unwrap(),
+            b"external-expired-must-survive"
+        );
+        assert!(!displaced_stale.join("expired.zip").exists());
+
+        // 3. TempExtractDir Drop after extensions_dir is displaced and replaced by a directory link
+        remove_path(&uploads).unwrap();
+        let temp_extract = TempExtractDir::new(&paths).unwrap();
+        let archive_dir_name = temp_extract.dir_name.clone();
+        write_atomic(&temp_extract.path.join("SKILL.md"), b"internal-temp", false).unwrap();
+        write_atomic(
+            &temp_extract.path.join("nested/only_in_internal.txt"),
+            b"internal-nested",
+            false,
+        )
+        .unwrap();
+
+        let external_ext = tmp.path().join("external-extensions");
+        write_atomic(
+            &external_ext.join(&archive_dir_name).join("SKILL.md"),
+            b"external-archive-must-survive",
+            false,
+        )
+        .unwrap();
+
+        let ext_dir = extensions_dir(&paths);
+        let displaced_ext = tmp.path().join("displaced-extensions");
+        fs::rename(&ext_dir, &displaced_ext).unwrap();
+        create_test_dir_link(&external_ext, &ext_dir);
+
+        drop(temp_extract);
+
+        assert_eq!(
+            fs::read(external_ext.join(&archive_dir_name).join("SKILL.md")).unwrap(),
+            b"external-archive-must-survive"
+        );
+        assert!(!displaced_ext.join(&archive_dir_name).exists());
     }
 }
