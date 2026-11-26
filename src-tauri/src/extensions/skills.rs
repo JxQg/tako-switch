@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{BufWriter, Cursor, ErrorKind, Read, Seek, Write};
+use std::io::{BufWriter, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -22,6 +23,9 @@ pub const MAX_LOCAL_SKILL_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_ARCHIVE_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STAGED_UPLOADS: usize = 16;
+const MAX_ZIP_CENTRAL_DIR_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ZIP_NAME_BYTES: usize = 4096;
+const MAX_ZIP64_EXTENSIBLE_BYTES: u64 = 64 * 1024;
 const MAX_SKILL_MD_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_FILES: usize = 20_000;
 const MAX_DEPTH: usize = 16;
@@ -29,6 +33,7 @@ const STREAM_BUF_SIZE: usize = 64 * 1024;
 const HASH_CACHE_MIN_BYTES: u64 = 256 * 1024;
 const HASH_CACHE_MAX_ENTRIES: usize = 512;
 const STALE_TEMP_TTL: Duration = Duration::from_secs(3600);
+const STAGED_REAPER_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 type HashCacheMap = BTreeMap<PathBuf, ([u8; 32], String)>;
 static TREE_HASH_CACHE: Mutex<Option<HashCacheMap>> = Mutex::new(None);
@@ -41,6 +46,7 @@ struct StagedUpload {
 }
 
 static STAGED_UPLOADS: Mutex<Option<BTreeMap<String, StagedUpload>>> = Mutex::new(None);
+static STAGED_UPLOAD_REAPER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -522,6 +528,49 @@ fn evict_expired_staged_uploads() {
     evict_expired_staged_uploads_at(Instant::now());
 }
 
+fn ensure_staged_upload_reaper() {
+    if STAGED_UPLOAD_REAPER_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    if std::thread::Builder::new()
+        .name("tako-staged-upload-reaper".to_string())
+        .spawn(|| loop {
+            std::thread::sleep(STAGED_REAPER_POLL_INTERVAL);
+            let now = Instant::now();
+            let mut guard = STAGED_UPLOADS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let empty = if let Some(map) = guard.as_mut() {
+                map.retain(|_, upload| {
+                    now.saturating_duration_since(upload.updated_at) <= STALE_TEMP_TTL
+                });
+                map.is_empty()
+            } else {
+                true
+            };
+            if empty {
+                STAGED_UPLOAD_REAPER_ACTIVE.store(false, Ordering::Release);
+                let still_empty = guard.as_ref().is_none_or(BTreeMap::is_empty);
+                if still_empty {
+                    break;
+                }
+                if STAGED_UPLOAD_REAPER_ACTIVE
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .is_err()
+    {
+        STAGED_UPLOAD_REAPER_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
 fn parse_frontmatter(bytes: &[u8], fallback: &str) -> Result<Frontmatter, String> {
     let raw = std::str::from_utf8(bytes).map_err(|e| format!("SKILL.md 不是 UTF-8: {e}"))?;
     let mut lines = raw.trim_start_matches('\u{feff}').lines();
@@ -763,6 +812,226 @@ fn validate_path_segment(segment: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn read_u16_le(slice: &[u8], offset: usize) -> Option<u16> {
+    slice
+        .get(offset..offset + 2)?
+        .try_into()
+        .ok()
+        .map(u16::from_le_bytes)
+}
+
+fn read_u32_le(slice: &[u8], offset: usize) -> Option<u32> {
+    slice
+        .get(offset..offset + 4)?
+        .try_into()
+        .ok()
+        .map(u32::from_le_bytes)
+}
+
+fn read_u64_le(slice: &[u8], offset: usize) -> Option<u64> {
+    slice
+        .get(offset..offset + 8)?
+        .try_into()
+        .ok()
+        .map(u64::from_le_bytes)
+}
+
+/// Pre-validates a ZIP archive's Central Directory before constructing `zip::ZipArchive`.
+/// Bounds entry count and metadata allocations and rejects exact duplicate raw entry names
+/// that `zip 2.6.1` would otherwise overwrite silently in its index.
+fn preflight_zip_central_directory<R: Read + Seek>(
+    reader: &mut R,
+    max_archive_bytes: u64,
+) -> Result<usize, String> {
+    const EOCD_SIG: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
+    const ZIP64_EOCD_SIG: [u8; 4] = [0x50, 0x4b, 0x06, 0x06];
+    const ZIP64_LOCATOR_SIG: [u8; 4] = [0x50, 0x4b, 0x06, 0x07];
+    const CDFH_SIG: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
+    const EOCD_MIN_LEN: u64 = 22;
+    const ZIP64_LOCATOR_LEN: u64 = 20;
+    const ZIP64_EOCD_MIN_LEN: u64 = 56;
+    const MAX_EOCD_SEARCH: u64 = EOCD_MIN_LEN + u16::MAX as u64;
+
+    let file_len = reader
+        .seek(SeekFrom::End(0))
+        .map_err(|e| format!("读取 ZIP 长度失败: {e}"))?;
+    if file_len > max_archive_bytes {
+        return Err(format!(
+            "ZIP 文件超过 {} MiB 上限",
+            max_archive_bytes / (1024 * 1024)
+        ));
+    }
+    if file_len < EOCD_MIN_LEN {
+        return Err("读取 ZIP 失败: 缺少中央目录结束标记".to_string());
+    }
+
+    let tail_len = file_len.min(MAX_EOCD_SEARCH) as usize;
+    let tail_start = file_len - tail_len as u64;
+    reader
+        .seek(SeekFrom::Start(tail_start))
+        .map_err(|e| format!("定位 ZIP 尾部失败: {e}"))?;
+    let mut tail = vec![0u8; tail_len];
+    reader
+        .read_exact(&mut tail)
+        .map_err(|e| format!("读取 ZIP 尾部失败: {e}"))?;
+
+    let mut eocd_rel: Option<usize> = None;
+    for pos in (0..=tail_len - EOCD_MIN_LEN as usize).rev() {
+        if tail[pos..pos + 4] == EOCD_SIG {
+            let comment_len = read_u16_le(&tail, pos + 20).unwrap_or(u16::MAX) as usize;
+            if pos + EOCD_MIN_LEN as usize + comment_len == tail_len {
+                eocd_rel = Some(pos);
+                break;
+            }
+        }
+    }
+    let eocd_rel = eocd_rel.ok_or_else(|| "读取 ZIP 失败: 未找到有效的中央目录结束标记".to_string())?;
+    let eocd_pos = tail_start + eocd_rel as u64;
+    let eocd = &tail[eocd_rel..eocd_rel + EOCD_MIN_LEN as usize];
+
+    let disk_num = read_u16_le(eocd, 4).ok_or("读取 ZIP 失败: EOCD 损坏")?;
+    let cd_disk = read_u16_le(eocd, 6).ok_or("读取 ZIP 失败: EOCD 损坏")?;
+    let disk_entries = read_u16_le(eocd, 8).ok_or("读取 ZIP 失败: EOCD 损坏")?;
+    let total_entries = read_u16_le(eocd, 10).ok_or("读取 ZIP 失败: EOCD 损坏")?;
+    let cd_size_32 = read_u32_le(eocd, 12).ok_or("读取 ZIP 失败: EOCD 损坏")?;
+    let cd_offset_32 = read_u32_le(eocd, 16).ok_or("读取 ZIP 失败: EOCD 损坏")?;
+
+    let needs_zip64 = disk_num == u16::MAX
+        || cd_disk == u16::MAX
+        || disk_entries == u16::MAX
+        || total_entries == u16::MAX
+        || cd_size_32 == u32::MAX
+        || cd_offset_32 == u32::MAX;
+
+    let mut locator_opt: Option<(u64, [u8; 20])> = None;
+    if eocd_pos >= ZIP64_LOCATOR_LEN {
+        let locator_pos = eocd_pos - ZIP64_LOCATOR_LEN;
+        let mut loc_buf = [0u8; 20];
+        reader
+            .seek(SeekFrom::Start(locator_pos))
+            .map_err(|e| format!("定位 ZIP64 标记失败: {e}"))?;
+        reader
+            .read_exact(&mut loc_buf)
+            .map_err(|e| format!("读取 ZIP64 标记失败: {e}"))?;
+        if loc_buf[0..4] == ZIP64_LOCATOR_SIG {
+            locator_opt = Some((locator_pos, loc_buf));
+        }
+    }
+
+    let (cd_offset, cd_size, cd_end, declared_entries) =
+        if let Some((locator_pos, loc_buf)) = locator_opt {
+            let eocd64_disk = read_u32_le(&loc_buf, 4).ok_or("读取 ZIP64 失败")?;
+            let eocd64_offset = read_u64_le(&loc_buf, 8).ok_or("读取 ZIP64 失败")?;
+            let total_disks = read_u32_le(&loc_buf, 16).ok_or("读取 ZIP64 失败")?;
+            if eocd64_disk != 0 || total_disks > 1 {
+                return Err("不支持分卷 ZIP 归档".to_string());
+            }
+            if eocd64_offset.saturating_add(ZIP64_EOCD_MIN_LEN) > locator_pos {
+                return Err("读取 ZIP64 失败: EOCD64 偏移无效".to_string());
+            }
+            let eocd64_span = locator_pos - eocd64_offset;
+            if eocd64_span > ZIP64_EOCD_MIN_LEN + MAX_ZIP64_EXTENSIBLE_BYTES {
+                return Err("ZIP64 中央目录元数据超过上限".to_string());
+            }
+            let mut eocd64 = [0u8; 56];
+            reader
+                .seek(SeekFrom::Start(eocd64_offset))
+                .map_err(|e| format!("定位 ZIP64 EOCD 失败: {e}"))?;
+            reader
+                .read_exact(&mut eocd64)
+                .map_err(|e| format!("读取 ZIP64 EOCD 失败: {e}"))?;
+            if eocd64[0..4] != ZIP64_EOCD_SIG {
+                return Err("读取 ZIP64 失败: EOCD64 签名无效".to_string());
+            }
+            let record_size = read_u64_le(&eocd64, 4).ok_or("读取 ZIP64 失败")?;
+            if record_size < 44 || record_size.checked_add(12) != Some(eocd64_span) {
+                return Err("读取 ZIP64 失败: EOCD64 长度不一致".to_string());
+            }
+            let z64_disk = read_u32_le(&eocd64, 16).ok_or("读取 ZIP64 失败")?;
+            let z64_cd_disk = read_u32_le(&eocd64, 20).ok_or("读取 ZIP64 失败")?;
+            let z64_disk_entries = read_u64_le(&eocd64, 24).ok_or("读取 ZIP64 失败")?;
+            let z64_total_entries = read_u64_le(&eocd64, 32).ok_or("读取 ZIP64 失败")?;
+            let z64_cd_size = read_u64_le(&eocd64, 40).ok_or("读取 ZIP64 失败")?;
+            let z64_cd_offset = read_u64_le(&eocd64, 48).ok_or("读取 ZIP64 失败")?;
+            if z64_disk != 0 || z64_cd_disk != 0 || z64_disk_entries != z64_total_entries {
+                return Err("不支持分卷 ZIP 归档".to_string());
+            }
+            (z64_cd_offset, z64_cd_size, eocd64_offset, z64_total_entries)
+        } else {
+            if needs_zip64 {
+                return Err("读取 ZIP 失败: 缺少 ZIP64 中央目录记录".to_string());
+            }
+            if disk_num != 0 || cd_disk != 0 || disk_entries != total_entries {
+                return Err("不支持分卷 ZIP 归档".to_string());
+            }
+            (
+                u64::from(cd_offset_32),
+                u64::from(cd_size_32),
+                eocd_pos,
+                u64::from(total_entries),
+            )
+        };
+
+    if declared_entries > MAX_FILES as u64 {
+        return Err("ZIP 文件数量超过上限".to_string());
+    }
+    if cd_size > MAX_ZIP_CENTRAL_DIR_BYTES {
+        return Err("ZIP 中央目录元数据超过上限".to_string());
+    }
+    if cd_offset.checked_add(cd_size) != Some(cd_end) {
+        return Err("读取 ZIP 失败: 中央目录偏移或大小不一致".to_string());
+    }
+
+    reader
+        .seek(SeekFrom::Start(cd_offset))
+        .map_err(|e| format!("定位 ZIP 中央目录失败: {e}"))?;
+    let mut cd_bytes = vec![0u8; cd_size as usize];
+    reader
+        .read_exact(&mut cd_bytes)
+        .map_err(|e| format!("读取 ZIP 中央目录失败: {e}"))?;
+
+    let mut raw_names: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut parsed_entries = 0usize;
+    let mut pos = 0usize;
+    while pos < cd_bytes.len() {
+        if pos + 46 > cd_bytes.len() || cd_bytes[pos..pos + 4] != CDFH_SIG {
+            return Err("读取 ZIP 失败: 中央目录条目头损坏".to_string());
+        }
+        parsed_entries += 1;
+        if parsed_entries > MAX_FILES {
+            return Err("ZIP 文件数量超过上限".to_string());
+        }
+        let name_len = read_u16_le(&cd_bytes, pos + 28).ok_or("读取 ZIP 失败")? as usize;
+        let extra_len = read_u16_le(&cd_bytes, pos + 30).ok_or("读取 ZIP 失败")? as usize;
+        let comment_len = read_u16_le(&cd_bytes, pos + 32).ok_or("读取 ZIP 失败")? as usize;
+        if name_len > MAX_ZIP_NAME_BYTES {
+            return Err("ZIP 路径长度超过上限".to_string());
+        }
+        let name_start = pos + 46;
+        let name_end = name_start.saturating_add(name_len);
+        let next_pos = name_end
+            .saturating_add(extra_len)
+            .saturating_add(comment_len);
+        if next_pos > cd_bytes.len() {
+            return Err("读取 ZIP 失败: 中央目录条目越界".to_string());
+        }
+        let raw_name = &cd_bytes[name_start..name_end];
+        if !raw_names.insert(raw_name.to_vec()) {
+            let display = String::from_utf8_lossy(raw_name);
+            return Err(format!("ZIP 存在重复路径: {display}"));
+        }
+        pos = next_pos;
+    }
+
+    if parsed_entries as u64 != declared_entries {
+        return Err("读取 ZIP 失败: 中央目录条目数量与声明不一致".to_string());
+    }
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("重置 ZIP 游标失败: {e}"))?;
+    Ok(parsed_entries)
+}
+
 struct ScannedZipEntry {
     zip_index: usize,
     size: u64,
@@ -771,19 +1040,24 @@ struct ScannedZipEntry {
 }
 
 fn scan_zip_archive_trees(
-    backing: ArchiveBacking,
+    mut backing: ArchiveBacking,
     strip_single_wrapper: bool,
     max_depth: usize,
     max_bytes: u64,
 ) -> Result<Vec<(String, LocalSkillTree)>, String> {
+    let preflight_entries = preflight_zip_central_directory(&mut backing, max_bytes)?;
     let mut archive =
         zip::ZipArchive::new(backing).map_err(|e| format!("读取 ZIP 失败: {e}"))?;
+    if archive.len() != preflight_entries {
+        return Err("ZIP 存在重复路径或中央目录条目异常".to_string());
+    }
     if archive.len() > MAX_FILES {
         return Err("ZIP 文件数量超过上限".to_string());
     }
     let mut raw_files: BTreeMap<String, ScannedZipEntry> = BTreeMap::new();
     let mut seen = BTreeSet::new();
     let mut path_kinds = BTreeMap::new();
+    let mut canonical_dir_spelling: BTreeMap<String, String> = BTreeMap::new();
     let mut total = 0u64;
     let mut buf = vec![0u8; STREAM_BUF_SIZE];
 
@@ -829,6 +1103,30 @@ fn scan_zip_archive_trees(
             return Err(format!("ZIP 文件与目录路径冲突: {name}"));
         }
         path_kinds.insert(lower, entry.is_dir());
+        let dir_segment_count = if entry.is_dir() {
+            segments.len()
+        } else {
+            segments.len().saturating_sub(1)
+        };
+        let mut prefix_orig = String::new();
+        let mut prefix_lower = String::new();
+        for segment in &segments[..dir_segment_count] {
+            if !prefix_orig.is_empty() {
+                prefix_orig.push('/');
+                prefix_lower.push('/');
+            }
+            prefix_orig.push_str(segment);
+            prefix_lower.push_str(&segment.to_lowercase());
+            if let Some(existing) = canonical_dir_spelling.get(&prefix_lower) {
+                if existing != &prefix_orig {
+                    return Err(format!(
+                        "ZIP 目录路径存在大小写冲突: {existing} 与 {prefix_orig}"
+                    ));
+                }
+            } else {
+                canonical_dir_spelling.insert(prefix_lower.clone(), prefix_orig.clone());
+            }
+        }
         let mode = entry.unix_mode().unwrap_or(0);
         if mode & 0o170000 != 0 && !matches!(mode & 0o170000, 0o100000 | 0o040000) {
             return Err(format!("ZIP 不允许链接或特殊文件: {name}"));
@@ -1943,6 +2241,8 @@ pub fn stage_skill_zip_chunk_for_paths(
                     updated_at: now,
                 },
             );
+            drop(guard);
+            ensure_staged_upload_reaper();
             Ok(id)
         }
     }
@@ -2869,5 +3169,140 @@ mod tests {
         write_tree_streaming(&copy2, archive_tree, MAX_ARCHIVE_BYTES).unwrap();
         assert_eq!(fs::read(copy1.join("sub/data.txt")).unwrap(), asset);
         assert_eq!(fs::read(copy2.join("sub/data.txt")).unwrap(), asset);
+    }
+
+    fn build_raw_stored_zip(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut cd = Vec::new();
+        for (name, body) in entries {
+            let local_offset = out.len() as u32;
+            let name_len = name.len() as u16;
+            let body_len = body.len() as u32;
+            // Local file header (stored, crc=0 is fine for preflight; valid stored entries use real body)
+            out.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]);
+            out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // method = store
+            out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+            out.extend_from_slice(&0u16.to_le_bytes()); // mod date
+            out.extend_from_slice(&0u32.to_le_bytes()); // crc32
+            out.extend_from_slice(&body_len.to_le_bytes()); // comp size
+            out.extend_from_slice(&body_len.to_le_bytes()); // uncomp size
+            out.extend_from_slice(&name_len.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+            out.extend_from_slice(name);
+            out.extend_from_slice(body);
+
+            // Central directory file header
+            cd.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]);
+            cd.extend_from_slice(&20u16.to_le_bytes()); // version made by
+            cd.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            cd.extend_from_slice(&0u16.to_le_bytes()); // flags
+            cd.extend_from_slice(&0u16.to_le_bytes()); // method = store
+            cd.extend_from_slice(&0u16.to_le_bytes()); // mod time
+            cd.extend_from_slice(&0u16.to_le_bytes()); // mod date
+            cd.extend_from_slice(&0u32.to_le_bytes()); // crc32
+            cd.extend_from_slice(&body_len.to_le_bytes());
+            cd.extend_from_slice(&body_len.to_le_bytes());
+            cd.extend_from_slice(&name_len.to_le_bytes());
+            cd.extend_from_slice(&0u16.to_le_bytes()); // extra len
+            cd.extend_from_slice(&0u16.to_le_bytes()); // comment len
+            cd.extend_from_slice(&0u16.to_le_bytes()); // disk start
+            cd.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+            cd.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+            cd.extend_from_slice(&local_offset.to_le_bytes());
+            cd.extend_from_slice(name);
+        }
+        let cd_offset = out.len() as u32;
+        let cd_size = cd.len() as u32;
+        let count = entries.len() as u16;
+        out.extend_from_slice(&cd);
+        // EOCD
+        out.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk num
+        out.extend_from_slice(&0u16.to_le_bytes()); // cd disk
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        out
+    }
+
+    #[test]
+    fn zip_preflight_rejects_exact_duplicates_oversized_cd_and_dir_case_conflicts() {
+        // 1. Exact byte-identical duplicate entry names (silently overwritten by zip 2.6.1 if unchecked).
+        let exact_dup = build_raw_stored_zip(&[
+            (b"demo/SKILL.md", b"---\nname: first\n---\n"),
+            (b"demo/SKILL.md", b"---\nname: second\n---\n"),
+        ]);
+        let dup_err = scan_zip_archive_trees(
+            ArchiveBacking::Bytes(Cursor::new(exact_dup)),
+            false,
+            2,
+            MAX_ARCHIVE_BYTES,
+        )
+        .unwrap_err();
+        assert!(dup_err.contains("重复路径"), "{dup_err}");
+
+        // 2. Raw entry count exceeding MAX_FILES even when all entries share the exact same name.
+        let over_limit_entries: Vec<(&[u8], &[u8])> =
+            vec![(b"dup.txt", b""); MAX_FILES + 1];
+        let over_limit_zip = build_raw_stored_zip(&over_limit_entries);
+        let limit_err = scan_zip_archive_trees(
+            ArchiveBacking::Bytes(Cursor::new(over_limit_zip)),
+            false,
+            2,
+            MAX_ARCHIVE_BYTES,
+        )
+        .unwrap_err();
+        assert!(limit_err.contains("文件数量超过上限"), "{limit_err}");
+
+        // 3. Central directory metadata size exceeding MAX_ZIP_CENTRAL_DIR_BYTES rejected before allocation.
+        let mut oversized_cd_eocd = Vec::new();
+        oversized_cd_eocd.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+        oversized_cd_eocd.extend_from_slice(&0u16.to_le_bytes());
+        oversized_cd_eocd.extend_from_slice(&0u16.to_le_bytes());
+        oversized_cd_eocd.extend_from_slice(&1u16.to_le_bytes());
+        oversized_cd_eocd.extend_from_slice(&1u16.to_le_bytes());
+        oversized_cd_eocd.extend_from_slice(&((MAX_ZIP_CENTRAL_DIR_BYTES as u32) + 1).to_le_bytes());
+        oversized_cd_eocd.extend_from_slice(&0u32.to_le_bytes());
+        oversized_cd_eocd.extend_from_slice(&0u16.to_le_bytes());
+        let cd_err = scan_zip_archive_trees(
+            ArchiveBacking::Bytes(Cursor::new(oversized_cd_eocd)),
+            false,
+            2,
+            MAX_ARCHIVE_BYTES,
+        )
+        .unwrap_err();
+        assert!(cd_err.contains("中央目录元数据超过上限"), "{cd_err}");
+
+        // 4. Case-inconsistent parent directory prefixes (e.g. Assets/a.txt vs assets/b.txt) must be rejected.
+        let mixed_nested = build_test_zip_bytes(&[
+            ("demo/SKILL.md", b"---\nname: demo\n---\nbody\n"),
+            ("demo/Assets/a.txt", b"aaa"),
+            ("demo/assets/b.txt", b"bbb"),
+        ]);
+        let case_err1 = scan_zip_archive_trees(
+            ArchiveBacking::Bytes(Cursor::new(mixed_nested)),
+            false,
+            2,
+            MAX_ARCHIVE_BYTES,
+        )
+        .unwrap_err();
+        assert!(case_err1.contains("大小写冲突"), "{case_err1}");
+
+        let mixed_root = build_test_zip_bytes(&[
+            ("Demo/SKILL.md", b"---\nname: demo\n---\nbody\n"),
+            ("demo/data.txt", b"ddd"),
+        ]);
+        let case_err2 = scan_zip_archive_trees(
+            ArchiveBacking::Bytes(Cursor::new(mixed_root)),
+            false,
+            2,
+            MAX_ARCHIVE_BYTES,
+        )
+        .unwrap_err();
+        assert!(case_err2.contains("大小写冲突"), "{case_err2}");
     }
 }
