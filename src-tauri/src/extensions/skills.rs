@@ -412,11 +412,26 @@ mod verified_fs {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    pub(super) struct ObjectIdentity {
+        dev: u64,
+        ino: u64,
+    }
+
+    pub(super) fn file_identity(file: &fs::File) -> Result<ObjectIdentity, String> {
+        let meta = file
+            .metadata()
+            .map_err(|e| format!("读取文件句柄标识失败: {e}"))?;
+        Ok(ObjectIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+
     #[derive(Debug)]
     pub(super) struct RawDir {
         pub(super) file: fs::File,
-        dev: u64,
-        ino: u64,
+        id: ObjectIdentity,
     }
 
     impl RawDir {
@@ -431,10 +446,16 @@ mod verified_fs {
                 return Err(format!("技能父路径不是目录: {}", display_path.display()));
             }
             Ok(Self {
-                dev: meta.dev(),
-                ino: meta.ino(),
+                id: ObjectIdentity {
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                },
                 file,
             })
+        }
+
+        pub(super) fn identity(&self) -> ObjectIdentity {
+            self.id
         }
 
         fn is_child_symlink(&self, cname: &CStr) -> bool {
@@ -528,7 +549,7 @@ mod verified_fs {
             step_path: &Path,
         ) -> Result<Self, String> {
             let cname = c_segment(name)?;
-            let dir_mode: libc::mode_t = 0o755;
+            let dir_mode: libc::mode_t = 0o700;
             let rc = unsafe { libc::mkdirat(self.file.as_raw_fd(), cname.as_ptr(), dir_mode) };
             if rc < 0 {
                 let err = std::io::Error::last_os_error();
@@ -549,7 +570,19 @@ mod verified_fs {
                 return Err(format!("打开目录 {} 失败: {err}", step_path.display()));
             }
             let file = unsafe { fs::File::from_raw_fd(raw) };
-            Self::from_file(file, step_path)
+            let dir = Self::from_file(file, step_path)?;
+            let meta = dir
+                .file
+                .metadata()
+                .map_err(|e| format!("检查目录 {} 失败: {e}", step_path.display()))?;
+            let euid = unsafe { libc::geteuid() };
+            if meta.uid() != euid
+                || (meta.mode() & 0o077) != 0
+                || !dir.list_entry_names().is_empty()
+            {
+                return Err(format!("临时目录 {} 绑定校验失败", step_path.display()));
+            }
+            Ok(dir)
         }
 
         pub(super) fn open_regular_read(&self, name: &str) -> Result<Option<fs::File>, String> {
@@ -703,17 +736,29 @@ mod verified_fs {
             unsafe { libc::unlinkat(self.file.as_raw_fd(), cname.as_ptr(), 0) == 0 }
         }
 
-        pub(super) fn unlink_non_dir_entry(&self, name: &str) -> Result<(), String> {
+        pub(super) fn unlink_verified_regular_file(
+            &self,
+            name: &str,
+            expected_id: ObjectIdentity,
+        ) -> Result<bool, String> {
+            let Some(verified) = self.open_regular_read(name)? else {
+                return Ok(false);
+            };
+            let matches = file_identity(&verified).is_ok_and(|id| id == expected_id);
+            drop(verified);
+            if !matches {
+                return Ok(false);
+            }
             let cname = c_segment(name)?;
             let rc = unsafe { libc::unlinkat(self.file.as_raw_fd(), cname.as_ptr(), 0) };
             if rc < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == ErrorKind::NotFound {
-                    return Ok(());
+                    return Ok(false);
                 }
                 return Err(format!("清理临时文件失败: {err}"));
             }
-            Ok(())
+            Ok(true)
         }
 
         pub(super) fn list_entry_names(&self) -> Vec<String> {
@@ -773,8 +818,10 @@ mod verified_fs {
             let same = reopened_file.metadata().is_ok_and(|meta| {
                 !is_link(&meta)
                     && meta.is_dir()
-                    && meta.dev() == child_ref.dev
-                    && meta.ino() == child_ref.ino
+                    && ObjectIdentity {
+                        dev: meta.dev(),
+                        ino: meta.ino(),
+                    } == child_ref.id
             });
             drop(reopened_file);
             if same {
@@ -944,23 +991,23 @@ mod verified_fs {
         ) -> i32;
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct WinFileId {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    pub(super) struct ObjectIdentity {
         vol: u32,
         idx_high: u32,
         idx_low: u32,
     }
 
-    fn file_id_by_handle(file: &fs::File) -> Result<WinFileId, String> {
+    pub(super) fn file_identity(file: &fs::File) -> Result<ObjectIdentity, String> {
         let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
         let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
         if ok == 0 {
             return Err(format!(
-                "读取目录句柄标识失败: {}",
+                "读取句柄标识失败: {}",
                 std::io::Error::last_os_error()
             ));
         }
-        Ok(WinFileId {
+        Ok(ObjectIdentity {
             vol: info.volume_serial_number,
             idx_high: info.file_index_high,
             idx_low: info.file_index_low,
@@ -1049,7 +1096,7 @@ mod verified_fs {
     #[derive(Debug)]
     pub(super) struct RawDir {
         pub(super) file: fs::File,
-        id: WinFileId,
+        id: ObjectIdentity,
     }
 
     impl RawDir {
@@ -1063,8 +1110,12 @@ mod verified_fs {
             if !meta.is_dir() {
                 return Err(format!("技能父路径不是目录: {}", display_path.display()));
             }
-            let id = file_id_by_handle(&file)?;
+            let id = file_identity(&file)?;
             Ok(Self { file, id })
+        }
+
+        pub(super) fn identity(&self) -> ObjectIdentity {
+            self.id
         }
 
         fn is_child_link(&self, name: &str) -> bool {
@@ -1352,41 +1403,38 @@ mod verified_fs {
             mark_handle_deleted(&file)
         }
 
-        pub(super) fn unlink_non_dir_entry(&self, name: &str) -> Result<(), String> {
+        pub(super) fn unlink_verified_regular_file(
+            &self,
+            name: &str,
+            expected_id: ObjectIdentity,
+        ) -> Result<bool, String> {
             validate_single_entry_name(name)?;
-            match nt_open_relative(
+            let file = match nt_open_relative(
                 self.file.as_raw_handle(),
                 name,
                 DELETE_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
                 FILE_OPEN,
                 FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             ) {
-                Ok(file) => {
-                    let _ = mark_handle_deleted(&file);
-                    Ok(())
-                }
+                Ok(file) => file,
                 Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND) => {
-                    Ok(())
+                    return Ok(false);
                 }
                 Err(STATUS_FILE_IS_A_DIRECTORY) => {
-                    if let Ok(link_dir) = nt_open_relative(
-                        self.file.as_raw_handle(),
-                        name,
-                        DELETE_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
-                        FILE_OPEN,
-                        FILE_DIRECTORY_FILE
-                            | FILE_OPEN_REPARSE_POINT
-                            | FILE_SYNCHRONOUS_IO_NONALERT
-                            | FILE_OPEN_FOR_BACKUP_INTENT,
-                    ) {
-                        if link_dir.metadata().is_ok_and(|m| is_link(&m)) {
-                            let _ = mark_handle_deleted(&link_dir);
-                        }
-                    }
-                    Ok(())
+                    return Ok(false);
                 }
-                Err(s) => Err(format!("清理临时文件失败 (NTSTATUS 0x{:08X})", s as u32)),
+                Err(s) => {
+                    return Err(format!("清理临时文件失败 (NTSTATUS 0x{:08X})", s as u32));
+                }
+            };
+            let valid = file
+                .metadata()
+                .is_ok_and(|meta| !is_link(&meta) && meta.is_file())
+                && file_identity(&file).is_ok_and(|id| id == expected_id);
+            if !valid {
+                return Ok(false);
             }
+            Ok(mark_handle_deleted(&file))
         }
 
         pub(super) fn list_entry_names(&self) -> Vec<String> {
@@ -1437,9 +1485,10 @@ mod verified_fs {
                     let name_start = offset + name_off;
                     let name_end = name_start.saturating_add(file_name_len_bytes);
                     if (file_name_len_bytes & 1) == 0 && name_end <= bytes.len() {
-                        let wide: Vec<u16> = bytes[name_start..name_end]
-                            .chunks_exact(2)
-                            .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+                        let (pairs, _) = bytes[name_start..name_end].as_chunks::<2>();
+                        let wide: Vec<u16> = pairs
+                            .iter()
+                            .map(|&pair| u16::from_ne_bytes(pair))
                             .collect();
                         if let Ok(name) = std::ffi::OsString::from_wide(&wide).into_string() {
                             if name != "." && name != ".." {
@@ -1484,12 +1533,131 @@ mod verified_fs {
             let same = del_dir
                 .metadata()
                 .is_ok_and(|meta| !is_link(&meta) && meta.is_dir())
-                && file_id_by_handle(&del_dir).is_ok_and(|id| id == child_ref.id);
+                && file_identity(&del_dir).is_ok_and(|id| id == child_ref.id);
             if same {
                 let _ = child.take();
                 let _ = mark_handle_deleted(&del_dir);
             }
         }
+    }
+}
+
+const ARCHIVE_LEDGER_FILE: &str = ".tako-archive-ledger";
+const MAX_ARCHIVE_LEDGER_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "k")]
+enum ArchiveLedgerEntry {
+    Root {
+        id: verified_fs::ObjectIdentity,
+    },
+    Dir {
+        parent: verified_fs::ObjectIdentity,
+        id: verified_fs::ObjectIdentity,
+        name: String,
+    },
+    File {
+        parent: verified_fs::ObjectIdentity,
+        id: verified_fs::ObjectIdentity,
+        name: String,
+    },
+}
+
+#[derive(Debug, Default)]
+struct OwnedTreeLedger {
+    dirs: BTreeMap<(verified_fs::ObjectIdentity, String), verified_fs::ObjectIdentity>,
+    files: BTreeMap<(verified_fs::ObjectIdentity, String), verified_fs::ObjectIdentity>,
+}
+
+impl OwnedTreeLedger {
+    fn record_dir(
+        &mut self,
+        parent: verified_fs::ObjectIdentity,
+        name: &str,
+        id: verified_fs::ObjectIdentity,
+    ) {
+        self.dirs.insert((parent, name.to_string()), id);
+    }
+
+    fn record_file(
+        &mut self,
+        parent: verified_fs::ObjectIdentity,
+        name: &str,
+        id: verified_fs::ObjectIdentity,
+    ) {
+        self.files.insert((parent, name.to_string()), id);
+    }
+
+    fn expected_dir(
+        &self,
+        parent: verified_fs::ObjectIdentity,
+        name: &str,
+    ) -> Option<verified_fs::ObjectIdentity> {
+        self.dirs.get(&(parent, name.to_string())).copied()
+    }
+
+    fn expected_file(
+        &self,
+        parent: verified_fs::ObjectIdentity,
+        name: &str,
+    ) -> Option<verified_fs::ObjectIdentity> {
+        self.files.get(&(parent, name.to_string())).copied()
+    }
+
+    fn load_from_verified_root(root: &VerifiedDir) -> Option<Self> {
+        let root_id = root.identity().ok()?;
+        let file = root.open_regular_read(ARCHIVE_LEDGER_FILE).ok()??;
+        let meta = file.metadata().ok()?;
+        if is_link(&meta) || !meta.is_file() || meta.len() > MAX_ARCHIVE_LEDGER_BYTES {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.uid() != unsafe { libc::geteuid() } {
+                return None;
+            }
+        }
+        let actual_ledger_id = verified_fs::file_identity(&file).ok()?;
+        let mut bytes = Vec::new();
+        file.take(MAX_ARCHIVE_LEDGER_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > MAX_ARCHIVE_LEDGER_BYTES {
+            return None;
+        }
+        let text = std::str::from_utf8(&bytes).ok()?;
+        let mut ledger = Self::default();
+        let mut saw_root = false;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let entry: ArchiveLedgerEntry = serde_json::from_str(trimmed).ok()?;
+            match entry {
+                ArchiveLedgerEntry::Root { id } => {
+                    if id != root_id {
+                        return None;
+                    }
+                    saw_root = true;
+                }
+                ArchiveLedgerEntry::Dir { parent, id, name } => {
+                    validate_single_entry_name(&name).ok()?;
+                    ledger.dirs.insert((parent, name), id);
+                }
+                ArchiveLedgerEntry::File { parent, id, name } => {
+                    validate_single_entry_name(&name).ok()?;
+                    ledger.files.insert((parent, name), id);
+                }
+            }
+        }
+        if !saw_root
+            || ledger.expected_file(root_id, ARCHIVE_LEDGER_FILE) != Some(actual_ledger_id)
+        {
+            return None;
+        }
+        Some(ledger)
     }
 }
 
@@ -1576,6 +1744,10 @@ impl VerifiedDir {
             .map_err(|e| format!("读取目录元数据失败: {e}"))
     }
 
+    fn identity(&self) -> Result<verified_fs::ObjectIdentity, String> {
+        Ok(self.raw()?.identity())
+    }
+
     fn open_child_dir(&self, name: &str, child_path: &Path) -> Result<Option<Self>, String> {
         let Some(sub) = self.raw()?.open_or_create_subdir(name, child_path, false)? else {
             return Ok(None);
@@ -1585,18 +1757,6 @@ impl VerifiedDir {
             leaf_name: Some(name.to_string()),
             dir: Some(sub),
         }))
-    }
-
-    fn create_child_dir(&self, name: &str, child_path: &Path) -> Result<Self, String> {
-        let sub = self
-            .raw()?
-            .open_or_create_subdir(name, child_path, true)?
-            .ok_or_else(|| format!("创建临时目录 {} 失败", child_path.display()))?;
-        Ok(Self {
-            parent: None,
-            leaf_name: Some(name.to_string()),
-            dir: Some(sub),
-        })
     }
 
     fn create_child_dir_exclusive(&self, name: &str, child_path: &Path) -> Result<Self, String> {
@@ -1627,17 +1787,31 @@ impl VerifiedDir {
         self.raw()?.open_regular_append(name, create)
     }
 
-    fn open_relative_child_dir(&self, relative: &str, display_root: &Path) -> Result<Self, String> {
+    fn open_relative_tracked_child_dir(
+        &self,
+        relative: &str,
+        display_root: &Path,
+        ledger: &OwnedTreeLedger,
+    ) -> Result<Self, String> {
         let mut step_display = display_root.to_path_buf();
         let mut current: Option<Self> = None;
         for seg in relative.split('/').filter(|s| !s.is_empty()) {
             validate_single_entry_name(seg)?;
             step_display.push(seg);
-            let next = match current.as_ref() {
-                Some(dir) => dir.open_child_dir(seg, &step_display)?,
-                None => self.open_child_dir(seg, &step_display)?,
+            let parent_ref = current.as_ref().unwrap_or(self);
+            let parent_id = parent_ref.identity()?;
+            let expected_id = ledger.expected_dir(parent_id, seg).ok_or_else(|| {
+                format!("检测到临时目录 {} 未在清单内，已中止操作", step_display.display())
+            })?;
+            let next = parent_ref
+                .open_child_dir(seg, &step_display)?
+                .ok_or_else(|| format!("未找到归档目录: {}", step_display.display()))?;
+            if next.identity()? != expected_id {
+                return Err(format!(
+                    "检测到临时目录 {} 被替换，已中止操作",
+                    step_display.display()
+                ));
             }
-            .ok_or_else(|| format!("未找到归档目录: {}", step_display.display()))?;
             current = Some(next);
         }
         current.ok_or_else(|| format!("归档相对目录为空: {}", display_root.display()))
@@ -1675,6 +1849,14 @@ impl VerifiedDir {
         self.raw()?.unlink_regular_file(name)
     }
 
+    fn unlink_verified_regular_file(
+        &self,
+        name: &str,
+        expected_id: verified_fs::ObjectIdentity,
+    ) -> Result<bool, String> {
+        self.raw()?.unlink_verified_regular_file(name, expected_id)
+    }
+
     fn unlink_stale_regular_file(&self, name: &str, now: SystemTime) -> bool {
         self.dir
             .as_ref()
@@ -1694,44 +1876,75 @@ impl VerifiedDir {
         }
     }
 
-    fn clear_contents_with_depth(&self, depth: usize) -> Result<(), String> {
+    fn clear_tracked_contents_with_depth(
+        &self,
+        ledger: &OwnedTreeLedger,
+        depth: usize,
+    ) -> Result<(), String> {
         if depth > MAX_DEPTH + 4 {
             return Err("临时目录清理嵌套过深".to_string());
         }
         let self_raw = self.raw()?;
+        let self_id = self_raw.identity();
+        let mut deferred_ledger_id: Option<verified_fs::ObjectIdentity> = None;
+
         for child_name in self.list_entry_names() {
             if validate_single_entry_name(&child_name).is_err() {
                 continue;
             }
-            let display_hint = Path::new(&child_name);
-            match self.open_child_dir(&child_name, display_hint) {
-                Ok(Some(sub)) => {
-                    let _ = self.remove_open_child_tree_with_depth(&child_name, sub, depth + 1);
+            if let Some(expected_dir_id) = ledger.expected_dir(self_id, &child_name) {
+                let display_hint = Path::new(&child_name);
+                if let Ok(Some(sub)) = self.open_child_dir(&child_name, display_hint) {
+                    if sub
+                        .identity()
+                        .is_ok_and(|actual_id| actual_id == expected_dir_id)
+                    {
+                        let _ = self.remove_tracked_open_child_tree_with_depth(
+                            &child_name,
+                            sub,
+                            ledger,
+                            depth + 1,
+                        );
+                    }
                 }
-                Ok(None) => {}
-                Err(_) => {
-                    let _ = self_raw.unlink_non_dir_entry(&child_name);
-                }
+                continue;
             }
+            if let Some(expected_file_id) = ledger.expected_file(self_id, &child_name) {
+                if depth == 0 && child_name == ARCHIVE_LEDGER_FILE {
+                    deferred_ledger_id = Some(expected_file_id);
+                    continue;
+                }
+                let _ = self_raw.unlink_verified_regular_file(&child_name, expected_file_id);
+            }
+        }
+
+        if let Some(ledger_id) = deferred_ledger_id {
+            let _ = self_raw.unlink_verified_regular_file(ARCHIVE_LEDGER_FILE, ledger_id);
         }
         Ok(())
     }
 
-    fn remove_open_child_tree_with_depth(
+    fn remove_tracked_open_child_tree_with_depth(
         &self,
         name: &str,
         mut child: VerifiedDir,
+        ledger: &OwnedTreeLedger,
         depth: usize,
     ) -> Result<(), String> {
         validate_single_entry_name(name)?;
         let parent_raw = self.raw()?;
-        let _ = child.clear_contents_with_depth(depth);
+        let _ = child.clear_tracked_contents_with_depth(ledger, depth);
         parent_raw.try_remove_empty_subdir(name, &mut child.dir);
         Ok(())
     }
 
-    fn remove_open_child_tree(&self, name: &str, child: VerifiedDir) -> Result<(), String> {
-        self.remove_open_child_tree_with_depth(name, child, 0)
+    fn remove_tracked_open_child_tree(
+        &self,
+        name: &str,
+        child: VerifiedDir,
+        ledger: &OwnedTreeLedger,
+    ) -> Result<(), String> {
+        self.remove_tracked_open_child_tree_with_depth(name, child, ledger, 0)
     }
 }
 
@@ -1834,12 +2047,14 @@ fn sweep_stale_open_archive_dir(
     sub: VerifiedDir,
     now: SystemTime,
 ) -> bool {
-    if sub.metadata().is_ok_and(|meta| is_stale_meta(&meta, now)) {
-        let _ = ext_verified.remove_open_child_tree(name, sub);
-        true
-    } else {
-        false
+    if !sub.metadata().is_ok_and(|meta| is_stale_meta(&meta, now)) {
+        return false;
     }
+    let Some(ledger) = OwnedTreeLedger::load_from_verified_root(&sub) else {
+        return false;
+    };
+    let _ = ext_verified.remove_tracked_open_child_tree(name, sub, &ledger);
+    true
 }
 
 fn sweep_stale_archives_in_verified_dir<I>(
@@ -2120,6 +2335,8 @@ struct TempExtractDir {
     parent: VerifiedDir,
     dir_name: String,
     dir: Option<VerifiedDir>,
+    ledger: OwnedTreeLedger,
+    ledger_file: Option<fs::File>,
     path: PathBuf,
 }
 
@@ -2131,12 +2348,55 @@ impl TempExtractDir {
         let dir_name = format!(".tako-archive-{nonce}");
         let path = base.join(&dir_name);
         let dir = parent.create_child_dir_exclusive(&dir_name, &path)?;
+        let root_id = dir.identity()?;
+        let ledger_path = path.join(ARCHIVE_LEDGER_FILE);
+        let mut ledger_file =
+            dir.create_regular_file_exclusive(ARCHIVE_LEDGER_FILE, false, 0o600, &ledger_path)?;
+        let ledger_file_id = verified_fs::file_identity(&ledger_file)?;
+        let mut ledger = OwnedTreeLedger::default();
+        ledger.record_file(root_id, ARCHIVE_LEDGER_FILE, ledger_file_id);
+        Self::write_ledger_line(&mut ledger_file, &ArchiveLedgerEntry::Root { id: root_id })?;
+        Self::write_ledger_line(
+            &mut ledger_file,
+            &ArchiveLedgerEntry::File {
+                parent: root_id,
+                id: ledger_file_id,
+                name: ARCHIVE_LEDGER_FILE.to_string(),
+            },
+        )?;
+        ledger_file
+            .flush()
+            .map_err(|e| format!("写入临时归档清单失败: {e}"))?;
         Ok(Self {
             parent,
             dir_name,
             dir: Some(dir),
+            ledger,
+            ledger_file: Some(ledger_file),
             path,
         })
+    }
+
+    fn write_ledger_line(file: &mut fs::File, entry: &ArchiveLedgerEntry) -> Result<(), String> {
+        let mut line =
+            serde_json::to_vec(entry).map_err(|e| format!("序列化临时归档清单失败: {e}"))?;
+        line.push(b'\n');
+        file.write_all(&line)
+            .map_err(|e| format!("写入临时归档清单失败: {e}"))
+    }
+
+    fn append_ledger(&mut self, entry: &ArchiveLedgerEntry) -> Result<(), String> {
+        let file = self
+            .ledger_file
+            .as_mut()
+            .ok_or_else(|| "临时归档清单句柄已释放".to_string())?;
+        Self::write_ledger_line(file, entry)
+    }
+
+    fn flush_ledger(&mut self) {
+        if let Some(file) = self.ledger_file.as_mut() {
+            let _ = file.flush();
+        }
     }
 
     fn dir(&self) -> Result<&VerifiedDir, String> {
@@ -2144,12 +2404,129 @@ impl TempExtractDir {
             .as_ref()
             .ok_or_else(|| "临时解压目录句柄已释放".to_string())
     }
+
+    fn create_root_subdir_exclusive(
+        &mut self,
+        name: &str,
+        child_path: &Path,
+    ) -> Result<VerifiedDir, String> {
+        let (parent_id, child) = {
+            let root = self.dir()?;
+            (
+                root.identity()?,
+                root.create_child_dir_exclusive(name, child_path)?,
+            )
+        };
+        let child_id = child.identity()?;
+        self.ledger.record_dir(parent_id, name, child_id);
+        self.append_ledger(&ArchiveLedgerEntry::Dir {
+            parent: parent_id,
+            id: child_id,
+            name: name.to_string(),
+        })?;
+        self.flush_ledger();
+        Ok(child)
+    }
+
+    fn create_root_file_exclusive(
+        &mut self,
+        name: &str,
+        readable: bool,
+        mode: u32,
+        display_path: &Path,
+    ) -> Result<fs::File, String> {
+        let (parent_id, file) = {
+            let root = self.dir()?;
+            (
+                root.identity()?,
+                root.create_regular_file_exclusive(name, readable, mode, display_path)?,
+            )
+        };
+        let file_id = verified_fs::file_identity(&file)?;
+        self.ledger.record_file(parent_id, name, file_id);
+        self.append_ledger(&ArchiveLedgerEntry::File {
+            parent: parent_id,
+            id: file_id,
+            name: name.to_string(),
+        })?;
+        self.flush_ledger();
+        Ok(file)
+    }
+
+    fn create_tracked_subdir(
+        &mut self,
+        parent: &VerifiedDir,
+        name: &str,
+        step_path: &Path,
+    ) -> Result<VerifiedDir, String> {
+        let parent_id = parent.identity()?;
+        if let Some(expected_id) = self.ledger.expected_dir(parent_id, name) {
+            let opened = parent
+                .open_child_dir(name, step_path)?
+                .ok_or_else(|| format!("检测到临时目录 {} 被移除，已中止操作", step_path.display()))?;
+            if opened.identity()? != expected_id {
+                return Err(format!(
+                    "检测到临时目录 {} 被替换，已中止操作",
+                    step_path.display()
+                ));
+            }
+            return Ok(opened);
+        }
+        let child = parent.create_child_dir_exclusive(name, step_path)?;
+        let child_id = child.identity()?;
+        self.ledger.record_dir(parent_id, name, child_id);
+        self.append_ledger(&ArchiveLedgerEntry::Dir {
+            parent: parent_id,
+            id: child_id,
+            name: name.to_string(),
+        })?;
+        Ok(child)
+    }
+
+    fn create_tracked_file_exclusive(
+        &mut self,
+        parent: &VerifiedDir,
+        name: &str,
+        readable: bool,
+        mode: u32,
+        display_path: &Path,
+    ) -> Result<fs::File, String> {
+        let parent_id = parent.identity()?;
+        let file = parent.create_regular_file_exclusive(name, readable, mode, display_path)?;
+        let file_id = verified_fs::file_identity(&file)?;
+        self.ledger.record_file(parent_id, name, file_id);
+        self.append_ledger(&ArchiveLedgerEntry::File {
+            parent: parent_id,
+            id: file_id,
+            name: name.to_string(),
+        })?;
+        Ok(file)
+    }
+
+    fn unlink_tracked_root_file(&self, name: &str) -> Result<bool, String> {
+        let root = self.dir()?;
+        let root_id = root.identity()?;
+        let Some(expected_id) = self.ledger.expected_file(root_id, name) else {
+            return Ok(false);
+        };
+        root.unlink_verified_regular_file(name, expected_id)
+    }
+
+    #[cfg(test)]
+    fn disarm_for_test(mut self) {
+        self.flush_ledger();
+        let _ = self.ledger_file.take();
+        let _ = self.dir.take();
+    }
 }
 
 impl Drop for TempExtractDir {
     fn drop(&mut self) {
+        let _ = self.ledger_file.take();
         if let Some(child) = self.dir.take() {
-            let _ = self.parent.remove_open_child_tree(&self.dir_name, child);
+            let _ = self
+                .parent
+                .remove_tracked_open_child_tree(&self.dir_name, child, &self.ledger);
         }
     }
 }
@@ -2182,6 +2559,7 @@ impl Drop for StagedUploadCleanup {
 
 fn extract_zip_reader_to_verified_dir<R: Read + Seek>(
     reader: R,
+    temp: &mut TempExtractDir,
     dest: &VerifiedDir,
     dest_display: &Path,
     max_bytes: u64,
@@ -2261,15 +2639,15 @@ fn extract_zip_reader_to_verified_dir<R: Read + Seek>(
         for seg in parent_segments {
             step_display.push(seg);
             let next = match current_owned.as_ref() {
-                Some(dir) => dir.create_child_dir(seg, &step_display)?,
-                None => dest.create_child_dir(seg, &step_display)?,
+                Some(dir) => temp.create_tracked_subdir(dir, seg, &step_display)?,
+                None => temp.create_tracked_subdir(dest, seg, &step_display)?,
             };
             current_owned = Some(next);
         }
         let parent_dir = current_owned.as_ref().unwrap_or(dest);
         let out_display = step_display.join(file_name);
         let out_file =
-            parent_dir.create_regular_file_exclusive(file_name, false, 0o644, &out_display)?;
+            temp.create_tracked_file_exclusive(parent_dir, file_name, false, 0o644, &out_display)?;
         let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, out_file);
         let mut limited = (&mut entry).take(expected + 1);
         let mut written = 0u64;
@@ -2305,6 +2683,7 @@ fn extract_zip_reader_to_verified_dir<R: Read + Seek>(
         let _ = out_file;
         extracted.push(normalized);
     }
+    temp.flush_ledger();
     Ok(extracted)
 }
 
@@ -2363,18 +2742,24 @@ fn hash_tree_cached(tree: &LocalSkillTree, force_rehash: bool) -> Result<String,
     Ok(computed)
 }
 
+struct VerifiedScanCtx<'a> {
+    ledger: &'a OwnedTreeLedger,
+    files: BTreeMap<String, (LocalFileEntry, fs::Metadata)>,
+    total: u64,
+    max_bytes: u64,
+}
+
 fn collect_verified_tree(
     dir: &VerifiedDir,
     display_dir: &Path,
     prefix: &str,
-    files: &mut BTreeMap<String, (LocalFileEntry, fs::Metadata)>,
-    total: &mut u64,
     depth: usize,
-    max_bytes: u64,
+    ctx: &mut VerifiedScanCtx<'_>,
 ) -> Result<(), String> {
     if depth > MAX_DEPTH {
         return Err("技能目录嵌套过深".to_string());
     }
+    let dir_id = dir.identity()?;
     let mut names = dir.list_entry_names();
     names.sort();
     for name in names {
@@ -2388,64 +2773,68 @@ fn collect_verified_tree(
             format!("{prefix}/{name}")
         };
         let entry_display = display_dir.join(&name);
-        match dir.open_child_dir(&name, &entry_display) {
-            Ok(Some(sub)) => {
-                collect_verified_tree(
-                    &sub,
-                    &entry_display,
-                    &relative,
-                    files,
-                    total,
-                    depth + 1,
-                    max_bytes,
-                )?;
+        if let Some(expected_sub_id) = ctx.ledger.expected_dir(dir_id, &name) {
+            let sub = dir
+                .open_child_dir(&name, &entry_display)?
+                .ok_or_else(|| format!("读取技能目录 {} 失败: 条目不存在", entry_display.display()))?;
+            if sub.identity()? != expected_sub_id {
+                return Err(format!(
+                    "检测到临时目录 {} 被替换，已中止操作",
+                    entry_display.display()
+                ));
             }
-            Ok(None) => {
-                return Err(format!("读取技能文件 {} 失败: 条目不存在", entry_display.display()));
-            }
-            Err(_) => {
-                let file = dir
-                    .open_regular_read(&name)
-                    .map_err(|_| format!("技能包含不支持的文件类型或链接: {relative}"))?
-                    .ok_or_else(|| {
-                        format!("读取技能文件 {} 失败: 条目不存在", entry_display.display())
-                    })?;
-                let metadata = file
-                    .metadata()
-                    .map_err(|e| format!("读取技能文件属性失败: {e}"))?;
-                if is_link(&metadata) || !metadata.is_file() {
-                    return Err(format!("技能包含不支持的文件类型或链接: {relative}"));
-                }
-                let size = metadata.len();
-                if files.len() >= MAX_FILES || size > max_bytes.saturating_sub(*total) {
-                    return Err(format!(
-                        "技能超过 {} MiB 或文件数量上限",
-                        max_bytes / (1024 * 1024)
-                    ));
-                }
-                *total += size;
-                #[cfg(unix)]
-                let executable = {
-                    use std::os::unix::fs::PermissionsExt;
-                    metadata.permissions().mode() & 0o111 != 0
-                };
-                #[cfg(not(unix))]
-                let executable = false;
-                let meta_stamp = compute_file_meta_stamp(&relative, &metadata);
-                files.insert(
-                    relative,
-                    (
-                        LocalFileEntry {
-                            source: entry_display,
-                            size,
-                            executable,
-                            meta_stamp,
-                        },
-                        metadata,
-                    ),
-                );
-            }
+            collect_verified_tree(&sub, &entry_display, &relative, depth + 1, ctx)?;
+            continue;
         }
+        let Some(expected_file_id) = ctx.ledger.expected_file(dir_id, &name) else {
+            return Err(format!("临时解压目录包含未记录的条目: {relative}"));
+        };
+        let file = dir
+            .open_regular_read(&name)
+            .map_err(|_| format!("技能包含不支持的文件类型或链接: {relative}"))?
+            .ok_or_else(|| {
+                format!("读取技能文件 {} 失败: 条目不存在", entry_display.display())
+            })?;
+        if verified_fs::file_identity(&file)? != expected_file_id {
+            return Err(format!(
+                "检测到临时文件 {} 被替换，已中止操作",
+                entry_display.display()
+            ));
+        }
+        let metadata = file
+            .metadata()
+            .map_err(|e| format!("读取技能文件属性失败: {e}"))?;
+        if is_link(&metadata) || !metadata.is_file() {
+            return Err(format!("技能包含不支持的文件类型或链接: {relative}"));
+        }
+        let size = metadata.len();
+        if ctx.files.len() >= MAX_FILES || size > ctx.max_bytes.saturating_sub(ctx.total) {
+            return Err(format!(
+                "技能超过 {} MiB 或文件数量上限",
+                ctx.max_bytes / (1024 * 1024)
+            ));
+        }
+        ctx.total += size;
+        #[cfg(unix)]
+        let executable = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o111 != 0
+        };
+        #[cfg(not(unix))]
+        let executable = false;
+        let meta_stamp = compute_file_meta_stamp(&relative, &metadata);
+        ctx.files.insert(
+            relative,
+            (
+                LocalFileEntry {
+                    source: entry_display,
+                    size,
+                    executable,
+                    meta_stamp,
+                },
+                metadata,
+            ),
+        );
     }
     Ok(())
 }
@@ -2453,12 +2842,18 @@ fn collect_verified_tree(
 fn scan_archive_trees_in_verified_dir(
     root_dir: Arc<VerifiedDir>,
     root_display: &Path,
+    ledger: &OwnedTreeLedger,
     max_depth: usize,
     max_bytes: u64,
 ) -> Result<Vec<(String, LocalSkillTree)>, String> {
-    let mut files = BTreeMap::new();
-    let mut total = 0u64;
-    collect_verified_tree(&root_dir, root_display, "", &mut files, &mut total, 0, max_bytes)?;
+    let mut ctx = VerifiedScanCtx {
+        ledger,
+        files: BTreeMap::new(),
+        total: 0,
+        max_bytes,
+    };
+    collect_verified_tree(&root_dir, root_display, "", 0, &mut ctx)?;
+    let files = ctx.files;
     let mut roots = Vec::new();
     for path in files.keys() {
         let root = if path == "SKILL.md" {
@@ -2508,7 +2903,7 @@ fn scan_archive_trees_in_verified_dir(
         let (sub_root_display, sub_verified) = if root.is_empty() {
             (root_display.to_path_buf(), Arc::clone(&root_dir))
         } else {
-            let sub_dir = root_dir.open_relative_child_dir(root, root_display)?;
+            let sub_dir = root_dir.open_relative_tracked_child_dir(root, root_display, ledger)?;
             (root_display.join(root), Arc::new(sub_dir))
         };
         result.push((
@@ -3410,8 +3805,8 @@ pub fn import_local_skill_for_paths(
                     return Err("ZIP 文件超过 200 MiB 上限".to_string());
                 }
                 let file = fs::File::open(&path).map_err(|e| format!("打开 ZIP 失败: {e}"))?;
-                let temp = TempExtractDir::new(paths)?;
-                let records = extract_local_archive_records(file, &temp)?;
+                let mut temp = TempExtractDir::new(paths)?;
+                let records = extract_local_archive_records(file, &mut temp)?;
                 temp_extract = Some(temp);
                 (records, MAX_ARCHIVE_BYTES)
             } else {
@@ -3428,8 +3823,8 @@ pub fn import_local_skill_for_paths(
             if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
                 return Err("ZIP 文件超过 200 MiB 上限".to_string());
             }
-            let temp = TempExtractDir::new(paths)?;
-            let records = extract_local_archive_records(Cursor::new(bytes), &temp)?;
+            let mut temp = TempExtractDir::new(paths)?;
+            let records = extract_local_archive_records(Cursor::new(bytes), &mut temp)?;
             temp_extract = Some(temp);
             (records, MAX_ARCHIVE_BYTES)
         }
@@ -3447,8 +3842,8 @@ pub fn import_local_skill_for_paths(
             if meta.len() > MAX_ARCHIVE_BYTES {
                 return Err("ZIP 文件超过 200 MiB 上限".to_string());
             }
-            let temp = TempExtractDir::new(paths)?;
-            let records = extract_local_archive_records(file, &temp)?;
+            let mut temp = TempExtractDir::new(paths)?;
+            let records = extract_local_archive_records(file, &mut temp)?;
             temp_extract = Some(temp);
             (records, MAX_ARCHIVE_BYTES)
         }
@@ -3462,13 +3857,24 @@ pub fn import_local_skill_for_paths(
 
 fn extract_local_archive_records<R: Read + Seek>(
     reader: R,
-    temp: &TempExtractDir,
+    temp: &mut TempExtractDir,
 ) -> Result<Vec<(SkillRecord, LocalSkillTree)>, String> {
     let extracted_path = temp.path.join("extracted");
-    let extracted_dir =
-        Arc::new(temp.dir()?.create_child_dir_exclusive("extracted", &extracted_path)?);
-    extract_zip_reader_to_verified_dir(reader, &extracted_dir, &extracted_path, MAX_ARCHIVE_BYTES)?;
-    scan_archive_trees_in_verified_dir(extracted_dir, &extracted_path, 2, MAX_ARCHIVE_BYTES)?
+    let extracted_dir = Arc::new(temp.create_root_subdir_exclusive("extracted", &extracted_path)?);
+    extract_zip_reader_to_verified_dir(
+        reader,
+        temp,
+        &extracted_dir,
+        &extracted_path,
+        MAX_ARCHIVE_BYTES,
+    )?;
+    scan_archive_trees_in_verified_dir(
+        extracted_dir,
+        &extracted_path,
+        &temp.ledger,
+        2,
+        MAX_ARCHIVE_BYTES,
+    )?
         .into_iter()
         .map(|(root, tree)| {
             let id = if root.is_empty() {
@@ -3609,14 +4015,12 @@ async fn fetch_repo_archive(paths: &AppPaths, repo: &SkillRepo) -> Result<RepoAr
         return Err("仓库 ZIP 超过 200 MiB 上限".to_string());
     }
 
-    let temp = TempExtractDir::new(paths)?;
-    let temp_dir = temp.dir()?;
+    let mut temp = TempExtractDir::new(paths)?;
     let zip_path = temp.path.join("repo.zip");
     let extracted_path = temp.path.join("extracted");
-    let extracted_dir = temp_dir.create_child_dir_exclusive("extracted", &extracted_path)?;
+    let extracted_dir = temp.create_root_subdir_exclusive("extracted", &extracted_path)?;
     let mut zip_file = {
-        let zip_file =
-            temp_dir.create_regular_file_exclusive("repo.zip", true, 0o600, &zip_path)?;
+        let zip_file = temp.create_root_file_exclusive("repo.zip", true, 0o600, &zip_path)?;
         let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, zip_file);
         let mut downloaded = 0u64;
         while let Some(chunk) = response
@@ -3642,11 +4046,12 @@ async fn fetch_repo_archive(paths: &AppPaths, repo: &SkillRepo) -> Result<RepoAr
 
     let extracted_files = extract_zip_reader_to_verified_dir(
         zip_file,
+        &mut temp,
         &extracted_dir,
         &extracted_path,
         MAX_ARCHIVE_BYTES,
     )?;
-    let _ = temp_dir.unlink_regular_file("repo.zip");
+    let _ = temp.unlink_tracked_root_file("repo.zip");
 
     // GitHub wraps archives in one repository directory; strip that wrapper without moving files.
     let first = extracted_files
@@ -3659,9 +4064,8 @@ async fn fetch_repo_archive(paths: &AppPaths, repo: &SkillRepo) -> Result<RepoAr
             .all(|path| path.starts_with(&format!("{prefix}/")))
     }) {
         let wrapped_path = extracted_path.join(&prefix);
-        let wrapped_dir = extracted_dir
-            .open_child_dir(&prefix, &wrapped_path)?
-            .ok_or_else(|| "未找到包含 SKILL.md 的技能目录".to_string())?;
+        let wrapped_dir =
+            extracted_dir.open_relative_tracked_child_dir(&prefix, &extracted_path, &temp.ledger)?;
         (wrapped_dir, wrapped_path)
     } else {
         (extracted_dir, extracted_path)
@@ -3670,6 +4074,7 @@ async fn fetch_repo_archive(paths: &AppPaths, repo: &SkillRepo) -> Result<RepoAr
     let skills = scan_archive_trees_in_verified_dir(
         Arc::new(repo_root_dir),
         &repo_root_path,
+        &temp.ledger,
         MAX_DEPTH,
         MAX_ARCHIVE_BYTES,
     )?;
@@ -4248,16 +4653,29 @@ mod tests {
 
         // 3. TempExtractDir Drop after post-validation directory link swap
         remove_path(&uploads).unwrap();
-        let temp_extract = TempExtractDir::new(&paths).unwrap();
+        let mut temp_extract = TempExtractDir::new(&paths).unwrap();
         let archive_dir_name = temp_extract.dir_name.clone();
         let archive_path = temp_extract.path.clone();
-        write_atomic(&archive_path.join("SKILL.md"), b"internal-temp", false).unwrap();
-        write_atomic(
-            &archive_path.join("nested/only_in_internal.txt"),
-            b"internal-nested",
-            false,
-        )
-        .unwrap();
+        {
+            let mut skill_md = temp_extract
+                .create_root_file_exclusive("SKILL.md", false, 0o644, &archive_path.join("SKILL.md"))
+                .unwrap();
+            skill_md.write_all(b"internal-temp").unwrap();
+            let nested = temp_extract
+                .create_root_subdir_exclusive("nested", &archive_path.join("nested"))
+                .unwrap();
+            let mut nested_file = temp_extract
+                .create_tracked_file_exclusive(
+                    &nested,
+                    "only_in_internal.txt",
+                    false,
+                    0o644,
+                    &archive_path.join("nested/only_in_internal.txt"),
+                )
+                .unwrap();
+            nested_file.write_all(b"internal-nested").unwrap();
+            temp_extract.flush_ledger();
+        }
 
         let external_ext = tmp.path().join("external-extensions");
         let external_archive = external_ext.join(&archive_dir_name);
@@ -4289,11 +4707,12 @@ mod tests {
             let parent_rename_err = fs::rename(&ext_dir, &displaced_ext).unwrap_err();
             assert_eq!(parent_rename_err.kind(), ErrorKind::PermissionDenied);
 
-            // Displacing the archive child dir itself and placing a junction at its name must still be safe.
+            // Close the ledger handle? No: archive_path itself can still be renamed while ledger_file is open?
+            // Note: on Windows, holding an open file handle inside archive_path (.tako-archive-ledger)
+            // ALSO prevents NTFS from renaming archive_path itself! Verify that kernel protection too.
             let displaced_archive = tmp.path().join("displaced-archive-link-swap");
-            fs::rename(&archive_path, &displaced_archive).unwrap();
-            create_test_dir_link(&external_archive, &archive_path);
-            assert!(is_link(&fs::symlink_metadata(&archive_path).unwrap()));
+            let child_rename_err = fs::rename(&archive_path, &displaced_archive).unwrap_err();
+            assert_eq!(child_rename_err.kind(), ErrorKind::PermissionDenied);
 
             drop(temp_extract);
 
@@ -4301,9 +4720,7 @@ mod tests {
                 fs::read(external_archive.join("SKILL.md")).unwrap(),
                 b"external-archive-must-survive"
             );
-            assert!(!displaced_archive.join("SKILL.md").exists());
-            assert!(!displaced_archive.join("nested/only_in_internal.txt").exists());
-            assert!(is_link(&fs::symlink_metadata(&archive_path).unwrap()));
+            assert!(!archive_path.exists());
         }
     }
 
@@ -4334,42 +4751,20 @@ mod tests {
             ("demo/nested/data.txt", b"real-extracted-payload"),
         ]);
 
-        // 1. Replace the .tako-archive-* child directory itself with a DIFFERENT plain directory
-        //    after TempExtractDir::new, before writing repo.zip, extracting, scanning, and Drop.
-        let temp = TempExtractDir::new(&paths).unwrap();
+        // 1. Subdirectory `extracted` replaced by a DIFFERENT plain directory after extraction and before Drop:
+        //    TempExtractDir::drop must skip the identity-mismatched `extracted` subdir, preserve all files in it,
+        //    skip untracked foreign files, and still unlink tracked sibling files (`repo.zip`).
+        let mut temp = TempExtractDir::new(&paths).unwrap();
         let archive_path = temp.path.clone();
-        let displaced_archive = tmp.path().join("displaced-archive-child");
-        fs::rename(&archive_path, &displaced_archive).unwrap();
-
-        write_atomic(
-            &archive_path.join("SKILL.md"),
-            b"replacement-plain-dir-must-survive",
-            false,
-        )
-        .unwrap();
-        write_atomic(
-            &archive_path.join("repo.zip"),
-            b"replacement-repo-zip-must-survive",
-            false,
-        )
-        .unwrap();
-        write_atomic(
-            &archive_path.join("extracted/demo/SKILL.md"),
-            b"replacement-extracted-must-survive",
-            false,
-        )
-        .unwrap();
-
+        let extracted_path = archive_path.join("extracted");
+        let displaced_extracted = tmp.path().join("displaced-extracted-subdir");
         {
-            let temp_dir = temp.dir().unwrap();
-            let extracted_path = temp.path.join("extracted");
             let extracted_dir = Arc::new(
-                temp_dir
-                    .create_child_dir_exclusive("extracted", &extracted_path)
+                temp.create_root_subdir_exclusive("extracted", &extracted_path)
                     .unwrap(),
             );
-            let mut zip_file = temp_dir
-                .create_regular_file_exclusive("repo.zip", true, 0o600, &temp.path.join("repo.zip"))
+            let mut zip_file = temp
+                .create_root_file_exclusive("repo.zip", true, 0o600, &archive_path.join("repo.zip"))
                 .unwrap();
             zip_file.write_all(&zip_bytes).unwrap();
             zip_file.flush().unwrap();
@@ -4377,17 +4772,18 @@ mod tests {
 
             let extracted_files = extract_zip_reader_to_verified_dir(
                 zip_file,
+                &mut temp,
                 &extracted_dir,
                 &extracted_path,
                 MAX_ARCHIVE_BYTES,
             )
             .unwrap();
             assert_eq!(extracted_files.len(), 2);
-            assert!(temp_dir.unlink_regular_file("repo.zip").unwrap());
 
             let trees = scan_archive_trees_in_verified_dir(
                 extracted_dir,
                 &extracted_path,
+                &temp.ledger,
                 2,
                 MAX_ARCHIVE_BYTES,
             )
@@ -4400,37 +4796,72 @@ mod tests {
             assert!(!hash.is_empty());
         }
 
-        // Original repo.zip in displaced archive was unlinked; replacement plain dir untouched.
-        assert!(!displaced_archive.join("repo.zip").exists());
-        assert_eq!(
-            fs::read(archive_path.join("repo.zip")).unwrap(),
-            b"replacement-repo-zip-must-survive"
-        );
-        assert_eq!(
-            fs::read(archive_path.join("extracted/demo/SKILL.md")).unwrap(),
-            b"replacement-extracted-must-survive"
-        );
+        // Now displace `extracted` itself and put an unverified plain directory at the same name,
+        // plus drop an untracked foreign file in the root archive dir.
+        fs::rename(&extracted_path, &displaced_extracted).unwrap();
+        write_atomic(
+            &extracted_path.join("demo/SKILL.md"),
+            b"replaced-extracted-subdir-must-survive",
+            false,
+        )
+        .unwrap();
+        write_atomic(
+            &archive_path.join("untracked-foreign.txt"),
+            b"untracked-file-must-survive",
+            false,
+        )
+        .unwrap();
 
         drop(temp);
 
-        // Drop must clean ONLY the retained displaced handle and never delete or touch the
-        // unverified plain directory placed at the same name.
+        // Tracked sibling `repo.zip` and `.tako-archive-ledger` were removed,
+        // while the replaced `extracted` subdir and untracked foreign file survived intact.
+        assert!(!archive_path.join("repo.zip").exists());
+        assert!(!archive_path.join(ARCHIVE_LEDGER_FILE).exists());
         assert_eq!(
-            fs::read(archive_path.join("SKILL.md")).unwrap(),
-            b"replacement-plain-dir-must-survive"
+            fs::read(extracted_path.join("demo/SKILL.md")).unwrap(),
+            b"replaced-extracted-subdir-must-survive"
         );
         assert_eq!(
-            fs::read(archive_path.join("repo.zip")).unwrap(),
-            b"replacement-repo-zip-must-survive"
+            fs::read(archive_path.join("untracked-foreign.txt")).unwrap(),
+            b"untracked-file-must-survive"
         );
-        assert_eq!(
-            fs::read(archive_path.join("extracted/demo/SKILL.md")).unwrap(),
-            b"replacement-extracted-must-survive"
-        );
-        assert!(!displaced_archive.join("extracted").exists());
 
-        // 2. Replace with a directory link/junction before ZIP write/extract/unlink/Drop.
-        let temp2 = TempExtractDir::new(&paths).unwrap();
+        // 2. Mid-extraction subdir replacement detection:
+        //    If a tracked subdir (`demo`) is swapped with another plain dir between two writes,
+        //    create_tracked_subdir must detect the identity mismatch and abort before writing.
+        let mut temp_mid = TempExtractDir::new(&paths).unwrap();
+        let mid_extracted_path = temp_mid.path.join("extracted");
+        let mid_extracted = temp_mid
+            .create_root_subdir_exclusive("extracted", &mid_extracted_path)
+            .unwrap();
+        let demo_path = mid_extracted_path.join("demo");
+        let demo_dir = temp_mid
+            .create_tracked_subdir(&mid_extracted, "demo", &demo_path)
+            .unwrap();
+        drop(demo_dir);
+        let displaced_demo = tmp.path().join("displaced-mid-demo");
+        fs::rename(&demo_path, &displaced_demo).unwrap();
+        write_atomic(
+            &demo_path.join("victim.txt"),
+            b"mid-extraction-victim-must-survive",
+            false,
+        )
+        .unwrap();
+        let swap_err = temp_mid
+            .create_tracked_subdir(&mid_extracted, "demo", &demo_path)
+            .unwrap_err();
+        assert!(swap_err.contains("被替换"), "{swap_err}");
+        drop(mid_extracted);
+        drop(temp_mid);
+        assert_eq!(
+            fs::read(demo_path.join("victim.txt")).unwrap(),
+            b"mid-extraction-victim-must-survive"
+        );
+
+        // 3. Replace root archive / extensions_dir with a link on Unix (and verify NTFS lock on Windows)
+        //    plus verify create_tracked_file_exclusive & unlink_tracked_root_file survive replacement.
+        let mut temp2 = TempExtractDir::new(&paths).unwrap();
         let archive2_name = temp2.dir_name.clone();
         let archive2_path = temp2.path.clone();
         let external_ext = tmp.path().join("external-archive-link-target");
@@ -4448,32 +4879,22 @@ mod tests {
         )
         .unwrap();
 
-        let ext_dir = extensions_dir(&paths);
-        let displaced_ext = tmp.path().join("displaced-extensions-for-archive");
-        #[cfg(windows)]
-        let displaced_archive2 = tmp.path().join("displaced-archive2-link-swap");
         #[cfg(unix)]
-        {
+        let displaced_ext = {
+            let ext_dir = extensions_dir(&paths);
+            let displaced_ext = tmp.path().join("displaced-extensions-for-archive");
             fs::rename(&ext_dir, &displaced_ext).unwrap();
             create_test_dir_link(&external_ext, &ext_dir);
-        }
-        #[cfg(windows)]
-        {
-            let parent_rename_err = fs::rename(&ext_dir, &displaced_ext).unwrap_err();
-            assert_eq!(parent_rename_err.kind(), ErrorKind::PermissionDenied);
-            fs::rename(&archive2_path, &displaced_archive2).unwrap();
-            create_test_dir_link(&external_archive2, &archive2_path);
-            assert!(is_link(&fs::symlink_metadata(&archive2_path).unwrap()));
-        }
+            displaced_ext
+        };
 
         {
-            let temp_dir = temp2.dir().unwrap();
-            let extracted_path = archive2_path.join("extracted");
-            let extracted_dir = temp_dir
-                .create_child_dir_exclusive("extracted", &extracted_path)
+            let extracted2_path = archive2_path.join("extracted");
+            let extracted_dir = temp2
+                .create_root_subdir_exclusive("extracted", &extracted2_path)
                 .unwrap();
-            let mut zip_file = temp_dir
-                .create_regular_file_exclusive(
+            let mut zip_file = temp2
+                .create_root_file_exclusive(
                     "repo.zip",
                     true,
                     0o600,
@@ -4486,13 +4907,14 @@ mod tests {
 
             let extracted_files = extract_zip_reader_to_verified_dir(
                 zip_file,
+                &mut temp2,
                 &extracted_dir,
-                &extracted_path,
+                &extracted2_path,
                 MAX_ARCHIVE_BYTES,
             )
             .unwrap();
             assert_eq!(extracted_files.len(), 2);
-            assert!(temp_dir.unlink_regular_file("repo.zip").unwrap());
+            assert!(temp2.unlink_tracked_root_file("repo.zip").unwrap());
         }
         drop(temp2);
 
@@ -4507,11 +4929,7 @@ mod tests {
         #[cfg(unix)]
         assert!(!displaced_ext.join(&archive2_name).exists());
         #[cfg(windows)]
-        {
-            assert!(!displaced_archive2.join("repo.zip").exists());
-            assert!(!displaced_archive2.join("extracted").exists());
-            assert!(is_link(&fs::symlink_metadata(&archive2_path).unwrap()));
-        }
+        assert!(!archive2_path.exists());
     }
 
     #[test]
@@ -4519,18 +4937,35 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
         let ext_dir = extensions_dir(&paths);
+        let future_now = SystemTime::now() + STALE_TEMP_TTL + Duration::from_secs(60);
 
-        // 1. Stale archive child directory is displaced and replaced by a DIFFERENT plain directory
-        //    after open_child_dir and before sweep_stale_open_archive_dir deletes it.
-        let stale_name = ".tako-archive-stale-race";
-        let stale_path = ext_dir.join(stale_name);
-        write_atomic(&stale_path.join("nested/old.txt"), b"old-stale-payload", false).unwrap();
+        // 1. Crashed stale archive with valid ledger: root archive dir is displaced and replaced by
+        //    a DIFFERENT plain directory after open_child_dir and before sweep_stale_open_archive_dir.
+        let mut crashed_root = TempExtractDir::new(&paths).unwrap();
+        let stale_name = crashed_root.dir_name.clone();
+        let stale_path = crashed_root.path.clone();
+        {
+            let nested = crashed_root
+                .create_root_subdir_exclusive("nested", &stale_path.join("nested"))
+                .unwrap();
+            let mut old_file = crashed_root
+                .create_tracked_file_exclusive(
+                    &nested,
+                    "old.txt",
+                    false,
+                    0o644,
+                    &stale_path.join("nested/old.txt"),
+                )
+                .unwrap();
+            old_file.write_all(b"old-stale-payload").unwrap();
+        }
+        crashed_root.disarm_for_test();
 
         let ext_verified = VerifiedDir::open_existing(&paths, &ext_dir)
             .unwrap()
             .unwrap();
         let opened_stale = ext_verified
-            .open_child_dir(stale_name, &stale_path)
+            .open_child_dir(&stale_name, &stale_path)
             .unwrap()
             .unwrap();
 
@@ -4543,10 +4978,9 @@ mod tests {
         )
         .unwrap();
 
-        let future_now = SystemTime::now() + STALE_TEMP_TTL + Duration::from_secs(60);
         assert!(sweep_stale_open_archive_dir(
             &ext_verified,
-            stale_name,
+            &stale_name,
             opened_stale,
             future_now
         ));
@@ -4557,13 +4991,124 @@ mod tests {
         );
         assert!(!displaced_stale.join("nested/old.txt").exists());
         assert!(!displaced_stale.join("nested").exists());
+        assert!(!displaced_stale.join(ARCHIVE_LEDGER_FILE).exists());
 
-        // 2. Pure handle enumeration across displacement + plain replacement + repeated calls + >150 entries.
+        // 2. Crashed stale archive whose nested `extracted` subdir is replaced by a DIFFERENT plain dir:
+        //    sweep must skip the mismatched `extracted` subdir, preserve its files, and clean tracked siblings.
+        let mut crashed_sub = TempExtractDir::new(&paths).unwrap();
+        let sub_archive_name = crashed_sub.dir_name.clone();
+        let sub_archive_path = crashed_sub.path.clone();
+        let sub_extracted_path = sub_archive_path.join("extracted");
+        {
+            let mut sibling = crashed_sub
+                .create_root_file_exclusive(
+                    "repo.zip",
+                    false,
+                    0o600,
+                    &sub_archive_path.join("repo.zip"),
+                )
+                .unwrap();
+            sibling.write_all(b"stale-zip").unwrap();
+            let extracted = crashed_sub
+                .create_root_subdir_exclusive("extracted", &sub_extracted_path)
+                .unwrap();
+            let mut extracted_file = crashed_sub
+                .create_tracked_file_exclusive(
+                    &extracted,
+                    "old.txt",
+                    false,
+                    0o644,
+                    &sub_extracted_path.join("old.txt"),
+                )
+                .unwrap();
+            extracted_file.write_all(b"stale-extracted").unwrap();
+        }
+        crashed_sub.disarm_for_test();
+
+        let displaced_sub_extracted = tmp.path().join("displaced-stale-extracted");
+        fs::rename(&sub_extracted_path, &displaced_sub_extracted).unwrap();
+        write_atomic(
+            &sub_extracted_path.join("precious.txt"),
+            b"stale-replaced-extracted-must-survive",
+            false,
+        )
+        .unwrap();
+
+        let opened_sub_archive = ext_verified
+            .open_child_dir(&sub_archive_name, &sub_archive_path)
+            .unwrap()
+            .unwrap();
+        assert!(sweep_stale_open_archive_dir(
+            &ext_verified,
+            &sub_archive_name,
+            opened_sub_archive,
+            future_now
+        ));
+        assert!(!sub_archive_path.join("repo.zip").exists());
+        assert!(!sub_archive_path.join(ARCHIVE_LEDGER_FILE).exists());
+        assert_eq!(
+            fs::read(sub_extracted_path.join("precious.txt")).unwrap(),
+            b"stale-replaced-extracted-must-survive"
+        );
+
+        // 3. Unowned / foreign `.tako-archive-*` without valid ledger (or with copied mismatched ledger):
+        //    sweep must refuse recursive deletion and leave every file untouched.
+        let foreign_name = ".tako-archive-foreign-unowned";
+        let foreign_path = ext_dir.join(foreign_name);
+        write_atomic(
+            &foreign_path.join("victim/secret.txt"),
+            b"foreign-archive-must-survive",
+            false,
+        )
+        .unwrap();
+        let opened_foreign = ext_verified
+            .open_child_dir(foreign_name, &foreign_path)
+            .unwrap()
+            .unwrap();
+        assert!(!sweep_stale_open_archive_dir(
+            &ext_verified,
+            foreign_name,
+            opened_foreign,
+            future_now
+        ));
+        assert_eq!(
+            fs::read(foreign_path.join("victim/secret.txt")).unwrap(),
+            b"foreign-archive-must-survive"
+        );
+
+        // Also test a forged ledger copied from a legitimate TempExtractDir into a different directory.
+        let donor = TempExtractDir::new(&paths).unwrap();
+        let donor_ledger_bytes = fs::read(donor.path.join(ARCHIVE_LEDGER_FILE)).unwrap();
+        drop(donor);
+        write_atomic(
+            &foreign_path.join(ARCHIVE_LEDGER_FILE),
+            &donor_ledger_bytes,
+            false,
+        )
+        .unwrap();
+        let opened_forged = ext_verified
+            .open_child_dir(foreign_name, &foreign_path)
+            .unwrap()
+            .unwrap();
+        assert!(!sweep_stale_open_archive_dir(
+            &ext_verified,
+            foreign_name,
+            opened_forged,
+            future_now
+        ));
+        assert_eq!(
+            fs::read(foreign_path.join("victim/secret.txt")).unwrap(),
+            b"foreign-archive-must-survive"
+        );
+
+        // 4. Pure handle enumeration across displacement + plain replacement + repeated calls
+        //    with 220 long filenames (~38.7 KiB > 2 * 16 KiB Windows buffer) to exercise multi-page reads.
         let enum_name = ".tako-archive-enum-test";
         let enum_path = ext_dir.join(enum_name);
-        let expected_entries: BTreeSet<String> = (0..160)
+        let pad = "a".repeat(40);
+        let expected_entries: BTreeSet<String> = (0..220)
             .map(|idx| {
-                let name = format!("entry-{idx:03}.txt");
+                let name = format!("entry-{idx:03}-{pad}.txt");
                 write_atomic(&enum_path.join(&name), b"x", false).unwrap();
                 name
             })
