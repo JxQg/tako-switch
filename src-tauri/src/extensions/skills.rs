@@ -9,11 +9,11 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{BufWriter, Cursor, ErrorKind, Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 #[cfg(windows)]
 use std::os::windows::fs::FileTypeExt;
@@ -21,6 +21,7 @@ use std::os::windows::fs::FileTypeExt;
 pub const MAX_LOCAL_SKILL_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_ARCHIVE_BYTES: u64 = 200 * 1024 * 1024;
 const MAX_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STAGED_UPLOADS: usize = 16;
 const MAX_SKILL_MD_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_FILES: usize = 20_000;
 const MAX_DEPTH: usize = 16;
@@ -31,6 +32,15 @@ const STALE_TEMP_TTL: Duration = Duration::from_secs(3600);
 
 type HashCacheMap = BTreeMap<PathBuf, ([u8; 32], String)>;
 static TREE_HASH_CACHE: Mutex<Option<HashCacheMap>> = Mutex::new(None);
+
+struct StagedUpload {
+    switch_dir: PathBuf,
+    file: fs::File,
+    size: u64,
+    updated_at: Instant,
+}
+
+static STAGED_UPLOADS: Mutex<Option<BTreeMap<String, StagedUpload>>> = Mutex::new(None);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -264,9 +274,54 @@ pub struct ImportLocalSkillRequest {
     pub targets: Option<Vec<ExtPlatform>>,
 }
 
+#[derive(Debug)]
+enum ArchiveBacking {
+    File(fs::File),
+    Bytes(Cursor<Vec<u8>>),
+}
+
+impl Read for ArchiveBacking {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(file) => file.read(buf),
+            Self::Bytes(cursor) => cursor.read(buf),
+        }
+    }
+}
+
+impl Seek for ArchiveBacking {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Self::File(file) => file.seek(pos),
+            Self::Bytes(cursor) => cursor.seek(pos),
+        }
+    }
+}
+
+struct ArchiveHandle {
+    archive: Mutex<zip::ZipArchive<ArchiveBacking>>,
+}
+
+impl std::fmt::Debug for ArchiveHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ArchiveHandle(..)")
+    }
+}
+
+#[derive(Debug, Clone)]
+enum FileSource {
+    Disk(PathBuf),
+    Archive {
+        handle: Arc<ArchiveHandle>,
+        zip_index: usize,
+        expected_sha256: [u8; 32],
+    },
+}
+
 #[derive(Debug, Clone)]
 struct LocalFileEntry {
-    source: PathBuf,
+    source: FileSource,
+    display: PathBuf,
     size: u64,
     executable: bool,
     meta_stamp: [u8; 32],
@@ -275,21 +330,10 @@ struct LocalFileEntry {
 #[derive(Debug, Clone)]
 struct LocalSkillTree {
     canonical_root: PathBuf,
-    verified_root: Option<Arc<VerifiedDir>>,
+    is_archive: bool,
     files: BTreeMap<String, LocalFileEntry>,
     total_bytes: u64,
     meta_digest: [u8; 32],
-}
-
-impl LocalSkillTree {
-    fn open_file(&self, relative: &str, entry: &LocalFileEntry) -> Result<fs::File, String> {
-        if let Some(root) = &self.verified_root {
-            root.open_relative_regular_read(relative, &entry.source)
-        } else {
-            fs::File::open(&entry.source)
-                .map_err(|e| format!("读取技能文件 {} 失败: {e}", entry.source.display()))
-        }
-    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -311,10 +355,6 @@ fn skills_store_path(paths: &AppPaths) -> PathBuf {
 
 fn repos_store_path(paths: &AppPaths) -> PathBuf {
     extension_store_path(paths, "skill_repos.json")
-}
-
-fn temp_uploads_dir(paths: &AppPaths) -> PathBuf {
-    extensions_dir(paths).join(".tmp-uploads")
 }
 
 fn is_link(metadata: &fs::Metadata) -> bool {
@@ -374,1578 +414,6 @@ fn ensure_plain_ancestors(paths: &AppPaths, path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn validate_single_entry_name(name: &str) -> Result<(), String> {
-    if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\\', '\0']) {
-        return Err(format!("不安全的临时目录项名称: {name}"));
-    }
-    Ok(())
-}
-
-fn is_stale_meta(meta: &fs::Metadata, now: SystemTime) -> bool {
-    meta.modified()
-        .ok()
-        .and_then(|mtime| now.duration_since(mtime).ok())
-        .is_some_and(|age| age > STALE_TEMP_TTL)
-}
-
-#[cfg(unix)]
-mod verified_fs {
-    use super::*;
-    use std::ffi::{CStr, CString};
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-    fn c_segment(name: &str) -> Result<CString, String> {
-        validate_single_entry_name(name)?;
-        CString::new(name.as_bytes()).map_err(|_| format!("不安全的临时目录项名称: {name}"))
-    }
-
-    fn clear_nonblock(file: &fs::File) {
-        let fd = file.as_raw_fd();
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags >= 0 && (flags & libc::O_NONBLOCK) != 0 {
-            unsafe {
-                let _ = libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-    pub(super) struct ObjectIdentity {
-        dev: u64,
-        ino: u64,
-    }
-
-    pub(super) fn file_identity(file: &fs::File) -> Result<ObjectIdentity, String> {
-        let meta = file
-            .metadata()
-            .map_err(|e| format!("读取文件句柄标识失败: {e}"))?;
-        Ok(ObjectIdentity {
-            dev: meta.dev(),
-            ino: meta.ino(),
-        })
-    }
-
-    #[derive(Debug)]
-    pub(super) struct RawDir {
-        pub(super) file: fs::File,
-        id: ObjectIdentity,
-    }
-
-    impl RawDir {
-        fn from_file(file: fs::File, display_path: &Path) -> Result<Self, String> {
-            let meta = file
-                .metadata()
-                .map_err(|e| format!("检查目录 {} 失败: {e}", display_path.display()))?;
-            if is_link(&meta) {
-                return Err(format!("拒绝通过链接目录写入技能: {}", display_path.display()));
-            }
-            if !meta.is_dir() {
-                return Err(format!("技能父路径不是目录: {}", display_path.display()));
-            }
-            Ok(Self {
-                id: ObjectIdentity {
-                    dev: meta.dev(),
-                    ino: meta.ino(),
-                },
-                file,
-            })
-        }
-
-        pub(super) fn identity(&self) -> ObjectIdentity {
-            self.id
-        }
-
-        fn is_child_symlink(&self, cname: &CStr) -> bool {
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            let rc = unsafe {
-                libc::fstatat(
-                    self.file.as_raw_fd(),
-                    cname.as_ptr(),
-                    &mut st,
-                    libc::AT_SYMLINK_NOFOLLOW,
-                )
-            };
-            rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
-        }
-
-        pub(super) fn open_anchor(anchor: &Path, create: bool) -> Result<Option<Self>, String> {
-            if create && !path_exists(anchor)? {
-                fs::create_dir_all(anchor)
-                    .map_err(|e| format!("创建目录 {} 失败: {e}", anchor.display()))?;
-            }
-            match OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(anchor)
-            {
-                Ok(file) => Self::from_file(file, anchor).map(Some),
-                Err(e)
-                    if !create
-                        && matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
-                {
-                    Ok(None)
-                }
-                Err(e) => {
-                    if e.raw_os_error() == Some(libc::ELOOP)
-                        || fs::symlink_metadata(anchor).is_ok_and(|m| is_link(&m))
-                    {
-                        Err(format!("拒绝通过链接目录写入技能: {}", anchor.display()))
-                    } else if e.kind() == ErrorKind::NotADirectory {
-                        Err(format!("技能父路径不是目录: {}", anchor.display()))
-                    } else {
-                        Err(format!("打开目录 {} 失败: {e}", anchor.display()))
-                    }
-                }
-            }
-        }
-
-        pub(super) fn open_or_create_subdir(
-            &self,
-            name: &str,
-            step_path: &Path,
-            create: bool,
-        ) -> Result<Option<Self>, String> {
-            let cname = c_segment(name)?;
-            if create {
-                let dir_mode: libc::mode_t = 0o755;
-                let rc = unsafe { libc::mkdirat(self.file.as_raw_fd(), cname.as_ptr(), dir_mode) };
-                if rc < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() != ErrorKind::AlreadyExists {
-                        return Err(format!("创建目录 {} 失败: {err}", step_path.display()));
-                    }
-                }
-            }
-            let raw = unsafe {
-                libc::openat(
-                    self.file.as_raw_fd(),
-                    cname.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if raw < 0 {
-                let err = std::io::Error::last_os_error();
-                if !create && err.kind() == ErrorKind::NotFound {
-                    return Ok(None);
-                }
-                if err.raw_os_error() == Some(libc::ELOOP) || self.is_child_symlink(&cname) {
-                    return Err(format!("拒绝通过链接目录写入技能: {}", step_path.display()));
-                }
-                if err.kind() == ErrorKind::NotADirectory {
-                    return Err(format!("技能父路径不是目录: {}", step_path.display()));
-                }
-                return Err(format!("打开目录 {} 失败: {err}", step_path.display()));
-            }
-            let file = unsafe { fs::File::from_raw_fd(raw) };
-            Self::from_file(file, step_path).map(Some)
-        }
-
-        pub(super) fn create_subdir_exclusive(
-            &self,
-            name: &str,
-            step_path: &Path,
-        ) -> Result<Self, String> {
-            let cname = c_segment(name)?;
-            let dir_mode: libc::mode_t = 0o700;
-            let rc = unsafe { libc::mkdirat(self.file.as_raw_fd(), cname.as_ptr(), dir_mode) };
-            if rc < 0 {
-                let err = std::io::Error::last_os_error();
-                return Err(format!("创建目录 {} 失败: {err}", step_path.display()));
-            }
-            let raw = unsafe {
-                libc::openat(
-                    self.file.as_raw_fd(),
-                    cname.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if raw < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::ELOOP) || self.is_child_symlink(&cname) {
-                    return Err(format!("拒绝通过链接目录写入技能: {}", step_path.display()));
-                }
-                return Err(format!("打开目录 {} 失败: {err}", step_path.display()));
-            }
-            let file = unsafe { fs::File::from_raw_fd(raw) };
-            let dir = Self::from_file(file, step_path)?;
-            let meta = dir
-                .file
-                .metadata()
-                .map_err(|e| format!("检查目录 {} 失败: {e}", step_path.display()))?;
-            let euid = unsafe { libc::geteuid() };
-            if meta.uid() != euid
-                || (meta.mode() & 0o077) != 0
-                || !dir.list_entry_names().is_empty()
-            {
-                return Err(format!("临时目录 {} 绑定校验失败", step_path.display()));
-            }
-            Ok(dir)
-        }
-
-        pub(super) fn open_regular_read(&self, name: &str) -> Result<Option<fs::File>, String> {
-            let cname = c_segment(name)?;
-            let raw = unsafe {
-                libc::openat(
-                    self.file.as_raw_fd(),
-                    cname.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-                )
-            };
-            if raw < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == ErrorKind::NotFound {
-                    return Ok(None);
-                }
-                if err.raw_os_error() == Some(libc::ELOOP) || err.kind() == ErrorKind::IsADirectory
-                {
-                    return Err("分片上传临时文件不是普通文件".to_string());
-                }
-                return Err(format!("检查分片临时文件失败: {err}"));
-            }
-            let file = unsafe { fs::File::from_raw_fd(raw) };
-            let meta = file
-                .metadata()
-                .map_err(|e| format!("检查分片临时文件失败: {e}"))?;
-            if is_link(&meta) || !meta.is_file() {
-                return Err("分片上传临时文件不是普通文件".to_string());
-            }
-            clear_nonblock(&file);
-            Ok(Some(file))
-        }
-
-        pub(super) fn create_regular_file_exclusive(
-            &self,
-            name: &str,
-            readable: bool,
-            mode: u32,
-            display_path: &Path,
-        ) -> Result<fs::File, String> {
-            let cname = c_segment(name)?;
-            let access = if readable {
-                libc::O_RDWR
-            } else {
-                libc::O_WRONLY
-            };
-            let flags = access
-                | libc::O_CREAT
-                | libc::O_EXCL
-                | libc::O_NOFOLLOW
-                | libc::O_CLOEXEC
-                | libc::O_NONBLOCK;
-            let create_mode: std::ffi::c_uint = mode;
-            let raw =
-                unsafe { libc::openat(self.file.as_raw_fd(), cname.as_ptr(), flags, create_mode) };
-            if raw < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::ELOOP) || self.is_child_symlink(&cname) {
-                    return Err(format!("拒绝通过链接写入文件: {}", display_path.display()));
-                }
-                return Err(format!("创建文件 {} 失败: {err}", display_path.display()));
-            }
-            let file = unsafe { fs::File::from_raw_fd(raw) };
-            let meta = file
-                .metadata()
-                .map_err(|e| format!("检查文件 {} 失败: {e}", display_path.display()))?;
-            if is_link(&meta) || !meta.is_file() {
-                return Err(format!("目标不是普通文件: {}", display_path.display()));
-            }
-            clear_nonblock(&file);
-            Ok(file)
-        }
-
-        pub(super) fn open_regular_append(
-            &self,
-            name: &str,
-            create: bool,
-        ) -> Result<fs::File, String> {
-            let cname = c_segment(name)?;
-            let base_flags = libc::O_WRONLY
-                | libc::O_APPEND
-                | libc::O_NOFOLLOW
-                | libc::O_CLOEXEC
-                | libc::O_NONBLOCK;
-            let create_mode: std::ffi::c_uint = 0o600;
-            let raw = if create {
-                unsafe {
-                    libc::openat(
-                        self.file.as_raw_fd(),
-                        cname.as_ptr(),
-                        base_flags | libc::O_CREAT,
-                        create_mode,
-                    )
-                }
-            } else {
-                unsafe { libc::openat(self.file.as_raw_fd(), cname.as_ptr(), base_flags) }
-            };
-            if raw < 0 {
-                let err = std::io::Error::last_os_error();
-                if !create && err.kind() == ErrorKind::NotFound {
-                    return Err("分片上传会话不存在或已过期".to_string());
-                }
-                if err.raw_os_error() == Some(libc::ELOOP) || err.kind() == ErrorKind::IsADirectory
-                {
-                    return Err("分片上传临时文件不是普通文件".to_string());
-                }
-                return Err(format!("写入分片临时文件失败: {err}"));
-            }
-            let file = unsafe { fs::File::from_raw_fd(raw) };
-            let meta = file
-                .metadata()
-                .map_err(|e| format!("检查分片临时文件失败: {e}"))?;
-            if is_link(&meta) || !meta.is_file() {
-                return Err("分片上传临时文件不是普通文件".to_string());
-            }
-            clear_nonblock(&file);
-            Ok(file)
-        }
-
-        pub(super) fn unlink_regular_file(&self, name: &str) -> Result<bool, String> {
-            let Some(verified) = self.open_regular_read(name)? else {
-                return Ok(false);
-            };
-            drop(verified);
-            let cname = c_segment(name)?;
-            let rc = unsafe { libc::unlinkat(self.file.as_raw_fd(), cname.as_ptr(), 0) };
-            if rc < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == ErrorKind::NotFound {
-                    return Ok(false);
-                }
-                return Err(format!("清理分片临时文件失败: {err}"));
-            }
-            Ok(true)
-        }
-
-        pub(super) fn unlink_stale_regular_file(&self, name: &str, now: SystemTime) -> bool {
-            let Ok(Some(file)) = self.open_regular_read(name) else {
-                return false;
-            };
-            let is_stale = file
-                .metadata()
-                .is_ok_and(|meta| !is_link(&meta) && meta.is_file() && is_stale_meta(&meta, now));
-            drop(file);
-            if !is_stale {
-                return false;
-            }
-            let Ok(cname) = c_segment(name) else {
-                return false;
-            };
-            unsafe { libc::unlinkat(self.file.as_raw_fd(), cname.as_ptr(), 0) == 0 }
-        }
-
-        pub(super) fn unlink_verified_regular_file(
-            &self,
-            name: &str,
-            expected_id: ObjectIdentity,
-        ) -> Result<bool, String> {
-            let Some(verified) = self.open_regular_read(name)? else {
-                return Ok(false);
-            };
-            let matches = file_identity(&verified).is_ok_and(|id| id == expected_id);
-            drop(verified);
-            if !matches {
-                return Ok(false);
-            }
-            let cname = c_segment(name)?;
-            let rc = unsafe { libc::unlinkat(self.file.as_raw_fd(), cname.as_ptr(), 0) };
-            if rc < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == ErrorKind::NotFound {
-                    return Ok(false);
-                }
-                return Err(format!("清理临时文件失败: {err}"));
-            }
-            Ok(true)
-        }
-
-        pub(super) fn list_entry_names(&self) -> Vec<String> {
-            let dup_fd = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-            if dup_fd < 0 {
-                return Vec::new();
-            }
-            let dirp = unsafe { libc::fdopendir(dup_fd) };
-            if dirp.is_null() {
-                unsafe {
-                    libc::close(dup_fd);
-                }
-                return Vec::new();
-            }
-            unsafe {
-                libc::rewinddir(dirp);
-            }
-            let mut names = Vec::new();
-            loop {
-                let entry = unsafe { libc::readdir(dirp) };
-                if entry.is_null() {
-                    break;
-                }
-                let name_ptr = unsafe { (&raw const (*entry).d_name).cast::<libc::c_char>() };
-                let bytes = unsafe { CStr::from_ptr(name_ptr).to_bytes() };
-                if bytes == b"." || bytes == b".." {
-                    continue;
-                }
-                if let Ok(name) = std::str::from_utf8(bytes) {
-                    names.push(name.to_string());
-                }
-            }
-            unsafe {
-                libc::closedir(dirp);
-            }
-            names
-        }
-
-        pub(super) fn try_remove_empty_subdir(&self, name: &str, child: &mut Option<RawDir>) {
-            let Some(ref child_ref) = child else {
-                return;
-            };
-            let Ok(cname) = c_segment(name) else {
-                return;
-            };
-            let reopened = unsafe {
-                libc::openat(
-                    self.file.as_raw_fd(),
-                    cname.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if reopened < 0 {
-                return;
-            }
-            let reopened_file = unsafe { fs::File::from_raw_fd(reopened) };
-            let same = reopened_file.metadata().is_ok_and(|meta| {
-                !is_link(&meta)
-                    && meta.is_dir()
-                    && ObjectIdentity {
-                        dev: meta.dev(),
-                        ino: meta.ino(),
-                    } == child_ref.id
-            });
-            drop(reopened_file);
-            if same {
-                let _ = child.take();
-                unsafe {
-                    let _ = libc::unlinkat(
-                        self.file.as_raw_fd(),
-                        cname.as_ptr(),
-                        libc::AT_REMOVEDIR,
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-mod verified_fs {
-    use super::*;
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
-
-    type NtStatus = i32;
-
-    const DELETE_ACCESS: u32 = 0x0001_0000;
-    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
-    const FILE_LIST_DIRECTORY_ACCESS: u32 = 0x0000_0001;
-    const FILE_APPEND_DATA_ACCESS: u32 = 0x0000_0004;
-    const FILE_READ_ATTRIBUTES_ACCESS: u32 = 0x0000_0080;
-    const FILE_GENERIC_READ_ACCESS: u32 = 0x0012_0089;
-    const FILE_GENERIC_WRITE_ACCESS: u32 = 0x0012_0116;
-
-    const FILE_SHARE_ALL: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
-    const FILE_ATTRIBUTE_NORMAL_VAL: u32 = 0x0000_0080;
-    const FILE_FLAG_OPEN_REPARSE_POINT_VAL: u32 = 0x0020_0000;
-    const FILE_FLAG_BACKUP_SEMANTICS_VAL: u32 = 0x0200_0000;
-
-    const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
-    const FILE_OPEN: u32 = 1;
-    const FILE_CREATE: u32 = 2;
-    const FILE_OPEN_IF: u32 = 3;
-    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
-    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
-    const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
-    const FILE_OPEN_FOR_BACKUP_INTENT: u32 = 0x0000_4000;
-    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-
-    const STATUS_OBJECT_NAME_INVALID: NtStatus = 0xC000_0033_u32 as i32;
-    const STATUS_OBJECT_NAME_NOT_FOUND: NtStatus = 0xC000_0034_u32 as i32;
-    const STATUS_OBJECT_PATH_NOT_FOUND: NtStatus = 0xC000_003A_u32 as i32;
-    const STATUS_FILE_IS_A_DIRECTORY: NtStatus = 0xC000_00BA_u32 as i32;
-    const STATUS_NOT_A_DIRECTORY: NtStatus = 0xC000_0103_u32 as i32;
-
-    const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
-    const FILE_FULL_DIRECTORY_INFO_CLASS: i32 = 14;
-    const FILE_FULL_DIRECTORY_RESTART_INFO_CLASS: i32 = 15;
-    const FILE_DISPOSITION_INFO_EX_CLASS: i32 = 21;
-    const FILE_DISPOSITION_DELETE_POSIX: u32 = 0x0000_0001 | 0x0000_0002;
-
-    #[repr(C)]
-    #[allow(dead_code)]
-    struct FileFullDirInfo {
-        next_entry_offset: u32,
-        file_index: u32,
-        creation_time: i64,
-        last_access_time: i64,
-        last_write_time: i64,
-        change_time: i64,
-        end_of_file: i64,
-        allocation_size: i64,
-        file_attributes: u32,
-        file_name_length: u32,
-        ea_size: u32,
-        file_name: [u16; 1],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct FileTime {
-        low: u32,
-        high: u32,
-    }
-
-    #[repr(C)]
-    struct ByHandleFileInformation {
-        file_attributes: u32,
-        creation_time: FileTime,
-        last_access_time: FileTime,
-        last_write_time: FileTime,
-        volume_serial_number: u32,
-        file_size_high: u32,
-        file_size_low: u32,
-        number_of_links: u32,
-        file_index_high: u32,
-        file_index_low: u32,
-    }
-
-    #[repr(C)]
-    struct UnicodeString {
-        length: u16,
-        maximum_length: u16,
-        buffer: *mut u16,
-    }
-
-    #[repr(C)]
-    struct ObjectAttributes {
-        length: u32,
-        root_directory: RawHandle,
-        object_name: *const UnicodeString,
-        attributes: u32,
-        security_descriptor: *const std::ffi::c_void,
-        security_quality_of_service: *const std::ffi::c_void,
-    }
-
-    #[repr(C)]
-    struct IoStatusBlock {
-        status_or_pointer: *mut std::ffi::c_void,
-        information: usize,
-    }
-
-    #[repr(C)]
-    struct FileDispositionInfo {
-        delete_file: u8,
-    }
-
-    #[repr(C)]
-    struct FileDispositionInfoEx {
-        flags: u32,
-    }
-
-    #[link(name = "ntdll")]
-    extern "system" {
-        fn NtCreateFile(
-            file_handle: *mut RawHandle,
-            desired_access: u32,
-            object_attributes: *const ObjectAttributes,
-            io_status_block: *mut IoStatusBlock,
-            allocation_size: *const i64,
-            file_attributes: u32,
-            share_access: u32,
-            create_disposition: u32,
-            create_options: u32,
-            ea_buffer: *const std::ffi::c_void,
-            ea_length: u32,
-        ) -> NtStatus;
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetFileInformationByHandle(
-            file: RawHandle,
-            file_information: *mut ByHandleFileInformation,
-        ) -> i32;
-        fn GetFileInformationByHandleEx(
-            file: RawHandle,
-            file_information_class: i32,
-            file_information: *mut std::ffi::c_void,
-            buffer_size: u32,
-        ) -> i32;
-        fn SetFileInformationByHandle(
-            file: RawHandle,
-            file_information_class: i32,
-            file_information: *const std::ffi::c_void,
-            buffer_size: u32,
-        ) -> i32;
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-    pub(super) struct ObjectIdentity {
-        vol: u32,
-        idx_high: u32,
-        idx_low: u32,
-    }
-
-    pub(super) fn file_identity(file: &fs::File) -> Result<ObjectIdentity, String> {
-        let mut info: ByHandleFileInformation = unsafe { std::mem::zeroed() };
-        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) };
-        if ok == 0 {
-            return Err(format!(
-                "读取句柄标识失败: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(ObjectIdentity {
-            vol: info.volume_serial_number,
-            idx_high: info.file_index_high,
-            idx_low: info.file_index_low,
-        })
-    }
-
-    fn mark_handle_deleted(file: &fs::File) -> bool {
-        let info_ex = FileDispositionInfoEx {
-            flags: FILE_DISPOSITION_DELETE_POSIX,
-        };
-        let ok_ex = unsafe {
-            SetFileInformationByHandle(
-                file.as_raw_handle(),
-                FILE_DISPOSITION_INFO_EX_CLASS,
-                (&raw const info_ex).cast(),
-                std::mem::size_of::<FileDispositionInfoEx>() as u32,
-            )
-        };
-        if ok_ex != 0 {
-            return true;
-        }
-        let info = FileDispositionInfo { delete_file: 1 };
-        let ok = unsafe {
-            SetFileInformationByHandle(
-                file.as_raw_handle(),
-                FILE_DISPOSITION_INFO_CLASS,
-                (&raw const info).cast(),
-                std::mem::size_of::<FileDispositionInfo>() as u32,
-            )
-        };
-        ok != 0
-    }
-
-    fn nt_open_relative(
-        root: RawHandle,
-        name: &str,
-        desired_access: u32,
-        disposition: u32,
-        create_options: u32,
-    ) -> Result<fs::File, NtStatus> {
-        let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
-        let byte_len = wide
-            .len()
-            .checked_mul(2)
-            .and_then(|n| u16::try_from(n).ok())
-            .ok_or(STATUS_OBJECT_NAME_INVALID)?;
-        let ustr = UnicodeString {
-            length: byte_len,
-            maximum_length: byte_len,
-            buffer: wide.as_mut_ptr(),
-        };
-        let attrs = ObjectAttributes {
-            length: std::mem::size_of::<ObjectAttributes>() as u32,
-            root_directory: root,
-            object_name: &ustr,
-            attributes: OBJ_CASE_INSENSITIVE,
-            security_descriptor: std::ptr::null(),
-            security_quality_of_service: std::ptr::null(),
-        };
-        let mut iosb = IoStatusBlock {
-            status_or_pointer: std::ptr::null_mut(),
-            information: 0,
-        };
-        let mut out_handle: RawHandle = std::ptr::null_mut();
-        let status = unsafe {
-            NtCreateFile(
-                &mut out_handle,
-                desired_access,
-                &attrs,
-                &mut iosb,
-                std::ptr::null(),
-                FILE_ATTRIBUTE_NORMAL_VAL,
-                FILE_SHARE_ALL,
-                disposition,
-                create_options,
-                std::ptr::null(),
-                0,
-            )
-        };
-        if status < 0 {
-            return Err(status);
-        }
-        Ok(unsafe { fs::File::from_raw_handle(out_handle) })
-    }
-
-    #[derive(Debug)]
-    pub(super) struct RawDir {
-        pub(super) file: fs::File,
-        id: ObjectIdentity,
-    }
-
-    impl RawDir {
-        fn from_file(file: fs::File, display_path: &Path) -> Result<Self, String> {
-            let meta = file
-                .metadata()
-                .map_err(|e| format!("检查目录 {} 失败: {e}", display_path.display()))?;
-            if is_link(&meta) {
-                return Err(format!("拒绝通过链接目录写入技能: {}", display_path.display()));
-            }
-            if !meta.is_dir() {
-                return Err(format!("技能父路径不是目录: {}", display_path.display()));
-            }
-            let id = file_identity(&file)?;
-            Ok(Self { file, id })
-        }
-
-        pub(super) fn identity(&self) -> ObjectIdentity {
-            self.id
-        }
-
-        fn is_child_link(&self, name: &str) -> bool {
-            nt_open_relative(
-                self.file.as_raw_handle(),
-                name,
-                FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
-                FILE_OPEN,
-                FILE_OPEN_REPARSE_POINT
-                    | FILE_SYNCHRONOUS_IO_NONALERT
-                    | FILE_OPEN_FOR_BACKUP_INTENT,
-            )
-            .ok()
-            .and_then(|file| file.metadata().ok())
-            .is_some_and(|meta| is_link(&meta))
-        }
-
-        pub(super) fn open_anchor(anchor: &Path, create: bool) -> Result<Option<Self>, String> {
-            if create && !path_exists(anchor)? {
-                fs::create_dir_all(anchor)
-                    .map_err(|e| format!("创建目录 {} 失败: {e}", anchor.display()))?;
-            }
-            match OpenOptions::new()
-                .read(true)
-                .access_mode(
-                    FILE_LIST_DIRECTORY_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
-                )
-                .share_mode(FILE_SHARE_ALL)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS_VAL | FILE_FLAG_OPEN_REPARSE_POINT_VAL)
-                .open(anchor)
-            {
-                Ok(file) => Self::from_file(file, anchor).map(Some),
-                Err(e)
-                    if !create
-                        && matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
-                {
-                    Ok(None)
-                }
-                Err(e) => {
-                    if fs::symlink_metadata(anchor).is_ok_and(|m| is_link(&m)) {
-                        Err(format!("拒绝通过链接目录写入技能: {}", anchor.display()))
-                    } else if e.kind() == ErrorKind::NotADirectory {
-                        Err(format!("技能父路径不是目录: {}", anchor.display()))
-                    } else {
-                        Err(format!("打开目录 {} 失败: {e}", anchor.display()))
-                    }
-                }
-            }
-        }
-
-        pub(super) fn open_or_create_subdir(
-            &self,
-            name: &str,
-            step_path: &Path,
-            create: bool,
-        ) -> Result<Option<Self>, String> {
-            validate_single_entry_name(name)?;
-            let disposition = if create { FILE_OPEN_IF } else { FILE_OPEN };
-            match nt_open_relative(
-                self.file.as_raw_handle(),
-                name,
-                FILE_LIST_DIRECTORY_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
-                disposition,
-                FILE_DIRECTORY_FILE
-                    | FILE_OPEN_REPARSE_POINT
-                    | FILE_SYNCHRONOUS_IO_NONALERT
-                    | FILE_OPEN_FOR_BACKUP_INTENT,
-            ) {
-                Ok(file) => Self::from_file(file, step_path).map(Some),
-                Err(s)
-                    if !create
-                        && matches!(
-                            s,
-                            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND
-                        ) =>
-                {
-                    Ok(None)
-                }
-                Err(s) => {
-                    if self.is_child_link(name) {
-                        Err(format!("拒绝通过链接目录写入技能: {}", step_path.display()))
-                    } else if s == STATUS_NOT_A_DIRECTORY {
-                        Err(format!("技能父路径不是目录: {}", step_path.display()))
-                    } else {
-                        Err(format!(
-                            "打开目录 {} 失败 (NTSTATUS 0x{:08X})",
-                            step_path.display(),
-                            s as u32
-                        ))
-                    }
-                }
-            }
-        }
-
-        pub(super) fn create_subdir_exclusive(
-            &self,
-            name: &str,
-            step_path: &Path,
-        ) -> Result<Self, String> {
-            validate_single_entry_name(name)?;
-            match nt_open_relative(
-                self.file.as_raw_handle(),
-                name,
-                FILE_LIST_DIRECTORY_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
-                FILE_CREATE,
-                FILE_DIRECTORY_FILE
-                    | FILE_OPEN_REPARSE_POINT
-                    | FILE_SYNCHRONOUS_IO_NONALERT
-                    | FILE_OPEN_FOR_BACKUP_INTENT,
-            ) {
-                Ok(file) => Self::from_file(file, step_path),
-                Err(s) => {
-                    if self.is_child_link(name) {
-                        Err(format!("拒绝通过链接目录写入技能: {}", step_path.display()))
-                    } else {
-                        Err(format!(
-                            "创建目录 {} 失败 (NTSTATUS 0x{:08X})",
-                            step_path.display(),
-                            s as u32
-                        ))
-                    }
-                }
-            }
-        }
-
-        pub(super) fn open_regular_read(&self, name: &str) -> Result<Option<fs::File>, String> {
-            validate_single_entry_name(name)?;
-            match nt_open_relative(
-                self.file.as_raw_handle(),
-                name,
-                FILE_GENERIC_READ_ACCESS,
-                FILE_OPEN,
-                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-            ) {
-                Ok(file) => {
-                    let meta = file
-                        .metadata()
-                        .map_err(|e| format!("检查分片临时文件失败: {e}"))?;
-                    if is_link(&meta) || !meta.is_file() {
-                        return Err("分片上传临时文件不是普通文件".to_string());
-                    }
-                    Ok(Some(file))
-                }
-                Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND) => Ok(None),
-                Err(STATUS_FILE_IS_A_DIRECTORY) => {
-                    Err("分片上传临时文件不是普通文件".to_string())
-                }
-                Err(s) => Err(format!("检查分片临时文件失败 (NTSTATUS 0x{:08X})", s as u32)),
-            }
-        }
-
-        pub(super) fn create_regular_file_exclusive(
-            &self,
-            name: &str,
-            readable: bool,
-            _mode: u32,
-            display_path: &Path,
-        ) -> Result<fs::File, String> {
-            validate_single_entry_name(name)?;
-            let desired_access = if readable {
-                FILE_GENERIC_READ_ACCESS | FILE_GENERIC_WRITE_ACCESS
-            } else {
-                FILE_GENERIC_WRITE_ACCESS | FILE_READ_ATTRIBUTES_ACCESS
-            };
-            match nt_open_relative(
-                self.file.as_raw_handle(),
-                name,
-                desired_access,
-                FILE_CREATE,
-                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-            ) {
-                Ok(file) => {
-                    let meta = file
-                        .metadata()
-                        .map_err(|e| format!("检查文件 {} 失败: {e}", display_path.display()))?;
-                    if is_link(&meta) || !meta.is_file() {
-                        return Err(format!("目标不是普通文件: {}", display_path.display()));
-                    }
-                    Ok(file)
-                }
-                Err(s) => {
-                    if self.is_child_link(name) {
-                        Err(format!("拒绝通过链接写入文件: {}", display_path.display()))
-                    } else {
-                        Err(format!(
-                            "创建文件 {} 失败 (NTSTATUS 0x{:08X})",
-                            display_path.display(),
-                            s as u32
-                        ))
-                    }
-                }
-            }
-        }
-
-        pub(super) fn open_regular_append(
-            &self,
-            name: &str,
-            create: bool,
-        ) -> Result<fs::File, String> {
-            validate_single_entry_name(name)?;
-            let disposition = if create { FILE_OPEN_IF } else { FILE_OPEN };
-            match nt_open_relative(
-                self.file.as_raw_handle(),
-                name,
-                FILE_APPEND_DATA_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
-                disposition,
-                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-            ) {
-                Ok(file) => {
-                    let meta = file
-                        .metadata()
-                        .map_err(|e| format!("检查分片临时文件失败: {e}"))?;
-                    if is_link(&meta) || !meta.is_file() {
-                        return Err("分片上传临时文件不是普通文件".to_string());
-                    }
-                    Ok(file)
-                }
-                Err(s)
-                    if !create
-                        && matches!(
-                            s,
-                            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND
-                        ) =>
-                {
-                    Err("分片上传会话不存在或已过期".to_string())
-                }
-                Err(STATUS_FILE_IS_A_DIRECTORY) => {
-                    Err("分片上传临时文件不是普通文件".to_string())
-                }
-                Err(s) => Err(format!("写入分片临时文件失败 (NTSTATUS 0x{:08X})", s as u32)),
-            }
-        }
-
-        pub(super) fn unlink_regular_file(&self, name: &str) -> Result<bool, String> {
-            validate_single_entry_name(name)?;
-            let file = match nt_open_relative(
-                self.file.as_raw_handle(),
-                name,
-                DELETE_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
-                FILE_OPEN,
-                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-            ) {
-                Ok(file) => file,
-                Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND) => {
-                    return Ok(false);
-                }
-                Err(STATUS_FILE_IS_A_DIRECTORY) => {
-                    return Err("分片上传临时文件不是普通文件".to_string());
-                }
-                Err(s) => {
-                    return Err(format!("清理分片临时文件失败 (NTSTATUS 0x{:08X})", s as u32));
-                }
-            };
-            let meta = file
-                .metadata()
-                .map_err(|e| format!("检查分片临时文件失败: {e}"))?;
-            if is_link(&meta) || !meta.is_file() {
-                return Err("分片上传临时文件不是普通文件".to_string());
-            }
-            if !mark_handle_deleted(&file) {
-                return Err("标记删除分片临时文件失败".to_string());
-            }
-            Ok(true)
-        }
-
-        pub(super) fn unlink_stale_regular_file(&self, name: &str, now: SystemTime) -> bool {
-            if validate_single_entry_name(name).is_err() {
-                return false;
-            }
-            let Ok(file) = nt_open_relative(
-                self.file.as_raw_handle(),
-                name,
-                DELETE_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
-                FILE_OPEN,
-                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-            ) else {
-                return false;
-            };
-            let is_stale = file
-                .metadata()
-                .is_ok_and(|meta| !is_link(&meta) && meta.is_file() && is_stale_meta(&meta, now));
-            if !is_stale {
-                return false;
-            }
-            mark_handle_deleted(&file)
-        }
-
-        pub(super) fn unlink_verified_regular_file(
-            &self,
-            name: &str,
-            expected_id: ObjectIdentity,
-        ) -> Result<bool, String> {
-            validate_single_entry_name(name)?;
-            let file = match nt_open_relative(
-                self.file.as_raw_handle(),
-                name,
-                DELETE_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
-                FILE_OPEN,
-                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-            ) {
-                Ok(file) => file,
-                Err(STATUS_OBJECT_NAME_NOT_FOUND | STATUS_OBJECT_PATH_NOT_FOUND) => {
-                    return Ok(false);
-                }
-                Err(STATUS_FILE_IS_A_DIRECTORY) => {
-                    return Ok(false);
-                }
-                Err(s) => {
-                    return Err(format!("清理临时文件失败 (NTSTATUS 0x{:08X})", s as u32));
-                }
-            };
-            let valid = file
-                .metadata()
-                .is_ok_and(|meta| !is_link(&meta) && meta.is_file())
-                && file_identity(&file).is_ok_and(|id| id == expected_id);
-            if !valid {
-                return Ok(false);
-            }
-            Ok(mark_handle_deleted(&file))
-        }
-
-        pub(super) fn list_entry_names(&self) -> Vec<String> {
-            use std::os::windows::ffi::OsStringExt;
-            let mut aligned_buf = vec![0u64; 2048];
-            let buf_len = (aligned_buf.len() * std::mem::size_of::<u64>()) as u32;
-            let next_off = std::mem::offset_of!(FileFullDirInfo, next_entry_offset);
-            let len_off = std::mem::offset_of!(FileFullDirInfo, file_name_length);
-            let name_off = std::mem::offset_of!(FileFullDirInfo, file_name);
-            let mut names = Vec::new();
-            let mut info_class = FILE_FULL_DIRECTORY_RESTART_INFO_CLASS;
-
-            loop {
-                let ok = unsafe {
-                    GetFileInformationByHandleEx(
-                        self.file.as_raw_handle(),
-                        info_class,
-                        aligned_buf.as_mut_ptr().cast(),
-                        buf_len,
-                    )
-                };
-                if ok == 0 {
-                    break;
-                }
-                info_class = FILE_FULL_DIRECTORY_INFO_CLASS;
-
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        aligned_buf.as_ptr().cast::<u8>(),
-                        buf_len as usize,
-                    )
-                };
-                let mut offset = 0usize;
-                loop {
-                    if offset + name_off > bytes.len() {
-                        break;
-                    }
-                    let next_entry_offset = u32::from_ne_bytes(
-                        bytes[offset + next_off..offset + next_off + 4]
-                            .try_into()
-                            .unwrap_or([0; 4]),
-                    ) as usize;
-                    let file_name_len_bytes = u32::from_ne_bytes(
-                        bytes[offset + len_off..offset + len_off + 4]
-                            .try_into()
-                            .unwrap_or([0; 4]),
-                    ) as usize;
-                    let name_start = offset + name_off;
-                    let name_end = name_start.saturating_add(file_name_len_bytes);
-                    if (file_name_len_bytes & 1) == 0 && name_end <= bytes.len() {
-                        let (pairs, _) = bytes[name_start..name_end].as_chunks::<2>();
-                        let wide: Vec<u16> = pairs
-                            .iter()
-                            .map(|&pair| u16::from_ne_bytes(pair))
-                            .collect();
-                        if let Ok(name) = std::ffi::OsString::from_wide(&wide).into_string() {
-                            if name != "." && name != ".." {
-                                names.push(name);
-                            }
-                        }
-                    }
-                    if next_entry_offset == 0 {
-                        break;
-                    }
-                    let Some(next) = offset.checked_add(next_entry_offset) else {
-                        break;
-                    };
-                    if next <= offset || next >= bytes.len() {
-                        break;
-                    }
-                    offset = next;
-                }
-            }
-            names
-        }
-
-        pub(super) fn try_remove_empty_subdir(&self, name: &str, child: &mut Option<RawDir>) {
-            let Some(ref child_ref) = child else {
-                return;
-            };
-            if validate_single_entry_name(name).is_err() {
-                return;
-            }
-            let Ok(del_dir) = nt_open_relative(
-                self.file.as_raw_handle(),
-                name,
-                DELETE_ACCESS | FILE_READ_ATTRIBUTES_ACCESS | SYNCHRONIZE_ACCESS,
-                FILE_OPEN,
-                FILE_DIRECTORY_FILE
-                    | FILE_OPEN_REPARSE_POINT
-                    | FILE_SYNCHRONOUS_IO_NONALERT
-                    | FILE_OPEN_FOR_BACKUP_INTENT,
-            ) else {
-                return;
-            };
-            let same = del_dir
-                .metadata()
-                .is_ok_and(|meta| !is_link(&meta) && meta.is_dir())
-                && file_identity(&del_dir).is_ok_and(|id| id == child_ref.id);
-            if same {
-                let _ = child.take();
-                let _ = mark_handle_deleted(&del_dir);
-            }
-        }
-    }
-}
-
-const ARCHIVE_LEDGER_FILE: &str = ".tako-archive-ledger";
-const MAX_ARCHIVE_LEDGER_BYTES: u64 = 4 * 1024 * 1024;
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "k")]
-enum ArchiveLedgerEntry {
-    Root {
-        id: verified_fs::ObjectIdentity,
-    },
-    Dir {
-        parent: verified_fs::ObjectIdentity,
-        id: verified_fs::ObjectIdentity,
-        name: String,
-    },
-    File {
-        parent: verified_fs::ObjectIdentity,
-        id: verified_fs::ObjectIdentity,
-        name: String,
-    },
-}
-
-#[derive(Debug, Default)]
-struct OwnedTreeLedger {
-    dirs: BTreeMap<(verified_fs::ObjectIdentity, String), verified_fs::ObjectIdentity>,
-    files: BTreeMap<(verified_fs::ObjectIdentity, String), verified_fs::ObjectIdentity>,
-}
-
-impl OwnedTreeLedger {
-    fn record_dir(
-        &mut self,
-        parent: verified_fs::ObjectIdentity,
-        name: &str,
-        id: verified_fs::ObjectIdentity,
-    ) {
-        self.dirs.insert((parent, name.to_string()), id);
-    }
-
-    fn record_file(
-        &mut self,
-        parent: verified_fs::ObjectIdentity,
-        name: &str,
-        id: verified_fs::ObjectIdentity,
-    ) {
-        self.files.insert((parent, name.to_string()), id);
-    }
-
-    fn expected_dir(
-        &self,
-        parent: verified_fs::ObjectIdentity,
-        name: &str,
-    ) -> Option<verified_fs::ObjectIdentity> {
-        self.dirs.get(&(parent, name.to_string())).copied()
-    }
-
-    fn expected_file(
-        &self,
-        parent: verified_fs::ObjectIdentity,
-        name: &str,
-    ) -> Option<verified_fs::ObjectIdentity> {
-        self.files.get(&(parent, name.to_string())).copied()
-    }
-
-    fn load_from_verified_root(root: &VerifiedDir) -> Option<Self> {
-        let root_id = root.identity().ok()?;
-        let file = root.open_regular_read(ARCHIVE_LEDGER_FILE).ok()??;
-        let meta = file.metadata().ok()?;
-        if is_link(&meta) || !meta.is_file() || meta.len() > MAX_ARCHIVE_LEDGER_BYTES {
-            return None;
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if meta.uid() != unsafe { libc::geteuid() } {
-                return None;
-            }
-        }
-        let actual_ledger_id = verified_fs::file_identity(&file).ok()?;
-        let mut bytes = Vec::new();
-        file.take(MAX_ARCHIVE_LEDGER_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .ok()?;
-        if bytes.len() as u64 > MAX_ARCHIVE_LEDGER_BYTES {
-            return None;
-        }
-        let text = std::str::from_utf8(&bytes).ok()?;
-        let mut ledger = Self::default();
-        let mut saw_root = false;
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let entry: ArchiveLedgerEntry = serde_json::from_str(trimmed).ok()?;
-            match entry {
-                ArchiveLedgerEntry::Root { id } => {
-                    if id != root_id {
-                        return None;
-                    }
-                    saw_root = true;
-                }
-                ArchiveLedgerEntry::Dir { parent, id, name } => {
-                    validate_single_entry_name(&name).ok()?;
-                    ledger.dirs.insert((parent, name), id);
-                }
-                ArchiveLedgerEntry::File { parent, id, name } => {
-                    validate_single_entry_name(&name).ok()?;
-                    ledger.files.insert((parent, name), id);
-                }
-            }
-        }
-        if !saw_root
-            || ledger.expected_file(root_id, ARCHIVE_LEDGER_FILE) != Some(actual_ledger_id)
-        {
-            return None;
-        }
-        Some(ledger)
-    }
-}
-
-#[derive(Debug)]
-struct VerifiedDir {
-    parent: Option<verified_fs::RawDir>,
-    leaf_name: Option<String>,
-    dir: Option<verified_fs::RawDir>,
-}
-
-impl VerifiedDir {
-    fn open_internal(
-        paths: &AppPaths,
-        dir_path: &Path,
-        create: bool,
-    ) -> Result<Option<Self>, String> {
-        ensure_plain_ancestors(paths, dir_path)?;
-        let anchor = anchor_for_path(paths, dir_path)?;
-        let rel = dir_path
-            .strip_prefix(anchor)
-            .map_err(|_| format!("技能写入路径不在应用目录内: {}", dir_path.display()))?;
-        let mut segments = Vec::new();
-        for comp in rel.components() {
-            match comp {
-                Component::Normal(seg) => {
-                    let s = seg
-                        .to_str()
-                        .ok_or_else(|| format!("技能目录路径包含非 UTF-8 字符: {}", dir_path.display()))?;
-                    validate_single_entry_name(s)?;
-                    segments.push(s);
-                }
-                Component::CurDir => {}
-                _ => return Err(format!("不安全的技能目录路径: {}", dir_path.display())),
-            }
-        }
-        let Some(mut cur) = verified_fs::RawDir::open_anchor(anchor, create)? else {
-            return Ok(None);
-        };
-        if segments.is_empty() {
-            return Ok(Some(Self {
-                parent: None,
-                leaf_name: None,
-                dir: Some(cur),
-            }));
-        }
-        let mut step_path = anchor.to_path_buf();
-        let last_idx = segments.len() - 1;
-        for (idx, seg) in segments.into_iter().enumerate() {
-            step_path.push(seg);
-            let Some(next) = cur.open_or_create_subdir(seg, &step_path, create)? else {
-                return Ok(None);
-            };
-            if idx == last_idx {
-                return Ok(Some(Self {
-                    parent: Some(cur),
-                    leaf_name: Some(seg.to_string()),
-                    dir: Some(next),
-                }));
-            }
-            cur = next;
-        }
-        Ok(None)
-    }
-
-    fn open_existing(paths: &AppPaths, dir_path: &Path) -> Result<Option<Self>, String> {
-        Self::open_internal(paths, dir_path, false)
-    }
-
-    fn open_or_create(paths: &AppPaths, dir_path: &Path) -> Result<Self, String> {
-        Self::open_internal(paths, dir_path, true)?
-            .ok_or_else(|| format!("无法打开技能目录: {}", dir_path.display()))
-    }
-
-    fn raw(&self) -> Result<&verified_fs::RawDir, String> {
-        self.dir
-            .as_ref()
-            .ok_or_else(|| "已释放的目录句柄".to_string())
-    }
-
-    fn metadata(&self) -> Result<fs::Metadata, String> {
-        self.raw()?
-            .file
-            .metadata()
-            .map_err(|e| format!("读取目录元数据失败: {e}"))
-    }
-
-    fn identity(&self) -> Result<verified_fs::ObjectIdentity, String> {
-        Ok(self.raw()?.identity())
-    }
-
-    fn open_child_dir(&self, name: &str, child_path: &Path) -> Result<Option<Self>, String> {
-        let Some(sub) = self.raw()?.open_or_create_subdir(name, child_path, false)? else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            parent: None,
-            leaf_name: Some(name.to_string()),
-            dir: Some(sub),
-        }))
-    }
-
-    fn create_child_dir_exclusive(&self, name: &str, child_path: &Path) -> Result<Self, String> {
-        let sub = self.raw()?.create_subdir_exclusive(name, child_path)?;
-        Ok(Self {
-            parent: None,
-            leaf_name: Some(name.to_string()),
-            dir: Some(sub),
-        })
-    }
-
-    fn open_regular_read(&self, name: &str) -> Result<Option<fs::File>, String> {
-        self.raw()?.open_regular_read(name)
-    }
-
-    fn create_regular_file_exclusive(
-        &self,
-        name: &str,
-        readable: bool,
-        mode: u32,
-        display_path: &Path,
-    ) -> Result<fs::File, String> {
-        self.raw()?
-            .create_regular_file_exclusive(name, readable, mode, display_path)
-    }
-
-    fn open_regular_append(&self, name: &str, create: bool) -> Result<fs::File, String> {
-        self.raw()?.open_regular_append(name, create)
-    }
-
-    fn open_relative_tracked_child_dir(
-        &self,
-        relative: &str,
-        display_root: &Path,
-        ledger: &OwnedTreeLedger,
-    ) -> Result<Self, String> {
-        let mut step_display = display_root.to_path_buf();
-        let mut current: Option<Self> = None;
-        for seg in relative.split('/').filter(|s| !s.is_empty()) {
-            validate_single_entry_name(seg)?;
-            step_display.push(seg);
-            let parent_ref = current.as_ref().unwrap_or(self);
-            let parent_id = parent_ref.identity()?;
-            let expected_id = ledger.expected_dir(parent_id, seg).ok_or_else(|| {
-                format!("检测到临时目录 {} 未在清单内，已中止操作", step_display.display())
-            })?;
-            let next = parent_ref
-                .open_child_dir(seg, &step_display)?
-                .ok_or_else(|| format!("未找到归档目录: {}", step_display.display()))?;
-            if next.identity()? != expected_id {
-                return Err(format!(
-                    "检测到临时目录 {} 被替换，已中止操作",
-                    step_display.display()
-                ));
-            }
-            current = Some(next);
-        }
-        current.ok_or_else(|| format!("归档相对目录为空: {}", display_root.display()))
-    }
-
-    fn open_relative_regular_read(
-        &self,
-        relative: &str,
-        display_path: &Path,
-    ) -> Result<fs::File, String> {
-        let segments: Vec<&str> = relative.split('/').filter(|s| !s.is_empty()).collect();
-        let (file_name, parent_segments) = segments
-            .split_last()
-            .ok_or_else(|| format!("技能相对路径无效: {relative}"))?;
-        validate_single_entry_name(file_name)?;
-        let mut step_display = PathBuf::new();
-        let mut current: Option<Self> = None;
-        for seg in parent_segments {
-            validate_single_entry_name(seg)?;
-            step_display.push(seg);
-            let next = match current.as_ref() {
-                Some(dir) => dir.open_child_dir(seg, &step_display)?,
-                None => self.open_child_dir(seg, &step_display)?,
-            }
-            .ok_or_else(|| format!("读取技能文件 {} 失败: 父目录不存在", display_path.display()))?;
-            current = Some(next);
-        }
-        let parent_dir = current.as_ref().unwrap_or(self);
-        parent_dir
-            .open_regular_read(file_name)?
-            .ok_or_else(|| format!("读取技能文件 {} 失败: 文件不存在", display_path.display()))
-    }
-
-    fn unlink_regular_file(&self, name: &str) -> Result<bool, String> {
-        self.raw()?.unlink_regular_file(name)
-    }
-
-    fn unlink_verified_regular_file(
-        &self,
-        name: &str,
-        expected_id: verified_fs::ObjectIdentity,
-    ) -> Result<bool, String> {
-        self.raw()?.unlink_verified_regular_file(name, expected_id)
-    }
-
-    fn unlink_stale_regular_file(&self, name: &str, now: SystemTime) -> bool {
-        self.dir
-            .as_ref()
-            .is_some_and(|raw| raw.unlink_stale_regular_file(name, now))
-    }
-
-    fn list_entry_names(&self) -> Vec<String> {
-        self.dir
-            .as_ref()
-            .map(verified_fs::RawDir::list_entry_names)
-            .unwrap_or_default()
-    }
-
-    fn try_remove_self_if_empty(&mut self) {
-        if let (Some(ref parent), Some(ref name)) = (&self.parent, &self.leaf_name) {
-            parent.try_remove_empty_subdir(name, &mut self.dir);
-        }
-    }
-
-    fn clear_tracked_contents_with_depth(
-        &self,
-        ledger: &OwnedTreeLedger,
-        depth: usize,
-    ) -> Result<(), String> {
-        if depth > MAX_DEPTH + 4 {
-            return Err("临时目录清理嵌套过深".to_string());
-        }
-        let self_raw = self.raw()?;
-        let self_id = self_raw.identity();
-        let mut deferred_ledger_id: Option<verified_fs::ObjectIdentity> = None;
-
-        for child_name in self.list_entry_names() {
-            if validate_single_entry_name(&child_name).is_err() {
-                continue;
-            }
-            if let Some(expected_dir_id) = ledger.expected_dir(self_id, &child_name) {
-                let display_hint = Path::new(&child_name);
-                if let Ok(Some(sub)) = self.open_child_dir(&child_name, display_hint) {
-                    if sub
-                        .identity()
-                        .is_ok_and(|actual_id| actual_id == expected_dir_id)
-                    {
-                        let _ = self.remove_tracked_open_child_tree_with_depth(
-                            &child_name,
-                            sub,
-                            ledger,
-                            depth + 1,
-                        );
-                    }
-                }
-                continue;
-            }
-            if let Some(expected_file_id) = ledger.expected_file(self_id, &child_name) {
-                if depth == 0 && child_name == ARCHIVE_LEDGER_FILE {
-                    deferred_ledger_id = Some(expected_file_id);
-                    continue;
-                }
-                let _ = self_raw.unlink_verified_regular_file(&child_name, expected_file_id);
-            }
-        }
-
-        if let Some(ledger_id) = deferred_ledger_id {
-            let _ = self_raw.unlink_verified_regular_file(ARCHIVE_LEDGER_FILE, ledger_id);
-        }
-        Ok(())
-    }
-
-    fn remove_tracked_open_child_tree_with_depth(
-        &self,
-        name: &str,
-        mut child: VerifiedDir,
-        ledger: &OwnedTreeLedger,
-        depth: usize,
-    ) -> Result<(), String> {
-        validate_single_entry_name(name)?;
-        let parent_raw = self.raw()?;
-        let _ = child.clear_tracked_contents_with_depth(ledger, depth);
-        parent_raw.try_remove_empty_subdir(name, &mut child.dir);
-        Ok(())
-    }
-
-    fn remove_tracked_open_child_tree(
-        &self,
-        name: &str,
-        child: VerifiedDir,
-        ledger: &OwnedTreeLedger,
-    ) -> Result<(), String> {
-        self.remove_tracked_open_child_tree_with_depth(name, child, ledger, 0)
-    }
 }
 
 fn read_store(paths: &AppPaths) -> Result<SkillsStore, String> {
@@ -2037,73 +505,21 @@ pub fn count_skills_for_summary_for_paths(paths: &AppPaths) -> usize {
     skills_summary_counts_for_paths(paths).0
 }
 
-fn cleanup_stale_temp_artifacts(paths: &AppPaths) {
-    cleanup_temp_artifacts_at(paths, SystemTime::now());
+fn create_anonymous_temp_file() -> Result<fs::File, String> {
+    tempfile::tempfile().map_err(|e| format!("创建匿名临时归档文件失败: {e}"))
 }
 
-fn sweep_stale_open_archive_dir(
-    ext_verified: &VerifiedDir,
-    name: &str,
-    sub: VerifiedDir,
-    now: SystemTime,
-) -> bool {
-    if !sub.metadata().is_ok_and(|meta| is_stale_meta(&meta, now)) {
-        return false;
-    }
-    let Some(ledger) = OwnedTreeLedger::load_from_verified_root(&sub) else {
-        return false;
-    };
-    let _ = ext_verified.remove_tracked_open_child_tree(name, sub, &ledger);
-    true
-}
-
-fn sweep_stale_archives_in_verified_dir<I>(
-    ext_verified: &VerifiedDir,
-    ext_dir: &Path,
-    names: I,
-    now: SystemTime,
-) where
-    I: IntoIterator<Item = String>,
-{
-    for name in names {
-        if !name.starts_with(".tako-archive-") || validate_single_entry_name(&name).is_err() {
-            continue;
-        }
-        let hint_path = ext_dir.join(&name);
-        match ext_verified.open_child_dir(&name, &hint_path) {
-            Ok(Some(sub)) => {
-                let _ = sweep_stale_open_archive_dir(ext_verified, &name, sub, now);
-            }
-            Ok(None) => {}
-            Err(_) => {
-                let _ = ext_verified.unlink_stale_regular_file(&name, now);
-            }
-        }
+fn evict_expired_staged_uploads_at(now: Instant) {
+    let mut guard = STAGED_UPLOADS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.retain(|_, upload| now.saturating_duration_since(upload.updated_at) <= STALE_TEMP_TTL);
     }
 }
 
-fn sweep_stale_uploads_in_verified_dir<I>(uploads_verified: &VerifiedDir, names: I, now: SystemTime)
-where
-    I: IntoIterator<Item = String>,
-{
-    for name in names {
-        if name.ends_with(".zip") && validate_single_entry_name(&name).is_ok() {
-            let _ = uploads_verified.unlink_stale_regular_file(&name, now);
-        }
-    }
-}
-
-fn cleanup_temp_artifacts_at(paths: &AppPaths, now: SystemTime) {
-    let ext_dir = extensions_dir(paths);
-    if let Ok(Some(ext_verified)) = VerifiedDir::open_existing(paths, &ext_dir) {
-        let names = ext_verified.list_entry_names();
-        sweep_stale_archives_in_verified_dir(&ext_verified, &ext_dir, names, now);
-    }
-    let uploads = temp_uploads_dir(paths);
-    if let Ok(Some(uploads_verified)) = VerifiedDir::open_existing(paths, &uploads) {
-        let names = uploads_verified.list_entry_names();
-        sweep_stale_uploads_in_verified_dir(&uploads_verified, names, now);
-    }
+fn evict_expired_staged_uploads() {
+    evict_expired_staged_uploads_at(Instant::now());
 }
 
 fn parse_frontmatter(bytes: &[u8], fallback: &str) -> Result<Frontmatter, String> {
@@ -2137,31 +553,46 @@ fn parse_frontmatter(bytes: &[u8], fallback: &str) -> Result<Frontmatter, String
     Ok(frontmatter)
 }
 
-fn read_frontmatter_reader(
-    file: fs::File,
-    display: &Path,
-    fallback: &str,
-) -> Result<Frontmatter, String> {
-    let mut bytes = Vec::new();
-    file.take(MAX_SKILL_MD_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("读取 {} 失败: {e}", display.display()))?;
-    if bytes.len() as u64 > MAX_SKILL_MD_BYTES {
-        return Err("SKILL.md 超过 2 MiB 解析上限".to_string());
-    }
-    parse_frontmatter(&bytes, fallback)
-}
-
-fn read_frontmatter_file(skill_md: &Path, fallback: &str) -> Result<Frontmatter, String> {
-    let file =
-        fs::File::open(skill_md).map_err(|e| format!("打开 {} 失败: {e}", skill_md.display()))?;
-    read_frontmatter_reader(file, skill_md, fallback)
-}
-
 fn read_frontmatter_in_tree(tree: &LocalSkillTree, fallback: &str) -> Result<Frontmatter, String> {
     let entry = tree.files.get("SKILL.md").ok_or("缺少 SKILL.md")?;
-    let file = tree.open_file("SKILL.md", entry)?;
-    read_frontmatter_reader(file, &entry.source, fallback)
+    let mut bytes = Vec::new();
+    match &entry.source {
+        FileSource::Disk(path) => {
+            let file =
+                fs::File::open(path).map_err(|e| format!("打开 {} 失败: {e}", path.display()))?;
+            file.take(MAX_SKILL_MD_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+            if bytes.len() as u64 > MAX_SKILL_MD_BYTES {
+                return Err("SKILL.md 超过 2 MiB 解析上限".to_string());
+            }
+        }
+        FileSource::Archive {
+            handle,
+            zip_index,
+            expected_sha256,
+        } => {
+            let mut archive = handle
+                .archive
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let zip_file = archive
+                .by_index(*zip_index)
+                .map_err(|e| format!("读取归档中的 SKILL.md 失败: {e}"))?;
+            zip_file
+                .take(MAX_SKILL_MD_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("读取归档中的 SKILL.md 失败: {e}"))?;
+            if bytes.len() as u64 > MAX_SKILL_MD_BYTES {
+                return Err("SKILL.md 超过 2 MiB 解析上限".to_string());
+            }
+            let actual_sha: [u8; 32] = Sha256::digest(&bytes).into();
+            if bytes.len() as u64 != entry.size || actual_sha != *expected_sha256 {
+                return Err("归档内容校验失败，源文件可能已被修改".to_string());
+            }
+        }
+    }
+    parse_frontmatter(&bytes, fallback)
 }
 
 fn compute_file_meta_stamp(relative: &str, metadata: &fs::Metadata) -> [u8; 32] {
@@ -2192,7 +623,7 @@ fn compute_file_meta_stamp(relative: &str, metadata: &fs::Metadata) -> [u8; 32] 
 
 fn build_tree_from_entries(
     canonical_root: PathBuf,
-    verified_root: Option<Arc<VerifiedDir>>,
+    is_archive: bool,
     files: BTreeMap<String, LocalFileEntry>,
 ) -> LocalSkillTree {
     let mut total_bytes = 0u64;
@@ -2203,7 +634,7 @@ fn build_tree_from_entries(
     }
     LocalSkillTree {
         canonical_root,
-        verified_root,
+        is_archive,
         files,
         total_bytes,
         meta_digest: meta_hasher.finalize().into(),
@@ -2227,7 +658,7 @@ fn scan_local_tree(root: &Path, max_bytes: u64) -> Result<LocalSkillTree, String
     if !files.contains_key("SKILL.md") {
         return Err(format!("技能目录缺少 SKILL.md: {}", root.display()));
     }
-    Ok(build_tree_from_entries(canonical, None, files))
+    Ok(build_tree_from_entries(canonical, false, files))
 }
 
 fn collect_local_tree(
@@ -2296,7 +727,8 @@ fn collect_local_tree(
             files.insert(
                 relative,
                 LocalFileEntry {
-                    source: canonical,
+                    display: canonical.clone(),
+                    source: FileSource::Disk(canonical),
                     size,
                     executable,
                     meta_stamp,
@@ -2331,249 +763,30 @@ fn validate_path_segment(segment: &str) -> Result<(), String> {
     Ok(())
 }
 
-struct TempExtractDir {
-    parent: VerifiedDir,
-    dir_name: String,
-    dir: Option<VerifiedDir>,
-    ledger: OwnedTreeLedger,
-    ledger_file: Option<fs::File>,
-    path: PathBuf,
+struct ScannedZipEntry {
+    zip_index: usize,
+    size: u64,
+    executable: bool,
+    sha256: [u8; 32],
 }
 
-impl TempExtractDir {
-    fn new(paths: &AppPaths) -> Result<Self, String> {
-        let base = extensions_dir(paths);
-        let parent = VerifiedDir::open_or_create(paths, &base)?;
-        let nonce = format!("{}-{:016x}", std::process::id(), rand::random::<u64>());
-        let dir_name = format!(".tako-archive-{nonce}");
-        let path = base.join(&dir_name);
-        let dir = parent.create_child_dir_exclusive(&dir_name, &path)?;
-        let root_id = dir.identity()?;
-        let ledger_path = path.join(ARCHIVE_LEDGER_FILE);
-        let mut ledger_file =
-            dir.create_regular_file_exclusive(ARCHIVE_LEDGER_FILE, false, 0o600, &ledger_path)?;
-        let ledger_file_id = verified_fs::file_identity(&ledger_file)?;
-        let mut ledger = OwnedTreeLedger::default();
-        ledger.record_file(root_id, ARCHIVE_LEDGER_FILE, ledger_file_id);
-        Self::write_ledger_line(&mut ledger_file, &ArchiveLedgerEntry::Root { id: root_id })?;
-        Self::write_ledger_line(
-            &mut ledger_file,
-            &ArchiveLedgerEntry::File {
-                parent: root_id,
-                id: ledger_file_id,
-                name: ARCHIVE_LEDGER_FILE.to_string(),
-            },
-        )?;
-        ledger_file
-            .flush()
-            .map_err(|e| format!("写入临时归档清单失败: {e}"))?;
-        Ok(Self {
-            parent,
-            dir_name,
-            dir: Some(dir),
-            ledger,
-            ledger_file: Some(ledger_file),
-            path,
-        })
-    }
-
-    fn write_ledger_line(file: &mut fs::File, entry: &ArchiveLedgerEntry) -> Result<(), String> {
-        let mut line =
-            serde_json::to_vec(entry).map_err(|e| format!("序列化临时归档清单失败: {e}"))?;
-        line.push(b'\n');
-        file.write_all(&line)
-            .map_err(|e| format!("写入临时归档清单失败: {e}"))
-    }
-
-    fn append_ledger(&mut self, entry: &ArchiveLedgerEntry) -> Result<(), String> {
-        let file = self
-            .ledger_file
-            .as_mut()
-            .ok_or_else(|| "临时归档清单句柄已释放".to_string())?;
-        Self::write_ledger_line(file, entry)
-    }
-
-    fn flush_ledger(&mut self) {
-        if let Some(file) = self.ledger_file.as_mut() {
-            let _ = file.flush();
-        }
-    }
-
-    fn dir(&self) -> Result<&VerifiedDir, String> {
-        self.dir
-            .as_ref()
-            .ok_or_else(|| "临时解压目录句柄已释放".to_string())
-    }
-
-    fn create_root_subdir_exclusive(
-        &mut self,
-        name: &str,
-        child_path: &Path,
-    ) -> Result<VerifiedDir, String> {
-        let (parent_id, child) = {
-            let root = self.dir()?;
-            (
-                root.identity()?,
-                root.create_child_dir_exclusive(name, child_path)?,
-            )
-        };
-        let child_id = child.identity()?;
-        self.ledger.record_dir(parent_id, name, child_id);
-        self.append_ledger(&ArchiveLedgerEntry::Dir {
-            parent: parent_id,
-            id: child_id,
-            name: name.to_string(),
-        })?;
-        self.flush_ledger();
-        Ok(child)
-    }
-
-    fn create_root_file_exclusive(
-        &mut self,
-        name: &str,
-        readable: bool,
-        mode: u32,
-        display_path: &Path,
-    ) -> Result<fs::File, String> {
-        let (parent_id, file) = {
-            let root = self.dir()?;
-            (
-                root.identity()?,
-                root.create_regular_file_exclusive(name, readable, mode, display_path)?,
-            )
-        };
-        let file_id = verified_fs::file_identity(&file)?;
-        self.ledger.record_file(parent_id, name, file_id);
-        self.append_ledger(&ArchiveLedgerEntry::File {
-            parent: parent_id,
-            id: file_id,
-            name: name.to_string(),
-        })?;
-        self.flush_ledger();
-        Ok(file)
-    }
-
-    fn create_tracked_subdir(
-        &mut self,
-        parent: &VerifiedDir,
-        name: &str,
-        step_path: &Path,
-    ) -> Result<VerifiedDir, String> {
-        let parent_id = parent.identity()?;
-        if let Some(expected_id) = self.ledger.expected_dir(parent_id, name) {
-            let opened = parent
-                .open_child_dir(name, step_path)?
-                .ok_or_else(|| format!("检测到临时目录 {} 被移除，已中止操作", step_path.display()))?;
-            if opened.identity()? != expected_id {
-                return Err(format!(
-                    "检测到临时目录 {} 被替换，已中止操作",
-                    step_path.display()
-                ));
-            }
-            return Ok(opened);
-        }
-        let child = parent.create_child_dir_exclusive(name, step_path)?;
-        let child_id = child.identity()?;
-        self.ledger.record_dir(parent_id, name, child_id);
-        self.append_ledger(&ArchiveLedgerEntry::Dir {
-            parent: parent_id,
-            id: child_id,
-            name: name.to_string(),
-        })?;
-        Ok(child)
-    }
-
-    fn create_tracked_file_exclusive(
-        &mut self,
-        parent: &VerifiedDir,
-        name: &str,
-        readable: bool,
-        mode: u32,
-        display_path: &Path,
-    ) -> Result<fs::File, String> {
-        let parent_id = parent.identity()?;
-        let file = parent.create_regular_file_exclusive(name, readable, mode, display_path)?;
-        let file_id = verified_fs::file_identity(&file)?;
-        self.ledger.record_file(parent_id, name, file_id);
-        self.append_ledger(&ArchiveLedgerEntry::File {
-            parent: parent_id,
-            id: file_id,
-            name: name.to_string(),
-        })?;
-        Ok(file)
-    }
-
-    fn unlink_tracked_root_file(&self, name: &str) -> Result<bool, String> {
-        let root = self.dir()?;
-        let root_id = root.identity()?;
-        let Some(expected_id) = self.ledger.expected_file(root_id, name) else {
-            return Ok(false);
-        };
-        root.unlink_verified_regular_file(name, expected_id)
-    }
-
-    #[cfg(test)]
-    fn disarm_for_test(mut self) {
-        self.flush_ledger();
-        let _ = self.ledger_file.take();
-        let _ = self.dir.take();
-    }
-}
-
-impl Drop for TempExtractDir {
-    fn drop(&mut self) {
-        let _ = self.ledger_file.take();
-        if let Some(child) = self.dir.take() {
-            let _ = self
-                .parent
-                .remove_tracked_open_child_tree(&self.dir_name, child, &self.ledger);
-        }
-    }
-}
-
-struct StagedUploadCleanup {
-    dir: VerifiedDir,
-    file_name: String,
-}
-
-impl StagedUploadCleanup {
-    fn open(paths: &AppPaths, upload_id: &str) -> Result<Option<Self>, String> {
-        validate_identifier(upload_id)?;
-        let uploads_dir = temp_uploads_dir(paths);
-        let Some(dir) = VerifiedDir::open_existing(paths, &uploads_dir)? else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            dir,
-            file_name: format!("{upload_id}.zip"),
-        }))
-    }
-}
-
-impl Drop for StagedUploadCleanup {
-    fn drop(&mut self) {
-        let _ = self.dir.unlink_regular_file(&self.file_name);
-        self.dir.try_remove_self_if_empty();
-    }
-}
-
-fn extract_zip_reader_to_verified_dir<R: Read + Seek>(
-    reader: R,
-    temp: &mut TempExtractDir,
-    dest: &VerifiedDir,
-    dest_display: &Path,
+fn scan_zip_archive_trees(
+    backing: ArchiveBacking,
+    strip_single_wrapper: bool,
+    max_depth: usize,
     max_bytes: u64,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<(String, LocalSkillTree)>, String> {
     let mut archive =
-        zip::ZipArchive::new(reader).map_err(|e| format!("读取 ZIP 失败: {e}"))?;
+        zip::ZipArchive::new(backing).map_err(|e| format!("读取 ZIP 失败: {e}"))?;
     if archive.len() > MAX_FILES {
         return Err("ZIP 文件数量超过上限".to_string());
     }
-    let mut extracted = Vec::new();
+    let mut raw_files: BTreeMap<String, ScannedZipEntry> = BTreeMap::new();
     let mut seen = BTreeSet::new();
     let mut path_kinds = BTreeMap::new();
     let mut total = 0u64;
     let mut buf = vec![0u8; STREAM_BUF_SIZE];
+
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -2631,26 +844,9 @@ fn extract_zip_reader_to_verified_dir<R: Read + Seek>(
             continue;
         }
         let expected = entry.size();
-        let (file_name, parent_segments) = segments
-            .split_last()
-            .ok_or_else(|| format!("Zip Slip: 不安全的路径 {name}"))?;
-        let mut step_display = dest_display.to_path_buf();
-        let mut current_owned: Option<VerifiedDir> = None;
-        for seg in parent_segments {
-            step_display.push(seg);
-            let next = match current_owned.as_ref() {
-                Some(dir) => temp.create_tracked_subdir(dir, seg, &step_display)?,
-                None => temp.create_tracked_subdir(dest, seg, &step_display)?,
-            };
-            current_owned = Some(next);
-        }
-        let parent_dir = current_owned.as_ref().unwrap_or(dest);
-        let out_display = step_display.join(file_name);
-        let out_file =
-            temp.create_tracked_file_exclusive(parent_dir, file_name, false, 0o644, &out_display)?;
-        let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, out_file);
         let mut limited = (&mut entry).take(expected + 1);
         let mut written = 0u64;
+        let mut hasher = Sha256::new();
         loop {
             let read = limited
                 .read(&mut buf)
@@ -2662,55 +858,147 @@ fn extract_zip_reader_to_verified_dir<R: Read + Seek>(
             if written > expected {
                 return Err(format!("ZIP 解压体积与声明不一致: {name}"));
             }
-            writer
-                .write_all(&buf[..read])
-                .map_err(|e| format!("写入解压项 {name} 失败: {e}"))?;
+            hasher.update(&buf[..read]);
         }
-        let out_file = writer
-            .into_inner()
-            .map_err(|e| format!("刷新解压项 {name} 失败: {}", e.error()))?;
         if written != expected {
             return Err(format!("ZIP 解压体积与声明不一致: {name}"));
         }
-        #[cfg(unix)]
-        if mode & 0o111 != 0 {
-            use std::os::unix::fs::PermissionsExt;
-            out_file
-                .set_permissions(fs::Permissions::from_mode(0o755))
-                .map_err(|e| format!("保留 ZIP 脚本执行权限失败: {e}"))?;
-        }
-        #[cfg(not(unix))]
-        let _ = out_file;
-        extracted.push(normalized);
+        let executable = cfg!(unix) && (mode & 0o111 != 0);
+        raw_files.insert(
+            normalized,
+            ScannedZipEntry {
+                zip_index: index,
+                size: expected,
+                executable,
+                sha256: hasher.finalize().into(),
+            },
+        );
     }
-    temp.flush_ledger();
-    Ok(extracted)
+
+    let files: BTreeMap<String, ScannedZipEntry> = if strip_single_wrapper {
+        let first = raw_files
+            .keys()
+            .next()
+            .and_then(|path| path.split_once('/'))
+            .map(|(prefix, _)| prefix.to_string());
+        if let Some(prefix) = first.filter(|prefix| {
+            let with_slash = format!("{prefix}/");
+            raw_files.keys().all(|path| path.starts_with(&with_slash))
+        }) {
+            let with_slash = format!("{prefix}/");
+            raw_files
+                .into_iter()
+                .filter_map(|(path, meta)| {
+                    path.strip_prefix(&with_slash)
+                        .map(|stripped| (stripped.to_string(), meta))
+                })
+                .collect()
+        } else {
+            raw_files
+        }
+    } else {
+        raw_files
+    };
+
+    let mut roots = Vec::new();
+    for path in files.keys() {
+        let root = if path == "SKILL.md" {
+            ""
+        } else if let Some(root) = path.strip_suffix("/SKILL.md") {
+            root
+        } else {
+            continue;
+        };
+        if root.is_empty() || root.split('/').count() <= max_depth {
+            roots.push(root.to_string());
+        }
+    }
+    if roots.is_empty() {
+        return Err("未找到包含 SKILL.md 的技能目录".to_string());
+    }
+    if roots.len() > 200 {
+        return Err("单次最多导入 200 个技能".to_string());
+    }
+
+    let handle = Arc::new(ArchiveHandle {
+        archive: Mutex::new(archive),
+    });
+    let mut result = Vec::new();
+    for root in &roots {
+        let prefix = if root.is_empty() {
+            String::new()
+        } else {
+            format!("{root}/")
+        };
+        let nested: Vec<_> = roots
+            .iter()
+            .filter(|other| *other != root && other.starts_with(&prefix))
+            .map(|other| format!("{other}/"))
+            .collect();
+        let subset: BTreeMap<String, LocalFileEntry> = files
+            .iter()
+            .filter_map(|(path, scanned)| {
+                if nested.iter().any(|nested_prefix| path.starts_with(nested_prefix)) {
+                    return None;
+                }
+                path.strip_prefix(&prefix).map(|relative| {
+                    let entry = LocalFileEntry {
+                        source: FileSource::Archive {
+                            handle: Arc::clone(&handle),
+                            zip_index: scanned.zip_index,
+                            expected_sha256: scanned.sha256,
+                        },
+                        display: PathBuf::from(relative),
+                        size: scanned.size,
+                        executable: scanned.executable,
+                        meta_stamp: scanned.sha256,
+                    };
+                    (relative.to_string(), entry)
+                })
+            })
+            .collect();
+        result.push((
+            root.clone(),
+            build_tree_from_entries(PathBuf::from(root), true, subset),
+        ));
+    }
+    Ok(result)
 }
 
 fn hash_tree_streaming(tree: &LocalSkillTree) -> Result<String, String> {
     let mut outer = Sha256::new();
     let mut buf = vec![0u8; STREAM_BUF_SIZE];
     for (path, entry) in &tree.files {
-        let mut file = tree.open_file(path, entry)?;
-        let mut inner = Sha256::new();
-        loop {
-            let read = file
-                .read(&mut buf)
-                .map_err(|e| format!("读取技能文件 {} 失败: {e}", entry.source.display()))?;
-            if read == 0 {
-                break;
+        let inner_hash: [u8; 32] = match &entry.source {
+            FileSource::Disk(source_path) => {
+                let mut file = fs::File::open(source_path).map_err(|e| {
+                    format!("读取技能文件 {} 失败: {e}", source_path.display())
+                })?;
+                let mut inner = Sha256::new();
+                loop {
+                    let read = file.read(&mut buf).map_err(|e| {
+                        format!("读取技能文件 {} 失败: {e}", source_path.display())
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    inner.update(&buf[..read]);
+                }
+                inner.finalize().into()
             }
-            inner.update(&buf[..read]);
-        }
+            FileSource::Archive {
+                expected_sha256, ..
+            } => *expected_sha256,
+        };
         outer.update((path.len() as u64).to_le_bytes());
         outer.update(path.as_bytes());
-        outer.update(inner.finalize());
+        outer.update(inner_hash);
     }
     Ok(hex::encode(outer.finalize()))
 }
 
 fn hash_tree_cached(tree: &LocalSkillTree, force_rehash: bool) -> Result<String, String> {
-    if tree.verified_root.is_some() {
+    if tree.is_archive {
         return hash_tree_streaming(tree);
     }
     if !force_rehash && tree.total_bytes >= HASH_CACHE_MIN_BYTES {
@@ -2740,178 +1028,6 @@ fn hash_tree_cached(tree: &LocalSkillTree, force_rehash: bool) -> Result<String,
         );
     }
     Ok(computed)
-}
-
-struct VerifiedScanCtx<'a> {
-    ledger: &'a OwnedTreeLedger,
-    files: BTreeMap<String, (LocalFileEntry, fs::Metadata)>,
-    total: u64,
-    max_bytes: u64,
-}
-
-fn collect_verified_tree(
-    dir: &VerifiedDir,
-    display_dir: &Path,
-    prefix: &str,
-    depth: usize,
-    ctx: &mut VerifiedScanCtx<'_>,
-) -> Result<(), String> {
-    if depth > MAX_DEPTH {
-        return Err("技能目录嵌套过深".to_string());
-    }
-    let dir_id = dir.identity()?;
-    let mut names = dir.list_entry_names();
-    names.sort();
-    for name in names {
-        if skipped(&name) {
-            continue;
-        }
-        validate_path_segment(&name)?;
-        let relative = if prefix.is_empty() {
-            name.clone()
-        } else {
-            format!("{prefix}/{name}")
-        };
-        let entry_display = display_dir.join(&name);
-        if let Some(expected_sub_id) = ctx.ledger.expected_dir(dir_id, &name) {
-            let sub = dir
-                .open_child_dir(&name, &entry_display)?
-                .ok_or_else(|| format!("读取技能目录 {} 失败: 条目不存在", entry_display.display()))?;
-            if sub.identity()? != expected_sub_id {
-                return Err(format!(
-                    "检测到临时目录 {} 被替换，已中止操作",
-                    entry_display.display()
-                ));
-            }
-            collect_verified_tree(&sub, &entry_display, &relative, depth + 1, ctx)?;
-            continue;
-        }
-        let Some(expected_file_id) = ctx.ledger.expected_file(dir_id, &name) else {
-            return Err(format!("临时解压目录包含未记录的条目: {relative}"));
-        };
-        let file = dir
-            .open_regular_read(&name)
-            .map_err(|_| format!("技能包含不支持的文件类型或链接: {relative}"))?
-            .ok_or_else(|| {
-                format!("读取技能文件 {} 失败: 条目不存在", entry_display.display())
-            })?;
-        if verified_fs::file_identity(&file)? != expected_file_id {
-            return Err(format!(
-                "检测到临时文件 {} 被替换，已中止操作",
-                entry_display.display()
-            ));
-        }
-        let metadata = file
-            .metadata()
-            .map_err(|e| format!("读取技能文件属性失败: {e}"))?;
-        if is_link(&metadata) || !metadata.is_file() {
-            return Err(format!("技能包含不支持的文件类型或链接: {relative}"));
-        }
-        let size = metadata.len();
-        if ctx.files.len() >= MAX_FILES || size > ctx.max_bytes.saturating_sub(ctx.total) {
-            return Err(format!(
-                "技能超过 {} MiB 或文件数量上限",
-                ctx.max_bytes / (1024 * 1024)
-            ));
-        }
-        ctx.total += size;
-        #[cfg(unix)]
-        let executable = {
-            use std::os::unix::fs::PermissionsExt;
-            metadata.permissions().mode() & 0o111 != 0
-        };
-        #[cfg(not(unix))]
-        let executable = false;
-        let meta_stamp = compute_file_meta_stamp(&relative, &metadata);
-        ctx.files.insert(
-            relative,
-            (
-                LocalFileEntry {
-                    source: entry_display,
-                    size,
-                    executable,
-                    meta_stamp,
-                },
-                metadata,
-            ),
-        );
-    }
-    Ok(())
-}
-
-fn scan_archive_trees_in_verified_dir(
-    root_dir: Arc<VerifiedDir>,
-    root_display: &Path,
-    ledger: &OwnedTreeLedger,
-    max_depth: usize,
-    max_bytes: u64,
-) -> Result<Vec<(String, LocalSkillTree)>, String> {
-    let mut ctx = VerifiedScanCtx {
-        ledger,
-        files: BTreeMap::new(),
-        total: 0,
-        max_bytes,
-    };
-    collect_verified_tree(&root_dir, root_display, "", 0, &mut ctx)?;
-    let files = ctx.files;
-    let mut roots = Vec::new();
-    for path in files.keys() {
-        let root = if path == "SKILL.md" {
-            ""
-        } else if let Some(root) = path.strip_suffix("/SKILL.md") {
-            root
-        } else {
-            continue;
-        };
-        if root.is_empty() || root.split('/').count() <= max_depth {
-            roots.push(root.to_string());
-        }
-    }
-    if roots.is_empty() {
-        return Err("未找到包含 SKILL.md 的技能目录".to_string());
-    }
-    if roots.len() > 200 {
-        return Err("单次最多导入 200 个技能".to_string());
-    }
-    let mut result = Vec::new();
-    for root in &roots {
-        let prefix = if root.is_empty() {
-            String::new()
-        } else {
-            format!("{root}/")
-        };
-        let nested: Vec<_> = roots
-            .iter()
-            .filter(|other| *other != root && other.starts_with(&prefix))
-            .map(|other| format!("{other}/"))
-            .collect();
-        let subset: BTreeMap<String, LocalFileEntry> = files
-            .iter()
-            .filter_map(|(path, (file, meta))| {
-                if nested.iter().any(|nested_prefix| path.starts_with(nested_prefix)) {
-                    return None;
-                }
-                path.strip_prefix(&prefix).map(|relative| {
-                    let mut entry = file.clone();
-                    if !prefix.is_empty() {
-                        entry.meta_stamp = compute_file_meta_stamp(relative, meta);
-                    }
-                    (relative.to_string(), entry)
-                })
-            })
-            .collect();
-        let (sub_root_display, sub_verified) = if root.is_empty() {
-            (root_display.to_path_buf(), Arc::clone(&root_dir))
-        } else {
-            let sub_dir = root_dir.open_relative_tracked_child_dir(root, root_display, ledger)?;
-            (root_display.join(root), Arc::new(sub_dir))
-        };
-        result.push((
-            root.clone(),
-            build_tree_from_entries(sub_root_display, Some(sub_verified), subset),
-        ));
-    }
-    Ok(result)
 }
 
 fn remove_path(path: &Path) -> Result<(), String> {
@@ -3124,28 +1240,77 @@ fn write_tree_streaming(
             fs::create_dir_all(parent)
                 .map_err(|e| format!("创建技能子目录 {} 失败: {e}", parent.display()))?;
         }
-        let src = tree.open_file(relative, entry)?;
         let dst = fs::File::create(&target)
             .map_err(|e| format!("创建技能文件 {} 失败: {e}", target.display()))?;
         let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, dst);
-        let mut limited = src.take(max_bytes.saturating_sub(copied_total) + 1);
-        loop {
-            let read = limited
-                .read(&mut buf)
-                .map_err(|e| format!("读取技能文件 {} 失败: {e}", entry.source.display()))?;
-            if read == 0 {
-                break;
+        match &entry.source {
+            FileSource::Disk(source_path) => {
+                let src = fs::File::open(source_path).map_err(|e| {
+                    format!("读取技能文件 {} 失败: {e}", source_path.display())
+                })?;
+                let mut limited = src.take(max_bytes.saturating_sub(copied_total) + 1);
+                loop {
+                    let read = limited.read(&mut buf).map_err(|e| {
+                        format!("读取技能文件 {} 失败: {e}", source_path.display())
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    copied_total += read as u64;
+                    if copied_total > max_bytes {
+                        return Err(format!(
+                            "技能超过 {} MiB 体积上限",
+                            max_bytes / (1024 * 1024)
+                        ));
+                    }
+                    writer
+                        .write_all(&buf[..read])
+                        .map_err(|e| format!("写入技能文件 {} 失败: {e}", target.display()))?;
+                }
             }
-            copied_total += read as u64;
-            if copied_total > max_bytes {
-                return Err(format!(
-                    "技能超过 {} MiB 体积上限",
-                    max_bytes / (1024 * 1024)
-                ));
+            FileSource::Archive {
+                handle,
+                zip_index,
+                expected_sha256,
+            } => {
+                let mut archive = handle
+                    .archive
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let zip_entry = archive.by_index(*zip_index).map_err(|e| {
+                    format!("读取归档文件 {} 失败: {e}", entry.display.display())
+                })?;
+                let mut limited = zip_entry.take(entry.size + 1);
+                let mut entry_written = 0u64;
+                let mut verify_hash = Sha256::new();
+                loop {
+                    let read = limited.read(&mut buf).map_err(|e| {
+                        format!("读取归档文件 {} 失败: {e}", entry.display.display())
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    entry_written += read as u64;
+                    copied_total += read as u64;
+                    if entry_written > entry.size {
+                        return Err("归档内容校验失败，源文件可能已被修改".to_string());
+                    }
+                    if copied_total > max_bytes {
+                        return Err(format!(
+                            "技能超过 {} MiB 体积上限",
+                            max_bytes / (1024 * 1024)
+                        ));
+                    }
+                    verify_hash.update(&buf[..read]);
+                    writer
+                        .write_all(&buf[..read])
+                        .map_err(|e| format!("写入技能文件 {} 失败: {e}", target.display()))?;
+                }
+                let actual_sha: [u8; 32] = verify_hash.finalize().into();
+                if entry_written != entry.size || actual_sha != *expected_sha256 {
+                    return Err("归档内容校验失败，源文件可能已被修改".to_string());
+                }
             }
-            writer
-                .write_all(&buf[..read])
-                .map_err(|e| format!("写入技能文件 {} 失败: {e}", target.display()))?;
         }
         writer
             .flush()
@@ -3230,7 +1395,7 @@ fn scan_adopt(
     store: &mut SkillsStore,
     force_rehash: bool,
 ) -> Result<Vec<String>, String> {
-    cleanup_stale_temp_artifacts(paths);
+    evict_expired_staged_uploads();
     let known: BTreeSet<_> = store
         .skills
         .iter()
@@ -3303,8 +1468,7 @@ fn scan_adopt(
                         return Err(format!("主副本不能是外部链接: {id}"));
                     }
                     let tree = scan_local_tree(&entry_path, MAX_LOCAL_SKILL_BYTES)?;
-                    let skill_md = &tree.files["SKILL.md"].source;
-                    let frontmatter = read_frontmatter_file(skill_md, &id)?;
+                    let frontmatter = read_frontmatter_in_tree(&tree, &id)?;
                     let installed_hash = hash_tree_cached(&tree, force_rehash)?;
                     let record = SkillRecord {
                         id: id.clone(),
@@ -3722,10 +1886,7 @@ pub fn stage_skill_zip_chunk_for_paths(
     upload_id: Option<&str>,
     chunk_base64: &str,
 ) -> Result<String, String> {
-    let _guard = lock_store()?;
-    let uploads_dir = temp_uploads_dir(paths);
-    ensure_plain_ancestors(paths, &uploads_dir)?;
-    cleanup_stale_temp_artifacts(paths);
+    let now = Instant::now();
     let max_encoded = (MAX_UPLOAD_CHUNK_BYTES.div_ceil(3)) * 4 + 4;
     if chunk_base64.len() > max_encoded {
         return Err("单次分片超过 8 MiB 上限".to_string());
@@ -3733,40 +1894,107 @@ pub fn stage_skill_zip_chunk_for_paths(
     let chunk = base64::engine::general_purpose::STANDARD
         .decode(chunk_base64)
         .map_err(|e| format!("ZIP 分片 Base64 无效: {e}"))?;
-    let mut uploads_verified = VerifiedDir::open_or_create(paths, &uploads_dir)?;
-    let (id, create_new) = match upload_id.map(str::trim).filter(|s| !s.is_empty()) {
+    let switch_dir = paths.switch_dir();
+    let mut guard = STAGED_UPLOADS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let map = guard.get_or_insert_with(BTreeMap::new);
+    map.retain(|_, upload| now.saturating_duration_since(upload.updated_at) <= STALE_TEMP_TTL);
+
+    match upload_id.map(str::trim).filter(|s| !s.is_empty()) {
         Some(existing) => {
             validate_identifier(existing)?;
-            (existing.to_string(), false)
+            let Some(upload) = map.get_mut(existing) else {
+                return Err("分片上传会话不存在或已过期".to_string());
+            };
+            if upload.switch_dir != switch_dir {
+                return Err("分片上传会话不存在或已过期".to_string());
+            }
+            if chunk.len() as u64 > MAX_ARCHIVE_BYTES.saturating_sub(upload.size) {
+                map.remove(existing);
+                return Err("ZIP 文件超过 200 MiB 上限".to_string());
+            }
+            if let Err(e) = upload.file.write_all(&chunk).and_then(|()| upload.file.flush()) {
+                map.remove(existing);
+                return Err(format!("保存分片临时文件失败: {e}"));
+            }
+            upload.size += chunk.len() as u64;
+            upload.updated_at = now;
+            Ok(existing.to_string())
         }
-        None => (
-            format!("zip-{}-{:016x}", std::process::id(), rand::random::<u64>()),
-            true,
-        ),
-    };
-    let file_name = format!("{id}.zip");
-    let mut file = uploads_verified.open_regular_append(&file_name, create_new)?;
-    let existing_len = file.metadata().map_or(0, |meta| meta.len());
-    if chunk.len() as u64 > MAX_ARCHIVE_BYTES.saturating_sub(existing_len) {
-        drop(file);
-        let _ = uploads_verified.unlink_regular_file(&file_name);
-        uploads_verified.try_remove_self_if_empty();
-        return Err("ZIP 文件超过 200 MiB 上限".to_string());
+        None => {
+            if chunk.len() as u64 > MAX_ARCHIVE_BYTES {
+                return Err("ZIP 文件超过 200 MiB 上限".to_string());
+            }
+            if map.len() >= MAX_STAGED_UPLOADS {
+                return Err("同时进行中的分片上传过多，请稍后重试".to_string());
+            }
+            let id = format!("zip-{}-{:016x}", std::process::id(), rand::random::<u64>());
+            let mut file = create_anonymous_temp_file()?;
+            file.write_all(&chunk)
+                .and_then(|()| file.flush())
+                .map_err(|e| format!("保存分片临时文件失败: {e}"))?;
+            map.insert(
+                id.clone(),
+                StagedUpload {
+                    switch_dir,
+                    file,
+                    size: chunk.len() as u64,
+                    updated_at: now,
+                },
+            );
+            Ok(id)
+        }
     }
-    file.write_all(&chunk)
-        .and_then(|()| file.flush())
-        .map_err(|e| format!("保存分片临时文件失败: {e}"))?;
-    Ok(id)
 }
 
 pub fn discard_skill_zip_upload_for_paths(paths: &AppPaths, upload_id: &str) -> Result<(), String> {
-    let _guard = lock_store()?;
     let trimmed = upload_id.trim();
     if trimmed.is_empty() {
         return Ok(());
     }
-    let _cleanup = StagedUploadCleanup::open(paths, trimmed)?;
+    validate_identifier(trimmed)?;
+    let switch_dir = paths.switch_dir();
+    let mut guard = STAGED_UPLOADS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(map) = guard.as_mut() {
+        if map
+            .get(trimmed)
+            .is_some_and(|upload| upload.switch_dir == switch_dir)
+        {
+            map.remove(trimmed);
+        }
+    }
     Ok(())
+}
+
+fn take_staged_upload(paths: &AppPaths, upload_id: &str) -> Result<(fs::File, u64), String> {
+    validate_identifier(upload_id)?;
+    let switch_dir = paths.switch_dir();
+    let now = Instant::now();
+    let mut guard = STAGED_UPLOADS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(map) = guard.as_mut() else {
+        return Err("分片上传文件不存在或已过期".to_string());
+    };
+    map.retain(|_, upload| now.saturating_duration_since(upload.updated_at) <= STALE_TEMP_TTL);
+    if map
+        .get(upload_id)
+        .is_none_or(|upload| upload.switch_dir != switch_dir)
+    {
+        return Err("分片上传文件不存在或已过期".to_string());
+    }
+    let mut upload = map
+        .remove(upload_id)
+        .ok_or_else(|| "分片上传文件不存在或已过期".to_string())?;
+    upload
+        .file
+        .flush()
+        .and_then(|()| upload.file.rewind())
+        .map_err(|e| format!("读取分片 ZIP 失败: {e}"))?;
+    Ok((upload.file, upload.size))
 }
 
 pub fn import_local_skill_for_paths(
@@ -3782,7 +2010,6 @@ pub fn import_local_skill_for_paths(
     let base64_opt = input.zip_base64.filter(|encoded| !encoded.trim().is_empty());
     let upload_opt = input.upload_id.filter(|id| !id.trim().is_empty());
 
-    let mut temp_extract: Option<TempExtractDir> = None;
     let (incoming, max_bytes) = match (path_opt, base64_opt, upload_opt) {
         (Some(path), None, None) => {
             let path = PathBuf::from(path.trim());
@@ -3800,14 +2027,15 @@ pub fn import_local_skill_for_paths(
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
             {
-                let meta = fs::metadata(&path).map_err(|e| format!("读取 ZIP 失败: {e}"))?;
+                let file = fs::File::open(&path).map_err(|e| format!("打开 ZIP 失败: {e}"))?;
+                let meta = file.metadata().map_err(|e| format!("读取 ZIP 失败: {e}"))?;
+                if !meta.is_file() {
+                    return Err("请选择包含 SKILL.md 的目录或 .zip 文件".to_string());
+                }
                 if meta.len() > MAX_ARCHIVE_BYTES {
                     return Err("ZIP 文件超过 200 MiB 上限".to_string());
                 }
-                let file = fs::File::open(&path).map_err(|e| format!("打开 ZIP 失败: {e}"))?;
-                let mut temp = TempExtractDir::new(paths)?;
-                let records = extract_local_archive_records(file, &mut temp)?;
-                temp_extract = Some(temp);
+                let records = extract_local_archive_records(ArchiveBacking::File(file))?;
                 (records, MAX_ARCHIVE_BYTES)
             } else {
                 return Err("请选择包含 SKILL.md 的目录或 .zip 文件".to_string());
@@ -3823,58 +2051,30 @@ pub fn import_local_skill_for_paths(
             if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
                 return Err("ZIP 文件超过 200 MiB 上限".to_string());
             }
-            let mut temp = TempExtractDir::new(paths)?;
-            let records = extract_local_archive_records(Cursor::new(bytes), &mut temp)?;
-            temp_extract = Some(temp);
+            let records =
+                extract_local_archive_records(ArchiveBacking::Bytes(Cursor::new(bytes)))?;
             (records, MAX_ARCHIVE_BYTES)
         }
         (None, None, Some(upload_id)) => {
             let trimmed = upload_id.trim();
-            let cleanup = StagedUploadCleanup::open(paths, trimmed)?
-                .ok_or_else(|| "分片上传文件不存在或已过期".to_string())?;
-            let file = cleanup
-                .dir
-                .open_regular_read(&cleanup.file_name)?
-                .ok_or_else(|| "分片上传文件不存在或已过期".to_string())?;
-            let meta = file
-                .metadata()
-                .map_err(|e| format!("读取分片 ZIP 失败: {e}"))?;
-            if meta.len() > MAX_ARCHIVE_BYTES {
+            let (file, size) = take_staged_upload(paths, trimmed)?;
+            if size > MAX_ARCHIVE_BYTES {
                 return Err("ZIP 文件超过 200 MiB 上限".to_string());
             }
-            let mut temp = TempExtractDir::new(paths)?;
-            let records = extract_local_archive_records(file, &mut temp)?;
-            temp_extract = Some(temp);
+            let records = extract_local_archive_records(ArchiveBacking::File(file))?;
             (records, MAX_ARCHIVE_BYTES)
         }
         _ => return Err("请只提供一个本地路径或 ZIP 文件".to_string()),
     };
 
     install_batch(paths, &mut store, incoming, &targets, max_bytes)?;
-    drop(temp_extract);
     snapshot(paths, &store, Vec::new(), false)
 }
 
-fn extract_local_archive_records<R: Read + Seek>(
-    reader: R,
-    temp: &mut TempExtractDir,
+fn extract_local_archive_records(
+    backing: ArchiveBacking,
 ) -> Result<Vec<(SkillRecord, LocalSkillTree)>, String> {
-    let extracted_path = temp.path.join("extracted");
-    let extracted_dir = Arc::new(temp.create_root_subdir_exclusive("extracted", &extracted_path)?);
-    extract_zip_reader_to_verified_dir(
-        reader,
-        temp,
-        &extracted_dir,
-        &extracted_path,
-        MAX_ARCHIVE_BYTES,
-    )?;
-    scan_archive_trees_in_verified_dir(
-        extracted_dir,
-        &extracted_path,
-        &temp.ledger,
-        2,
-        MAX_ARCHIVE_BYTES,
-    )?
+    scan_zip_archive_trees(backing, false, 2, MAX_ARCHIVE_BYTES)?
         .into_iter()
         .map(|(root, tree)| {
             let id = if root.is_empty() {
@@ -3986,7 +2186,6 @@ fn archive_url(repo: &SkillRepo, branch: &str) -> Result<reqwest::Url, String> {
 struct RepoArchive {
     skills: Vec<(String, LocalSkillTree)>,
     branch: String,
-    _temp: TempExtractDir,
 }
 
 async fn fetch_repo_archive(paths: &AppPaths, repo: &SkillRepo) -> Result<RepoArchive, String> {
@@ -4015,13 +2214,9 @@ async fn fetch_repo_archive(paths: &AppPaths, repo: &SkillRepo) -> Result<RepoAr
         return Err("仓库 ZIP 超过 200 MiB 上限".to_string());
     }
 
-    let mut temp = TempExtractDir::new(paths)?;
-    let zip_path = temp.path.join("repo.zip");
-    let extracted_path = temp.path.join("extracted");
-    let extracted_dir = temp.create_root_subdir_exclusive("extracted", &extracted_path)?;
     let mut zip_file = {
-        let zip_file = temp.create_root_file_exclusive("repo.zip", true, 0o600, &zip_path)?;
-        let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, zip_file);
+        let file = create_anonymous_temp_file()?;
+        let mut writer = BufWriter::with_capacity(STREAM_BUF_SIZE, file);
         let mut downloaded = 0u64;
         while let Some(chunk) = response
             .chunk()
@@ -4044,45 +2239,13 @@ async fn fetch_repo_archive(paths: &AppPaths, repo: &SkillRepo) -> Result<RepoAr
         .rewind()
         .map_err(|e| format!("重置临时归档游标失败: {e}"))?;
 
-    let extracted_files = extract_zip_reader_to_verified_dir(
-        zip_file,
-        &mut temp,
-        &extracted_dir,
-        &extracted_path,
-        MAX_ARCHIVE_BYTES,
-    )?;
-    let _ = temp.unlink_tracked_root_file("repo.zip");
-
-    // GitHub wraps archives in one repository directory; strip that wrapper without moving files.
-    let first = extracted_files
-        .first()
-        .and_then(|path| path.split_once('/'))
-        .map(|(prefix, _)| prefix.to_string());
-    let (repo_root_dir, repo_root_path) = if let Some(prefix) = first.filter(|prefix| {
-        extracted_files
-            .iter()
-            .all(|path| path.starts_with(&format!("{prefix}/")))
-    }) {
-        let wrapped_path = extracted_path.join(&prefix);
-        let wrapped_dir =
-            extracted_dir.open_relative_tracked_child_dir(&prefix, &extracted_path, &temp.ledger)?;
-        (wrapped_dir, wrapped_path)
-    } else {
-        (extracted_dir, extracted_path)
-    };
-
-    let skills = scan_archive_trees_in_verified_dir(
-        Arc::new(repo_root_dir),
-        &repo_root_path,
-        &temp.ledger,
+    let skills = scan_zip_archive_trees(
+        ArchiveBacking::File(zip_file),
+        true,
         MAX_DEPTH,
         MAX_ARCHIVE_BYTES,
     )?;
-    Ok(RepoArchive {
-        skills,
-        branch,
-        _temp: temp,
-    })
+    Ok(RepoArchive { skills, branch })
 }
 
 fn same_source(skill: &SkillRecord, repo: &SkillRepo, branch: &str, subdir: &str) -> bool {
@@ -4528,202 +2691,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn temp_upload_cleanup_and_staging_never_traverse_directory_links() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let paths = AppPaths::for_test(tmp.path());
-        let external = tmp.path().join("external-target");
-        write_atomic(&external.join("stale-upload.zip"), b"keep-zip", false).unwrap();
-        write_atomic(&external.join("notes.txt"), b"keep-notes", false).unwrap();
-        write_atomic(&external.join("nested/doc.md"), b"keep-nested", false).unwrap();
-
-        let ext_dir = extensions_dir(&paths);
-        fs::create_dir_all(&ext_dir).unwrap();
-        let uploads_link = temp_uploads_dir(&paths);
-        create_test_dir_link(&external, &uploads_link);
-        assert!(is_link(&fs::symlink_metadata(&uploads_link).unwrap()));
-
-        let future_now = SystemTime::now() + STALE_TEMP_TTL + Duration::from_secs(60);
-        cleanup_temp_artifacts_at(&paths, future_now);
-        let _snapshot = get_skills_hub_snapshot_for_paths(&paths).unwrap();
-
-        let err_stage = stage_skill_zip_chunk_for_paths(&paths, None, "UEsD").unwrap_err();
-        assert!(err_stage.contains("拒绝通过链接目录写入技能"), "{err_stage}");
-        let err_discard = discard_skill_zip_upload_for_paths(&paths, "stale-upload").unwrap_err();
-        assert!(
-            err_discard.contains("拒绝通过链接目录写入技能"),
-            "{err_discard}"
-        );
-        let err_import = import_local_skill_for_paths(
-            &paths,
-            ImportLocalSkillRequest {
-                upload_id: Some("stale-upload".to_string()),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        assert!(
-            err_import.contains("拒绝通过链接目录写入技能"),
-            "{err_import}"
-        );
-
-        assert_eq!(fs::read(external.join("stale-upload.zip")).unwrap(), b"keep-zip");
-        assert_eq!(fs::read(external.join("notes.txt")).unwrap(), b"keep-notes");
-        assert_eq!(
-            fs::read(external.join("nested/doc.md")).unwrap(),
-            b"keep-nested"
-        );
-
-        remove_path(&uploads_link).unwrap();
-        write_atomic(&uploads_link.join("expired.zip"), b"expired", false).unwrap();
-        write_atomic(&uploads_link.join("keep.txt"), b"keep", false).unwrap();
-        write_atomic(&uploads_link.join("dir.zip/inner.txt"), b"keep-dir", false).unwrap();
-
-        cleanup_temp_artifacts_at(&paths, future_now);
-        assert!(!uploads_link.join("expired.zip").exists());
-        assert_eq!(fs::read(uploads_link.join("keep.txt")).unwrap(), b"keep");
-        assert_eq!(
-            fs::read(uploads_link.join("dir.zip/inner.txt")).unwrap(),
-            b"keep-dir"
-        );
-    }
-
-    #[test]
-    fn upload_cleanup_and_stale_sweep_survive_post_validation_directory_swap() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let paths = AppPaths::for_test(tmp.path());
-        let uploads = temp_uploads_dir(&paths);
-        let external = tmp.path().join("external-swap-target");
-
-        // 1. StagedUploadCleanup Drop after .tmp-uploads is displaced and replaced by a directory link
-        let upload_id = stage_skill_zip_chunk_for_paths(&paths, None, "UEsD").unwrap();
-        let zip_name = format!("{upload_id}.zip");
-        write_atomic(&external.join(&zip_name), b"external-must-survive", false).unwrap();
-
-        let cleanup = StagedUploadCleanup::open(&paths, &upload_id)
-            .unwrap()
-            .unwrap();
-        let displaced = tmp.path().join("displaced-uploads-1");
-        fs::rename(&uploads, &displaced).unwrap();
-        create_test_dir_link(&external, &uploads);
-        assert!(is_link(&fs::symlink_metadata(&uploads).unwrap()));
-
-        drop(cleanup);
-
-        assert_eq!(
-            fs::read(external.join(&zip_name)).unwrap(),
-            b"external-must-survive"
-        );
-        assert!(
-            !displaced.join(&zip_name).exists(),
-            "staged file in original verified directory handle should be unlinked"
-        );
-        assert!(is_link(&fs::symlink_metadata(&uploads).unwrap()));
-
-        // 2. Stale sweep after VerifiedDir open and before unlink
-        remove_path(&uploads).unwrap();
-        write_atomic(&uploads.join("expired.zip"), b"stale-internal", false).unwrap();
-        write_atomic(
-            &external.join("expired.zip"),
-            b"external-expired-must-survive",
-            false,
-        )
-        .unwrap();
-
-        let verified_uploads = VerifiedDir::open_existing(&paths, &uploads)
-            .unwrap()
-            .unwrap();
-        let displaced_stale = tmp.path().join("displaced-uploads-2");
-        fs::rename(&uploads, &displaced_stale).unwrap();
-        create_test_dir_link(&external, &uploads);
-
-        let future_now = SystemTime::now() + STALE_TEMP_TTL + Duration::from_secs(60);
-        sweep_stale_uploads_in_verified_dir(
-            &verified_uploads,
-            vec!["expired.zip".to_string()],
-            future_now,
-        );
-        drop(verified_uploads);
-
-        assert_eq!(
-            fs::read(external.join("expired.zip")).unwrap(),
-            b"external-expired-must-survive"
-        );
-        assert!(!displaced_stale.join("expired.zip").exists());
-
-        // 3. TempExtractDir Drop after post-validation directory link swap
-        remove_path(&uploads).unwrap();
-        let mut temp_extract = TempExtractDir::new(&paths).unwrap();
-        let archive_dir_name = temp_extract.dir_name.clone();
-        let archive_path = temp_extract.path.clone();
-        {
-            let mut skill_md = temp_extract
-                .create_root_file_exclusive("SKILL.md", false, 0o644, &archive_path.join("SKILL.md"))
-                .unwrap();
-            skill_md.write_all(b"internal-temp").unwrap();
-            let nested = temp_extract
-                .create_root_subdir_exclusive("nested", &archive_path.join("nested"))
-                .unwrap();
-            let mut nested_file = temp_extract
-                .create_tracked_file_exclusive(
-                    &nested,
-                    "only_in_internal.txt",
-                    false,
-                    0o644,
-                    &archive_path.join("nested/only_in_internal.txt"),
-                )
-                .unwrap();
-            nested_file.write_all(b"internal-nested").unwrap();
-            temp_extract.flush_ledger();
-        }
-
-        let external_ext = tmp.path().join("external-extensions");
-        let external_archive = external_ext.join(&archive_dir_name);
-        write_atomic(
-            &external_archive.join("SKILL.md"),
-            b"external-archive-must-survive",
-            false,
-        )
-        .unwrap();
-
-        let ext_dir = extensions_dir(&paths);
-        let displaced_ext = tmp.path().join("displaced-extensions");
-        #[cfg(unix)]
-        {
-            fs::rename(&ext_dir, &displaced_ext).unwrap();
-            create_test_dir_link(&external_ext, &ext_dir);
-
-            drop(temp_extract);
-
-            assert_eq!(
-                fs::read(external_archive.join("SKILL.md")).unwrap(),
-                b"external-archive-must-survive"
-            );
-            assert!(!displaced_ext.join(&archive_dir_name).exists());
-        }
-        #[cfg(windows)]
-        {
-            // Holding an open handle to .tako-archive-* prevents NTFS from renaming parent extensions_dir.
-            let parent_rename_err = fs::rename(&ext_dir, &displaced_ext).unwrap_err();
-            assert_eq!(parent_rename_err.kind(), ErrorKind::PermissionDenied);
-
-            // Close the ledger handle? No: archive_path itself can still be renamed while ledger_file is open?
-            // Note: on Windows, holding an open file handle inside archive_path (.tako-archive-ledger)
-            // ALSO prevents NTFS from renaming archive_path itself! Verify that kernel protection too.
-            let displaced_archive = tmp.path().join("displaced-archive-link-swap");
-            let child_rename_err = fs::rename(&archive_path, &displaced_archive).unwrap_err();
-            assert_eq!(child_rename_err.kind(), ErrorKind::PermissionDenied);
-
-            drop(temp_extract);
-
-            assert_eq!(
-                fs::read(external_archive.join("SKILL.md")).unwrap(),
-                b"external-archive-must-survive"
-            );
-            assert!(!archive_path.exists());
-        }
-    }
-
     fn build_test_zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut cursor = Cursor::new(Vec::new());
         {
@@ -4740,398 +2707,167 @@ mod tests {
     }
 
     #[test]
-    fn archive_extraction_and_temp_cleanup_survive_child_dir_plain_replacement() {
+    fn staged_zip_uploads_use_anonymous_handles_and_never_touch_extension_links() {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = AppPaths::for_test(tmp.path());
+        let other_tmp = tempfile::TempDir::new().unwrap();
+        let other_paths = AppPaths::for_test(other_tmp.path());
+
+        let external = tmp.path().join("external-target");
+        write_atomic(&external.join("stale-upload.zip"), b"keep-zip", false).unwrap();
+        write_atomic(&external.join("notes.txt"), b"keep-notes", false).unwrap();
+        write_atomic(&external.join("nested/doc.md"), b"keep-nested", false).unwrap();
+
+        let ext_dir = extensions_dir(&paths);
+        fs::create_dir_all(&ext_dir).unwrap();
+        let uploads_link = ext_dir.join(".tmp-uploads");
+        let archive_link = ext_dir.join(".tako-archive-decoy");
+        create_test_dir_link(&external, &uploads_link);
+        create_test_dir_link(&external, &archive_link);
+        assert!(is_link(&fs::symlink_metadata(&uploads_link).unwrap()));
+        assert!(is_link(&fs::symlink_metadata(&archive_link).unwrap()));
+
         let zip_bytes = build_test_zip_bytes(&[
             (
-                "demo/SKILL.md",
-                b"---\nname: verified-demo\ndescription: extracted via handle\n---\nbody\n",
+                "anon-demo/SKILL.md",
+                b"---\nname: Anon Demo\ndescription: Streamed from anonymous temp file\n---\nbody\n",
             ),
-            ("demo/nested/data.txt", b"real-extracted-payload"),
+            ("anon-demo/assets/data.txt", b"anonymous-payload"),
         ]);
+        let mid = zip_bytes.len() / 2;
+        let c1 = base64::engine::general_purpose::STANDARD.encode(&zip_bytes[..mid]);
+        let c2 = base64::engine::general_purpose::STANDARD.encode(&zip_bytes[mid..]);
 
-        // 1. Subdirectory `extracted` replaced by a DIFFERENT plain directory after extraction and before Drop:
-        //    TempExtractDir::drop must skip the identity-mismatched `extracted` subdir, preserve all files in it,
-        //    skip untracked foreign files, and still unlink tracked sibling files (`repo.zip`).
-        let mut temp = TempExtractDir::new(&paths).unwrap();
-        let archive_path = temp.path.clone();
-        let extracted_path = archive_path.join("extracted");
-        let displaced_extracted = tmp.path().join("displaced-extracted-subdir");
-        {
-            let extracted_dir = Arc::new(
-                temp.create_root_subdir_exclusive("extracted", &extracted_path)
-                    .unwrap(),
-            );
-            let mut zip_file = temp
-                .create_root_file_exclusive("repo.zip", true, 0o600, &archive_path.join("repo.zip"))
-                .unwrap();
-            zip_file.write_all(&zip_bytes).unwrap();
-            zip_file.flush().unwrap();
-            zip_file.rewind().unwrap();
+        let _snapshot = get_skills_hub_snapshot_for_paths(&paths).unwrap();
+        let upload_id = stage_skill_zip_chunk_for_paths(&paths, None, &c1).unwrap();
 
-            let extracted_files = extract_zip_reader_to_verified_dir(
-                zip_file,
-                &mut temp,
-                &extracted_dir,
-                &extracted_path,
-                MAX_ARCHIVE_BYTES,
-            )
-            .unwrap();
-            assert_eq!(extracted_files.len(), 2);
-
-            let trees = scan_archive_trees_in_verified_dir(
-                extracted_dir,
-                &extracted_path,
-                &temp.ledger,
-                2,
-                MAX_ARCHIVE_BYTES,
-            )
-            .unwrap();
-            assert_eq!(trees.len(), 1);
-            assert_eq!(trees[0].0, "demo");
-            let fm = read_frontmatter_in_tree(&trees[0].1, "fallback").unwrap();
-            assert_eq!(fm.name, "verified-demo");
-            let hash = hash_tree_streaming(&trees[0].1).unwrap();
-            assert!(!hash.is_empty());
-        }
-
-        // Now displace `extracted` itself and put an unverified plain directory at the same name,
-        // plus drop an untracked foreign file in the root archive dir.
-        fs::rename(&extracted_path, &displaced_extracted).unwrap();
-        write_atomic(
-            &extracted_path.join("demo/SKILL.md"),
-            b"replaced-extracted-subdir-must-survive",
-            false,
-        )
-        .unwrap();
-        write_atomic(
-            &archive_path.join("untracked-foreign.txt"),
-            b"untracked-file-must-survive",
-            false,
-        )
-        .unwrap();
-
-        drop(temp);
-
-        // Tracked sibling `repo.zip` and `.tako-archive-ledger` were removed,
-        // while the replaced `extracted` subdir and untracked foreign file survived intact.
-        assert!(!archive_path.join("repo.zip").exists());
-        assert!(!archive_path.join(ARCHIVE_LEDGER_FILE).exists());
-        assert_eq!(
-            fs::read(extracted_path.join("demo/SKILL.md")).unwrap(),
-            b"replaced-extracted-subdir-must-survive"
-        );
-        assert_eq!(
-            fs::read(archive_path.join("untracked-foreign.txt")).unwrap(),
-            b"untracked-file-must-survive"
-        );
-
-        // 2. Mid-extraction subdir replacement detection:
-        //    If a tracked subdir (`demo`) is swapped with another plain dir between two writes,
-        //    create_tracked_subdir must detect the identity mismatch and abort before writing.
-        let mut temp_mid = TempExtractDir::new(&paths).unwrap();
-        let mid_extracted_path = temp_mid.path.join("extracted");
-        let mid_extracted = temp_mid
-            .create_root_subdir_exclusive("extracted", &mid_extracted_path)
-            .unwrap();
-        let demo_path = mid_extracted_path.join("demo");
-        let demo_dir = temp_mid
-            .create_tracked_subdir(&mid_extracted, "demo", &demo_path)
-            .unwrap();
-        drop(demo_dir);
-        let displaced_demo = tmp.path().join("displaced-mid-demo");
-        fs::rename(&demo_path, &displaced_demo).unwrap();
-        write_atomic(
-            &demo_path.join("victim.txt"),
-            b"mid-extraction-victim-must-survive",
-            false,
-        )
-        .unwrap();
-        let swap_err = temp_mid
-            .create_tracked_subdir(&mid_extracted, "demo", &demo_path)
+        // Cross-sandbox isolation: another AppPaths cannot append, discard, or import this upload_id.
+        let other_append = stage_skill_zip_chunk_for_paths(&other_paths, Some(&upload_id), &c2)
             .unwrap_err();
-        assert!(swap_err.contains("被替换"), "{swap_err}");
-        drop(mid_extracted);
-        drop(temp_mid);
-        assert_eq!(
-            fs::read(demo_path.join("victim.txt")).unwrap(),
-            b"mid-extraction-victim-must-survive"
-        );
+        assert!(other_append.contains("不存在或已过期"), "{other_append}");
+        discard_skill_zip_upload_for_paths(&other_paths, &upload_id).unwrap();
+        let other_import = import_local_skill_for_paths(
+            &other_paths,
+            ImportLocalSkillRequest {
+                upload_id: Some(upload_id.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(other_import.contains("不存在或已过期"), "{other_import}");
 
-        // 3. Replace root archive / extensions_dir with a link on Unix (and verify NTFS lock on Windows)
-        //    plus verify create_tracked_file_exclusive & unlink_tracked_root_file survive replacement.
-        let mut temp2 = TempExtractDir::new(&paths).unwrap();
-        let archive2_name = temp2.dir_name.clone();
-        let archive2_path = temp2.path.clone();
-        let external_ext = tmp.path().join("external-archive-link-target");
-        let external_archive2 = external_ext.join(&archive2_name);
-        write_atomic(
-            &external_archive2.join("repo.zip"),
-            b"external-repo-zip-must-survive",
-            false,
+        // Original owner completes chunked upload and imports cleanly without touching links.
+        let same_id = stage_skill_zip_chunk_for_paths(&paths, Some(&upload_id), &c2).unwrap();
+        assert_eq!(same_id, upload_id);
+        let imported = import_local_skill_for_paths(
+            &paths,
+            ImportLocalSkillRequest {
+                upload_id: Some(upload_id),
+                targets: Some(vec![ExtPlatform::Codex]),
+                ..Default::default()
+            },
         )
         .unwrap();
-        write_atomic(
-            &external_archive2.join("extracted/demo/SKILL.md"),
-            b"external-extracted-must-survive",
-            false,
-        )
-        .unwrap();
+        assert!(imported.skills.iter().any(|s| s.skill.id == "anon-demo"));
 
-        #[cfg(unix)]
-        let displaced_ext = {
-            let ext_dir = extensions_dir(&paths);
-            let displaced_ext = tmp.path().join("displaced-extensions-for-archive");
-            fs::rename(&ext_dir, &displaced_ext).unwrap();
-            create_test_dir_link(&external_ext, &ext_dir);
-            displaced_ext
-        };
+        // Staged upload TTL eviction drops expired sessions cleanly.
+        let stale_id = stage_skill_zip_chunk_for_paths(&paths, None, &c1).unwrap();
+        evict_expired_staged_uploads_at(Instant::now() + STALE_TEMP_TTL + Duration::from_secs(60));
+        let expired_err = stage_skill_zip_chunk_for_paths(&paths, Some(&stale_id), &c2).unwrap_err();
+        assert!(expired_err.contains("不存在或已过期"), "{expired_err}");
 
-        {
-            let extracted2_path = archive2_path.join("extracted");
-            let extracted_dir = temp2
-                .create_root_subdir_exclusive("extracted", &extracted2_path)
-                .unwrap();
-            let mut zip_file = temp2
-                .create_root_file_exclusive(
-                    "repo.zip",
-                    true,
-                    0o600,
-                    &archive2_path.join("repo.zip"),
-                )
-                .unwrap();
-            zip_file.write_all(&zip_bytes).unwrap();
-            zip_file.flush().unwrap();
-            zip_file.rewind().unwrap();
-
-            let extracted_files = extract_zip_reader_to_verified_dir(
-                zip_file,
-                &mut temp2,
-                &extracted_dir,
-                &extracted2_path,
-                MAX_ARCHIVE_BYTES,
-            )
-            .unwrap();
-            assert_eq!(extracted_files.len(), 2);
-            assert!(temp2.unlink_tracked_root_file("repo.zip").unwrap());
-        }
-        drop(temp2);
-
+        // External link targets and link entries remain completely untouched.
+        assert!(is_link(&fs::symlink_metadata(&uploads_link).unwrap()));
+        assert!(is_link(&fs::symlink_metadata(&archive_link).unwrap()));
+        assert_eq!(fs::read(external.join("stale-upload.zip")).unwrap(), b"keep-zip");
+        assert_eq!(fs::read(external.join("notes.txt")).unwrap(), b"keep-notes");
         assert_eq!(
-            fs::read(external_archive2.join("repo.zip")).unwrap(),
-            b"external-repo-zip-must-survive"
+            fs::read(external.join("nested/doc.md")).unwrap(),
+            b"keep-nested"
         );
-        assert_eq!(
-            fs::read(external_archive2.join("extracted/demo/SKILL.md")).unwrap(),
-            b"external-extracted-must-survive"
-        );
-        #[cfg(unix)]
-        assert!(!displaced_ext.join(&archive2_name).exists());
-        #[cfg(windows)]
-        assert!(!archive2_path.exists());
     }
 
     #[test]
-    fn stale_archive_sweep_and_handle_enumeration_survive_child_dir_plain_replacement() {
+    fn archive_import_rejects_in_place_zip_tampering_between_scan_and_write() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let paths = AppPaths::for_test(tmp.path());
-        let ext_dir = extensions_dir(&paths);
-        let future_now = SystemTime::now() + STALE_TEMP_TTL + Duration::from_secs(60);
+        let zip_path = tmp.path().join("local-skill.zip");
+        let original = build_test_zip_bytes(&[
+            (
+                "demo/SKILL.md",
+                b"---\nname: demo\ndescription: orig-v1\n---\nbody-1111\n",
+            ),
+            ("demo/data.txt", b"payload-v1"),
+        ]);
+        fs::write(&zip_path, &original).unwrap();
 
-        // 1. Crashed stale archive with valid ledger: root archive dir is displaced and replaced by
-        //    a DIFFERENT plain directory after open_child_dir and before sweep_stale_open_archive_dir.
-        let mut crashed_root = TempExtractDir::new(&paths).unwrap();
-        let stale_name = crashed_root.dir_name.clone();
-        let stale_path = crashed_root.path.clone();
-        {
-            let nested = crashed_root
-                .create_root_subdir_exclusive("nested", &stale_path.join("nested"))
+        let file = fs::File::open(&zip_path).unwrap();
+        let trees =
+            scan_zip_archive_trees(ArchiveBacking::File(file), false, 2, MAX_ARCHIVE_BYTES)
                 .unwrap();
-            let mut old_file = crashed_root
-                .create_tracked_file_exclusive(
-                    &nested,
-                    "old.txt",
-                    false,
-                    0o644,
-                    &stale_path.join("nested/old.txt"),
-                )
-                .unwrap();
-            old_file.write_all(b"old-stale-payload").unwrap();
-        }
-        crashed_root.disarm_for_test();
-
-        let ext_verified = VerifiedDir::open_existing(&paths, &ext_dir)
-            .unwrap()
-            .unwrap();
-        let opened_stale = ext_verified
-            .open_child_dir(&stale_name, &stale_path)
-            .unwrap()
-            .unwrap();
-
-        let displaced_stale = tmp.path().join("displaced-stale-child");
-        fs::rename(&stale_path, &displaced_stale).unwrap();
-        write_atomic(
-            &stale_path.join("keep/precious.txt"),
-            b"plain-replacement-must-survive",
-            false,
-        )
-        .unwrap();
-
-        assert!(sweep_stale_open_archive_dir(
-            &ext_verified,
-            &stale_name,
-            opened_stale,
-            future_now
-        ));
-
+        assert_eq!(trees.len(), 1);
+        let (_, tree) = &trees[0];
         assert_eq!(
-            fs::read(stale_path.join("keep/precious.txt")).unwrap(),
-            b"plain-replacement-must-survive"
-        );
-        assert!(!displaced_stale.join("nested/old.txt").exists());
-        assert!(!displaced_stale.join("nested").exists());
-        assert!(!displaced_stale.join(ARCHIVE_LEDGER_FILE).exists());
-
-        // 2. Crashed stale archive whose nested `extracted` subdir is replaced by a DIFFERENT plain dir:
-        //    sweep must skip the mismatched `extracted` subdir, preserve its files, and clean tracked siblings.
-        let mut crashed_sub = TempExtractDir::new(&paths).unwrap();
-        let sub_archive_name = crashed_sub.dir_name.clone();
-        let sub_archive_path = crashed_sub.path.clone();
-        let sub_extracted_path = sub_archive_path.join("extracted");
-        {
-            let mut sibling = crashed_sub
-                .create_root_file_exclusive(
-                    "repo.zip",
-                    false,
-                    0o600,
-                    &sub_archive_path.join("repo.zip"),
-                )
-                .unwrap();
-            sibling.write_all(b"stale-zip").unwrap();
-            let extracted = crashed_sub
-                .create_root_subdir_exclusive("extracted", &sub_extracted_path)
-                .unwrap();
-            let mut extracted_file = crashed_sub
-                .create_tracked_file_exclusive(
-                    &extracted,
-                    "old.txt",
-                    false,
-                    0o644,
-                    &sub_extracted_path.join("old.txt"),
-                )
-                .unwrap();
-            extracted_file.write_all(b"stale-extracted").unwrap();
-        }
-        crashed_sub.disarm_for_test();
-
-        let displaced_sub_extracted = tmp.path().join("displaced-stale-extracted");
-        fs::rename(&sub_extracted_path, &displaced_sub_extracted).unwrap();
-        write_atomic(
-            &sub_extracted_path.join("precious.txt"),
-            b"stale-replaced-extracted-must-survive",
-            false,
-        )
-        .unwrap();
-
-        let opened_sub_archive = ext_verified
-            .open_child_dir(&sub_archive_name, &sub_archive_path)
-            .unwrap()
-            .unwrap();
-        assert!(sweep_stale_open_archive_dir(
-            &ext_verified,
-            &sub_archive_name,
-            opened_sub_archive,
-            future_now
-        ));
-        assert!(!sub_archive_path.join("repo.zip").exists());
-        assert!(!sub_archive_path.join(ARCHIVE_LEDGER_FILE).exists());
-        assert_eq!(
-            fs::read(sub_extracted_path.join("precious.txt")).unwrap(),
-            b"stale-replaced-extracted-must-survive"
+            read_frontmatter_in_tree(tree, "demo").unwrap().description,
+            "orig-v1"
         );
 
-        // 3. Unowned / foreign `.tako-archive-*` without valid ledger (or with copied mismatched ledger):
-        //    sweep must refuse recursive deletion and leave every file untouched.
-        let foreign_name = ".tako-archive-foreign-unowned";
-        let foreign_path = ext_dir.join(foreign_name);
-        write_atomic(
-            &foreign_path.join("victim/secret.txt"),
-            b"foreign-archive-must-survive",
-            false,
-        )
-        .unwrap();
-        let opened_foreign = ext_verified
-            .open_child_dir(foreign_name, &foreign_path)
-            .unwrap()
-            .unwrap();
-        assert!(!sweep_stale_open_archive_dir(
-            &ext_verified,
-            foreign_name,
-            opened_foreign,
-            future_now
-        ));
-        assert_eq!(
-            fs::read(foreign_path.join("victim/secret.txt")).unwrap(),
-            b"foreign-archive-must-survive"
+        // Overwrite the backing local ZIP in place after scanning.
+        let tampered = build_test_zip_bytes(&[
+            (
+                "demo/SKILL.md",
+                b"---\nname: demo\ndescription: evil-v2\n---\nbody-2222\n",
+            ),
+            ("demo/data.txt", b"payload-v2"),
+        ]);
+        fs::write(&zip_path, &tampered).unwrap();
+
+        let fm_err = read_frontmatter_in_tree(tree, "demo").unwrap_err();
+        assert!(
+            fm_err.contains("校验失败") || fm_err.contains("读取归档中的 SKILL.md 失败"),
+            "{fm_err}"
         );
-
-        // Also test a forged ledger copied from a legitimate TempExtractDir into a different directory.
-        let donor = TempExtractDir::new(&paths).unwrap();
-        let donor_ledger_bytes = fs::read(donor.path.join(ARCHIVE_LEDGER_FILE)).unwrap();
-        drop(donor);
-        write_atomic(
-            &foreign_path.join(ARCHIVE_LEDGER_FILE),
-            &donor_ledger_bytes,
-            false,
-        )
-        .unwrap();
-        let opened_forged = ext_verified
-            .open_child_dir(foreign_name, &foreign_path)
-            .unwrap()
-            .unwrap();
-        assert!(!sweep_stale_open_archive_dir(
-            &ext_verified,
-            foreign_name,
-            opened_forged,
-            future_now
-        ));
-        assert_eq!(
-            fs::read(foreign_path.join("victim/secret.txt")).unwrap(),
-            b"foreign-archive-must-survive"
+        let stage_dir = tmp.path().join("staged-out");
+        let write_err = write_tree_streaming(&stage_dir, tree, MAX_ARCHIVE_BYTES).unwrap_err();
+        assert!(
+            write_err.contains("校验失败") || write_err.contains("读取归档文件"),
+            "{write_err}"
         );
+    }
 
-        // 4. Pure handle enumeration across displacement + plain replacement + repeated calls
-        //    with 220 long filenames (~38.7 KiB > 2 * 16 KiB Windows buffer) to exercise multi-page reads.
-        let enum_name = ".tako-archive-enum-test";
-        let enum_path = ext_dir.join(enum_name);
-        let pad = "a".repeat(40);
-        let expected_entries: BTreeSet<String> = (0..220)
-            .map(|idx| {
-                let name = format!("entry-{idx:03}-{pad}.txt");
-                write_atomic(&enum_path.join(&name), b"x", false).unwrap();
-                name
-            })
-            .collect();
+    #[test]
+    fn streaming_zip_archive_matches_disk_hash_and_strips_single_wrapper() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skill_md = b"---\nname: Alpha\ndescription: Wrapped skill\n---\n# Alpha\n";
+        let asset = b"wrapped-asset-body";
+        let zip_bytes = build_test_zip_bytes(&[
+            ("owner-repo-main/skills/alpha/SKILL.md", skill_md),
+            ("owner-repo-main/skills/alpha/sub/data.txt", asset),
+        ]);
 
-        let enum_verified = ext_verified
-            .open_child_dir(enum_name, &enum_path)
-            .unwrap()
-            .unwrap();
+        let disk_dir = tmp.path().join("disk-alpha");
+        write_atomic(&disk_dir.join("SKILL.md"), skill_md, false).unwrap();
+        write_atomic(&disk_dir.join("sub/data.txt"), asset, false).unwrap();
+        let disk_tree = scan_local_tree(&disk_dir, MAX_LOCAL_SKILL_BYTES).unwrap();
+        let disk_hash = hash_tree_streaming(&disk_tree).unwrap();
 
-        let displaced_enum = tmp.path().join("displaced-enum-child");
-        fs::rename(&enum_path, &displaced_enum).unwrap();
-        write_atomic(
-            &enum_path.join("decoy-in-replacement.txt"),
-            b"decoy",
-            false,
+        let trees = scan_zip_archive_trees(
+            ArchiveBacking::Bytes(Cursor::new(zip_bytes)),
+            true,
+            MAX_DEPTH,
+            MAX_ARCHIVE_BYTES,
         )
         .unwrap();
+        assert_eq!(trees.len(), 1);
+        assert_eq!(trees[0].0, "skills/alpha");
+        let archive_tree = &trees[0].1;
+        assert_eq!(hash_tree_streaming(archive_tree).unwrap(), disk_hash);
 
-        let first_pass: BTreeSet<String> = enum_verified.list_entry_names().into_iter().collect();
-        let second_pass: BTreeSet<String> = enum_verified.list_entry_names().into_iter().collect();
-        assert_eq!(first_pass, expected_entries);
-        assert_eq!(second_pass, expected_entries);
-        assert!(!first_pass.contains("decoy-in-replacement.txt"));
+        // Repeated streaming writes (e.g. master + multiple platforms) must succeed identically.
+        let copy1 = tmp.path().join("copy-1");
+        let copy2 = tmp.path().join("copy-2");
+        write_tree_streaming(&copy1, archive_tree, MAX_ARCHIVE_BYTES).unwrap();
+        write_tree_streaming(&copy2, archive_tree, MAX_ARCHIVE_BYTES).unwrap();
+        assert_eq!(fs::read(copy1.join("sub/data.txt")).unwrap(), asset);
+        assert_eq!(fs::read(copy2.join("sub/data.txt")).unwrap(), asset);
     }
 }
