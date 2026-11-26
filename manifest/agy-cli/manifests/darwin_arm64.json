@@ -1,6 +1,6 @@
 {
   "version": "1.5.17",
-  "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/darwin-arm/cli_mac_arm64.tar.gz",
+  "url": "https://dl.lven.asia/apps/agy-cli/darwin_arm64/1.5.17/cli_mac_arm64.tar.gz",
   "sha512": "209e6d2e938f2c2eb908d6d4ffd6a130a058b32e97aa16cf4e7e29cc0cd3a08867c6af4522bd41eb762a7e505eee418409a8887c2ce2d24d8abd66e246b6b972",
   "size": 85162736,
   "minSupportedVersion": "1.5.16",
@@ -9,5 +9,6 @@
     "1.5.17"
   ],
   "channel": "tako-managed",
-  "approvedAt": "2026-11-25T16:00:00Z"
+  "approvedAt": "2026-11-25T16:00:00Z",
+  "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/darwin-arm/cli_mac_arm64.tar.gz"
 }

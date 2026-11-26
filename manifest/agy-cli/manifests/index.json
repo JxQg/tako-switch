@@ -14,29 +14,34 @@
   ],
   "platforms": {
     "darwin_amd64": {
-      "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/darwin-x64/cli_mac_x64.tar.gz",
+      "url": "https://dl.lven.asia/apps/agy-cli/darwin_amd64/1.5.17/cli_mac_x64.tar.gz",
       "sha512": "6206eaef8296920839769db7a842f959b7d58b4751929e80f27cfb087dd90ba4896ccfec4157a4e05e3b9de51e963f4c344cd00a77c7de31c08627dbb47a6308",
-      "size": 90729669
+      "size": 90729669,
+      "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/darwin-x64/cli_mac_x64.tar.gz"
     },
     "darwin_arm64": {
-      "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/darwin-arm/cli_mac_arm64.tar.gz",
+      "url": "https://dl.lven.asia/apps/agy-cli/darwin_arm64/1.5.17/cli_mac_arm64.tar.gz",
       "sha512": "209e6d2e938f2c2eb908d6d4ffd6a130a058b32e97aa16cf4e7e29cc0cd3a08867c6af4522bd41eb762a7e505eee418409a8887c2ce2d24d8abd66e246b6b972",
-      "size": 85162736
+      "size": 85162736,
+      "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/darwin-arm/cli_mac_arm64.tar.gz"
     },
     "linux_amd64": {
-      "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/linux-x64/cli_linux_x64.tar.gz",
+      "url": "https://dl.lven.asia/apps/agy-cli/linux_amd64/1.5.17/cli_linux_x64.tar.gz",
       "sha512": "71a967aa16e0ab5d87196bcd6772130bdab55b2fd768cd24d21b1da401ff9f60280b976cad3dc14a2d646233b0eaf8caf87c490eed73044d54550cbb3d8d67d2",
-      "size": 102886235
+      "size": 102886235,
+      "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/linux-x64/cli_linux_x64.tar.gz"
     },
     "linux_arm64": {
-      "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/linux-arm/cli_linux_arm64.tar.gz",
+      "url": "https://dl.lven.asia/apps/agy-cli/linux_arm64/1.5.17/cli_linux_arm64.tar.gz",
       "sha512": "e4f086d0730b325cfd438ea90396ee78eb23a3110ef7f792824c8817b8d0432462b7b5f91b3d933fc1932a6f4ba73de505e2e96f44448c9fb2427292ead716f7",
-      "size": 93662528
+      "size": 93662528,
+      "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/linux-arm/cli_linux_arm64.tar.gz"
     },
     "windows_amd64": {
-      "url": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/windows-x64/cli_windows_x64.exe",
+      "url": "https://dl.lven.asia/apps/agy-cli/windows_amd64/1.5.17/cli_windows_x64.exe",
       "sha512": "7b468fb7b83f0dbd5be39afebc5ce71570de4d1020e248cf1d2461d338f5d0f6eb689500e0f68a36d26179be6632f74a2d96a34f37d6ef20f62b28b87d7c55b2",
-      "size": 243373976
+      "size": 243373976,
+      "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/windows-x64/cli_windows_x64.exe"
     }
   }
 }
