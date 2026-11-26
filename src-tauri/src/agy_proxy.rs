@@ -2212,6 +2212,11 @@ pub fn parse_gemini_action_path(path: &str) -> Option<(String, String)> {
     Some((model.to_string(), action.to_string()))
 }
 
+fn split_synthetic_model_id(model: &str) -> Option<(&str, &str)> {
+    let (base, effort) = model.rsplit_once('-')?;
+    (!base.is_empty() && ALLOWED_EFFORTS.contains(&effort)).then_some((base, effort))
+}
+
 pub fn resolve_synthetic_route(
     model: &str,
     routes: &HashMap<String, SyntheticRoute>,
@@ -2220,27 +2225,24 @@ pub fn resolve_synthetic_route(
     if let Some(hit) = routes.get(model) {
         return Some(hit.clone());
     }
-    for effort in ["xhigh", "medium", "high", "low", "max"] {
-        let suffix = format!("-{effort}");
-        if let Some(base) = model.strip_suffix(&suffix) {
-            if let Some(levels) = effective_effort_levels(base, pricing) {
-                if levels.iter().any(|l| l == effort) {
-                    let target_base = if base == "gemini-3.1-pro"
-                        && !pricing.descriptions.contains_key("gemini-3.1-pro")
-                    {
-                        "gemini-3.1-pro-preview"
-                    } else {
-                        base
-                    };
-                    return Some(SyntheticRoute {
-                        base_model: target_base.to_string(),
-                        effort: effort.to_string(),
-                    });
-                }
-            }
-        }
+    let (base, effort) = split_synthetic_model_id(model)?;
+    if !effective_effort_levels(base, pricing)?
+        .iter()
+        .any(|level| level == effort)
+    {
+        return None;
     }
-    None
+
+    let target_base =
+        if base == "gemini-3.1-pro" && !pricing.descriptions.contains_key("gemini-3.1-pro") {
+            "gemini-3.1-pro-preview"
+        } else {
+            base
+        };
+    Some(SyntheticRoute {
+        base_model: target_base.to_string(),
+        effort: effort.to_string(),
+    })
 }
 
 pub fn inject_thinking_effort(body_bytes: &[u8], effort: &str) -> Vec<u8> {
@@ -5074,12 +5076,15 @@ async fn handle_request(
                     let routes = state.synthetic_routes.read().await;
                     routes.get(&model).cloned()
                 };
-                let route = if let Some(hit) = cached_route {
-                    Some(hit)
-                } else {
-                    let pricing = get_pricing_cache(&state, &base_url, bypass_proxy).await;
-                    let routes = state.synthetic_routes.read().await;
-                    resolve_synthetic_route(&model, &routes, &pricing)
+                let route = match cached_route {
+                    Some(hit) => Some(hit),
+                    // Native models must not wait for an unrelated pricing fetch.
+                    None if split_synthetic_model_id(&model).is_some() => {
+                        let pricing = get_pricing_cache(&state, &base_url, bypass_proxy).await;
+                        let routes = state.synthetic_routes.read().await;
+                        resolve_synthetic_route(&model, &routes, &pricing)
+                    }
+                    None => None,
                 };
 
                 if let Some(route) = route {

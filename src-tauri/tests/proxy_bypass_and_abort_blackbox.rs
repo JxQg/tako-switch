@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::io::ErrorKind;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,14 +10,22 @@ use tako_switch_lib::config::{
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch, Notify};
 
 fn setup_sandbox() -> (TempDir, AppPaths) {
     let tmp = TempDir::new().expect("create tempdir");
     let paths = AppPaths::for_test(tmp.path());
-    assert!(paths.is_test, "blackbox tests must run with paths.is_test == true");
-    save_switch_auth(&paths, Some("cr_test_proxy_bypass_key"), Some("1"), Some("oauth"))
-        .expect("seed test auth");
+    assert!(
+        paths.is_test,
+        "blackbox tests must run with paths.is_test == true"
+    );
+    save_switch_auth(
+        &paths,
+        Some("cr_test_proxy_bypass_key"),
+        Some("1"),
+        Some("oauth"),
+    )
+    .expect("seed test auth");
     (tmp, paths)
 }
 
@@ -44,6 +53,7 @@ async fn read_chunked_or_fixed_body(
     stream: &mut TcpStream,
     headers: &str,
     mut remainder: Vec<u8>,
+    mut first_chunk: Option<oneshot::Sender<()>>,
 ) -> Result<Vec<u8>, String> {
     let lower = headers.to_ascii_lowercase();
     if lower.contains("transfer-encoding: chunked") {
@@ -97,6 +107,9 @@ async fn read_chunked_or_fixed_body(
             }
             decoded.extend_from_slice(&remainder[..chunk_len]);
             remainder.drain(..chunk_len + 2);
+            if let Some(tx) = first_chunk.take() {
+                let _ = tx.send(());
+            }
         }
     }
 
@@ -203,18 +216,25 @@ async fn gateway_honors_bypass_system_proxy_toggle_live_without_restart() {
         }
     });
 
-    // Configure process env HTTP_PROXY before gateway clients are constructed.
-    // Note: this test runs in its own integration test binary process.
+    // The other tests use direct clients and do not route through this mock proxy.
     std::env::set_var("HTTP_PROXY", format!("http://{proxy_addr}"));
     std::env::remove_var("NO_PROXY");
     std::env::remove_var("no_proxy");
 
-    // A closed loopback port fails immediately without depending on system DNS timeouts.
-    let closed_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let closed_upstream_addr = closed_upstream.local_addr().unwrap();
-    drop(closed_upstream);
+    // Keep the direct origin bound: a refused loopback connect can take seconds on Windows.
+    let direct_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let direct_upstream_addr = direct_upstream.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = direct_upstream.accept().await {
+            if read_http_headers(&mut sock).await.is_ok() {
+                let _ = sock
+                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        }
+    });
     let mut state = read_switch_state(&paths);
-    state.base_url = format!("http://{closed_upstream_addr}");
+    state.base_url = format!("http://{direct_upstream_addr}");
     assert!(state.bypass_system_proxy);
     save_switch_state(&paths, &state).unwrap();
 
@@ -237,7 +257,7 @@ async fn gateway_honors_bypass_system_proxy_toggle_live_without_restart() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp_direct.status().as_u16(), 502);
+    assert_eq!(resp_direct.status().as_u16(), 503);
     assert_eq!(
         proxy_hits.load(Ordering::SeqCst),
         0,
@@ -269,7 +289,7 @@ async fn gateway_honors_bypass_system_proxy_toggle_live_without_restart() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp_direct_again.status().as_u16(), 502);
+    assert_eq!(resp_direct_again.status().as_u16(), 503);
     assert_eq!(
         proxy_hits.load(Ordering::SeqCst),
         hits_before,
@@ -281,18 +301,18 @@ async fn gateway_honors_bypass_system_proxy_toggle_live_without_restart() {
 async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_large_body() {
     let (_tmp, paths) = setup_sandbox();
 
-    // Start mock upstream server that:
-    // - handles `/api/pricing` quickly (declaring `gemini-4-carbon` reasoning levels)
-    // - on `/echo-large`, verifies >100 KB streamed body arrives intact and responds with SSE
-    // - on `:streamGenerateContent`, signals arrival and holds response headers until client disconnects,
-    //   recording exact time until upstream TCP EOF.
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
 
-    let (hang1_arrived_tx, hang1_arrived_rx) = oneshot::channel::<usize>();
-    let (hang1_closed_tx, hang1_closed_rx) = oneshot::channel::<Duration>();
+    let pricing_started = Arc::new(Notify::new());
+    let pricing_started_upstream = pricing_started.clone();
+    let (release_pricing, pricing_released) = watch::channel(false);
+    let (hang1_streamed_tx, hang1_streamed_rx) = oneshot::channel();
+    let (hang1_arrived_tx, hang1_arrived_rx) = oneshot::channel::<Vec<u8>>();
+    let (hang1_closed_tx, hang1_closed_rx) = oneshot::channel();
     let (hang2_arrived_tx, hang2_arrived_rx) = oneshot::channel::<Value>();
-    let (hang2_closed_tx, hang2_closed_rx) = oneshot::channel::<Duration>();
+    let (hang2_closed_tx, hang2_closed_rx) = oneshot::channel();
+    let hang1_streamed = Arc::new(std::sync::Mutex::new(Some(hang1_streamed_tx)));
     let hang1_arrived = Arc::new(std::sync::Mutex::new(Some(hang1_arrived_tx)));
     let hang1_closed = Arc::new(std::sync::Mutex::new(Some(hang1_closed_tx)));
     let hang2_arrived = Arc::new(std::sync::Mutex::new(Some(hang2_arrived_tx)));
@@ -303,6 +323,9 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
 
     tokio::spawn(async move {
         while let Ok((mut sock, _)) = upstream_listener.accept().await {
+            let pricing_started = pricing_started_upstream.clone();
+            let mut pricing_released = pricing_released.clone();
+            let h1_streamed = hang1_streamed.clone();
             let h1_a = hang1_arrived.clone();
             let h1_c = hang1_closed.clone();
             let h2_a = hang2_arrived.clone();
@@ -315,7 +338,26 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
                 };
                 let req_line = head.lines().next().unwrap_or("").to_string();
 
+                if req_line.starts_with("GET /v1beta/models ") {
+                    // Leave the synthetic route unset so its request exercises the pricing fallback.
+                    let body = r#"{"models":[]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    return;
+                }
+
                 if req_line.starts_with("GET /api/pricing ") {
+                    pricing_started.notify_one();
+                    if pricing_released
+                        .wait_for(|released| *released)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                     let body = json!({
                         "data": [{
                             "model_name": "gemini-4-carbon",
@@ -333,7 +375,10 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
                 }
 
                 if req_line.starts_with("GET /codex/ping ") || req_line.starts_with("GET /ping ") {
-                    if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+                    if head
+                        .to_ascii_lowercase()
+                        .contains("transfer-encoding: chunked")
+                    {
                         get_chunked.fetch_add(1, Ordering::SeqCst);
                     }
                     let body = r#"{"pong":true}"#;
@@ -346,9 +391,29 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
                     return;
                 }
 
-                let Ok(body_bytes) = read_chunked_or_fixed_body(&mut sock, &head, rem).await else {
-                    return;
+                let first_chunk = if req_line.starts_with(
+                    "POST /v1beta/models/gemini-4-carbon:streamGenerateContent?alt=sse ",
+                ) {
+                    h1_streamed.lock().unwrap().take()
+                } else {
+                    None
                 };
+                if first_chunk.is_some() {
+                    assert!(
+                        !head.lines().any(|line| {
+                            line.split_once(':').is_some_and(|(name, _)| {
+                                name.eq_ignore_ascii_case("content-length")
+                            })
+                        }),
+                        "chunked native upload must not include Content-Length"
+                    );
+                }
+
+                let body_bytes = read_chunked_or_fixed_body(&mut sock, &head, rem, first_chunk)
+                    .await
+                    .unwrap_or_else(|err| {
+                        panic!("cannot read upstream body for {req_line}: {err}")
+                    });
 
                 if req_line.starts_with("POST /v1/responses ")
                     || req_line.contains("/codex/v1/responses")
@@ -372,25 +437,33 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
                     .pointer("/generationConfig/thinkingConfig/thinkingLevel")
                     .is_some();
 
-                let received_at = Instant::now();
                 if !has_injected_effort {
                     if let Some(tx) = h1_a.lock().unwrap().take() {
-                        let _ = tx.send(body_bytes.len());
+                        let _ = tx.send(body_bytes);
                     }
                 } else if let Some(tx) = h2_a.lock().unwrap().take() {
                     let _ = tx.send(body_json);
                 }
 
-                let mut probe = [0u8; 16];
-                let _ = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut probe)).await;
-                let elapsed = received_at.elapsed();
+                let closed = match sock.read(&mut [0u8; 1]).await {
+                    Ok(0) => Ok(()),
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        Ok(())
+                    }
+                    result => Err(format!("expected upstream EOF or reset, got {result:?}")),
+                };
 
                 if !has_injected_effort {
                     if let Some(tx) = h1_c.lock().unwrap().take() {
-                        let _ = tx.send(elapsed);
+                        let _ = tx.send(closed);
                     }
                 } else if let Some(tx) = h2_c.lock().unwrap().take() {
-                    let _ = tx.send(elapsed);
+                    let _ = tx.send(closed);
                 }
             });
         }
@@ -449,7 +522,19 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
         "streamed large body size mismatch, got: {sse_text}"
     );
 
-    // C) Case 1: Native streamed large POST (`gemini-4-carbon`, >80 KB) — client disconnects while awaiting headers.
+    // Hold the pricing fetch open while the native model streams its request.
+    let catalog_client = client.clone();
+    let catalog = tokio::spawn(async move {
+        catalog_client
+            .get(format!("http://{gw_addr}/v1beta/models"))
+            .send()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), pricing_started.notified())
+        .await
+        .expect("catalog request should start a pricing fetch");
+
+    // C) Native streamed POST: withhold the tail to detect buffering before forwarding.
     let mut raw_client1 = TcpStream::connect(gw_addr).await.unwrap();
     let body1 = json!({
         "contents": [{
@@ -463,28 +548,38 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
         body1.len()
     );
     raw_client1.write_all(req1.as_bytes()).await.unwrap();
-    raw_client1.write_all(body1.as_bytes()).await.unwrap();
+    let (prefix, tail) = body1.as_bytes().split_at(body1.len() / 2);
+    raw_client1.write_all(prefix).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), hang1_streamed_rx)
+        .await
+        .expect("native upload should start before pricing or the full request body is available")
+        .expect("native upload should deliver a chunked body frame");
+    raw_client1.write_all(tail).await.unwrap();
 
-    let arrived_len = tokio::time::timeout(Duration::from_secs(2), hang1_arrived_rx)
+    let arrived_body = tokio::time::timeout(Duration::from_secs(2), hang1_arrived_rx)
         .await
         .expect("upstream should receive streamed request body")
         .unwrap();
-    assert_eq!(arrived_len, body1.len());
+    assert!(arrived_body == body1.as_bytes(), "native body was modified");
 
     // Simulate Antigravity 60s ResponseHeaderTimeout closing the local socket.
     let disconnect_started = Instant::now();
     drop(raw_client1);
 
-    let _upstream_total = tokio::time::timeout(Duration::from_millis(600), hang1_closed_rx)
+    tokio::time::timeout(Duration::from_millis(600), hang1_closed_rx)
         .await
         .expect("upstream connection must be aborted promptly when downstream disconnects")
+        .unwrap()
         .unwrap();
     assert!(
         disconnect_started.elapsed() < Duration::from_millis(600),
         "abort took too long after downstream close"
     );
 
-    // D) Case 2: Synthetic rewritten POST (`gemini-4-carbon-high`) — client disconnects while awaiting headers.
+    release_pricing.send(true).unwrap();
+    assert_eq!(catalog.await.unwrap().unwrap().status().as_u16(), 200);
+
+    // D) Synthetic rewritten POST: client disconnects while awaiting response headers.
     let mut raw_client2 = TcpStream::connect(gw_addr).await.unwrap();
     let body2 = json!({
         "contents": [{
@@ -515,6 +610,7 @@ async fn downstream_disconnect_immediately_aborts_hanging_upstream_and_streams_l
     tokio::time::timeout(Duration::from_millis(600), hang2_closed_rx)
         .await
         .expect("rewritten synthetic upstream connection must also abort promptly on client close")
+        .unwrap()
         .unwrap();
     assert!(disconnect_started2.elapsed() < Duration::from_millis(600));
 }
