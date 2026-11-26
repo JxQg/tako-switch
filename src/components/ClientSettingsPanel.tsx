@@ -10,15 +10,17 @@ import {
   RotateCw,
   SlidersHorizontal,
 } from "lucide-react";
-import type {
-  AppId,
-  AppMode,
-  AppSnapshot,
-  AppUpdateStatus,
-  DashboardPayload,
-  InstallProgressEvent,
-  SettingsPatch,
-  UiPatchProgressEvent,
+import {
+  api,
+  type AppId,
+  type AppMode,
+  type AppSnapshot,
+  type AppUpdateStatus,
+  type ClientModelOption,
+  type DashboardPayload,
+  type InstallProgressEvent,
+  type SettingsPatch,
+  type UiPatchProgressEvent,
 } from "../lib/api";
 import { AppBrandIcon } from "./BrandIcons";
 import {
@@ -153,11 +155,38 @@ export function ClientSettingsPanel({
   const [claudeSubtitleDraft, setClaudeSubtitleDraft] = useState(
     dashboard.state.gatewayDisplaySubtitle ?? "Tako AI Gateway",
   );
+  const [workbuddyModels, setWorkbuddyModels] = useState<ClientModelOption[]>([]);
+  const [loadingWorkbuddyModels, setLoadingWorkbuddyModels] = useState(false);
 
   useEffect(() => {
     setDiagOpen(false);
     setClaudeAdvancedOpen(false);
   }, [app.id]);
+
+  useEffect(() => {
+    if (app.id !== "workbuddy") return;
+    let cancelled = false;
+    setLoadingWorkbuddyModels(true);
+    void api
+      .listClientModels("workbuddy", false)
+      .then((res) => {
+        if (!cancelled) setWorkbuddyModels(res.models);
+      })
+      .catch(() => {
+        // Fallback options rendered cleanly when offline or logged out.
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingWorkbuddyModels(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    app.id,
+    dashboard.account.loggedIn,
+    dashboard.state.modelFilters?.workbuddy?.mode,
+    dashboard.state.modelFilters?.workbuddy?.enabledIds.join(","),
+  ]);
 
   useEffect(() => {
     setAgyKeyDraft(dashboard.state.agyApiKey ?? "");
@@ -209,7 +238,7 @@ export function ClientSettingsPanel({
         : app.id === "antigravity"
           ? "模型按你的选择过滤后映射到 32 个自定义槽位，自动同步本地网关。"
           : app.id === "workbuddy"
-            ? "自动将 Tako 网关模型写入 ~/.workbuddy/models.json（保留你原有的自定义模型与官方连接器），在 WorkBuddy 模型选择器「自定义模型」分组中即可选用。"
+            ? "自动将 Tako 网关模型写入 ~/.workbuddy/models.json（保留原有自定义模型与官方连接器），并在 WorkBuddy 新建对话时自动默认选中 Tako 模型。"
             : "同步模式自动写入当前 Tako 账号密钥；独立模式保留应用内独立登录。";
 
   const patchInfo = getUiPatchPresentation(app);
@@ -532,6 +561,77 @@ export function ClientSettingsPanel({
               </button>
             </div>
           )}
+
+          {/* WorkBuddy-only: Default Selected Model */}
+          {app.id === "workbuddy" && (() => {
+            const fallbackDefaults: { id: string; displayName: string }[] = [
+              { id: "claude-opus-5-5", displayName: "Claude Opus 5.5" },
+              { id: "claude-sonnet-5-5", displayName: "Claude Sonnet 5.5" },
+              { id: "gpt-6.2-sol", displayName: "GPT-6.2 Sol" },
+              { id: "gpt-6.2-astra", displayName: "GPT-6.2 Astra" },
+              { id: "deepseek-v4.1-flash", displayName: "DeepSeek V4.1 Flash" },
+              { id: "swe-2", displayName: "SWE-2" },
+            ];
+            const visibleOptions = workbuddyModels
+              .filter((m) => m.visible)
+              .map((m) => ({ id: m.id, displayName: m.displayName }));
+            const options = visibleOptions.length > 0 ? visibleOptions : fallbackDefaults;
+            const currentPref = (dashboard.state.workbuddyDefaultModel ?? "").trim();
+            const hasPrefInOptions =
+              !currentPref ||
+              options.some((o) => o.id.toLowerCase() === currentPref.toLowerCase());
+            const firstOption = options[0];
+
+            return (
+              <div className="tako-setting-row flex flex-wrap items-center justify-between gap-4">
+                <div className="min-w-0 flex-1">
+                  <div className="text-[13px] font-medium text-[var(--text-primary)]">
+                    默认选中模型
+                  </div>
+                  <p className="text-[11.5px] text-[var(--text-muted)] mt-0.5 leading-snug">
+                    {app.mode === "tako"
+                      ? app.running
+                        ? "新建对话时自动选中的 Tako 模型；修改后点击上方「重启」立即生效。"
+                        : "已自动写入 WorkBuddy 默认模型，下次打开新建对话即默认选中。"
+                      : "切至 Tako 模式后，将自动在 WorkBuddy 新建对话时默认选中该模型。"}
+                  </p>
+                </div>
+                <select
+                  aria-label="WorkBuddy 默认选中模型"
+                  value={currentPref}
+                  disabled={savingInlineSetting || loadingWorkbuddyModels}
+                  onChange={(e) => {
+                    const nextVal = e.target.value;
+                    const chosen = options.find((o) => o.id === nextVal);
+                    const label = chosen
+                      ? chosen.displayName
+                      : `自动首选（${firstOption?.displayName ?? "Claude Opus 5.5"}）`;
+                    const suffix =
+                      app.mode === "tako" && app.running
+                        ? "（重启 WorkBuddy 后生效）"
+                        : "（下次打开自动选中）";
+                    void onSaveInlineSettings(
+                      { workbuddyDefaultModel: nextVal },
+                      `WorkBuddy 默认模型已设为 ${label}${suffix}`,
+                    );
+                  }}
+                  className="h-[34px] max-w-[230px] px-2.5 rounded-[9px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] cursor-pointer disabled:opacity-50 shrink-0"
+                >
+                  <option value="">
+                    {`自动首选（${firstOption?.displayName ?? "Claude Opus 5.5"}）`}
+                  </option>
+                  {!hasPrefInOptions && currentPref && (
+                    <option value={currentPref}>{currentPref}</option>
+                  )}
+                  {options.map((opt) => (
+                    <option key={opt.id} value={opt.id}>
+                      {opt.displayName}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            );
+          })()}
 
           {/* Codex-only: Preserve Official ChatGPT Login + Chinese Reply Status */}
           {app.id === "codex" && (

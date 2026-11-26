@@ -158,7 +158,7 @@ function briefClientSummary(
     parts.push(app.mode === "tako" ? "已同步当前账号密钥" : "使用独立账号登录");
   } else if (app.id === "workbuddy") {
     parts.push(
-      app.mode === "tako" ? "已接入 Tako 网关 · 自定义模型直连" : "官方原版直连",
+      app.mode === "tako" ? "已接入 Tako 网关 · 自动默认选中主力模型" : "官方原版直连",
     );
   } else {
     parts.push(app.mode === "tako" ? "免官方登录直连 Tako" : "官方原版直连");

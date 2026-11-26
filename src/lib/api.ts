@@ -132,6 +132,7 @@ export interface SwitchState {
   modelFilters?: ModelFiltersConfig;
   explicitOfficialApps?: AppId[];
   hiddenApps?: AppId[];
+  workbuddyDefaultModel?: string | null;
 }
 
 export interface InstallInfo {
@@ -373,6 +374,7 @@ export interface SettingsPatch {
   themePref?: ThemePref;
   mcp?: McpToolsConfig;
   hiddenApps?: AppId[];
+  workbuddyDefaultModel?: string;
 }
 
 export interface FrontendErrorInput {

@@ -13,12 +13,15 @@ use crate::config::{
     backup_file_once, read_backup, read_main_api_key, read_switch_state, write_atomic, AppPaths,
     ClientModelFilter, ModelFilterMode,
 };
+use base64::Engine as _;
+use rusty_leveldb::{LdbIterator, Options as LevelDbOptions, Status, StatusCode, DB};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "windows")]
 use std::path::{Component, Path};
@@ -44,6 +47,39 @@ const WORKBUDDY_MACOS_FALLBACK_BUNDLE_ID: &str = "com.tencent.workbuddy.workbudd
 pub const WORKBUDDY_LOCAL_API_KEY_PLACEHOLDER: &str = "tako-local-gateway";
 pub const WORKBUDDY_CHAT_COMPLETIONS_URL: &str =
     "http://127.0.0.1:18419/workbuddy/v1/chat/completions";
+pub const WORKBUDDY_CUSTOM_LOCAL_PREFIX: &str = "custom-local:";
+
+const CHROMIUM_LS_FILE_ORIGIN_PREFIX: &[u8] = b"_file://\x00\x01";
+const WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX: &str = "cb-newtask:model";
+const WORKBUDDY_EFFORT_BY_MODEL_KEY_PREFIX: &str = "cb-effort:by-model";
+const WORKBUDDY_THINKING_BY_MODEL_KEY_PREFIX: &str = "cb-thinking-pref:by-model";
+const WORKBUDDY_LS_BACKUP_NAME: &str = "local_storage_default_model.json";
+const WORKBUDDY_LS_PENDING_NAME: &str = "pending_default_model.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkBuddyDefaultModelSyncOutcome {
+    Applied,
+    PreservedExistingTako,
+    DeferredAppRunning,
+    LocalStorageNotInitialized,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingDefaultModelSync {
+    mode: String,
+    force: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LocalStorageModelBackup {
+    /// Map from localStorage key name (e.g. `cb-newtask:model:<uid>`) to original raw
+    /// LevelDB value bytes encoded in standard base64, or `None` if the key did not exist.
+    entries: BTreeMap<String, Option<String>>,
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkBuddyModelEntrySpec {
@@ -70,6 +106,57 @@ impl WorkBuddyAdapter {
 
     pub fn settings_json_path(paths: &AppPaths) -> PathBuf {
         paths.workbuddy_dir.join("settings.json")
+    }
+
+    /// WorkBuddy's Electron `sessionData` Chromium Local Storage LevelDB path.
+    /// Verified from WorkBuddy 5.11.3 `main/workbuddy-paths2.js`:
+    /// `getWorkbuddySessionDataDir() = join(getWorkbuddyConfigDir(), "app", "session")`
+    /// identically across macOS, Windows, and Linux.
+    pub fn local_storage_leveldb_dir(paths: &AppPaths) -> PathBuf {
+        paths
+            .workbuddy_dir
+            .join("app")
+            .join("session")
+            .join("Local Storage")
+            .join("leveldb")
+    }
+
+    fn local_storage_backup_path(paths: &AppPaths) -> PathBuf {
+        paths.backups_dir("workbuddy").join(WORKBUDDY_LS_BACKUP_NAME)
+    }
+
+    fn local_storage_pending_path(paths: &AppPaths) -> PathBuf {
+        paths.backups_dir("workbuddy").join(WORKBUDDY_LS_PENDING_NAME)
+    }
+
+    pub fn has_pending_default_model_sync(paths: &AppPaths) -> bool {
+        Self::local_storage_pending_path(paths).is_file()
+    }
+
+    pub fn resolve_default_model_spec(
+        paths: &AppPaths,
+        target_specs: &[WorkBuddyModelEntrySpec],
+    ) -> Option<WorkBuddyModelEntrySpec> {
+        if target_specs.is_empty() {
+            return None;
+        }
+        let state = read_switch_state(paths);
+        if let Some(raw_pref) = state.workbuddy_default_model.as_deref() {
+            let trimmed = raw_pref.trim();
+            let clean = trimmed
+                .strip_prefix(WORKBUDDY_CUSTOM_LOCAL_PREFIX)
+                .unwrap_or(trimmed)
+                .trim();
+            if !clean.is_empty() {
+                if let Some(found) = target_specs
+                    .iter()
+                    .find(|s| s.id.eq_ignore_ascii_case(clean))
+                {
+                    return Some(found.clone());
+                }
+            }
+        }
+        target_specs.first().cloned()
     }
 
     pub fn is_tako_managed_model(val: &Value) -> bool {
@@ -170,25 +257,8 @@ impl WorkBuddyAdapter {
         obj.insert("takoManaged".to_string(), Value::Bool(true));
 
         if spec.supports_reasoning {
-            const EFFORT_ORDER: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
-            let mut efforts: Vec<String> = Vec::new();
-            for &lvl in EFFORT_ORDER {
-                if spec
-                    .effort_levels
-                    .iter()
-                    .any(|e| e.eq_ignore_ascii_case(lvl))
-                {
-                    efforts.push(lvl.to_string());
-                }
-            }
-            if !efforts.is_empty() {
-                let default_effort = if efforts.iter().any(|e| e == "medium") {
-                    "medium".to_string()
-                } else if efforts.iter().any(|e| e == "high") {
-                    "high".to_string()
-                } else {
-                    efforts[0].clone()
-                };
+            let (efforts, default_effort) = compute_workbuddy_efforts(spec);
+            if let Some(default_effort) = default_effort {
                 // WorkBuddy's `convertInternalModelToOptions` + `dedupeInputModelOptions`
                 // defaults thinking to OFF unless `onlyReasoning: true` (matching built-in
                 // reasoning models in `acc-product-config-v3`). Setting `onlyReasoning: true`
@@ -298,6 +368,524 @@ impl WorkBuddyAdapter {
                 Ok(())
             }
         }
+    }
+
+    /// Forces both `settings.json` and Chromium Local Storage (`cb-newtask:model[:<uid>]`)
+    /// to select the currently configured default Tako model.
+    pub fn apply_default_model_preference(paths: &AppPaths) -> WorkBuddyDefaultModelSyncOutcome {
+        let target_specs = Self::resolve_target_models(paths);
+        let Some(default_spec) = Self::resolve_default_model_spec(paths, &target_specs) else {
+            return WorkBuddyDefaultModelSyncOutcome::LocalStorageNotInitialized;
+        };
+        let _ = Self::sync_default_model_in_settings(paths, Some(&default_spec.id));
+        let enabled_ids: HashSet<String> = target_specs
+            .iter()
+            .map(|s| s.id.to_ascii_lowercase())
+            .collect();
+        Self::sync_default_model_in_local_storage(paths, &default_spec, &enabled_ids, true, false)
+    }
+
+    /// Runs right after WorkBuddy exits (before restart) or before a cold launch so any
+    /// deferred default-model write (or newly created first-login Local Storage) takes effect
+    /// cleanly while LevelDB is unlocked.
+    pub fn flush_after_stop_or_before_launch(paths: &AppPaths) -> WorkBuddyDefaultModelSyncOutcome {
+        let pending = Self::read_pending_sync(paths);
+        let adapter = WorkBuddyAdapter;
+        match adapter.read_mode(paths) {
+            AppMode::Tako => {
+                let force = pending
+                    .as_ref()
+                    .is_some_and(|p| p.mode == "tako" && p.force);
+                let target_specs = Self::resolve_target_models(paths);
+                let Some(default_spec) = Self::resolve_default_model_spec(paths, &target_specs)
+                else {
+                    Self::clear_pending_sync(paths);
+                    return WorkBuddyDefaultModelSyncOutcome::LocalStorageNotInitialized;
+                };
+                let _ = Self::sync_default_model_in_settings(paths, Some(&default_spec.id));
+                let enabled_ids: HashSet<String> = target_specs
+                    .iter()
+                    .map(|s| s.id.to_ascii_lowercase())
+                    .collect();
+                Self::sync_default_model_in_local_storage(
+                    paths,
+                    &default_spec,
+                    &enabled_ids,
+                    force,
+                    true,
+                )
+            }
+            AppMode::Official => {
+                if pending.as_ref().is_some_and(|p| p.mode == "official") {
+                    Self::restore_default_model_in_local_storage(paths, true);
+                }
+                WorkBuddyDefaultModelSyncOutcome::Applied
+            }
+        }
+    }
+
+    fn read_pending_sync(paths: &AppPaths) -> Option<PendingDefaultModelSync> {
+        let raw = fs::read(Self::local_storage_pending_path(paths)).ok()?;
+        serde_json::from_slice(&raw).ok()
+    }
+
+    fn write_pending_sync(paths: &AppPaths, mode: &str, force: bool, model_id: Option<&str>) {
+        let path = Self::local_storage_pending_path(paths);
+        let payload = PendingDefaultModelSync {
+            mode: mode.to_string(),
+            force,
+            model_id: model_id.map(str::to_string),
+        };
+        if let Ok(bytes) = serde_json::to_vec_pretty(&payload) {
+            let _ = write_atomic(&path, &bytes, false);
+        }
+    }
+
+    fn clear_pending_sync(paths: &AppPaths) {
+        let _ = fs::remove_file(Self::local_storage_pending_path(paths));
+    }
+
+    fn open_local_storage_db(
+        paths: &AppPaths,
+        retry_lock: bool,
+    ) -> Result<Option<DB>, LevelDbOpenError> {
+        let ldb_dir = Self::local_storage_leveldb_dir(paths);
+        if !ldb_dir.join("CURRENT").is_file() {
+            return Ok(None);
+        }
+        let max_attempts = if retry_lock { 8 } else { 1 };
+        for attempt in 0..max_attempts {
+            let opts = LevelDbOptions {
+                create_if_missing: false,
+                ..LevelDbOptions::default()
+            };
+            match DB::open(&ldb_dir, opts) {
+                Ok(db) => return Ok(Some(db)),
+                Err(err) if is_leveldb_lock_contention(&err) => {
+                    if attempt + 1 < max_attempts {
+                        std::thread::sleep(Duration::from_millis(200));
+                    } else {
+                        return Err(LevelDbOpenError::Locked);
+                    }
+                }
+                Err(_) => return Err(LevelDbOpenError::Other),
+            }
+        }
+        Err(LevelDbOpenError::Locked)
+    }
+
+    fn sync_default_model_in_local_storage(
+        paths: &AppPaths,
+        spec: &WorkBuddyModelEntrySpec,
+        enabled_tako_ids: &HashSet<String>,
+        force: bool,
+        retry_lock: bool,
+    ) -> WorkBuddyDefaultModelSyncOutcome {
+        let mut db = match Self::open_local_storage_db(paths, retry_lock) {
+            Ok(Some(db)) => db,
+            Ok(None) => return WorkBuddyDefaultModelSyncOutcome::LocalStorageNotInitialized,
+            Err(LevelDbOpenError::Locked) => {
+                // Keep strongest `force` flag if an earlier deferred write requested force=true.
+                let prev_force = Self::read_pending_sync(paths)
+                    .is_some_and(|p| p.mode == "tako" && p.force);
+                Self::write_pending_sync(paths, "tako", force || prev_force, Some(&spec.id));
+                return WorkBuddyDefaultModelSyncOutcome::DeferredAppRunning;
+            }
+            Err(LevelDbOpenError::Other) => {
+                return WorkBuddyDefaultModelSyncOutcome::LocalStorageNotInitialized;
+            }
+        };
+
+        let existing_keys = collect_leveldb_keys(&mut db);
+        let uids = discover_workbuddy_uids(paths, &existing_keys);
+
+        let mut target_key_names: Vec<String> = Vec::with_capacity(uids.len() + 1);
+        target_key_names.push(WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX.to_string());
+        for uid in &uids {
+            target_key_names.push(format!("{WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX}:{uid}"));
+        }
+
+        // Back up original Chromium Local Storage values once before first Tako write so
+        // switching back to Official restores the user's pre-Tako model selection losslessly.
+        let backup_path = Self::local_storage_backup_path(paths);
+        if !backup_path.exists() {
+            let mut backup = LocalStorageModelBackup::default();
+            for key_name in &target_key_names {
+                let raw_key = encode_chromium_ls_key(key_name);
+                let orig = db
+                    .get(&raw_key)
+                    .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes));
+                backup.entries.insert(key_name.clone(), orig);
+            }
+            if let Ok(bytes) = serde_json::to_vec_pretty(&backup) {
+                let _ = write_atomic(&backup_path, &bytes, false);
+            }
+        }
+
+        let payload_json = build_newtask_model_payload(spec);
+        let encoded_payload = encode_chromium_ls_string(&payload_json);
+        let mut wrote_any = false;
+
+        for key_name in &target_key_names {
+            let raw_key = encode_chromium_ls_key(key_name);
+            if !force {
+                if let Some(cur_bytes) = db.get(&raw_key) {
+                    if is_enabled_tako_newtask_value(&cur_bytes, enabled_tako_ids) {
+                        continue;
+                    }
+                }
+            }
+            if db.put(&raw_key, &encoded_payload).is_ok() {
+                wrote_any = true;
+            }
+        }
+
+        // Gently seed thinking & effort preference caches for the selected model if absent so
+        // WorkBuddy opens with reasoning & default effort aligned immediately.
+        let full_model_id = format!("{WORKBUDDY_CUSTOM_LOCAL_PREFIX}{}", spec.id);
+        let (_, default_effort) = compute_workbuddy_efforts(spec);
+        for uid in &uids {
+            seed_json_map_entry_if_absent(
+                &mut db,
+                &format!("{WORKBUDDY_THINKING_BY_MODEL_KEY_PREFIX}:{uid}"),
+                &full_model_id,
+                Value::Bool(spec.supports_reasoning && default_effort.is_some()),
+            );
+            if let Some(ref effort) = default_effort {
+                seed_json_map_entry_if_absent(
+                    &mut db,
+                    &format!("{WORKBUDDY_EFFORT_BY_MODEL_KEY_PREFIX}:{uid}"),
+                    &full_model_id,
+                    Value::String(effort.clone()),
+                );
+            }
+        }
+
+        let _ = db.flush();
+        drop(db);
+        Self::clear_pending_sync(paths);
+
+        if wrote_any {
+            WorkBuddyDefaultModelSyncOutcome::Applied
+        } else {
+            WorkBuddyDefaultModelSyncOutcome::PreservedExistingTako
+        }
+    }
+
+    fn restore_default_model_in_local_storage(paths: &AppPaths, retry_lock: bool) {
+        let mut db = match Self::open_local_storage_db(paths, retry_lock) {
+            Ok(Some(db)) => db,
+            Ok(None) => {
+                Self::clear_pending_sync(paths);
+                return;
+            }
+            Err(LevelDbOpenError::Locked) => {
+                Self::write_pending_sync(paths, "official", true, None);
+                return;
+            }
+            Err(LevelDbOpenError::Other) => return,
+        };
+
+        let backup_path = Self::local_storage_backup_path(paths);
+        if let Ok(raw) = fs::read(&backup_path) {
+            if let Ok(backup) = serde_json::from_slice::<LocalStorageModelBackup>(&raw) {
+                for (key_name, orig_b64) in &backup.entries {
+                    let raw_key = encode_chromium_ls_key(key_name);
+                    match orig_b64 {
+                        Some(b64) => {
+                            if let Ok(orig_bytes) =
+                                base64::engine::general_purpose::STANDARD.decode(b64)
+                            {
+                                let _ = db.put(&raw_key, &orig_bytes);
+                            }
+                        }
+                        None => {
+                            let _ = db.delete(&raw_key);
+                        }
+                    }
+                }
+            }
+            let _ = fs::remove_file(&backup_path);
+        } else {
+            // No backup found: remove any `cb-newtask:model*` entries pointing to custom-local models.
+            let existing_keys = collect_leveldb_keys(&mut db);
+            for raw_key in existing_keys {
+                let Some(key_name) = decode_chromium_ls_key(&raw_key) else {
+                    continue;
+                };
+                if key_name == WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX
+                    || key_name
+                        .strip_prefix(&format!("{WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX}:"))
+                        .is_some_and(|rest| !rest.is_empty() && !rest.contains(':'))
+                {
+                    if let Some(cur_bytes) = db.get(&raw_key) {
+                        if let Some(cur_text) = decode_chromium_ls_string(&cur_bytes) {
+                            if let Ok(val) = serde_json::from_str::<Value>(&cur_text) {
+                                if val
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|id| id.starts_with(WORKBUDDY_CUSTOM_LOCAL_PREFIX))
+                                {
+                                    let _ = db.delete(&raw_key);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ = db.flush();
+        drop(db);
+        Self::clear_pending_sync(paths);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LevelDbOpenError {
+    Locked,
+    Other,
+}
+
+fn is_leveldb_lock_contention(status: &Status) -> bool {
+    if matches!(
+        status.code,
+        StatusCode::LockError | StatusCode::AlreadyExists
+    ) {
+        return true;
+    }
+    // On Windows, Chromium holds `LOCK` open exclusively (`FILE_SHARE_NONE`) or via
+    // `LockFileEx`, so `rusty-leveldb` surfaces `PermissionDenied` / `IOError` / `Errno(_)`
+    // with error text prefixed `"lock: ..."` or `"unknown lock error..."`.
+    let msg = status.err.to_ascii_lowercase();
+    msg.contains("lock")
+        || msg.contains("sharing violation")
+        || msg.contains("being used by another process")
+}
+
+fn compute_workbuddy_efforts(spec: &WorkBuddyModelEntrySpec) -> (Vec<String>, Option<String>) {
+    if !spec.supports_reasoning {
+        return (Vec::new(), None);
+    }
+    const EFFORT_ORDER: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
+    let mut efforts: Vec<String> = Vec::new();
+    for &lvl in EFFORT_ORDER {
+        if spec
+            .effort_levels
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(lvl))
+        {
+            efforts.push(lvl.to_string());
+        }
+    }
+    if efforts.is_empty() {
+        return (efforts, None);
+    }
+    let default_effort = if efforts.iter().any(|e| e == "medium") {
+        "medium".to_string()
+    } else if efforts.iter().any(|e| e == "high") {
+        "high".to_string()
+    } else {
+        efforts[0].clone()
+    };
+    (efforts, Some(default_effort))
+}
+
+fn build_newtask_model_payload(spec: &WorkBuddyModelEntrySpec) -> String {
+    let full_id = format!("{WORKBUDDY_CUSTOM_LOCAL_PREFIX}{}", spec.id);
+    let (_, default_effort) = compute_workbuddy_efforts(spec);
+    let val = if let Some(effort) = default_effort {
+        json!({
+            "id": full_id,
+            "isThinking": true,
+            "reasoningEffort": effort,
+        })
+    } else {
+        json!({
+            "id": full_id,
+            "isThinking": false,
+        })
+    };
+    serde_json::to_string(&val).unwrap_or_else(|_| {
+        format!("{{\"id\":\"{full_id}\",\"isThinking\":false}}")
+    })
+}
+
+fn encode_chromium_ls_key(key_name: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CHROMIUM_LS_FILE_ORIGIN_PREFIX.len() + key_name.len());
+    out.extend_from_slice(CHROMIUM_LS_FILE_ORIGIN_PREFIX);
+    out.extend_from_slice(key_name.as_bytes());
+    out
+}
+
+fn decode_chromium_ls_key(raw: &[u8]) -> Option<&str> {
+    let rest = raw.strip_prefix(CHROMIUM_LS_FILE_ORIGIN_PREFIX)?;
+    std::str::from_utf8(rest).ok()
+}
+
+fn decode_chromium_ls_string(raw: &[u8]) -> Option<String> {
+    let (&tag, rest) = raw.split_first()?;
+    match tag {
+        0x01 => Some(String::from_utf8_lossy(rest).into_owned()),
+        0x00 if rest.len() % 2 == 0 => {
+            let units: Vec<u16> = rest
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            String::from_utf16(&units).ok()
+        }
+        _ => None,
+    }
+}
+
+fn encode_chromium_ls_string(text: &str) -> Vec<u8> {
+    if text.is_ascii() {
+        let mut out = Vec::with_capacity(1 + text.len());
+        out.push(0x01);
+        out.extend_from_slice(text.as_bytes());
+        out
+    } else {
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        let mut out = Vec::with_capacity(1 + utf16.len() * 2);
+        out.push(0x00);
+        for u in utf16 {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out
+    }
+}
+
+fn collect_leveldb_keys(db: &mut DB) -> Vec<Vec<u8>> {
+    let Ok(mut iter) = db.new_iter() else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    while let Some((k, _)) = iter.next() {
+        keys.push(k);
+    }
+    keys
+}
+
+fn is_valid_uid_token(uid: &str) -> bool {
+    let trimmed = uid.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 128
+        && !trimmed.contains(':')
+        && !trimmed.contains('/')
+        && !trimmed.contains('\\')
+        && !trimmed.chars().any(char::is_whitespace)
+}
+
+fn discover_workbuddy_uids(paths: &AppPaths, db_keys: &[Vec<u8>]) -> Vec<String> {
+    let mut uids = BTreeSet::new();
+
+    // 1. Scan existing Chromium Local Storage keys for known user-scoped model keys.
+    for raw_key in db_keys {
+        let Some(key_name) = decode_chromium_ls_key(raw_key) else {
+            continue;
+        };
+        for prefix in [
+            WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX,
+            WORKBUDDY_EFFORT_BY_MODEL_KEY_PREFIX,
+            WORKBUDDY_THINKING_BY_MODEL_KEY_PREFIX,
+        ] {
+            if let Some(rest) = key_name.strip_prefix(&format!("{prefix}:")) {
+                if is_valid_uid_token(rest) {
+                    uids.insert(rest.to_string());
+                }
+            }
+        }
+    }
+
+    // 2. Read `~/.workbuddy/storage/skeleton/account-snapshot.json` (`primary.uid`, etc.).
+    let snapshot_path = paths
+        .workbuddy_dir
+        .join("storage")
+        .join("skeleton")
+        .join("account-snapshot.json");
+    if let Ok(raw) = fs::read_to_string(&snapshot_path) {
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&raw) {
+            if let Some(uid) = map.get("uid").and_then(Value::as_str) {
+                if is_valid_uid_token(uid) {
+                    uids.insert(uid.trim().to_string());
+                }
+            }
+            for v in map.values() {
+                if let Some(uid) = v.get("uid").and_then(Value::as_str) {
+                    if is_valid_uid_token(uid) {
+                        uids.insert(uid.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Read `~/.workbuddy/settings.json` (`claw.legacyOwnerUid`).
+    if let Ok(raw) = fs::read_to_string(WorkBuddyAdapter::settings_json_path(paths)) {
+        if let Ok(val) = serde_json::from_str::<Value>(&raw) {
+            if let Some(uid) = val
+                .get("claw")
+                .and_then(|c| c.get("legacyOwnerUid"))
+                .and_then(Value::as_str)
+            {
+                if is_valid_uid_token(uid) {
+                    uids.insert(uid.trim().to_string());
+                }
+            }
+        }
+    }
+
+    // 4. Scan `~/.workbuddy/storage/user-<uid>[-personal]` and `~/.workbuddy/user-<uid>[-personal]`.
+    for dir in [paths.workbuddy_dir.join("storage"), paths.workbuddy_dir.clone()] {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name_str) = name.to_str() else {
+                    continue;
+                };
+                if let Some(after_user) = name_str.strip_prefix("user-") {
+                    let candidate = after_user.strip_suffix("-personal").unwrap_or(after_user);
+                    if is_valid_uid_token(candidate) {
+                        uids.insert(candidate.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    uids.into_iter().collect()
+}
+
+fn is_enabled_tako_newtask_value(raw_val: &[u8], enabled_tako_ids: &HashSet<String>) -> bool {
+    let Some(text) = decode_chromium_ls_string(raw_val) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    let Some(id) = val.get("id").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(stripped) = id.strip_prefix(WORKBUDDY_CUSTOM_LOCAL_PREFIX) else {
+        return false;
+    };
+    enabled_tako_ids.contains(&stripped.to_ascii_lowercase())
+}
+
+fn seed_json_map_entry_if_absent(db: &mut DB, key_name: &str, entry_key: &str, entry_val: Value) {
+    let raw_key = encode_chromium_ls_key(key_name);
+    let mut map = db
+        .get(&raw_key)
+        .and_then(|bytes| decode_chromium_ls_string(&bytes))
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    if map.contains_key(entry_key) {
+        return;
+    }
+    map.insert(entry_key.to_string(), entry_val);
+    if let Ok(serialized) = serde_json::to_string(&Value::Object(map)) {
+        let _ = db.put(&raw_key, &encode_chromium_ls_string(&serialized));
     }
 }
 
@@ -685,6 +1273,8 @@ impl DesktopAppAdapter for WorkBuddyAdapter {
                     );
                 }
 
+                let was_official = self.read_mode(paths) == AppMode::Official;
+
                 ensure_gateway_service(paths)?;
 
                 backup_file_once(paths, "workbuddy", "models.json", &models_path)?;
@@ -736,8 +1326,15 @@ impl DesktopAppAdapter for WorkBuddyAdapter {
                     .map_err(|e| format!("序列化 {} 失败: {e}", models_path.display()))?;
                 write_atomic(&models_path, &bytes, false)?;
 
-                if let Some(first) = target_specs.first() {
-                    let _ = Self::sync_default_model_in_settings(paths, Some(&first.id));
+                if let Some(default_spec) = Self::resolve_default_model_spec(paths, &target_specs) {
+                    let _ = Self::sync_default_model_in_settings(paths, Some(&default_spec.id));
+                    let _ = Self::sync_default_model_in_local_storage(
+                        paths,
+                        &default_spec,
+                        &tako_ids,
+                        was_official,
+                        false,
+                    );
                 }
 
                 merge_tako_mcp_server(&mcp_path, paths, true)?;
@@ -781,6 +1378,7 @@ impl DesktopAppAdapter for WorkBuddyAdapter {
                 }
 
                 Self::sync_default_model_in_settings(paths, None)?;
+                Self::restore_default_model_in_local_storage(paths, false);
 
                 let mcp_absent = paths.backups_dir("workbuddy").join("mcp.json.absent");
                 if mcp_path.exists() {
@@ -835,6 +1433,26 @@ impl DesktopAppAdapter for WorkBuddyAdapter {
             notes.push(format!(
                 "已通过 models.json 注入 {tako_count} 个 Tako 网关模型（{WORKBUDDY_PROXY_BASE_URL}），在 WorkBuddy 模型选择器「自定义模型」分组可见"
             ));
+            let target_specs = Self::resolve_target_models(paths);
+            if let Some(default_spec) = Self::resolve_default_model_spec(paths, &target_specs) {
+                let state = read_switch_state(paths);
+                let pref_tag = if state.workbuddy_default_model.is_some() {
+                    "已固定"
+                } else {
+                    "自动首选"
+                };
+                if Self::has_pending_default_model_sync(paths) {
+                    notes.push(format!(
+                        "默认选中模型: {}（{pref_tag}，重启 WorkBuddy 后自动生效）",
+                        default_spec.display_name
+                    ));
+                } else {
+                    notes.push(format!(
+                        "默认选中模型: {}（{pref_tag}，新会话自动选中）",
+                        default_spec.display_name
+                    ));
+                }
+            }
             if !paths.is_test && !is_proxy_healthy(LOCAL_GATEWAY_PORT) {
                 issues.push(format!(
                     "本地网关 {LOCAL_GATEWAY_URL} 未运行，WorkBuddy 无法调用 Tako 自定义模型"
@@ -2221,5 +2839,198 @@ mod tests {
         // 3. Stale shortcut after executable deletion must NOT false-positive as installed.
         fs::remove_file(&shortcut_exe).unwrap();
         assert!(!adapter.detect_install(&paths).installed);
+    }
+
+    fn init_mock_chromium_leveldb(paths: &AppPaths, uid: &str, initial_model_json: Option<&str>) {
+        let ldb_dir = WorkBuddyAdapter::local_storage_leveldb_dir(paths);
+        fs::create_dir_all(&ldb_dir).unwrap();
+        let opts = LevelDbOptions {
+            create_if_missing: true,
+            ..LevelDbOptions::default()
+        };
+        let mut db = DB::open(&ldb_dir, opts).unwrap();
+        db.put(b"VERSION", b"1").unwrap();
+        db.put(b"META:file://", b"\x08\x01\x10\x20").unwrap();
+        if let Some(json_str) = initial_model_json {
+            let key = encode_chromium_ls_key(&format!("{WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX}:{uid}"));
+            db.put(&key, &encode_chromium_ls_string(json_str)).unwrap();
+        }
+        db.flush().unwrap();
+    }
+
+    fn read_leveldb_str(paths: &AppPaths, key_name: &str) -> Option<String> {
+        let ldb_dir = WorkBuddyAdapter::local_storage_leveldb_dir(paths);
+        let opts = LevelDbOptions {
+            create_if_missing: false,
+            ..LevelDbOptions::default()
+        };
+        let mut db = DB::open(&ldb_dir, opts).unwrap();
+        let raw = db.get(&encode_chromium_ls_key(key_name))?;
+        decode_chromium_ls_string(&raw)
+    }
+
+    #[test]
+    fn apply_tako_selects_default_model_in_chromium_local_storage_and_restores_on_official() {
+        let (_dir, paths) = test_paths();
+        save_switch_auth(&paths, Some("sk-tako-test-key"), None, Some("test")).unwrap();
+
+        let uid = "f6e9321d-a316-492b-8ff9-19fc2a37d244";
+        let orig_official_json = r#"{"id":"default-model","isThinking":false}"#;
+        init_mock_chromium_leveldb(&paths, uid, Some(orig_official_json));
+
+        // Also seed account-snapshot.json to verify UID discovery from disk too.
+        let snapshot_path = paths
+            .workbuddy_dir
+            .join("storage")
+            .join("skeleton")
+            .join("account-snapshot.json");
+        write_atomic(
+            &snapshot_path,
+            format!(r#"{{"primary":{{"uid":"{uid}"}}}}"#).as_bytes(),
+            false,
+        )
+        .unwrap();
+
+        let adapter = WorkBuddyAdapter;
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+
+        // Both UID-scoped and unscoped keys should now default to custom-local:claude-opus-5-5.
+        let scoped: Value = serde_json::from_str(
+            &read_leveldb_str(&paths, &format!("{WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX}:{uid}"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(scoped["id"], "custom-local:claude-opus-5-5");
+        assert_eq!(scoped["isThinking"], true);
+        assert_eq!(scoped["reasoningEffort"], "medium");
+
+        let unscoped: Value = serde_json::from_str(
+            &read_leveldb_str(&paths, WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unscoped["id"], "custom-local:claude-opus-5-5");
+
+        // Effort and thinking caches should also be seeded for the UID.
+        let effort_map: Value = serde_json::from_str(
+            &read_leveldb_str(
+                &paths,
+                &format!("{WORKBUDDY_EFFORT_BY_MODEL_KEY_PREFIX}:{uid}"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(effort_map["custom-local:claude-opus-5-5"], "medium");
+
+        // Simulate user manually switching inside WorkBuddy to another enabled Tako model (`swe-2`).
+        {
+            let opts = LevelDbOptions {
+                create_if_missing: false,
+                ..LevelDbOptions::default()
+            };
+            let mut db = DB::open(WorkBuddyAdapter::local_storage_leveldb_dir(&paths), opts).unwrap();
+            db.put(
+                &encode_chromium_ls_key(&format!("{WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX}:{uid}")),
+                &encode_chromium_ls_string(
+                    r#"{"id":"custom-local:swe-2","isThinking":true,"reasoningEffort":"max"}"#,
+                ),
+            )
+            .unwrap();
+            db.flush().unwrap();
+        }
+
+        // Passive re-apply while already in Tako mode MUST preserve user's manual Tako model choice.
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        let kept: Value = serde_json::from_str(
+            &read_leveldb_str(&paths, &format!("{WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX}:{uid}"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(kept["id"], "custom-local:swe-2");
+        assert_eq!(kept["reasoningEffort"], "max");
+
+        // Explicit preference override forces BOTH settings.json and LevelDB immediately.
+        let mut st = read_switch_state(&paths);
+        st.workbuddy_default_model = Some("gpt-6.2-sol".to_string());
+        save_switch_state(&paths, &st).unwrap();
+        assert_eq!(
+            WorkBuddyAdapter::apply_default_model_preference(&paths),
+            WorkBuddyDefaultModelSyncOutcome::Applied
+        );
+        let forced: Value = serde_json::from_str(
+            &read_leveldb_str(&paths, &format!("{WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX}:{uid}"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(forced["id"], "custom-local:gpt-6.2-sol");
+        assert_eq!(forced["isThinking"], true);
+        let settings: Value = serde_json::from_str(
+            &fs::read_to_string(WorkBuddyAdapter::settings_json_path(&paths)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settings["model"], "gpt-6.2-sol");
+
+        // Switching back to Official restores the backed-up original Tencent default-model losslessly.
+        adapter.apply_mode(&paths, AppMode::Official).unwrap();
+        let restored = read_leveldb_str(&paths, &format!("{WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX}:{uid}"))
+            .unwrap();
+        assert_eq!(restored, orig_official_json);
+        assert!(read_leveldb_str(&paths, WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX).is_none());
+    }
+
+    #[test]
+    fn locked_leveldb_defers_cleanly_and_flushes_on_restart() {
+        let (_dir, paths) = test_paths();
+        save_switch_auth(&paths, Some("sk-tako-test-key"), None, Some("test")).unwrap();
+
+        let uid = "11111111-2222-3333-4444-555555555555";
+        init_mock_chromium_leveldb(&paths, uid, Some(r#"{"id":"default-model","isThinking":false}"#));
+
+        // Hold an open LevelDB handle to simulate a running WorkBuddy Electron process.
+        let opts = LevelDbOptions {
+            create_if_missing: false,
+            ..LevelDbOptions::default()
+        };
+        let held_db = DB::open(WorkBuddyAdapter::local_storage_leveldb_dir(&paths), opts).unwrap();
+
+        let adapter = WorkBuddyAdapter;
+        // Switching to Tako while WorkBuddy holds the lock must NOT fail; it writes models.json
+        // and queues a pending default-model sync for restart/next launch.
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        assert!(WorkBuddyAdapter::has_pending_default_model_sync(&paths));
+
+        // Release lock (simulating WorkBuddy exiting before restart).
+        drop(held_db);
+
+        let outcome = WorkBuddyAdapter::flush_after_stop_or_before_launch(&paths);
+        assert_eq!(outcome, WorkBuddyDefaultModelSyncOutcome::Applied);
+        assert!(!WorkBuddyAdapter::has_pending_default_model_sync(&paths));
+
+        let synced: Value = serde_json::from_str(
+            &read_leveldb_str(&paths, &format!("{WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX}:{uid}"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(synced["id"], "custom-local:claude-opus-5-5");
+        assert_eq!(synced["isThinking"], true);
+    }
+
+    #[test]
+    fn leveldb_lock_contention_detects_macos_and_windows_errors() {
+        assert!(is_leveldb_lock_contention(&Status::new(
+            StatusCode::LockError,
+            "lock on database is already held by different process"
+        )));
+        assert!(is_leveldb_lock_contention(&Status::new(
+            StatusCode::PermissionDenied,
+            "lock: PermissionDenied: C:\\Users\\foo\\.workbuddy\\app\\session\\Local Storage\\leveldb\\LOCK"
+        )));
+        assert!(is_leveldb_lock_contention(&Status::new(
+            StatusCode::IOError,
+            "The process cannot access the file because it is being used by another process."
+        )));
+        assert!(!is_leveldb_lock_contention(&Status::new(
+            StatusCode::Corruption,
+            "bad manifest"
+        )));
     }
 }

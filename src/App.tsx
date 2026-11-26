@@ -1107,6 +1107,12 @@ export default function App() {
     try {
       const saved = await api.saveSettings(patch);
       setDashboard((prev) => (prev ? { ...prev, state: saved } : prev));
+      if (
+        patch.workbuddyDefaultModel !== undefined &&
+        dashboard.apps.find((a) => a.id === "workbuddy")?.running
+      ) {
+        setNeedsRestart((prev) => ({ ...prev, workbuddy: true }));
+      }
       if (note) showTransientNote(note);
     } catch (err) {
       setErrorMsg(`保存设置失败：${String(err)}`);

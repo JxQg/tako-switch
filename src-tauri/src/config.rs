@@ -514,6 +514,10 @@ pub struct SwitchState {
     /// Empty by default so all tools are shown unless explicitly hidden in settings.
     #[serde(default)]
     pub hidden_apps: Vec<AppId>,
+    /// Optional preferred default model ID for WorkBuddy (raw ID without `custom-local:` prefix).
+    /// When None, automatically selects the first enabled Tako model in WorkBuddy's new-task selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workbuddy_default_model: Option<String>,
 }
 
 impl SwitchState {
@@ -537,6 +541,7 @@ impl SwitchState {
             model_filters: ModelFiltersConfig::default(),
             explicit_official_apps: Vec::new(),
             hidden_apps: Vec::new(),
+            workbuddy_default_model: None,
         }
     }
 

@@ -144,6 +144,7 @@ pub struct SettingsPatch {
     pub theme_pref: Option<config::ThemePref>,
     pub mcp: Option<McpToolsConfig>,
     pub hidden_apps: Option<Vec<AppId>>,
+    pub workbuddy_default_model: Option<String>,
 }
 
 fn current_cached_account(app: &AppHandle, paths: &AppPaths) -> Option<AccountStatus> {
@@ -699,6 +700,7 @@ pub fn apply_settings_patch_for_paths(
     let prev_base = state.normalized_base_url();
     let prev_agy_key = state.agy_api_key.clone();
     let prev_codex_preserve = state.codex_preserve_official_auth;
+    let prev_workbuddy_default_model = state.workbuddy_default_model.clone();
     let prev_name = state.normalized_gateway_name();
     let prev_subtitle = state.normalized_gateway_subtitle();
     let prev_zh = state.prefer_chinese_ui;
@@ -790,6 +792,14 @@ pub fn apply_settings_patch_for_paths(
         }
         state.hidden_apps = deduped;
     }
+    if let Some(raw_wb_default) = input.workbuddy_default_model {
+        let trimmed = raw_wb_default.trim();
+        let clean = trimmed
+            .strip_prefix(adapters::workbuddy::WORKBUDDY_CUSTOM_LOCAL_PREFIX)
+            .unwrap_or(trimmed)
+            .trim();
+        state.workbuddy_default_model = (!clean.is_empty()).then(|| clean.to_string());
+    }
 
     save_switch_state(paths, &state)?;
 
@@ -831,6 +841,7 @@ pub fn apply_settings_patch_for_paths(
         || prev_zh != state.prefer_chinese_ui
         || edgeone_mcp_changed;
     let codex_auth_mode_changed = prev_codex_preserve != state.codex_preserve_official_auth;
+    let workbuddy_default_changed = prev_workbuddy_default_model != state.workbuddy_default_model;
     if endpoint_or_profile_changed || codex_auth_mode_changed {
         for &app_id in AppId::all() {
             if !app_id.requires_local_gateway() {
@@ -844,6 +855,11 @@ pub fn apply_settings_patch_for_paths(
                 let _ = adapter.apply_mode(paths, AppMode::Tako);
             }
         }
+    }
+    if workbuddy_default_changed
+        && get_adapter(AppId::WorkBuddy).read_mode(paths) == AppMode::Tako
+    {
+        let _ = adapters::workbuddy::WorkBuddyAdapter::apply_default_model_preference(paths);
     }
     if prev_zh != state.prefer_chinese_ui {
         sync_standalone_chinese_for_installed(paths, state.prefer_chinese_ui);
@@ -2045,6 +2061,11 @@ async fn set_app_mode(
     if auto_restart && adapter.is_running(&paths) {
         adapter.quit_app(&paths)?;
         std::thread::sleep(std::time::Duration::from_millis(450));
+        if app_id == AppId::WorkBuddy {
+            let _ = adapters::workbuddy::WorkBuddyAdapter::flush_after_stop_or_before_launch(
+                &paths,
+            );
+        }
         client_monitor::launch_and_monitor(&paths, app_id, "mode_switch_restart")?;
     }
     refresh_tray(&app, &paths);
@@ -2062,6 +2083,9 @@ async fn restart_app(app: AppHandle, app_id: AppId) -> Result<AppSnapshot, Strin
         }
     }
     let switched = ensure_default_tako_mode_before_launch(&paths, app_id).await?;
+    if app_id == AppId::WorkBuddy {
+        let _ = adapters::workbuddy::WorkBuddyAdapter::flush_after_stop_or_before_launch(&paths);
+    }
     client_monitor::launch_and_monitor(&paths, app_id, "restart")?;
     if switched {
         refresh_tray(&app, &paths);
@@ -2076,6 +2100,11 @@ fn close_app(app_id: AppId) -> Result<AppSnapshot, String> {
     if adapter.is_running(&paths) {
         adapter.quit_app(&paths)?;
         std::thread::sleep(std::time::Duration::from_millis(300));
+        if app_id == AppId::WorkBuddy {
+            let _ = adapters::workbuddy::WorkBuddyAdapter::flush_after_stop_or_before_launch(
+                &paths,
+            );
+        }
     }
     Ok(snapshot_app(&paths, app_id))
 }
@@ -2091,6 +2120,9 @@ async fn launch_app(app: AppHandle, app_id: AppId) -> Result<AppSnapshot, String
     } else {
         false
     };
+    if !was_running && app_id == AppId::WorkBuddy {
+        let _ = adapters::workbuddy::WorkBuddyAdapter::flush_after_stop_or_before_launch(&paths);
+    }
     client_monitor::launch_and_monitor(&paths, app_id, "launch")?;
     if switched {
         refresh_tray(&app, &paths);
