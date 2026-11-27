@@ -147,6 +147,7 @@ pub struct SettingsPatch {
     pub mcp: Option<McpToolsConfig>,
     pub hidden_apps: Option<Vec<AppId>>,
     pub workbuddy_default_model: Option<String>,
+    pub claude_workspace_mode: Option<config::ClaudeWorkspaceMode>,
 }
 
 fn current_cached_account(app: &AppHandle, paths: &AppPaths) -> Option<AccountStatus> {
@@ -825,6 +826,7 @@ pub fn apply_settings_patch_for_paths(
     let prev_agy_key = state.agy_api_key.clone();
     let prev_codex_preserve = state.codex_preserve_official_auth;
     let prev_workbuddy_default_model = state.workbuddy_default_model.clone();
+    let prev_claude_workspace_mode = state.claude_workspace_mode;
     let prev_name = state.normalized_gateway_name();
     let prev_subtitle = state.normalized_gateway_subtitle();
     let prev_zh = state.prefer_chinese_ui;
@@ -924,6 +926,9 @@ pub fn apply_settings_patch_for_paths(
             .trim();
         state.workbuddy_default_model = (!clean.is_empty()).then(|| clean.to_string());
     }
+    if let Some(claude_ws) = input.claude_workspace_mode {
+        state.claude_workspace_mode = claude_ws;
+    }
 
     save_switch_state(paths, &state)?;
 
@@ -966,12 +971,15 @@ pub fn apply_settings_patch_for_paths(
         || edgeone_mcp_changed;
     let codex_auth_mode_changed = prev_codex_preserve != state.codex_preserve_official_auth;
     let workbuddy_default_changed = prev_workbuddy_default_model != state.workbuddy_default_model;
-    if endpoint_or_profile_changed || codex_auth_mode_changed {
+    let claude_workspace_changed = prev_claude_workspace_mode != state.claude_workspace_mode;
+    if endpoint_or_profile_changed || codex_auth_mode_changed || claude_workspace_changed {
         for &app_id in AppId::all() {
             if !app_id.requires_local_gateway() {
                 continue;
             }
-            if !endpoint_or_profile_changed && app_id != AppId::Codex {
+            let targeted_change = (codex_auth_mode_changed && app_id == AppId::Codex)
+                || (claude_workspace_changed && app_id == AppId::Claude);
+            if !endpoint_or_profile_changed && !targeted_change {
                 continue;
             }
             let adapter = get_adapter(app_id);
@@ -2207,6 +2215,9 @@ async fn restart_app(app: AppHandle, app_id: AppId) -> Result<AppSnapshot, Strin
         }
     }
     let switched = ensure_default_tako_mode_before_launch(&paths, app_id).await?;
+    if app_id == AppId::Claude {
+        let _ = adapters::claude::ClaudeAdapter::ensure_tako_profile_up_to_date(&paths);
+    }
     if app_id == AppId::WorkBuddy {
         let _ = adapters::workbuddy::WorkBuddyAdapter::flush_after_stop_or_before_launch(&paths);
     }
@@ -2244,6 +2255,9 @@ async fn launch_app(app: AppHandle, app_id: AppId) -> Result<AppSnapshot, String
     } else {
         false
     };
+    if !was_running && app_id == AppId::Claude {
+        let _ = adapters::claude::ClaudeAdapter::ensure_tako_profile_up_to_date(&paths);
+    }
     if !was_running && app_id == AppId::WorkBuddy {
         let _ = adapters::workbuddy::WorkBuddyAdapter::flush_after_stop_or_before_launch(&paths);
     }
@@ -2755,6 +2769,38 @@ pub fn run() {
             if any_tako {
                 let _ = agy_proxy::ensure_gateway_service(&paths);
             }
+            let _ = adapters::claude::ClaudeAdapter::ensure_tako_profile_up_to_date(&paths);
+
+            // Refresh Claude 3p and WorkBuddy model catalog caches shortly after startup so
+            // upgraded clients automatically pick up updated recommended models (e.g. swe-2-1)
+            // and newly supported multi-vendor Tako models without manual re-saving.
+            tauri::async_runtime::spawn(async move {
+                if let Ok(sync_paths) = AppPaths::detect() {
+                    if config::read_main_api_key(&sync_paths).is_some() {
+                        let claude_tako =
+                            adapters::claude::ClaudeAdapter.read_mode(&sync_paths) == AppMode::Tako;
+                        let wb_tako =
+                            adapters::workbuddy::WorkBuddyAdapter.read_mode(&sync_paths)
+                                == AppMode::Tako;
+                        if claude_tako
+                            && crate::agy_proxy::refresh_claude_catalog_cache(&sync_paths)
+                                .await
+                                .is_ok()
+                        {
+                            let _ = adapters::claude::ClaudeAdapter
+                                .apply_mode(&sync_paths, AppMode::Tako);
+                        }
+                        if wb_tako
+                            && crate::agy_proxy::refresh_workbuddy_catalog_cache(&sync_paths)
+                                .await
+                                .is_ok()
+                        {
+                            let _ = adapters::workbuddy::WorkBuddyAdapter
+                                .apply_mode(&sync_paths, AppMode::Tako);
+                        }
+                    }
+                }
+            });
 
             let bg_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

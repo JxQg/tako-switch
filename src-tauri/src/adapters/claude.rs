@@ -13,6 +13,7 @@ use crate::config::{
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine;
+use rand::Rng;
 use serde_json::{Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,6 +62,139 @@ impl ClaudeAdapter {
 
     fn claude_code_settings_path(paths: &AppPaths) -> PathBuf {
         paths.home.join(".claude").join("settings.json")
+    }
+
+    fn ant_did_3p_path(paths: &AppPaths) -> PathBuf {
+        paths.claude_3p_dir.join("ant-did")
+    }
+
+    fn is_valid_uuid(s: &str) -> bool {
+        let bytes = s.as_bytes();
+        if bytes.len() != 36 {
+            return false;
+        }
+        bytes.iter().enumerate().all(|(idx, &b)| match idx {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+    }
+
+    fn read_or_create_3p_account_uuid(paths: &AppPaths, create: bool) -> Result<Option<String>, String> {
+        let path = Self::ant_did_3p_path(paths);
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(decoded) = BASE64_STD.decode(raw.trim()) {
+                if let Ok(text) = String::from_utf8(decoded) {
+                    let trimmed = text.trim();
+                    if Self::is_valid_uuid(trimmed) {
+                        return Ok(Some(trimmed.to_string()));
+                    }
+                }
+            }
+        }
+        if !create {
+            return Ok(None);
+        }
+        // Generate an RFC 4122 UUIDv4 matching Claude Desktop's `ant-did` format (base64(uuid)).
+        let mut buf = [0u8; 16];
+        rand::thread_rng().fill(&mut buf);
+        buf[6] = (buf[6] & 0x0f) | 0x40;
+        buf[8] = (buf[8] & 0x3f) | 0x80;
+        let uuid = format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            buf[0], buf[1], buf[2], buf[3],
+            buf[4], buf[5],
+            buf[6], buf[7],
+            buf[8], buf[9],
+            buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+        );
+        let encoded = BASE64_STD.encode(uuid.as_bytes());
+        write_atomic(&path, encoded.as_bytes(), true)?;
+        Ok(Some(uuid))
+    }
+
+    fn collect_3p_account_uuids(prefs: &Map<String, Value>, primary: Option<&str>) -> Vec<String> {
+        let mut uuids: Vec<String> = Vec::new();
+        if let Some(id) = primary {
+            if Self::is_valid_uuid(id) {
+                uuids.push(id.to_string());
+            }
+        }
+        for map_key in [
+            "bypassPermissionsOptInByAccount",
+            "bypassPermissionsGateByAccount",
+            "bypassPermissionsGateWithoutDeviceLockByAccount",
+            "coworkModelAutoFallbackByAccount",
+        ] {
+            if let Some(obj) = prefs.get(map_key).and_then(Value::as_object) {
+                for k in obj.keys() {
+                    if Self::is_valid_uuid(k) && !uuids.iter().any(|u| u.eq_ignore_ascii_case(k)) {
+                        uuids.push(k.clone());
+                    }
+                }
+            }
+        }
+        uuids
+    }
+
+    fn is_bypass_permissions_enabled(paths: &AppPaths) -> bool {
+        let Ok(cfg) = read_json_object_or_empty(&Self::mcp_3p_path(paths)) else {
+            return false;
+        };
+        let Some(prefs) = cfg.get("preferences").and_then(Value::as_object) else {
+            return false;
+        };
+        if prefs
+            .get("bypassPermissionsModeEnabled")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            return false;
+        }
+        let Ok(primary) = Self::read_or_create_3p_account_uuid(paths, false) else {
+            return false;
+        };
+        let Some(primary_id) = primary else {
+            return false;
+        };
+        prefs
+            .get("bypassPermissionsOptInByAccount")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get(&primary_id))
+            .and_then(Value::as_bool)
+            == Some(true)
+    }
+
+    /// Enables Claude Desktop's "Bypass permissions" (`bypassPermissions`) option in Claude-3p
+    /// preferences so it is selectable in the session permission picker instead of disabled.
+    fn enable_claude_3p_bypass_permissions(paths: &AppPaths) -> Result<(), String> {
+        let primary_uuid = Self::read_or_create_3p_account_uuid(paths, true)?;
+        let cfg_path = Self::mcp_3p_path(paths);
+        let mut root = read_json_object_or_empty(&cfg_path)?;
+        let prefs_val = root
+            .entry("preferences".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !prefs_val.is_object() {
+            *prefs_val = Value::Object(Map::new());
+        }
+        let Some(prefs) = prefs_val.as_object_mut() else {
+            return Ok(());
+        };
+        let uuids = Self::collect_3p_account_uuids(prefs, primary_uuid.as_deref());
+        prefs.insert("bypassPermissionsModeEnabled".to_string(), Value::Bool(true));
+        let opt_in_val = prefs
+            .entry("bypassPermissionsOptInByAccount".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !opt_in_val.is_object() {
+            *opt_in_val = Value::Object(Map::new());
+        }
+        if let Some(opt_in) = opt_in_val.as_object_mut() {
+            for uuid in uuids {
+                opt_in.insert(uuid, Value::Bool(true));
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&Value::Object(root))
+            .map_err(|e| format!("序列化 {} 失败: {e}", cfg_path.display()))?;
+        write_atomic(&cfg_path, &bytes, false)
     }
 
     fn has_managed_tako_mcp(paths: &AppPaths) -> bool {
@@ -272,6 +406,46 @@ impl ClaudeAdapter {
 
     pub fn sync_standalone_chinese_locale(paths: &AppPaths, enable: bool) -> Result<(), String> {
         Self::sync_claude_chinese_locale(paths, enable)
+    }
+
+    /// Upgrade an existing Tako 3p profile in place when workspace/agent policy fields
+    /// are missing or out of sync with `SwitchState::claude_workspace_mode`.
+    /// No-op when Claude is in Official mode or not logged into Tako.
+    pub fn ensure_tako_profile_up_to_date(paths: &AppPaths) -> Result<bool, String> {
+        let adapter = ClaudeAdapter;
+        if adapter.read_mode(paths) != AppMode::Tako || read_main_api_key(paths).is_none() {
+            return Ok(false);
+        }
+        let state = read_switch_state(paths);
+        let expected_home = state.claude_workspace_mode.desktop_home_value();
+        let up_to_date = Self::is_bypass_permissions_enabled(paths)
+            && read_json_object_or_empty(&Self::profile_3p_path(paths))
+                .ok()
+                .is_some_and(|prof| {
+                    prof.get("desktopHome").and_then(Value::as_str) == Some(expected_home)
+                        && prof
+                            .get("isClaudeCodeForDesktopEnabled")
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                        && prof
+                            .get("blockReadsOutsideWorkingDirectories")
+                            .and_then(Value::as_bool)
+                            == Some(false)
+                        && prof.get("autoModeEnabled").and_then(Value::as_bool) == Some(true)
+                        && prof
+                            .get("codeDefaultPermissionMode")
+                            .and_then(Value::as_str)
+                            == Some("acceptEdits")
+                        && prof
+                            .get("modelDiscoveryEnabled")
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                });
+        if up_to_date {
+            return Ok(false);
+        }
+        adapter.apply_mode(paths, AppMode::Tako)?;
+        Ok(true)
     }
 
     fn deactivate_3p(paths: &AppPaths) -> Result<(), String> {
@@ -525,6 +699,10 @@ impl DesktopAppAdapter for ClaudeAdapter {
                     Value::String(Self::tako_deployment_logo_data_uri()),
                 );
                 profile.insert("inferenceModelPricingEnabled".to_string(), Value::Bool(true));
+                // Enable gateway `/v1/models` discovery alongside `inferenceModels` so Claude Desktop
+                // hydrates live model descriptions (intro + real-time RMB pricing) onto every row
+                // in the model picker instead of skipping discovery (`inferenceModels obviates discovery`).
+                profile.insert("modelDiscoveryEnabled".to_string(), Value::Bool(true));
                 // Prevent Claude Desktop from auto-updating into an unverified release
                 // (which would overwrite the Chinese UI patch and bypass version pinning)
                 // and silence 403 region errors from nonessential telemetry flushes.
@@ -538,6 +716,33 @@ impl DesktopAppAdapter for ClaudeAdapter {
                 profile.insert(
                     "mcpPersistentAlwaysAllowEnabled".to_string(),
                     Value::Bool(true),
+                );
+                // Default to pure Agent / Code surface (`desktopHome: "off"`) so users land straight
+                // in Claude Code with scratch-workspace support and local file access, avoiding the
+                // file-restricted Chat tab. Users can switch back to Full (`"standard"`) in settings.
+                profile.insert(
+                    "desktopHome".to_string(),
+                    Value::String(
+                        state
+                            .claude_workspace_mode
+                            .desktop_home_value()
+                            .to_string(),
+                    ),
+                );
+                profile.insert(
+                    "isClaudeCodeForDesktopEnabled".to_string(),
+                    Value::Bool(true),
+                );
+                // Allow reading user-referenced local folders (e.g. ~/Downloads/Tako) without hard blocking.
+                profile.insert(
+                    "blockReadsOutsideWorkingDirectories".to_string(),
+                    Value::Bool(false),
+                );
+                // Allow Auto mode and default Code sessions to `acceptEdits` to cut repetitive approval prompts.
+                profile.insert("autoModeEnabled".to_string(), Value::Bool(true));
+                profile.insert(
+                    "codeDefaultPermissionMode".to_string(),
+                    Value::String("acceptEdits".to_string()),
                 );
                 // The 3p deployment gates tool egress with a fail-closed allowlist, which
                 // blocks WebFetch/WebSearch on any host not listed here.
@@ -652,6 +857,7 @@ impl DesktopAppAdapter for ClaudeAdapter {
                 merge_tako_mcp_server(&mcp_3p, paths, false)?;
                 merge_edgeone_mcp_server(&mcp_1p, &state.mcp, state.mcp.web_page)?;
                 merge_edgeone_mcp_server(&mcp_3p, &state.mcp, false)?;
+                Self::enable_claude_3p_bypass_permissions(paths)?;
                 Self::set_claude_code_mcp_permissions(paths, true, state.mcp.web_page)?;
                 Self::sync_claude_chinese_locale(paths, state.prefer_chinese_ui)?;
                 Ok(())
@@ -708,10 +914,27 @@ impl DesktopAppAdapter for ClaudeAdapter {
                     if key.is_empty() {
                         issues.push("inferenceGatewayApiKey 为空".to_string());
                     }
+                    match prof.get("desktopHome").and_then(Value::as_str) {
+                        Some("off") => notes.push(
+                            "工作区模式: 纯 Agent 模式 (desktopHome=off · 默认权限 acceptEdits · 允许读取本机目录)"
+                                .to_string(),
+                        ),
+                        Some("standard") => notes.push(
+                            "工作区模式: 完整模式 (desktopHome=standard · 含 Chat / Cowork / Code · 默认权限 acceptEdits)"
+                                .to_string(),
+                        ),
+                        _ => notes.push(
+                            "提示: Claude-3p profile 尚未同步工作区模式，请重新点击 Tako 或重启 Claude"
+                                .to_string(),
+                        ),
+                    }
                 }
             }
             if !Self::has_managed_tako_mcp(paths) {
                 notes.push("提示: Claude-3p profile 尚未下发 tako MCP".to_string());
+            }
+            if Self::is_bypass_permissions_enabled(paths) {
+                notes.push("跳过权限确认: 已启用 (bypassPermissions)".to_string());
             }
             if Self::has_managed_edgeone_mcp(paths)
                 || has_edgeone_mcp_server(&Self::mcp_3p_path(paths))
@@ -1222,5 +1445,132 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("existing"));
+    }
+
+    #[test]
+    fn claude_workspace_mode_defaults_to_agent_only_and_supports_full_and_migration() {
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        save_switch_auth(&paths, Some("cr_claude_secret"), Some("2"), Some("oauth")).unwrap();
+        let adapter = ClaudeAdapter;
+
+        // Default state -> AgentOnly (`desktopHome: "off"`)
+        adapter.apply_mode(&paths, AppMode::Tako).unwrap();
+        let prof_agent = read_json_object_or_empty(&ClaudeAdapter::profile_3p_path(&paths)).unwrap();
+        assert_eq!(prof_agent.get("desktopHome").and_then(Value::as_str), Some("off"));
+        assert_eq!(
+            prof_agent
+                .get("isClaudeCodeForDesktopEnabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            prof_agent
+                .get("blockReadsOutsideWorkingDirectories")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            prof_agent.get("autoModeEnabled").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            prof_agent
+                .get("codeDefaultPermissionMode")
+                .and_then(Value::as_str),
+            Some("acceptEdits")
+        );
+        assert!(adapter
+            .diagnose(&paths)
+            .notes
+            .iter()
+            .any(|n| n.contains("纯 Agent 模式")));
+        assert!(ClaudeAdapter::is_bypass_permissions_enabled(&paths));
+        assert!(adapter
+            .diagnose(&paths)
+            .notes
+            .iter()
+            .any(|n| n.contains("跳过权限确认: 已启用")));
+        let cfg_3p_bypass = read_json_object_or_empty(&ClaudeAdapter::mcp_3p_path(&paths)).unwrap();
+        let prefs = cfg_3p_bypass["preferences"].as_object().unwrap();
+        assert_eq!(
+            prefs.get("bypassPermissionsModeEnabled").and_then(Value::as_bool),
+            Some(true)
+        );
+        let ant_uuid = ClaudeAdapter::read_or_create_3p_account_uuid(&paths, false)
+            .unwrap()
+            .expect("ant-did uuid should be generated");
+        assert_eq!(
+            prefs["bypassPermissionsOptInByAccount"][&ant_uuid].as_bool(),
+            Some(true)
+        );
+        // Already up to date -> no-op
+        assert!(!ClaudeAdapter::ensure_tako_profile_up_to_date(&paths).unwrap());
+
+        // Switch to Full -> `desktopHome: "standard"` while keeping read/permission ergonomics
+        let mut st = read_switch_state(&paths);
+        st.claude_workspace_mode = crate::config::ClaudeWorkspaceMode::Full;
+        save_switch_state(&paths, &st).unwrap();
+        assert!(ClaudeAdapter::ensure_tako_profile_up_to_date(&paths).unwrap());
+        let prof_full = read_json_object_or_empty(&ClaudeAdapter::profile_3p_path(&paths)).unwrap();
+        assert_eq!(
+            prof_full.get("desktopHome").and_then(Value::as_str),
+            Some("standard")
+        );
+        assert_eq!(
+            prof_full
+                .get("blockReadsOutsideWorkingDirectories")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            prof_full
+                .get("codeDefaultPermissionMode")
+                .and_then(Value::as_str),
+            Some("acceptEdits")
+        );
+        assert!(adapter
+            .diagnose(&paths)
+            .notes
+            .iter()
+            .any(|n| n.contains("完整模式")));
+
+        // Legacy 3p profile missing `desktopHome` / `modelDiscoveryEnabled` gets migrated back
+        let mut legacy = prof_full.clone();
+        legacy.remove("desktopHome");
+        legacy.remove("codeDefaultPermissionMode");
+        legacy.remove("modelDiscoveryEnabled");
+        write_atomic(
+            &ClaudeAdapter::profile_3p_path(&paths),
+            &serde_json::to_vec_pretty(&Value::Object(legacy)).unwrap(),
+            true,
+        )
+        .unwrap();
+        st.claude_workspace_mode = crate::config::ClaudeWorkspaceMode::AgentOnly;
+        save_switch_state(&paths, &st).unwrap();
+        assert!(ClaudeAdapter::ensure_tako_profile_up_to_date(&paths).unwrap());
+        let prof_migrated =
+            read_json_object_or_empty(&ClaudeAdapter::profile_3p_path(&paths)).unwrap();
+        assert_eq!(
+            prof_migrated.get("desktopHome").and_then(Value::as_str),
+            Some("off")
+        );
+        assert_eq!(
+            prof_migrated
+                .get("codeDefaultPermissionMode")
+                .and_then(Value::as_str),
+            Some("acceptEdits")
+        );
+        assert_eq!(
+            prof_migrated
+                .get("modelDiscoveryEnabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // Official mode -> migration helper must not touch or reactivate 3p
+        adapter.apply_mode(&paths, AppMode::Official).unwrap();
+        assert!(!ClaudeAdapter::ensure_tako_profile_up_to_date(&paths).unwrap());
+        assert_eq!(adapter.read_mode(&paths), AppMode::Official);
     }
 }

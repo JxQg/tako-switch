@@ -570,7 +570,7 @@ export function ClientSettingsPanel({
               { id: "gpt-6.2-sol", displayName: "GPT-6.2 Sol" },
               { id: "gpt-6.2-astra", displayName: "GPT-6.2 Astra" },
               { id: "deepseek-v4.1-flash", displayName: "DeepSeek V4.1 Flash" },
-              { id: "swe-2", displayName: "SWE-2" },
+              { id: "swe-2-1", displayName: "SWE-2.1" },
             ];
             const visibleOptions = workbuddyModels
               .filter((m) => m.visible)
@@ -712,51 +712,92 @@ export function ClientSettingsPanel({
             </div>
           )}
 
-          {/* Claude-only: Collapsible Gateway Subtitle */}
-          {app.id === "claude" && (
-            <div className="py-3">
-              <button
-                type="button"
-                onClick={() => setClaudeAdvancedOpen((prev) => !prev)}
-                className="w-full flex items-center justify-between text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
-              >
-                <span>高级：Claude 网关副标题</span>
-                <ChevronDown
-                  className={`h-3.5 w-3.5 transition-transform ${
-                    claudeAdvancedOpen ? "rotate-180" : ""
-                  }`}
-                />
-              </button>
-              {claudeAdvancedOpen && (
-                <div className="mt-2.5 flex items-center gap-2">
-                  <input
-                    type="text"
-                    maxLength={80}
-                    value={claudeSubtitleDraft}
-                    onChange={(e) => setClaudeSubtitleDraft(e.target.value)}
-                    placeholder="Tako AI Gateway"
-                    className="flex-1 h-[34px] px-3 rounded-[8px] border border-[var(--border)] bg-[var(--bg-canvas)] text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+          {/* Claude-only: Workspace Mode + Collapsible Gateway Subtitle */}
+          {app.id === "claude" && (() => {
+            const workspaceMode = dashboard.state.claudeWorkspaceMode ?? "agent_only";
+            return (
+              <>
+                <div className="tako-setting-row flex flex-wrap items-center justify-between gap-4">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[13px] font-medium text-[var(--text-primary)]">
+                      工作区模式
+                    </div>
+                    <p className="text-[11.5px] text-[var(--text-muted)] mt-0.5 leading-snug">
+                      {workspaceMode === "agent_only"
+                        ? app.mode === "tako" && app.running
+                          ? "默认直达纯 Agent（Code）模式，允许直接读取本机目录并默认放行文件修改；切换后点击上方「重启」生效。"
+                          : "默认直达纯 Agent（Code）模式，免选文件夹即可读写本机目录并默认放行文件修改，彻底避开受限 Chat 模式。"
+                        : app.mode === "tako" && app.running
+                          ? "完整模式同时显示 Chat / Cowork / Code 标签页（Chat 无法直接读取本机目录）；切换后点击上方「重启」生效。"
+                          : "完整模式同时显示 Chat、Cowork 与 Code 三个标签页（注：Chat 由官方限制无法直接读取本机目录）。"}
+                    </p>
+                  </div>
+                  <SegmentedControl
+                    options={[
+                      { id: "agent_only", label: "纯 Agent（推荐）" },
+                      { id: "full", label: "完整模式" },
+                    ]}
+                    value={workspaceMode}
+                    disabled={savingInlineSetting}
+                    onChange={(next) => {
+                      const label = next === "agent_only" ? "纯 Agent 模式" : "完整模式";
+                      const suffix =
+                        app.mode === "tako" && app.running
+                          ? "（重启 Claude Desktop 后生效）"
+                          : "（下次打开 Claude Desktop 生效）";
+                      void onSaveInlineSettings(
+                        { claudeWorkspaceMode: next },
+                        `Claude Desktop 已设为${label}${suffix}`,
+                      );
+                    }}
                   />
+                </div>
+
+                <div className="py-3">
                   <button
                     type="button"
-                    disabled={!claudeSubtitleDirty || savingInlineSetting}
-                    onClick={() =>
-                      void onSaveInlineSettings(
-                        {
-                          gatewayDisplaySubtitle:
-                            claudeSubtitleDraft.trim() || "Tako AI Gateway",
-                        },
-                        "Claude 网关副标题已保存",
-                      )
-                    }
-                    className="h-[34px] px-3 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-primary)] cursor-pointer disabled:opacity-45 shrink-0"
+                    onClick={() => setClaudeAdvancedOpen((prev) => !prev)}
+                    className="w-full flex items-center justify-between text-[12px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] cursor-pointer"
                   >
-                    保存
+                    <span>高级：Claude 网关副标题</span>
+                    <ChevronDown
+                      className={`h-3.5 w-3.5 transition-transform ${
+                        claudeAdvancedOpen ? "rotate-180" : ""
+                      }`}
+                    />
                   </button>
+                  {claudeAdvancedOpen && (
+                    <div className="mt-2.5 flex items-center gap-2">
+                      <input
+                        type="text"
+                        maxLength={80}
+                        value={claudeSubtitleDraft}
+                        onChange={(e) => setClaudeSubtitleDraft(e.target.value)}
+                        placeholder="Tako AI Gateway"
+                        className="flex-1 h-[34px] px-3 rounded-[8px] border border-[var(--border)] bg-[var(--bg-canvas)] text-[12px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                      />
+                      <button
+                        type="button"
+                        disabled={!claudeSubtitleDirty || savingInlineSetting}
+                        onClick={() =>
+                          void onSaveInlineSettings(
+                            {
+                              gatewayDisplaySubtitle:
+                                claudeSubtitleDraft.trim() || "Tako AI Gateway",
+                            },
+                            "Claude 网关副标题已保存",
+                          )
+                        }
+                        className="h-[34px] px-3 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-primary)] cursor-pointer disabled:opacity-45 shrink-0"
+                      >
+                        保存
+                      </button>
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
-          )}
+              </>
+            );
+          })()}
         </div>
       </section>
 

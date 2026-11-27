@@ -111,7 +111,7 @@ const CLIENT_HINTS: Record<AppId, string> = {
   "dsh-tako":
     "免登录实时同步网关 /api/pricing 全量目录；切换上方客户端标签可勾选并下发专属模型列表。",
   claude:
-    "Claude Desktop 仅展示 Claude 系列模型：勾选并保存后会自动写入本地 Claude 3p 配置。",
+    "Claude Desktop 已支持 Tako 全量多厂商模型（Claude / GPT / SWE / DeepSeek / GLM / Kimi / Grok 等）：勾选并保存后会自动写入本地 Claude 3p 配置。",
   codex: "Codex 原生支持多厂商模型，可切换精简推荐或自由勾选展示列表。",
   antigravity:
     "Antigravity 最多映射 32 个自定义槽位，精简勾选可避免主力模型被裁掉。",

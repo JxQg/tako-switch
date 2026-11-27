@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { AlertCircle, ExternalLink, FileText, Globe, MessageSquare, X } from "lucide-react";
+import { AlertCircle, ExternalLink, FileText, Globe, MessageSquare, Trash2, X } from "lucide-react";
 import packageJson from "../package.json";
 import {
   api,
@@ -14,6 +14,7 @@ import {
   type DashboardPayload,
   type InstallProgressEvent,
   type McpToolsConfig,
+  type SavedKeySummary,
   type SelfUpdateCheckResult,
   type SelfUpdateProgressEvent,
   type SettingsPatch,
@@ -131,6 +132,7 @@ export default function App() {
   const [apiKeyAliasInput, setApiKeyAliasInput] = useState("");
   const [activateNewKey, setActivateNewKey] = useState(true);
   const [switchingKeyId, setSwitchingKeyId] = useState<string | null>(null);
+  const [pendingRemoveKey, setPendingRemoveKey] = useState<SavedKeySummary | null>(null);
   const [showChangelogModal, setShowChangelogModal] = useState(false);
   const [showFeedbackModal, setShowFeedbackModal] = useState(false);
   const [mcpInitialTab, setMcpInitialTab] = useState<McpToolKey | null>(null);
@@ -725,13 +727,33 @@ export default function App() {
     }
   };
 
-  const handleRemoveSavedKey = async (keyId: string) => {
+  useEffect(() => {
+    if (!pendingRemoveKey) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !switchingKeyId) {
+        setPendingRemoveKey(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [pendingRemoveKey, switchingKeyId]);
+
+  const handleRequestRemoveSavedKey = (keyId: string) => {
     if (switchingKeyId) return;
+    const target = dashboard?.account.savedKeys?.find((item) => item.id === keyId);
+    if (!target) return;
+    setPendingRemoveKey(target);
+  };
+
+  const handleConfirmRemoveSavedKey = async () => {
+    if (!pendingRemoveKey || switchingKeyId) return;
+    const keyId = pendingRemoveKey.id;
     setSwitchingKeyId(keyId);
     setErrorMsg(null);
     try {
       const updatedAccount = await api.removeSavedKey(keyId);
       setDashboard((prev) => (prev ? { ...prev, account: updatedAccount } : prev));
+      setPendingRemoveKey(null);
       await loadDashboard(false);
       showTransientNote(
         updatedAccount.loggedIn && updatedAccount.displayLabel
@@ -1196,6 +1218,12 @@ export default function App() {
       ) {
         setNeedsRestart((prev) => ({ ...prev, workbuddy: true }));
       }
+      if (
+        patch.claudeWorkspaceMode !== undefined &&
+        dashboard.apps.find((a) => a.id === "claude")?.running
+      ) {
+        setNeedsRestart((prev) => ({ ...prev, claude: true }));
+      }
       if (note) showTransientNote(note);
     } catch (err) {
       setErrorMsg(`保存设置失败：${String(err)}`);
@@ -1399,7 +1427,7 @@ export default function App() {
         onOAuthLogin={() => void handleOAuthLogin()}
         onOpenKeyModal={handleOpenKeyModal}
         onSwitchKey={(keyId) => void handleSwitchSavedKey(keyId)}
-        onRemoveKey={(keyId) => void handleRemoveSavedKey(keyId)}
+        onRemoveKey={handleRequestRemoveSavedKey}
         onLogout={() => void handleLogout()}
         onOpenGeneralSettings={() => setActiveRoute("general")}
         onMinimizeWindow={nativeWindow.minimize}
@@ -1526,7 +1554,7 @@ export default function App() {
             onOAuthLogin={() => void handleOAuthLogin()}
             onOpenKeyModal={handleOpenKeyModal}
             onSwitchKey={(keyId) => void handleSwitchSavedKey(keyId)}
-            onRemoveKey={(keyId) => void handleRemoveSavedKey(keyId)}
+            onRemoveKey={handleRequestRemoveSavedKey}
             onRenameKeyAlias={handleRenameSavedKeyAlias}
             onLogout={() => void handleLogout()}
             onRefreshAccount={() => void loadDashboard(true)}
@@ -1787,6 +1815,107 @@ export default function App() {
           </form>
         </div>
       )}
+
+      {/* Confirm Remove Saved Key Modal */}
+      {pendingRemoveKey && (() => {
+        const isRemoving = switchingKeyId === pendingRemoveKey.id;
+        const remainingCount = Math.max(
+          0,
+          (dashboard?.account.savedKeys?.length ?? 0) - 1,
+        );
+        return (
+          <div
+            className="fixed inset-0 z-50 modal-backdrop flex items-center justify-center p-4"
+            onClick={() => {
+              if (!isRemoving) setPendingRemoveKey(null);
+            }}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="remove-key-modal-title"
+              onClick={(e) => e.stopPropagation()}
+              className="w-full max-w-[392px] rounded-[15px] border border-[var(--border)] bg-[var(--bg-card)] p-5 shadow-[var(--shadow-modal)] flex flex-col gap-3.5"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="h-7 w-7 rounded-[8px] bg-[var(--danger-soft)] text-[var(--danger)] inline-flex items-center justify-center shrink-0">
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </span>
+                  <h3
+                    id="remove-key-modal-title"
+                    className="text-[14px] font-semibold text-[var(--text-primary)]"
+                  >
+                    确认移除本地密钥？
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  aria-label="关闭弹窗"
+                  disabled={isRemoving}
+                  onClick={() => setPendingRemoveKey(null)}
+                  className="p-1 rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] cursor-pointer disabled:opacity-40"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              <div className="rounded-[10px] border border-[var(--border)] bg-[var(--bg-canvas)] px-3 py-2.5 flex flex-col gap-1">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="text-[12.5px] font-semibold text-[var(--text-primary)] break-all">
+                    {pendingRemoveKey.displayLabel}
+                  </span>
+                  {pendingRemoveKey.alias && (
+                    <span className="text-[10.5px] font-medium px-1.5 py-0.5 rounded bg-[var(--bg-card)] border border-[var(--border)] text-[var(--accent)] shrink-0">
+                      {pendingRemoveKey.alias}
+                    </span>
+                  )}
+                  {pendingRemoveKey.authSource === "oauth" && (
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--bg-subtle)] text-[var(--text-muted)] shrink-0">
+                      OAuth
+                    </span>
+                  )}
+                </div>
+                <div className="text-[11px] font-mono text-[var(--text-muted)]">
+                  {pendingRemoveKey.maskedKey}
+                </div>
+              </div>
+
+              {pendingRemoveKey.active && (
+                <p className="text-[12px] text-[var(--warning)] bg-[var(--warning-soft)] border border-[var(--warning-border)] rounded-[9px] px-3 py-2 leading-relaxed">
+                  {remainingCount > 0
+                    ? "该密钥当前正在使用，移除后将自动切换到另一把已保存密钥，本地网关同步更新。"
+                    : "该密钥当前正在使用且为最后一把本地密钥，移除后将退出当前账号登录状态。"}
+                </p>
+              )}
+
+              <p className="text-[12px] text-[var(--text-secondary)] leading-relaxed">
+                仅从本机列表中移除记录，不会删除或停用 Tako 平台上的密钥，之后仍可随时重新添加。
+              </p>
+
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  disabled={isRemoving}
+                  onClick={() => setPendingRemoveKey(null)}
+                  className="h-8 px-3 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-secondary)] cursor-pointer disabled:opacity-50"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  data-testid="confirm-remove-key-btn"
+                  disabled={isRemoving}
+                  onClick={() => void handleConfirmRemoveSavedKey()}
+                  className="h-8 px-3.5 rounded-[8px] bg-[var(--danger)] hover:opacity-90 text-white text-[12px] font-semibold cursor-pointer disabled:opacity-50"
+                >
+                  {isRemoving ? "移除中..." : "确认移除"}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Changelog Modal */}
       {showChangelogModal && (

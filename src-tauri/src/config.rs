@@ -23,11 +23,18 @@ pub const DEFAULT_CLAUDE_RECOMMENDED_MODELS: &[&str] = &[
     "claude-opus-5-5",
     "claude-sonnet-5-5",
     "claude-fable-5-2",
+    "gpt-6.2-sol",
+    "gpt-6.2-astra",
+    "swe-2-1",
+    "deepseek-v4.1-flash",
+    "glm-5.3",
+    "kimi-k3.1-pro",
+    "grok-4.7",
 ];
 pub const DEFAULT_CODEX_RECOMMENDED_MODELS: &[&str] = &[
     "gpt-6.2-sol",
     "gpt-6.2-astra",
-    "swe-2",
+    "swe-2-1",
     "deepseek-v4.1-flash",
     "claude-opus-5-5",
     "claude-sonnet-5-5",
@@ -41,7 +48,7 @@ pub const DEFAULT_ANTIGRAVITY_RECOMMENDED_MODELS: &[&str] = &[
     "gpt-6.2-sol",
     "gpt-6.2-astra",
     "deepseek-v4.1-flash",
-    "swe-2",
+    "swe-2-1",
     "gemini-3.1-flash-image",
 ];
 pub const DEFAULT_WORKBUDDY_RECOMMENDED_MODELS: &[&str] = &[
@@ -50,7 +57,7 @@ pub const DEFAULT_WORKBUDDY_RECOMMENDED_MODELS: &[&str] = &[
     "gpt-6.2-sol",
     "gpt-6.2-astra",
     "deepseek-v4.1-flash",
-    "swe-2",
+    "swe-2-1",
 ];
 
 #[derive(Debug, Clone)]
@@ -427,9 +434,16 @@ impl ClientModelFilter {
             if trimmed.is_empty() {
                 continue;
             }
-            let lower = trimmed.to_ascii_lowercase();
+            let effective =
+                if self.mode == ModelFilterMode::Recommended && trimmed.eq_ignore_ascii_case("swe-2")
+                {
+                    "swe-2-1"
+                } else {
+                    trimmed
+                };
+            let lower = effective.to_ascii_lowercase();
             if seen.insert(lower) {
-                enabled_ids.push(trimmed.to_string());
+                enabled_ids.push(effective.to_string());
             }
         }
         Self {
@@ -505,6 +519,25 @@ pub enum ThemePref {
     Dark,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeWorkspaceMode {
+    /// Default: `desktopHome: "off"` (Code / Agent only, avoiding the file-restricted Chat tab).
+    #[default]
+    AgentOnly,
+    /// Full desktop home (`desktopHome: "standard"`): exposes Chat, Cowork, and Code tabs.
+    Full,
+}
+
+impl ClaudeWorkspaceMode {
+    pub fn desktop_home_value(self) -> &'static str {
+        match self {
+            Self::AgentOnly => "off",
+            Self::Full => "standard",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchState {
@@ -549,6 +582,10 @@ pub struct SwitchState {
     /// When None, automatically selects the first enabled Tako model in WorkBuddy's new-task selector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workbuddy_default_model: Option<String>,
+    /// Claude Desktop workspace surface mode in Tako 3p profile.
+    /// Defaults to `AgentOnly` (`desktopHome: "off"`) so users land straight in Agent/Code mode.
+    #[serde(default)]
+    pub claude_workspace_mode: ClaudeWorkspaceMode,
 }
 
 impl SwitchState {
@@ -573,6 +610,7 @@ impl SwitchState {
             explicit_official_apps: Vec::new(),
             hidden_apps: Vec::new(),
             workbuddy_default_model: None,
+            claude_workspace_mode: ClaudeWorkspaceMode::AgentOnly,
         }
     }
 
@@ -1437,6 +1475,25 @@ mod tests {
             normalized.enabled_ids,
             vec!["claude-opus-5-5", "claude-sonnet-5-5"]
         );
+
+        // Recommended mode migrates legacy `swe-2` -> `swe-2-1` (deduped), while Custom mode preserves explicit `swe-2`.
+        let rec_migrated = ClientModelFilter {
+            mode: ModelFilterMode::Recommended,
+            enabled_ids: vec![
+                "gpt-6.2-sol".to_string(),
+                "swe-2".to_string(),
+                "swe-2-1".to_string(),
+            ],
+        }
+        .normalized();
+        assert_eq!(rec_migrated.enabled_ids, vec!["gpt-6.2-sol", "swe-2-1"]);
+
+        let custom_kept = ClientModelFilter {
+            mode: ModelFilterMode::Custom,
+            enabled_ids: vec!["swe-2".to_string()],
+        }
+        .normalized();
+        assert_eq!(custom_kept.enabled_ids, vec!["swe-2"]);
     }
 
     #[test]

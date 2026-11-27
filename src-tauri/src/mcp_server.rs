@@ -236,7 +236,7 @@ pub fn build_tools_catalog(cfg: &McpToolsConfig) -> Vec<Value> {
     if cfg.consult {
         tools.push(json!({
             "name": "tako_consult",
-            "description": "Consult another frontier model via Tako POST /v1/chat/completions for a second opinion, architecture critique, or verification (e.g. gpt-6.2-sol, gpt-6.2-astra, deepseek-v4.1-flash, swe-2, claude-opus-5-5, deepseek-v4-pro, gemini-3.8-flash).",
+            "description": "Consult another frontier model via Tako POST /v1/chat/completions for a second opinion, architecture critique, or verification (e.g. gpt-6.2-sol, gpt-6.2-astra, deepseek-v4.1-flash, swe-2-1, claude-opus-5-5, deepseek-v4-pro, gemini-3.8-flash).",
             "annotations": {
                 "readOnlyHint": true,
                 "destructiveHint": false,
@@ -248,7 +248,7 @@ pub fn build_tools_catalog(cfg: &McpToolsConfig) -> Vec<Value> {
                 "properties": {
                     "question": { "type": "string", "description": "Question or decision prompt to consult on." },
                     "context": { "type": "string", "description": "Optional relevant code/logs/constraints context." },
-                    "model": { "type": "string", "description": "Model ID (default from Tako Switch settings, e.g. gpt-6.2-sol / gpt-6.2-astra / deepseek-v4.1-flash / swe-2 / claude-opus-5-5 / deepseek-v4-pro / gemini-3.8-flash)." },
+                    "model": { "type": "string", "description": "Model ID (default from Tako Switch settings, e.g. gpt-6.2-sol / gpt-6.2-astra / deepseek-v4.1-flash / swe-2-1 / claude-opus-5-5 / deepseek-v4-pro / gemini-3.8-flash)." },
                     "system_prompt": { "type": "string", "description": "Optional advisor system instruction." }
                 },
                 "required": ["question"]

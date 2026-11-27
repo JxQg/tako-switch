@@ -401,7 +401,7 @@ const CONSULT_MODEL_PRESETS = [
   "gpt-6.2-astra",
   "claude-opus-5-5",
   "deepseek-v4.1-flash",
-  "swe-2",
+  "swe-2-1",
 ] as const;
 
 const IMAGE_MODELS = [

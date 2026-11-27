@@ -459,6 +459,7 @@ export function TopHeaderBar({
                                 disabled={Boolean(switchingKeyId)}
                                 onClick={(e) => {
                                   e.stopPropagation();
+                                  setAccountOpen(false);
                                   onRemoveKey(item.id);
                                 }}
                                 title="从本地列表移除此密钥（不会删除平台密钥）"
@@ -581,6 +582,7 @@ export function TopHeaderBar({
                               disabled={Boolean(switchingKeyId)}
                               onClick={(e) => {
                                 e.stopPropagation();
+                                setAccountOpen(false);
                                 onRemoveKey(item.id);
                               }}
                               title="从本地列表移除"
