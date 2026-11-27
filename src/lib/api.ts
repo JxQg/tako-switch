@@ -15,11 +15,27 @@ export interface QuotaSummary {
   weeklyUsed: number;
 }
 
+export interface SavedKeySummary {
+  id: string;
+  maskedKey: string;
+  userName: string | null;
+  keyName: string | null;
+  alias: string | null;
+  displayLabel: string;
+  authSource: string | null;
+  active: boolean;
+}
+
 export interface AccountStatus {
   loggedIn: boolean;
   baseUrl: string;
   maskedKey: string | null;
   userName: string | null;
+  keyName?: string | null;
+  activeKeyId?: string | null;
+  activeKeyAlias?: string | null;
+  displayLabel?: string | null;
+  savedKeys?: SavedKeySummary[];
   planName: string | null;
   walletRemain: number | null;
   walletUsed: number | null;
@@ -132,6 +148,7 @@ export interface SwitchState {
   modelFilters?: ModelFiltersConfig;
   explicitOfficialApps?: AppId[];
   hiddenApps?: AppId[];
+  workbuddyDefaultModel?: string | null;
 }
 
 export interface InstallInfo {
@@ -373,6 +390,7 @@ export interface SettingsPatch {
   themePref?: ThemePref;
   mcp?: McpToolsConfig;
   hiddenApps?: AppId[];
+  workbuddyDefaultModel?: string;
 }
 
 export interface FrontendErrorInput {
@@ -665,6 +683,21 @@ export const api = {
     invoke<Record<AppId, boolean>>("get_running_states"),
   loginOAuth: () => invoke<AccountStatus>("login_oauth"),
   loginWithKey: (key: string) => invoke<AccountStatus>("login_with_key", { key }),
+  addSavedKey: (key: string, alias?: string | null, activate = true) =>
+    invoke<AccountStatus>("add_saved_key", {
+      key,
+      alias: alias ?? null,
+      activate,
+    }),
+  switchSavedKey: (keyId: string) =>
+    invoke<AccountStatus>("switch_saved_key", { keyId }),
+  removeSavedKey: (keyId: string) =>
+    invoke<AccountStatus>("remove_saved_key", { keyId }),
+  renameSavedKeyAlias: (keyId: string, alias?: string | null) =>
+    invoke<AccountStatus>("rename_saved_key_alias", {
+      keyId,
+      alias: alias ?? null,
+    }),
   logoutAccount: () => invoke<AccountStatus>("logout_account"),
   openUrl: (url: string) => invoke<void>("open_url", { url }),
   saveSettings: (input: SettingsPatch) =>

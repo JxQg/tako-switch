@@ -268,6 +268,83 @@ class ManageReleasesTests(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_render_agy_cli_manifests_from_pinned_compatible_with_official_schema(self) -> None:
+        pinned = json.loads(self.mod.DEFAULT_PINNED_PATH.read_text(encoding="utf-8"))
+        files = self.mod.render_agy_cli_manifests_from_pinned(pinned, generated_at="2026-11-26T10:00:00Z")
+        self.assertIn("darwin_arm64.json", files)
+        self.assertIn("windows_amd64.json", files)
+        self.assertIn("index.json", files)
+        mac = files["darwin_arm64.json"]
+        self.assertEqual(mac["version"], "1.5.17")
+        self.assertTrue(mac["url"].startswith("https://"))
+        self.assertEqual(len(mac["sha512"]), 128)
+        self.assertEqual(mac["minSupportedVersion"], "1.5.16")
+        self.assertEqual(mac["supportedVersions"], ["1.5.16", "1.5.17"])
+        self.assertEqual(mac["channel"], "tako-managed")
+        self.assertEqual(files["index.json"]["version"], "1.5.17")
+
+    def test_verify_and_promote_agy_cli_independently_enforces_gateway_lock(self) -> None:
+        sha = "a" * 128
+        platforms = {
+            plat: {
+                "version": "1.5.18",
+                "url": f"https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.18/{plat}.tar.gz",
+                "sha512": sha,
+            }
+            for plat in self.mod.AGY_CLI_REQUIRED_PLATFORMS
+        }
+        candidate = {
+            "cliTools": {
+                "agy": {
+                    "upstreamEntry": {
+                        "version": "1.5.18",
+                        "platforms": platforms,
+                    }
+                }
+            }
+        }
+        gw_lock_missing = {
+            "families": {
+                "cli": {
+                    "supported_window": ["1.5.16", "1.5.17"],
+                    "versions": {"1.5.17": {"status": "approved"}},
+                }
+            }
+        }
+        failed = self.mod.verify_agy_cli_candidate(
+            candidate, gateway_lock=gw_lock_missing, diff_report={"passed": True, "fail_count": 0}
+        )
+        self.assertEqual(failed["overall"], "fail")
+        self.assertEqual(failed["gates"]["gatewayLock"]["status"], "fail")
+
+        pinned = json.loads(self.mod.DEFAULT_PINNED_PATH.read_text(encoding="utf-8"))
+        original_apps = json.loads(json.dumps(pinned["apps"]))
+        with self.assertRaises(ValueError):
+            self.mod.promote_agy_cli_candidate(pinned, candidate, failed)
+
+        gw_lock_ready = {
+            "families": {
+                "cli": {
+                    "supported_window": ["1.5.17", "1.5.18"],
+                    "versions": {
+                        "1.5.17": {"status": "supported"},
+                        "1.5.18": {"status": "approved"},
+                    },
+                }
+            }
+        }
+        passed = self.mod.verify_agy_cli_candidate(
+            candidate, gateway_lock=gw_lock_ready, diff_report={"passed": True, "fail_count": 0}
+        )
+        self.assertEqual(passed["overall"], "pass")
+
+        updated = self.mod.promote_agy_cli_candidate(pinned, candidate, passed)
+        self.assertEqual(updated["cliTools"]["agy"]["version"], "1.5.18")
+        self.assertEqual(updated["cliTools"]["agy"]["supportedVersions"], ["1.5.17", "1.5.18"])
+        self.assertEqual(updated["cliTools"]["agy"]["minSupportedVersion"], "1.5.17")
+        # Independent promotion must never mutate Desktop app pins
+        self.assertEqual(updated["apps"], original_apps)
+
 
 if __name__ == "__main__":
     unittest.main()

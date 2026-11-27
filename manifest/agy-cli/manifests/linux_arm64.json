@@ -1,0 +1,14 @@
+{
+  "version": "1.5.17",
+  "url": "https://dl.lven.asia/apps/agy-cli/linux_arm64/1.5.17/cli_linux_arm64.tar.gz",
+  "sha512": "e4f086d0730b325cfd438ea90396ee78eb23a3110ef7f792824c8817b8d0432462b7b5f91b3d933fc1932a6f4ba73de505e2e96f44448c9fb2427292ead716f7",
+  "size": 93662528,
+  "minSupportedVersion": "1.5.16",
+  "supportedVersions": [
+    "1.5.16",
+    "1.5.17"
+  ],
+  "channel": "tako-managed",
+  "approvedAt": "2026-11-25T16:00:00Z",
+  "fallbackUrl": "https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.17-4823843970351104/linux-arm/cli_linux_arm64.tar.gz"
+}

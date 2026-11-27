@@ -1,10 +1,12 @@
 use crate::adapters::AppId;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -61,6 +63,7 @@ pub struct AppPaths {
     pub claude_1p_dir: PathBuf,
     pub claude_3p_dir: PathBuf,
     pub agy_gemini_config_dir: PathBuf,
+    pub agy_user_data_dir: PathBuf,
     pub workbuddy_dir: PathBuf,
     pub launch_agents_dir: PathBuf,
     pub agy_app_override_dir: Option<PathBuf>,
@@ -93,6 +96,7 @@ impl AppPaths {
 
         let (claude_1p_dir, claude_3p_dir) = detect_claude_dirs(&home);
         let agy_gemini_config_dir = home.join(".gemini").join("config");
+        let agy_user_data_dir = detect_agy_user_data_dir(&home);
         let workbuddy_dir = std::env::var_os("WORKBUDDY_CONFIG_DIR")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
@@ -107,6 +111,7 @@ impl AppPaths {
             claude_1p_dir,
             claude_3p_dir,
             agy_gemini_config_dir,
+            agy_user_data_dir,
             workbuddy_dir,
             launch_agents_dir,
             agy_app_override_dir: None,
@@ -124,6 +129,7 @@ impl AppPaths {
             claude_1p_dir: root.join("claude_1p"),
             claude_3p_dir: root.join("claude_3p"),
             agy_gemini_config_dir: root.join(".gemini").join("config"),
+            agy_user_data_dir: root.join("antigravity_user_data"),
             workbuddy_dir: root.join(".workbuddy"),
             launch_agents_dir: root.join("LaunchAgents"),
             agy_app_override_dir: None,
@@ -162,6 +168,31 @@ impl AppPaths {
 
     pub fn mcp_server_exe(&self) -> PathBuf {
         std::env::current_exe().unwrap_or_else(|_| PathBuf::from("tako-switch"))
+    }
+}
+
+fn detect_agy_user_data_dir(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library")
+            .join("Application Support")
+            .join("Antigravity")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let roaming_app_data = std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData").join("Roaming"));
+        roaming_app_data.join("Antigravity")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let cfg = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        cfg.join("Antigravity")
     }
 }
 
@@ -515,6 +546,10 @@ pub struct SwitchState {
     /// Empty by default so all tools are shown unless explicitly hidden in settings.
     #[serde(default)]
     pub hidden_apps: Vec<AppId>,
+    /// Optional preferred default model ID for WorkBuddy (raw ID without `custom-local:` prefix).
+    /// When None, automatically selects the first enabled Tako model in WorkBuddy's new-task selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workbuddy_default_model: Option<String>,
 }
 
 impl SwitchState {
@@ -538,6 +573,7 @@ impl SwitchState {
             model_filters: ModelFiltersConfig::default(),
             explicit_official_apps: Vec::new(),
             hidden_apps: Vec::new(),
+            workbuddy_default_model: None,
         }
     }
 
@@ -722,6 +758,41 @@ pub fn copy_file_atomic(
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedApiKey {
+    pub id: String,
+    pub api_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UpsertSavedKeyInput<'a> {
+    pub api_key: &'a str,
+    pub api_id: Option<&'a str>,
+    pub token_id: Option<&'a str>,
+    pub user_name: Option<&'a str>,
+    pub key_name: Option<&'a str>,
+    pub alias: Option<Option<&'a str>>,
+    pub auth_source: Option<&'a str>,
+    pub activate: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchAuth {
@@ -731,6 +802,95 @@ pub struct SwitchAuth {
     pub api_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saved_keys: Vec<SavedApiKey>,
+}
+
+fn unix_now_secs_config() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn clean_opt_str(raw: Option<&str>, max_chars: usize) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.chars().take(max_chars).collect())
+}
+
+/// Deterministic, non-reversible identifier derived from raw API key content.
+/// Ensures keys are deduplicated by key identity rather than account identity.
+pub fn key_profile_id(raw_key: &str) -> String {
+    let trimmed = raw_key.trim();
+    let digest = Sha256::digest(format!("tako-key:{trimmed}").as_bytes());
+    hex::encode(&digest[..6])
+}
+
+fn normalize_switch_auth(mut auth: SwitchAuth) -> SwitchAuth {
+    auth.api_key = clean_opt_str(auth.api_key.as_deref(), 512);
+    auth.api_id = clean_opt_str(auth.api_id.as_deref(), 128);
+    auth.auth_source = clean_opt_str(auth.auth_source.as_deref(), 64);
+    auth.active_key_id = clean_opt_str(auth.active_key_id.as_deref(), 64);
+
+    let mut seen_ids = HashSet::new();
+    let mut normalized_keys = Vec::with_capacity(auth.saved_keys.len());
+    for mut item in auth.saved_keys.drain(..) {
+        let Some(trimmed_key) = clean_opt_str(Some(item.api_key.as_str()), 512) else {
+            continue;
+        };
+        let derived_id = key_profile_id(&trimmed_key);
+        if !seen_ids.insert(derived_id.clone()) {
+            continue;
+        }
+        item.id = derived_id;
+        item.api_key = trimmed_key;
+        item.api_id = clean_opt_str(item.api_id.as_deref(), 128);
+        item.token_id = clean_opt_str(item.token_id.as_deref(), 128);
+        item.user_name = clean_opt_str(item.user_name.as_deref(), 120);
+        item.key_name = clean_opt_str(item.key_name.as_deref(), 120);
+        item.alias = clean_opt_str(item.alias.as_deref(), 40);
+        item.auth_source = clean_opt_str(item.auth_source.as_deref(), 64);
+        normalized_keys.push(item);
+    }
+
+    if let Some(ref active_key) = auth.api_key {
+        let derived_id = key_profile_id(active_key);
+        if let Some(existing) = normalized_keys.iter_mut().find(|k| k.id == derived_id) {
+            if existing.api_id.is_none() && auth.api_id.is_some() {
+                existing.api_id = auth.api_id.clone();
+            }
+            if existing.auth_source.is_none() && auth.auth_source.is_some() {
+                existing.auth_source = auth.auth_source.clone();
+            }
+        } else {
+            normalized_keys.insert(
+                0,
+                SavedApiKey {
+                    id: derived_id.clone(),
+                    api_key: active_key.clone(),
+                    api_id: auth.api_id.clone(),
+                    token_id: None,
+                    user_name: None,
+                    key_name: None,
+                    alias: None,
+                    auth_source: auth.auth_source.clone(),
+                    added_at_unix: None,
+                    last_used_at_unix: None,
+                },
+            );
+        }
+        auth.active_key_id = Some(derived_id);
+    } else {
+        auth.active_key_id = None;
+    }
+
+    auth.saved_keys = normalized_keys;
+    auth
 }
 
 pub fn read_switch_auth(paths: &AppPaths) -> SwitchAuth {
@@ -738,7 +898,23 @@ pub fn read_switch_auth(paths: &AppPaths) -> SwitchAuth {
     let Ok(raw) = fs::read_to_string(&path) else {
         return SwitchAuth::default();
     };
-    serde_json::from_str::<SwitchAuth>(&raw).unwrap_or_default()
+    let parsed = serde_json::from_str::<SwitchAuth>(&raw).unwrap_or_default();
+    normalize_switch_auth(parsed)
+}
+
+pub fn write_switch_auth(paths: &AppPaths, auth: &SwitchAuth) -> Result<(), String> {
+    let normalized = normalize_switch_auth(auth.clone());
+    if normalized.api_key.is_none() && normalized.saved_keys.is_empty() {
+        let path = paths.auth_path();
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|e| format!("清理凭据文件 {} 失败: {e}", path.display()))?;
+        }
+        return Ok(());
+    }
+    let serialized = serde_json::to_vec_pretty(&normalized)
+        .map_err(|e| format!("序列化 Tako Switch 凭据失败: {e}"))?;
+    write_atomic(&paths.auth_path(), &serialized, true)
 }
 
 pub fn save_switch_auth(
@@ -756,20 +932,253 @@ pub fn save_switch_auth(
         return Ok(());
     };
 
-    let payload = SwitchAuth {
-        api_key: Some(key.to_string()),
-        api_id: api_id
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
-        auth_source: auth_source
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+    upsert_saved_key(
+        paths,
+        UpsertSavedKeyInput {
+            api_key: key,
+            api_id,
+            token_id: None,
+            user_name: None,
+            key_name: None,
+            alias: None,
+            auth_source,
+            activate: true,
+        },
+    )?;
+    Ok(())
+}
+
+pub fn upsert_saved_key(
+    paths: &AppPaths,
+    input: UpsertSavedKeyInput<'_>,
+) -> Result<SavedApiKey, String> {
+    let key = input.api_key.trim();
+    if key.is_empty() {
+        return Err("API Key 不能为空".to_string());
+    }
+    let now = unix_now_secs_config();
+    let id = key_profile_id(key);
+    let mut auth = read_switch_auth(paths);
+
+    let api_id = clean_opt_str(input.api_id, 128);
+    let token_id = clean_opt_str(input.token_id, 128);
+    let user_name = clean_opt_str(input.user_name, 120);
+    let key_name = clean_opt_str(input.key_name, 120);
+    let auth_source = clean_opt_str(input.auth_source, 64);
+
+    // OAuth re-login on the same device revokes/replaces the previous OAuth token for the same user.
+    // Remove superseded OAuth entries for the same user so dead OAuth keys don't pile up, while never touching manual keys.
+    if auth_source.as_deref() == Some("oauth") {
+        if let Some(ref uid) = api_id {
+            auth.saved_keys.retain(|k| {
+                k.id == id
+                    || k.auth_source.as_deref() != Some("oauth")
+                    || k.api_id.as_deref() != Some(uid.as_str())
+            });
+        }
+    }
+
+    let should_activate = input.activate || auth.api_key.is_none();
+
+    let updated = if let Some(existing) = auth.saved_keys.iter_mut().find(|k| k.id == id) {
+        if api_id.is_some() {
+            existing.api_id = api_id;
+        }
+        if token_id.is_some() {
+            existing.token_id = token_id;
+        }
+        if user_name.is_some() {
+            existing.user_name = user_name;
+        }
+        if key_name.is_some() {
+            existing.key_name = key_name;
+        }
+        if let Some(alias_opt) = input.alias {
+            existing.alias = clean_opt_str(alias_opt, 40);
+        }
+        if auth_source.is_some() {
+            existing.auth_source = auth_source;
+        }
+        if existing.added_at_unix.is_none() {
+            existing.added_at_unix = Some(now);
+        }
+        if should_activate {
+            existing.last_used_at_unix = Some(now);
+        }
+        existing.clone()
+    } else {
+        let entry = SavedApiKey {
+            id: id.clone(),
+            api_key: key.to_string(),
+            api_id,
+            token_id,
+            user_name,
+            key_name,
+            alias: input.alias.and_then(|v| clean_opt_str(v, 40)),
+            auth_source,
+            added_at_unix: Some(now),
+            last_used_at_unix: should_activate.then_some(now),
+        };
+        auth.saved_keys.push(entry.clone());
+        entry
     };
-    let serialized = serde_json::to_vec_pretty(&payload)
-        .map_err(|e| format!("序列化 Tako Switch 凭据失败: {e}"))?;
-    write_atomic(&paths.auth_path(), &serialized, true)
+
+    if should_activate {
+        auth.api_key = Some(updated.api_key.clone());
+        auth.api_id = updated.api_id.clone();
+        auth.auth_source = updated.auth_source.clone();
+        auth.active_key_id = Some(updated.id.clone());
+    }
+
+    write_switch_auth(paths, &auth)?;
+    Ok(updated)
+}
+
+pub fn activate_saved_key(paths: &AppPaths, key_id: &str) -> Result<SavedApiKey, String> {
+    let target_id = key_id.trim();
+    if target_id.is_empty() {
+        return Err("密钥 ID 不能为空".to_string());
+    }
+    let mut auth = read_switch_auth(paths);
+    let now = unix_now_secs_config();
+    let Some(entry) = auth.saved_keys.iter_mut().find(|k| k.id == target_id) else {
+        return Err("未找到对应的本地保存密钥".to_string());
+    };
+    entry.last_used_at_unix = Some(now);
+    let activated = entry.clone();
+    auth.api_key = Some(activated.api_key.clone());
+    auth.api_id = activated.api_id.clone();
+    auth.auth_source = activated.auth_source.clone();
+    auth.active_key_id = Some(activated.id.clone());
+    write_switch_auth(paths, &auth)?;
+    Ok(activated)
+}
+
+pub fn remove_saved_key_entry(
+    paths: &AppPaths,
+    key_id: &str,
+) -> Result<(SavedApiKey, Option<SavedApiKey>), String> {
+    let target_id = key_id.trim();
+    let mut auth = read_switch_auth(paths);
+    let Some(pos) = auth.saved_keys.iter().position(|k| k.id == target_id) else {
+        return Err("未找到对应的本地保存密钥".to_string());
+    };
+    let removed = auth.saved_keys.remove(pos);
+    let was_active = auth.active_key_id.as_deref() == Some(removed.id.as_str())
+        || auth.api_key.as_deref() == Some(removed.api_key.as_str());
+
+    let next_active = if was_active {
+        if let Some(first) = auth.saved_keys.first_mut() {
+            first.last_used_at_unix = Some(unix_now_secs_config());
+            let next = first.clone();
+            auth.api_key = Some(next.api_key.clone());
+            auth.api_id = next.api_id.clone();
+            auth.auth_source = next.auth_source.clone();
+            auth.active_key_id = Some(next.id.clone());
+            Some(next)
+        } else {
+            auth.api_key = None;
+            auth.api_id = None;
+            auth.auth_source = None;
+            auth.active_key_id = None;
+            None
+        }
+    } else {
+        None
+    };
+
+    write_switch_auth(paths, &auth)?;
+    Ok((removed, next_active))
+}
+
+pub fn update_saved_key_alias(
+    paths: &AppPaths,
+    key_id: &str,
+    alias: Option<&str>,
+) -> Result<SavedApiKey, String> {
+    let target_id = key_id.trim();
+    let mut auth = read_switch_auth(paths);
+    let Some(entry) = auth.saved_keys.iter_mut().find(|k| k.id == target_id) else {
+        return Err("未找到对应的本地保存密钥".to_string());
+    };
+    entry.alias = clean_opt_str(alias, 40);
+    let updated = entry.clone();
+    write_switch_auth(paths, &auth)?;
+    Ok(updated)
+}
+
+pub fn update_saved_key_metadata(
+    paths: &AppPaths,
+    raw_key: &str,
+    api_id: Option<&str>,
+    token_id: Option<&str>,
+    user_name: Option<&str>,
+    key_name: Option<&str>,
+) -> Result<(), String> {
+    let id = key_profile_id(raw_key);
+    let mut auth = read_switch_auth(paths);
+    let Some(entry) = auth.saved_keys.iter_mut().find(|k| k.id == id) else {
+        return Ok(());
+    };
+    let mut changed = false;
+    if let Some(v) = clean_opt_str(api_id, 128) {
+        if entry.api_id.as_deref() != Some(v.as_str()) {
+            entry.api_id = Some(v.clone());
+            changed = true;
+        }
+        if auth.active_key_id.as_deref() == Some(id.as_str())
+            && auth.api_id.as_deref() != Some(v.as_str())
+        {
+            auth.api_id = Some(v);
+            changed = true;
+        }
+    }
+    if let Some(v) = clean_opt_str(token_id, 128) {
+        if entry.token_id.as_deref() != Some(v.as_str()) {
+            entry.token_id = Some(v);
+            changed = true;
+        }
+    }
+    if let Some(v) = clean_opt_str(user_name, 120) {
+        if entry.user_name.as_deref() != Some(v.as_str()) {
+            entry.user_name = Some(v);
+            changed = true;
+        }
+    }
+    if let Some(v) = clean_opt_str(key_name, 120) {
+        if entry.key_name.as_deref() != Some(v.as_str()) {
+            entry.key_name = Some(v);
+            changed = true;
+        }
+    }
+    if changed {
+        write_switch_auth(paths, &auth)?;
+    }
+    Ok(())
+}
+
+/// Logs out the currently active key:
+/// - If the active key was an OAuth device token (just revoked on the server), removes it from `saved_keys`.
+/// - If it was a manually added key, keeps it in `saved_keys` so the user can switch back with one click.
+/// - Clears `api_key` / `active_key_id` so the app enters the logged-out state; deletes `auth.json` if no saved keys remain.
+pub fn deactivate_current_auth(paths: &AppPaths, remove_if_oauth: bool) -> Result<(), String> {
+    let mut auth = read_switch_auth(paths);
+    if remove_if_oauth && auth.auth_source.as_deref() == Some("oauth") {
+        if let Some(active_id) = auth.active_key_id.clone() {
+            auth.saved_keys.retain(|k| k.id != active_id);
+        }
+    }
+    auth.api_key = None;
+    auth.api_id = None;
+    auth.auth_source = None;
+    auth.active_key_id = None;
+    write_switch_auth(paths, &auth)
+}
+
+pub fn read_active_saved_key(paths: &AppPaths) -> Option<SavedApiKey> {
+    let auth = read_switch_auth(paths);
+    let active_id = auth.active_key_id.as_deref()?;
+    auth.saved_keys.into_iter().find(|k| k.id == active_id)
 }
 
 pub fn read_main_api_key(paths: &AppPaths) -> Option<String> {

@@ -138,6 +138,8 @@ function installMock({ theme, density, native = false }) {
     baseUrl: "https://example.invalid",
     maskedKey: "masked",
     userName: "Workspace User With Long Name",
+    displayLabel: "Workspace User With Long Name - Development Key",
+    activeKeyAlias: "Workspace development",
     planName: "Professional Workspace Plan",
     walletRemainUsd: 12.34,
     walletUsedUsd: 1.23,
@@ -360,6 +362,12 @@ if (preview) {
             .filter({ hasText: "3 项 · 1 可更新" })
             .waitFor();
           await verifyBounds(page, `${label}-overview`);
+          const keySwitcher = page.getByTestId("topbar-key-switcher");
+          await keySwitcher.click();
+          await page.getByTestId("popover-add-key").waitFor();
+          await verifyBounds(page, `${label}-key-switcher`);
+          await page.keyboard.press("Escape");
+          await page.getByTestId("popover-add-key").waitFor({ state: "hidden" });
           const homeGridRows = await page
             .locator('[data-testid^="open-ext-hub-"]')
             .evaluateAll((elements) =>

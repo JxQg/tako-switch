@@ -132,6 +132,9 @@ export default function App() {
 
   const [showKeyModal, setShowKeyModal] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState("");
+  const [apiKeyAliasInput, setApiKeyAliasInput] = useState("");
+  const [activateNewKey, setActivateNewKey] = useState(true);
+  const [switchingKeyId, setSwitchingKeyId] = useState<string | null>(null);
   const [showChangelogModal, setShowChangelogModal] = useState(false);
   const [showFeedbackModal, setShowFeedbackModal] = useState(false);
   const [mcpInitialTab, setMcpInitialTab] = useState<McpToolKey | null>(null);
@@ -320,11 +323,15 @@ export default function App() {
     try {
       const data = await api.getDashboard(refreshAccount);
       setDashboard((prev) => {
+        const sameKey =
+          prev?.account.activeKeyId && data.account.activeKeyId
+            ? prev.account.activeKeyId === data.account.activeKeyId
+            : prev?.account.maskedKey === data.account.maskedKey;
         if (
           !refreshAccount &&
           prev?.account.loggedIn &&
           data.account.loggedIn &&
-          prev.account.maskedKey === data.account.maskedKey &&
+          sameKey &&
           !data.account.userName
         ) {
           return {
@@ -332,6 +339,8 @@ export default function App() {
             account: {
               ...data.account,
               userName: prev.account.userName,
+              keyName: data.account.keyName ?? prev.account.keyName,
+              displayLabel: data.account.displayLabel ?? prev.account.displayLabel,
               planName: prev.account.planName,
               walletRemain: prev.account.walletRemain,
               walletUsed: prev.account.walletUsed,
@@ -712,18 +721,38 @@ export default function App() {
     }
   };
 
+  const handleOpenKeyModal = () => {
+    setApiKeyInput("");
+    setApiKeyAliasInput("");
+    setActivateNewKey(true);
+    setShowKeyModal(true);
+  };
+
   const handleKeyLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = apiKeyInput.trim();
     if (!trimmed) return;
+    const trimmedAlias = apiKeyAliasInput.trim() || null;
+    const wasLoggedIn = Boolean(dashboard?.account.loggedIn);
+    const shouldActivate = wasLoggedIn ? activateNewKey : true;
     setLoggingIn(true);
     setErrorMsg(null);
     try {
-      await api.loginWithKey(trimmed);
+      const updatedAccount = await api.addSavedKey(trimmed, trimmedAlias, shouldActivate);
       setApiKeyInput("");
+      setApiKeyAliasInput("");
+      setActivateNewKey(true);
       setShowKeyModal(false);
-      await loadDashboard(true);
-      showTransientNote("API Key 验证成功");
+      setDashboard((prev) => (prev ? { ...prev, account: updatedAccount } : prev));
+      await loadDashboard(false);
+      const label = updatedAccount.displayLabel ?? updatedAccount.maskedKey ?? "新密钥";
+      showTransientNote(
+        shouldActivate
+          ? wasLoggedIn
+            ? `已添加并切换到 ${label}（本地网关即时生效）`
+            : `已登录：${label}`
+          : "已添加到本地密钥列表",
+      );
     } catch (err) {
       setErrorMsg(`Key 验证失败：${String(err)}`);
     } finally {
@@ -731,11 +760,65 @@ export default function App() {
     }
   };
 
+  const handleSwitchSavedKey = async (keyId: string) => {
+    if (switchingKeyId) return;
+    setSwitchingKeyId(keyId);
+    setErrorMsg(null);
+    try {
+      const updatedAccount = await api.switchSavedKey(keyId);
+      setDashboard((prev) => (prev ? { ...prev, account: updatedAccount } : prev));
+      await loadDashboard(false);
+      const label = updatedAccount.displayLabel ?? updatedAccount.maskedKey ?? "已选密钥";
+      showTransientNote(`已切换密钥：${label}（本地网关即时生效）`);
+    } catch (err) {
+      setErrorMsg(`切换密钥失败：${String(err)}`);
+    } finally {
+      setSwitchingKeyId(null);
+    }
+  };
+
+  const handleRemoveSavedKey = async (keyId: string) => {
+    if (switchingKeyId) return;
+    setSwitchingKeyId(keyId);
+    setErrorMsg(null);
+    try {
+      const updatedAccount = await api.removeSavedKey(keyId);
+      setDashboard((prev) => (prev ? { ...prev, account: updatedAccount } : prev));
+      await loadDashboard(false);
+      showTransientNote(
+        updatedAccount.loggedIn && updatedAccount.displayLabel
+          ? `已移除密钥，当前使用 ${updatedAccount.displayLabel}`
+          : "已从本地列表移除密钥",
+      );
+    } catch (err) {
+      setErrorMsg(`移除密钥失败：${String(err)}`);
+    } finally {
+      setSwitchingKeyId(null);
+    }
+  };
+
+  const handleRenameSavedKeyAlias = async (keyId: string, alias: string | null) => {
+    setErrorMsg(null);
+    try {
+      const updatedAccount = await api.renameSavedKeyAlias(keyId, alias);
+      setDashboard((prev) => (prev ? { ...prev, account: updatedAccount } : prev));
+      showTransientNote(alias ? `备注已更新为「${alias}」` : "已清除本地备注");
+    } catch (err) {
+      setErrorMsg(`更新备注失败：${String(err)}`);
+    }
+  };
+
   const handleLogout = async () => {
     try {
-      await api.logoutAccount();
+      const updatedAccount = await api.logoutAccount();
+      setDashboard((prev) => (prev ? { ...prev, account: updatedAccount } : prev));
       await loadDashboard(false);
-      showTransientNote("已退出当前账号");
+      const keptCount = updatedAccount.savedKeys?.length ?? 0;
+      showTransientNote(
+        keptCount > 0
+          ? `已退出当前密钥（本地保留 ${keptCount} 把密钥，可随时重新启用）`
+          : "已退出当前账号",
+      );
     } catch (err) {
       setErrorMsg(String(err));
     }
@@ -1160,6 +1243,12 @@ export default function App() {
     try {
       const saved = await api.saveSettings(patch);
       setDashboard((prev) => (prev ? { ...prev, state: saved } : prev));
+      if (
+        patch.workbuddyDefaultModel !== undefined &&
+        dashboard.apps.find((a) => a.id === "workbuddy")?.running
+      ) {
+        setNeedsRestart((prev) => ({ ...prev, workbuddy: true }));
+      }
       if (note) showTransientNote(note);
     } catch (err) {
       setErrorMsg(`保存设置失败：${String(err)}`);
@@ -1357,11 +1446,14 @@ export default function App() {
         refreshing={refreshing}
         checkingUpdates={checkingUpdates}
         loggingIn={loggingIn}
+        switchingKeyId={switchingKeyId}
         onGoHome={() => navigate("overview")}
         onToggleTheme={toggleThemeQuick}
         onRefresh={() => void handleRefresh()}
         onOAuthLogin={() => void handleOAuthLogin()}
-        onOpenKeyModal={() => setShowKeyModal(true)}
+        onOpenKeyModal={handleOpenKeyModal}
+        onSwitchKey={(keyId) => void handleSwitchSavedKey(keyId)}
+        onRemoveKey={(keyId) => void handleRemoveSavedKey(keyId)}
         onLogout={() => void handleLogout()}
         onOpenGeneralSettings={() => navigate("general")}
         onMinimizeWindow={nativeWindow.minimize}
@@ -1465,6 +1557,7 @@ export default function App() {
             anyTakoMode={anyTakoMode}
             fixingGateway={fixingGateway}
             loggingIn={loggingIn}
+            switchingKeyId={switchingKeyId}
             savingSettings={savingSettings}
             checkingUpdates={checkingUpdates}
             lastCheckedAt={lastCheckedAt}
@@ -1484,7 +1577,10 @@ export default function App() {
             mcpTotalCount={6}
             onEnsureGateway={() => void handleEnsureGateway()}
             onOAuthLogin={() => void handleOAuthLogin()}
-            onOpenKeyModal={() => setShowKeyModal(true)}
+            onOpenKeyModal={handleOpenKeyModal}
+            onSwitchKey={(keyId) => void handleSwitchSavedKey(keyId)}
+            onRemoveKey={(keyId) => void handleRemoveSavedKey(keyId)}
+            onRenameKeyAlias={handleRenameSavedKeyAlias}
             onLogout={() => void handleLogout()}
             onRefreshAccount={() => void loadDashboard(true)}
             onSavePatch={handleSaveSettingsPatch}
@@ -1636,15 +1732,17 @@ export default function App() {
 
       {/* Transient Floating Toast */}
       {statusNote && (
-        <div
-          role="status"
-          className="toast-enter fixed bottom-5 left-1/2 -translate-x-1/2 z-40 px-3.5 py-2 rounded-full bg-[var(--btn-dark-bg)] text-[var(--btn-dark-fg)] text-[12px] font-medium shadow-lg pointer-events-none"
-        >
-          {statusNote}
+        <div className="fixed inset-x-0 bottom-5 z-40 flex justify-center px-4 pointer-events-none">
+          <div
+            role="status"
+            className="toast-enter max-w-full px-3.5 py-2 rounded-full bg-[var(--btn-dark-bg)] text-[var(--btn-dark-fg)] text-[12px] font-medium shadow-lg text-center"
+          >
+            {statusNote}
+          </div>
         </div>
       )}
 
-      {/* Manual API Key Login Modal */}
+      {/* Add / Login API Key Modal */}
       {showKeyModal && (
         <div
           className="fixed inset-0 z-50 modal-backdrop flex items-center justify-center p-4"
@@ -1653,11 +1751,11 @@ export default function App() {
           <form
             onSubmit={handleKeyLogin}
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-[380px] rounded-[15px] border border-[var(--border)] bg-[var(--bg-card)] p-5 shadow-[var(--shadow-modal)] flex flex-col gap-3.5"
+            className="w-full max-w-[404px] rounded-[15px] border border-[var(--border)] bg-[var(--bg-card)] p-5 shadow-[var(--shadow-modal)] flex flex-col gap-3.5"
           >
             <div className="flex items-center justify-between">
               <h3 className="text-[14px] font-semibold text-[var(--text-primary)]">
-                手动填入 Tako API Key
+                {dashboard?.account.loggedIn ? "添加 Tako API Key" : "手动填入 Tako API Key"}
               </h3>
               <button
                 type="button"
@@ -1668,32 +1766,86 @@ export default function App() {
                 <X className="h-4 w-4" />
               </button>
             </div>
-            <p className="text-[12px] text-[var(--text-secondary)]">
-              粘贴以 <code className="font-mono">sk-</code> 开头的 Tako Key，验证后同步到本机配置。
+            <p className="text-[12px] text-[var(--text-secondary)] leading-relaxed">
+              粘贴 Tako API Key（如 <code className="font-mono">cr_...</code> 或{" "}
+              <code className="font-mono">sk-...</code>），验证后自动识别「账号名 - 密钥名」并保存到本地列表；同一账号可添加多把不同配置的 Key 随时切换。
             </p>
-            <input
-              type="password"
-              autoFocus
-              value={apiKeyInput}
-              onChange={(e) => setApiKeyInput(e.target.value)}
-              placeholder="sk-..."
-              className="h-9 px-3 rounded-[9px] border border-[var(--border)] bg-[var(--bg-canvas)] text-[12.5px] font-mono text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
-            />
-            <div className="flex items-center justify-end gap-2 pt-1">
+            <div className="flex flex-col gap-2.5">
+              <div className="flex flex-col gap-1">
+                <label className="text-[11.5px] font-medium text-[var(--text-secondary)]">
+                  API Key
+                </label>
+                <input
+                  type="password"
+                  autoFocus
+                  value={apiKeyInput}
+                  onChange={(e) => setApiKeyInput(e.target.value)}
+                  placeholder="cr_... 或 sk-..."
+                  className="h-9 px-3 rounded-[9px] border border-[var(--border)] bg-[var(--bg-canvas)] text-[12.5px] font-mono text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-[11.5px] font-medium text-[var(--text-secondary)]">
+                  本地备注标签 <span className="font-normal text-[var(--text-muted)]">（可选，便于区分多把密钥）</span>
+                </label>
+                <input
+                  type="text"
+                  maxLength={40}
+                  value={apiKeyAliasInput}
+                  onChange={(e) => setApiKeyAliasInput(e.target.value)}
+                  placeholder="例如：主力 / 备用 / 测试"
+                  className="h-9 px-3 rounded-[9px] border border-[var(--border)] bg-[var(--bg-canvas)] text-[12.5px] text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)]"
+                />
+              </div>
+              {dashboard?.account.loggedIn && (
+                <label className="inline-flex items-center gap-2 text-[12px] text-[var(--text-secondary)] cursor-pointer select-none pt-0.5">
+                  <input
+                    type="checkbox"
+                    checked={activateNewKey}
+                    onChange={(e) => setActivateNewKey(e.target.checked)}
+                    className="h-3.5 w-3.5 rounded accent-[var(--accent)] cursor-pointer"
+                  />
+                  <span>添加后立即切换到此密钥</span>
+                </label>
+              )}
+            </div>
+            <div className="flex items-center justify-between gap-2 pt-1">
               <button
                 type="button"
-                onClick={() => setShowKeyModal(false)}
-                className="h-8 px-3 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-secondary)] cursor-pointer"
+                onClick={() => {
+                  const rawOrigin = (dashboard?.account.baseUrl || dashboard?.state.baseUrl || "https://tako.shiroha.tech")
+                    .trim()
+                    .replace(/\/+$/, "");
+                  const origin = rawOrigin.endsWith("/v1") ? rawOrigin.slice(0, -3) : rawOrigin;
+                  void api.openUrl(`${origin}/keys`);
+                }}
+                className="inline-flex items-center gap-1 text-[11.5px] text-[var(--text-muted)] hover:text-[var(--accent)] cursor-pointer"
               >
-                取消
+                <ExternalLink className="h-3 w-3" />
+                <span>去平台管理密钥</span>
               </button>
-              <button
-                type="submit"
-                disabled={loggingIn || !apiKeyInput.trim()}
-                className="h-8 px-3.5 rounded-[8px] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12px] font-semibold cursor-pointer disabled:opacity-50"
-              >
-                {loggingIn ? "验证中..." : "验证并登录"}
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowKeyModal(false)}
+                  className="h-8 px-3 rounded-[8px] border border-[var(--border)] bg-[var(--bg-card)] hover:bg-[var(--bg-subtle)] text-[12px] font-medium text-[var(--text-secondary)] cursor-pointer"
+                >
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  disabled={loggingIn || !apiKeyInput.trim()}
+                  className="h-8 px-3.5 rounded-[8px] bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-white text-[12px] font-semibold cursor-pointer disabled:opacity-50"
+                >
+                  {loggingIn
+                    ? "验证中..."
+                    : dashboard?.account.loggedIn
+                      ? activateNewKey
+                        ? "验证并切换"
+                        : "验证并添加"
+                      : "验证并登录"}
+                </button>
+              </div>
             </div>
           </form>
         </div>

@@ -7,13 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "check-candidates (read-only changelog report) | mirror-pinned (mirror approved pinned-versions.json)"
+        description: "check-candidates (read-only) | mirror-pinned (desktop + agy-cli) | mirror-agy-cli (agy-cli only)"
         required: true
         default: "check-candidates"
         type: choice
         options:
           - check-candidates
           - mirror-pinned
+          - mirror-agy-cli
 
 permissions:
   contents: write
@@ -58,14 +59,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Render manifest/manifest.json from manifest/pinned-versions.json
+      - name: Render manifest/manifest.json & agy-cli manifests from manifest/pinned-versions.json
         run: |
           cp manifest/manifest.json /tmp/prev-manifest.json
           python3 scripts/manage-releases.py render-manifest \
             --pinned manifest/pinned-versions.json \
-            --out manifest/manifest.json
+            --out manifest/manifest.json \
+            --agy-cli-out-dir manifest/agy-cli/manifests
 
-      - name: Mirror approved installers and companion binaries (e.g. claude-code) to China OSS / R2
+      - name: Mirror approved installers, companion binaries, and agy-cli to China OSS / R2
         env:
           DOGE_ACCESS_KEY: ${{ secrets.DOGE_ACCESS_KEY }}
           DOGE_SECRET_KEY: ${{ secrets.DOGE_SECRET_KEY }}
@@ -81,21 +83,22 @@ jobs:
           python3 scripts/mirror-to-r2.py \
             --manifest manifest/manifest.json \
             --pinned manifest/pinned-versions.json \
-            --prev-manifest /tmp/prev-manifest.json
+            --prev-manifest /tmp/prev-manifest.json \
+            --agy-cli-manifests-dir manifest/agy-cli/manifests
 
-      - name: Commit updated manifest if changed
+      - name: Commit updated manifests if changed
         run: |
-          if git diff --quiet manifest/manifest.json; then
+          if git diff --quiet manifest/manifest.json manifest/agy-cli/manifests && [ -z "$(git ls-files --others --exclude-standard manifest/agy-cli/manifests)" ]; then
             echo "No manifest changes after mirroring pinned versions."
             exit 0
           fi
           git config user.name "tako-bot"
           git config user.email "bot@shiroha.tech"
-          git add manifest/manifest.json
+          git add manifest/manifest.json manifest/agy-cli/manifests
           git commit -m "chore(manifest): mirror approved pinned versions [skip ci]"
           git push
 
-      - name: Sync manifest.json to China mirror bucket (optional)
+      - name: Sync manifest.json & agy-cli manifests to China mirror bucket (optional)
         if: env.MIRROR_S3_BUCKET != ''
         env:
           MIRROR_S3_BUCKET: ${{ secrets.MIRROR_S3_BUCKET }}
@@ -104,3 +107,62 @@ jobs:
           AWS_ENDPOINT_URL: ${{ secrets.MIRROR_ENDPOINT_URL }}
         run: |
           aws s3 cp manifest/manifest.json "s3://${MIRROR_S3_BUCKET}/tako-switch/manifest.json"
+          if [ -d manifest/agy-cli/manifests ]; then
+            aws s3 sync manifest/agy-cli/manifests "s3://${MIRROR_S3_BUCKET}/tako-switch/agy-cli/manifests" --delete
+          fi
+
+  mirror-agy-cli:
+    name: Mirror & Publish Approved Antigravity CLI (agy) Independently
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'mirror-agy-cli'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Render manifest/agy-cli/manifests from manifest/pinned-versions.json
+        run: |
+          python3 scripts/manage-releases.py render-manifest \
+            --pinned manifest/pinned-versions.json \
+            --agy-cli-only \
+            --agy-cli-out-dir manifest/agy-cli/manifests
+
+      - name: Mirror approved agy-cli archives & sync manifests to China OSS / R2
+        env:
+          DOGE_ACCESS_KEY: ${{ secrets.DOGE_ACCESS_KEY }}
+          DOGE_SECRET_KEY: ${{ secrets.DOGE_SECRET_KEY }}
+          DOGE_OSS_BUCKET: ${{ secrets.DOGE_OSS_BUCKET }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          MIRROR_APPS_BASE: ${{ vars.MIRROR_APPS_BASE }}
+        run: |
+          python3 scripts/mirror-to-r2.py \
+            --only-agy-cli \
+            --agy-cli-manifests-dir manifest/agy-cli/manifests
+
+      - name: Commit updated agy-cli manifests if changed
+        run: |
+          if git diff --quiet manifest/agy-cli/manifests && [ -z "$(git ls-files --others --exclude-standard manifest/agy-cli/manifests)" ]; then
+            echo "No agy-cli manifest changes after mirroring."
+            exit 0
+          fi
+          git config user.name "tako-bot"
+          git config user.email "bot@shiroha.tech"
+          git add manifest/agy-cli/manifests
+          git commit -m "chore(agy-cli): mirror approved agy-cli manifests [skip ci]"
+          git push
+
+      - name: Sync agy-cli manifests to China mirror bucket (optional)
+        if: env.MIRROR_S3_BUCKET != ''
+        env:
+          MIRROR_S3_BUCKET: ${{ secrets.MIRROR_S3_BUCKET }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.MIRROR_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MIRROR_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.MIRROR_ENDPOINT_URL }}
+        run: |
+          aws s3 sync manifest/agy-cli/manifests "s3://${MIRROR_S3_BUCKET}/tako-switch/agy-cli/manifests" --delete

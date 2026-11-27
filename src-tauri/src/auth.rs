@@ -1,6 +1,8 @@
 use crate::config::{
-    read_main_api_id, read_main_api_key, read_switch_auth, read_switch_state, save_switch_auth,
-    write_atomic, AppPaths,
+    activate_saved_key, deactivate_current_auth, read_active_saved_key, read_main_api_id,
+    read_main_api_key, read_switch_auth, read_switch_state, remove_saved_key_entry,
+    save_switch_auth, update_saved_key_alias, update_saved_key_metadata, upsert_saved_key,
+    write_atomic, AppPaths, SavedApiKey, UpsertSavedKeyInput,
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -36,6 +38,23 @@ pub struct QuotaSummary {
     pub weekly_used: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedKeySummary {
+    pub id: String,
+    pub masked_key: String,
+    #[serde(default)]
+    pub user_name: Option<String>,
+    #[serde(default)]
+    pub key_name: Option<String>,
+    #[serde(default)]
+    pub alias: Option<String>,
+    pub display_label: String,
+    #[serde(default)]
+    pub auth_source: Option<String>,
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountStatus {
@@ -43,6 +62,16 @@ pub struct AccountStatus {
     pub base_url: String,
     pub masked_key: Option<String>,
     pub user_name: Option<String>,
+    #[serde(default)]
+    pub key_name: Option<String>,
+    #[serde(default)]
+    pub active_key_id: Option<String>,
+    #[serde(default)]
+    pub active_key_alias: Option<String>,
+    #[serde(default)]
+    pub display_label: Option<String>,
+    #[serde(default)]
+    pub saved_keys: Vec<SavedKeySummary>,
     pub plan_name: Option<String>,
     pub wallet_remain: Option<i64>,
     pub wallet_used: Option<i64>,
@@ -52,6 +81,161 @@ pub struct AccountStatus {
     pub wallet_used_usd: Option<f64>,
     pub quota: Option<QuotaSummary>,
     pub error: Option<String>,
+}
+
+pub fn format_key_display_label(
+    user_name: Option<&str>,
+    key_name: Option<&str>,
+    masked_key: &str,
+) -> String {
+    let user = user_name.map(str::trim).filter(|s| !s.is_empty());
+    let key = key_name.map(str::trim).filter(|s| !s.is_empty());
+    match (user, key) {
+        (Some(u), Some(k)) => format!("{u} - {k}"),
+        (Some(u), None) => format!("{u} - {masked_key}"),
+        (None, Some(k)) => k.to_string(),
+        (None, None) => masked_key.to_string(),
+    }
+}
+
+pub fn summarize_saved_key(entry: &SavedApiKey, active_key_id: Option<&str>) -> SavedKeySummary {
+    let masked = mask_api_key(&entry.api_key);
+    let display_label = format_key_display_label(
+        entry.user_name.as_deref(),
+        entry.key_name.as_deref(),
+        &masked,
+    );
+    SavedKeySummary {
+        id: entry.id.clone(),
+        masked_key: masked,
+        user_name: entry.user_name.clone(),
+        key_name: entry.key_name.clone(),
+        alias: entry.alias.clone(),
+        display_label,
+        auth_source: entry.auth_source.clone(),
+        active: active_key_id == Some(entry.id.as_str()),
+    }
+}
+
+pub fn list_saved_key_summaries(paths: &AppPaths) -> Vec<SavedKeySummary> {
+    let auth = read_switch_auth(paths);
+    let active_id = auth.active_key_id.as_deref();
+    auth.saved_keys
+        .iter()
+        .map(|entry| summarize_saved_key(entry, active_id))
+        .collect()
+}
+
+pub fn build_local_account_status(
+    paths: &AppPaths,
+    cached: Option<AccountStatus>,
+) -> AccountStatus {
+    let state = read_switch_state(paths);
+    let base_url = state.normalized_base_url();
+    let auth = read_switch_auth(paths);
+    let active_id = auth.active_key_id.clone();
+    let saved_keys: Vec<SavedKeySummary> = auth
+        .saved_keys
+        .iter()
+        .map(|entry| summarize_saved_key(entry, active_id.as_deref()))
+        .collect();
+
+    let Some(key) = auth.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return AccountStatus {
+            logged_in: false,
+            base_url,
+            masked_key: None,
+            user_name: None,
+            key_name: None,
+            active_key_id: None,
+            active_key_alias: None,
+            display_label: None,
+            saved_keys,
+            plan_name: None,
+            wallet_remain: None,
+            wallet_used: None,
+            wallet_remain_usd: None,
+            wallet_used_usd: None,
+            quota: None,
+            error: None,
+        };
+    };
+
+    let masked = mask_api_key(key);
+    let active_entry = active_id
+        .as_deref()
+        .and_then(|id| auth.saved_keys.iter().find(|k| k.id == id));
+    let matching_cache = cached.filter(|c| {
+        c.logged_in
+            && c.masked_key.as_deref() == Some(masked.as_str())
+            && (c.active_key_id.is_none() || c.active_key_id == active_id)
+    });
+
+    if let Some(c) = matching_cache {
+        let user_name = c
+            .user_name
+            .or_else(|| active_entry.and_then(|e| e.user_name.clone()));
+        let key_name = c
+            .key_name
+            .or_else(|| active_entry.and_then(|e| e.key_name.clone()));
+        let active_key_alias = active_entry
+            .and_then(|e| e.alias.clone())
+            .or(c.active_key_alias);
+        let display_label = Some(format_key_display_label(
+            user_name.as_deref(),
+            key_name.as_deref(),
+            &masked,
+        ));
+        AccountStatus {
+            logged_in: true,
+            base_url,
+            masked_key: Some(masked),
+            user_name,
+            key_name,
+            active_key_id: active_id,
+            active_key_alias,
+            display_label,
+            saved_keys,
+            plan_name: c.plan_name,
+            wallet_remain: c.wallet_remain,
+            wallet_used: c.wallet_used,
+            wallet_remain_usd: c
+                .wallet_remain_usd
+                .or_else(|| c.wallet_remain.map(quota_units_to_usd)),
+            wallet_used_usd: c
+                .wallet_used_usd
+                .or_else(|| c.wallet_used.map(quota_units_to_usd)),
+            quota: c.quota,
+            error: c.error,
+        }
+    } else {
+        let user_name = active_entry.and_then(|e| e.user_name.clone());
+        let key_name = active_entry.and_then(|e| e.key_name.clone());
+        let active_key_alias = active_entry.and_then(|e| e.alias.clone());
+        let display_label = Some(format_key_display_label(
+            user_name.as_deref(),
+            key_name.as_deref(),
+            &masked,
+        ));
+        AccountStatus {
+            logged_in: true,
+            base_url,
+            masked_key: Some(masked),
+            user_name,
+            key_name,
+            active_key_id: active_id,
+            active_key_alias,
+            display_label,
+            saved_keys,
+            plan_name: None,
+            wallet_remain: None,
+            wallet_used: None,
+            wallet_remain_usd: None,
+            wallet_used_usd: None,
+            quota: None,
+            error: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -473,14 +657,77 @@ pub async fn exchange_desktop_token(
     save_switch_auth(paths, Some(key), api_id.as_deref(), Some("oauth"))
 }
 
-pub async fn login_with_key(paths: &AppPaths, raw_key: &str) -> Result<AccountStatus, String> {
-    let key = raw_key.trim();
-    if key.is_empty() {
-        return Err("API Key 不能为空".to_string());
+fn json_value_to_id_string(val: Option<&serde_json::Value>) -> Option<String> {
+    let v = val?;
+    if let Some(s) = v.as_str() {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
     }
-    let state = read_switch_state(paths);
-    let base_url = state.normalized_base_url();
-    let client = build_http_client(state.bypass_system_proxy)?;
+    if let Some(n) = v.as_i64() {
+        return Some(n.to_string());
+    }
+    if let Some(n) = v.as_u64() {
+        return Some(n.to_string());
+    }
+    None
+}
+
+#[derive(Debug, Default)]
+struct ProbedKeyIdentity {
+    api_id: Option<String>,
+    token_id: Option<String>,
+    user_name: Option<String>,
+    key_name: Option<String>,
+}
+
+async fn verify_and_probe_key(
+    client: &Client,
+    base_url: &str,
+    key: &str,
+) -> Result<ProbedKeyIdentity, String> {
+    let mut desktop_me_err: Option<String> = None;
+
+    if let Ok(resp) = client
+        .get(format!("{base_url}/api/desktop/me"))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+    {
+        let status = resp.status();
+        if let Ok(val) = resp.json::<serde_json::Value>().await {
+            if status.is_success() && val.get("success").and_then(|v| v.as_bool()) == Some(true) {
+                let mut identity = ProbedKeyIdentity {
+                    api_id: json_value_to_id_string(val.pointer("/data/user/id")),
+                    token_id: json_value_to_id_string(val.pointer("/data/token/id")),
+                    user_name: val
+                        .pointer("/data/user/name")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                    key_name: val
+                        .pointer("/data/token/name")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string),
+                };
+                if identity.api_id.is_none() {
+                    identity.api_id = get_key_id(client, base_url, key).await.ok();
+                }
+                return Ok(identity);
+            }
+            desktop_me_err = val
+                .get("message")
+                .or_else(|| val.get("error"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+        }
+    }
 
     let verify_resp = client
         .post(format!("{base_url}/apiStats/api/verify-identity"))
@@ -496,14 +743,126 @@ pub async fn login_with_key(paths: &AppPaths, raw_key: &str) -> Result<AccountSt
     if body.get("success").and_then(|v| v.as_bool()) != Some(true) {
         let msg = body
             .get("error")
+            .or_else(|| body.get("message"))
             .and_then(|v| v.as_str())
-            .unwrap_or("无效的 Tako API Key");
-        return Err(msg.to_string());
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or(desktop_me_err)
+            .unwrap_or_else(|| "无效的 Tako API Key".to_string());
+        return Err(msg);
     }
 
-    let api_id = get_key_id(&client, &base_url, key).await.ok();
-    save_switch_auth(paths, Some(key), api_id.as_deref(), Some("manual_key"))?;
+    let api_id = get_key_id(client, base_url, key).await.ok();
+    let user_name = body
+        .pointer("/user/name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let key_name = body
+        .pointer("/token/name")
+        .or_else(|| body.pointer("/key/name"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok(ProbedKeyIdentity {
+        api_id,
+        token_id: None,
+        user_name,
+        key_name,
+    })
+}
+
+pub async fn add_saved_key(
+    paths: &AppPaths,
+    raw_key: &str,
+    alias: Option<&str>,
+    activate: bool,
+) -> Result<AccountStatus, String> {
+    let key = raw_key.trim();
+    if key.is_empty() {
+        return Err("API Key 不能为空".to_string());
+    }
+    let state = read_switch_state(paths);
+    let base_url = state.normalized_base_url();
+    let client = build_http_client(state.bypass_system_proxy)?;
+
+    let probed = verify_and_probe_key(&client, &base_url, key).await?;
+    let had_active = read_main_api_key(paths).is_some();
+    let will_activate = activate || !had_active;
+
+    let alias_arg = alias.map(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+
+    upsert_saved_key(
+        paths,
+        UpsertSavedKeyInput {
+            api_key: key,
+            api_id: probed.api_id.as_deref(),
+            token_id: probed.token_id.as_deref(),
+            user_name: probed.user_name.as_deref(),
+            key_name: probed.key_name.as_deref(),
+            alias: alias_arg,
+            auth_source: Some("manual_key"),
+            activate: will_activate,
+        },
+    )?;
+
+    if will_activate {
+        clear_balance_cache(paths);
+    }
     Ok(fetch_account_status(paths).await)
+}
+
+pub async fn switch_saved_key(paths: &AppPaths, key_id: &str) -> Result<AccountStatus, String> {
+    activate_saved_key(paths, key_id)?;
+    clear_balance_cache(paths);
+    Ok(fetch_account_status(paths).await)
+}
+
+pub async fn remove_saved_key(paths: &AppPaths, key_id: &str) -> Result<AccountStatus, String> {
+    let state = read_switch_state(paths);
+    let base_url = state.normalized_base_url();
+    let (removed, next_active) = remove_saved_key_entry(paths, key_id)?;
+    if removed.auth_source.as_deref() == Some("oauth") {
+        if let Ok(client) = build_http_client(state.bypass_system_proxy) {
+            let _ = client
+                .post(format!("{base_url}/api/desktop/revoke"))
+                .header("Authorization", format!("Bearer {}", removed.api_key))
+                .send()
+                .await;
+        }
+    }
+    if next_active.is_some() || read_main_api_key(paths).is_none() {
+        clear_balance_cache(paths);
+    }
+    Ok(fetch_account_status(paths).await)
+}
+
+pub async fn rename_saved_key_alias(
+    paths: &AppPaths,
+    key_id: &str,
+    alias: Option<&str>,
+) -> Result<AccountStatus, String> {
+    update_saved_key_alias(paths, key_id, alias)?;
+    let cached = read_balance_cache(paths).map(|c| c.status);
+    let updated = build_local_account_status(paths, cached);
+    if updated.logged_in && updated.error.is_none() {
+        write_balance_cache(paths, &updated);
+    }
+    Ok(updated)
+}
+
+pub async fn login_with_key(paths: &AppPaths, raw_key: &str) -> Result<AccountStatus, String> {
+    add_saved_key(paths, raw_key, None, true).await
 }
 
 pub async fn logout(paths: &AppPaths) -> Result<AccountStatus, String> {
@@ -521,7 +880,7 @@ pub async fn logout(paths: &AppPaths) -> Result<AccountStatus, String> {
             }
         }
     }
-    save_switch_auth(paths, None, None, None)?;
+    deactivate_current_auth(paths, true)?;
     clear_balance_cache(paths);
     Ok(fetch_account_status(paths).await)
 }
@@ -552,6 +911,11 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
             base_url,
             masked_key: None,
             user_name: None,
+            key_name: None,
+            active_key_id: None,
+            active_key_alias: None,
+            display_label: None,
+            saved_keys: list_saved_key_summaries(paths),
             plan_name: None,
             wallet_remain: None,
             wallet_used: None,
@@ -562,13 +926,29 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
         };
     };
 
-    let masked = Some(mask_api_key(&key));
+    let active_entry = read_active_saved_key(paths);
+    let active_key_id = active_entry.as_ref().map(|e| e.id.clone());
+    let active_key_alias = active_entry.as_ref().and_then(|e| e.alias.clone());
+    let masked_str = mask_api_key(&key);
+    let masked = Some(masked_str.clone());
     let Ok(client) = build_http_client(state.bypass_system_proxy) else {
+        let user_name = active_entry.as_ref().and_then(|e| e.user_name.clone());
+        let key_name = active_entry.as_ref().and_then(|e| e.key_name.clone());
+        let display_label = Some(format_key_display_label(
+            user_name.as_deref(),
+            key_name.as_deref(),
+            &masked_str,
+        ));
         return AccountStatus {
             logged_in: true,
             base_url,
             masked_key: masked,
-            user_name: None,
+            user_name,
+            key_name,
+            active_key_id,
+            active_key_alias,
+            display_label,
+            saved_keys: list_saved_key_summaries(paths),
             plan_name: None,
             wallet_remain: None,
             wallet_used: None,
@@ -580,8 +960,10 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
     };
 
     let mut api_id = read_main_api_id(paths);
+    let mut token_id = active_entry.as_ref().and_then(|e| e.token_id.clone());
     let auth_source = read_switch_auth(paths).auth_source;
-    let mut user_name = None;
+    let mut user_name = active_entry.as_ref().and_then(|e| e.user_name.clone());
+    let mut key_name = active_entry.as_ref().and_then(|e| e.key_name.clone());
     let mut plan_name = None;
     let mut wallet_remain = None;
     let mut wallet_used = None;
@@ -596,10 +978,25 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
         Ok(resp) if resp.status().is_success() => {
             if let Ok(val) = resp.json::<serde_json::Value>().await {
                 if val.get("success").and_then(|v| v.as_bool()) == Some(true) {
-                    user_name = val
+                    if let Some(u) = val
                         .pointer("/data/user/name")
                         .and_then(|v| v.as_str())
-                        .map(str::to_string);
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        user_name = Some(u.to_string());
+                    }
+                    if let Some(kn) = val
+                        .pointer("/data/token/name")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        key_name = Some(kn.to_string());
+                    }
+                    if let Some(tid) = json_value_to_id_string(val.pointer("/data/token/id")) {
+                        token_id = Some(tid);
+                    }
                     plan_name = val
                         .pointer("/data/plan/name")
                         .and_then(|v| v.as_str())
@@ -608,18 +1005,7 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
                     wallet_remain = val.pointer("/data/quota/remain").and_then(|v| v.as_i64());
                     wallet_used = val.pointer("/data/quota/used").and_then(|v| v.as_i64());
                     if api_id.is_none() {
-                        api_id = val
-                            .pointer("/data/user/id")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                        if let Some(ref found_id) = api_id {
-                            let _ = save_switch_auth(
-                                paths,
-                                Some(&key),
-                                Some(found_id),
-                                auth_source.as_deref(),
-                            );
-                        }
+                        api_id = json_value_to_id_string(val.pointer("/data/user/id"));
                     }
                 }
             }
@@ -634,10 +1020,23 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
             {
                 if let Ok(val) = ver.json::<serde_json::Value>().await {
                     if val.get("success").and_then(|v| v.as_bool()) == Some(true) {
-                        user_name = val
+                        if let Some(u) = val
                             .pointer("/user/name")
                             .and_then(|v| v.as_str())
-                            .map(str::to_string);
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            user_name = Some(u.to_string());
+                        }
+                        if let Some(kn) = val
+                            .pointer("/token/name")
+                            .or_else(|| val.pointer("/key/name"))
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            key_name = Some(kn.to_string());
+                        }
                         plan_name = val
                             .pointer("/user/plan/name")
                             .and_then(|v| v.as_str())
@@ -662,6 +1061,15 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
             api_id = Some(id);
         }
     }
+
+    let _ = update_saved_key_metadata(
+        paths,
+        &key,
+        api_id.as_deref(),
+        token_id.as_deref(),
+        user_name.as_deref(),
+        key_name.as_deref(),
+    );
 
     let mut quota = None;
     if let Some(ref uid) = api_id {
@@ -709,11 +1117,23 @@ pub async fn fetch_account_status(paths: &AppPaths) -> AccountStatus {
         }
     }
 
+    let display_label = Some(format_key_display_label(
+        user_name.as_deref(),
+        key_name.as_deref(),
+        &masked_str,
+    ));
+    let saved_keys = list_saved_key_summaries(paths);
+
     let status = AccountStatus {
         logged_in: true,
         base_url,
         masked_key: masked,
         user_name,
+        key_name,
+        active_key_id,
+        active_key_alias,
+        display_label,
+        saved_keys,
         plan_name,
         wallet_remain,
         wallet_used,
@@ -758,6 +1178,11 @@ mod tests {
             base_url: "https://tako.shiroha.tech".to_string(),
             masked_key: Some("cr_abcd…efgh".to_string()),
             user_name: Some("Shiroha".to_string()),
+            key_name: Some("主力密钥".to_string()),
+            active_key_id: Some("k1".to_string()),
+            active_key_alias: None,
+            display_label: Some("Shiroha - 主力密钥".to_string()),
+            saved_keys: Vec::new(),
             plan_name: None,
             wallet_remain: Some(6_250_000),
             wallet_used: Some(1_000_000),
@@ -881,5 +1306,149 @@ mod tests {
             parsed["redirect_uri"],
             "http://127.0.0.1:9999/tako/callback"
         );
+    }
+
+    #[test]
+    fn format_key_display_label_combines_account_and_key_name() {
+        assert_eq!(
+            format_key_display_label(Some("Alice"), Some("主力密钥"), "sk-1234…abcd"),
+            "Alice - 主力密钥"
+        );
+        assert_eq!(
+            format_key_display_label(Some("Alice"), None, "sk-1234…abcd"),
+            "Alice - sk-1234…abcd"
+        );
+        assert_eq!(
+            format_key_display_label(None, Some("备用 Key"), "sk-1234…abcd"),
+            "备用 Key"
+        );
+        assert_eq!(
+            format_key_display_label(None, None, "sk-1234…abcd"),
+            "sk-1234…abcd"
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_key_same_account_add_switch_rename_logout_and_remove() {
+        use tempfile::TempDir;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let Ok(n) = sock.read(&mut buf).await else {
+                        return;
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let resp_body = if req.starts_with("GET /api/desktop/me ") {
+                        if req.contains("Bearer sk-primary-key-11112222") {
+                            r#"{"success":true,"data":{"user":{"id":"42","name":"Alice"},"token":{"id":101,"name":"主力密钥"},"plan":{"name":"Pro"},"quota":{"remain":50000000,"used":10000000}}}"#
+                        } else if req.contains("Bearer sk-backup-key-33334444") {
+                            r#"{"success":true,"data":{"user":{"id":"42","name":"Alice"},"token":{"id":102,"name":"备用密钥"},"plan":{"name":""},"quota":{"remain":5000000,"used":500000}}}"#
+                        } else {
+                            r#"{"success":false,"message":"invalid token"}"#
+                        }
+                    } else if req.starts_with("POST /apiStats/api/verify-identity ") {
+                        r#"{"success":false,"error":"invalid key"}"#
+                    } else if req.starts_with("POST /apiStats/api/user-quota ") {
+                        r#"{"success":true}"#
+                    } else {
+                        r#"{"success":false}"#
+                    };
+                    let status_line = if resp_body.contains("\"success\":true") {
+                        "HTTP/1.1 200 OK"
+                    } else {
+                        "HTTP/1.1 401 Unauthorized"
+                    };
+                    let resp = format!(
+                        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let mut st = read_switch_state(&paths);
+        st.base_url = format!("http://{addr}");
+        crate::config::save_switch_state(&paths, &st).unwrap();
+
+        // 1. Add first key (same account "Alice", key "主力密钥")
+        let s1 = add_saved_key(&paths, "sk-primary-key-11112222", Some("主力"), true)
+            .await
+            .unwrap();
+        assert!(s1.logged_in);
+        assert_eq!(s1.user_name.as_deref(), Some("Alice"));
+        assert_eq!(s1.key_name.as_deref(), Some("主力密钥"));
+        assert_eq!(s1.display_label.as_deref(), Some("Alice - 主力密钥"));
+        assert_eq!(s1.active_key_alias.as_deref(), Some("主力"));
+        assert_eq!(s1.saved_keys.len(), 1);
+        let id1 = s1.active_key_id.clone().unwrap();
+
+        // 2. Add second key belonging to the SAME account ("Alice", key "备用密钥") without activating yet
+        let s2 = add_saved_key(&paths, "sk-backup-key-33334444", Some("备用"), false)
+            .await
+            .unwrap();
+        assert_eq!(s2.active_key_id.as_deref(), Some(id1.as_str()));
+        assert_eq!(s2.saved_keys.len(), 2);
+        let id2 = s2
+            .saved_keys
+            .iter()
+            .find(|k| k.id != id1)
+            .unwrap()
+            .id
+            .clone();
+        assert_eq!(
+            s2.saved_keys.iter().find(|k| k.id == id2).unwrap().display_label,
+            "Alice - 备用密钥"
+        );
+
+        // 3. Switch to key 2 -> active key, balance & display label switch cleanly
+        let s3 = switch_saved_key(&paths, &id2).await.unwrap();
+        assert_eq!(read_main_api_key(&paths).as_deref(), Some("sk-backup-key-33334444"));
+        assert_eq!(s3.display_label.as_deref(), Some("Alice - 备用密钥"));
+        assert_eq!(s3.wallet_remain_usd, Some(10.0));
+        assert_eq!(s3.active_key_alias.as_deref(), Some("备用"));
+
+        // 4. Rename alias
+        let s4 = rename_saved_key_alias(&paths, &id2, Some("测试备用"))
+            .await
+            .unwrap();
+        assert_eq!(s4.active_key_alias.as_deref(), Some("测试备用"));
+
+        // 5. Logout keeps manual keys in saved_keys so user can switch back with one click
+        let s5 = logout(&paths).await.unwrap();
+        assert!(!s5.logged_in);
+        assert_eq!(s5.saved_keys.len(), 2);
+        assert!(s5.saved_keys.iter().all(|k| !k.active));
+
+        // 6. Re-activate key 1, then remove active key 1 -> auto-activates remaining key 2
+        let s6 = switch_saved_key(&paths, &id1).await.unwrap();
+        assert_eq!(s6.display_label.as_deref(), Some("Alice - 主力密钥"));
+        assert_eq!(s6.wallet_remain_usd, Some(100.0));
+
+        let s7 = remove_saved_key(&paths, &id1).await.unwrap();
+        assert!(s7.logged_in);
+        assert_eq!(s7.saved_keys.len(), 1);
+        assert_eq!(s7.active_key_id.as_deref(), Some(id2.as_str()));
+        assert_eq!(read_main_api_key(&paths).as_deref(), Some("sk-backup-key-33334444"));
+
+        // 7. Invalid key rejected without mutating saved list
+        let err = add_saved_key(&paths, "sk-bad-key-99999999", None, true)
+            .await
+            .unwrap_err();
+        assert!(!err.is_empty());
+        assert_eq!(list_saved_key_summaries(&paths).len(), 1);
+
+        server.abort();
     }
 }

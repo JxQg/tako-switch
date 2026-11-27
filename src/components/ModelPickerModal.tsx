@@ -116,7 +116,7 @@ const CLIENT_HINTS: Record<AppId, string> = {
   antigravity:
     "Antigravity 最多映射 32 个自定义槽位，精简勾选可避免主力模型被裁掉。",
   workbuddy:
-    "WorkBuddy 通过 ~/.workbuddy/models.json 接入本地 Tako 网关：勾选保存后自动热更新，在「自定义模型」分组可见。",
+    "WorkBuddy 通过 ~/.workbuddy/models.json 接入本地 Tako 网关：勾选保存后自动写入并同步默认选中模型。",
 };
 
 function formatContextWindow(tokens: number | null): string | null {
