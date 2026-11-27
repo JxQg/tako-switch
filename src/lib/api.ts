@@ -129,6 +129,8 @@ export interface ClientModelsResponse {
   models: ClientModelOption[];
 }
 
+export type ClaudeWorkspaceMode = "agent_only" | "full";
+
 export interface SwitchState {
   baseUrl: string;
   agyApiKey?: string | null;
@@ -149,6 +151,7 @@ export interface SwitchState {
   explicitOfficialApps?: AppId[];
   hiddenApps?: AppId[];
   workbuddyDefaultModel?: string | null;
+  claudeWorkspaceMode?: ClaudeWorkspaceMode;
 }
 
 export interface InstallInfo {
@@ -391,6 +394,7 @@ export interface SettingsPatch {
   mcp?: McpToolsConfig;
   hiddenApps?: AppId[];
   workbuddyDefaultModel?: string;
+  claudeWorkspaceMode?: ClaudeWorkspaceMode;
 }
 
 export interface FrontendErrorInput {

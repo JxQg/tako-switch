@@ -2919,7 +2919,7 @@ mod tests {
         .unwrap();
         assert_eq!(effort_map["custom-local:claude-opus-5-5"], "medium");
 
-        // Simulate user manually switching inside WorkBuddy to another enabled Tako model (`swe-2`).
+        // Simulate user manually switching inside WorkBuddy to another enabled Tako model (`swe-2-1`).
         {
             let opts = LevelDbOptions {
                 create_if_missing: false,
@@ -2929,7 +2929,7 @@ mod tests {
             db.put(
                 &encode_chromium_ls_key(&format!("{WORKBUDDY_NEWTASK_MODEL_KEY_PREFIX}:{uid}")),
                 &encode_chromium_ls_string(
-                    r#"{"id":"custom-local:swe-2","isThinking":true,"reasoningEffort":"max"}"#,
+                    r#"{"id":"custom-local:swe-2-1","isThinking":true,"reasoningEffort":"max"}"#,
                 ),
             )
             .unwrap();
@@ -2943,7 +2943,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(kept["id"], "custom-local:swe-2");
+        assert_eq!(kept["id"], "custom-local:swe-2-1");
         assert_eq!(kept["reasoningEffort"], "max");
 
         // Explicit preference override forces BOTH settings.json and LevelDB immediately.

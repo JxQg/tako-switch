@@ -26,6 +26,15 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub const CLAUDE_PATCH_GUARD_COMMENT: &str = "/* __TAKO_CLAUDE_ZH_PATCH_V1__ */";
+const CLAUDE_UI_POLISH_STYLE_ID: &str = "tako-claude-code-landing-polish";
+const CLAUDE_UI_POLISH_MARKER: &str = "/* __TAKO_CLAUDE_UI_POLISH_V1__ */";
+const CLAUDE_UI_POLISH_STYLE_TAG: &str = r#"<style id="tako-claude-code-landing-polish">/* __TAKO_CLAUDE_UI_POLISH_V1__ */
+[data-testid="epitaxy-start-card"]{padding-inline:1.5rem;gap:.875rem!important}
+[data-testid="epitaxy-start-card"]::before{content:"今天想一起完成什么？";display:block;width:min(100%,40rem);text-align:center;font-size:1.45rem;font-weight:500;letter-spacing:-.02em;line-height:1.35;color:var(--cds-text-primary,inherit);margin-bottom:.25rem;opacity:.94}
+[data-testid="epitaxy-start-card"] .w-80,[data-testid="epitaxy-start-card"]>ul,[data-testid="epitaxy-start-card"] [data-start-card-environments],[data-testid="epitaxy-start-card"] [data-start-card-setup]{width:min(100%,40rem)!important;max-width:100%!important}
+[data-testid="epitaxy-start-card"] [data-start-card-environments],[data-testid="epitaxy-start-card"] [data-start-card-setup]>ul,[data-testid="epitaxy-start-card"] [data-start-card-setup]>.rounded-xl{border-radius:1rem!important}
+@media (min-height:680px){.epitaxy-chat-panel:has([data-testid="epitaxy-start-card"]) .epitaxy-prompt{margin-bottom:clamp(1.5rem,11vh,6.25rem);transition:margin-bottom 180ms ease}}
+</style>"#;
 
 const CLAUDE_ZH_DICT_RAW: &str = include_str!("claude_zh_dict.json");
 
@@ -389,10 +398,38 @@ fn extract_icu_vars_and_kinds(
     complex_kinds: &mut BTreeMap<String, String>,
     record_complex: bool,
 ) -> bool {
+    let chars: Vec<(usize, char)> = input.char_indices().collect();
+    let mut pos = 0usize;
     let mut depth = 0usize;
     let mut block_start = 0usize;
 
-    for (idx, ch) in input.char_indices() {
+    while pos < chars.len() {
+        let (idx, ch) = chars[pos];
+        // Respect ICU MessageFormat single-quote escaping (`'{'`, `'}'`, `'<'`, `''`)
+        // at top level so literal braces like `should start with '{'` validate cleanly.
+        if ch == '\'' && depth == 0 {
+            if let Some(&(_, next_ch)) = chars.get(pos + 1) {
+                if next_ch == '\'' {
+                    pos += 2;
+                    continue;
+                }
+                if matches!(next_ch, '{' | '}' | '<') {
+                    pos += 2;
+                    while pos < chars.len() {
+                        if chars[pos].1 == '\'' {
+                            if chars.get(pos + 1).is_some_and(|&(_, c)| c == '\'') {
+                                pos += 2;
+                                continue;
+                            }
+                            pos += 1;
+                            break;
+                        }
+                        pos += 1;
+                    }
+                    continue;
+                }
+            }
+        }
         if ch == '{' {
             if depth == 0 {
                 block_start = idx + ch.len_utf8();
@@ -433,6 +470,7 @@ fn extract_icu_vars_and_kinds(
                 }
             }
         }
+        pos += 1;
     }
 
     depth == 0
@@ -478,6 +516,29 @@ fn extract_xml_tags(input: &str) -> Option<BTreeSet<String>> {
     let mut stack: Vec<String> = Vec::new();
 
     while i < bytes.len() {
+        // Skip ICU single-quoted literals like `'<device>'` or `'{'` so CLI placeholders
+        // inside quotes are not misinterpreted as unclosed FormatJS XML tags.
+        if bytes[i] == b'\'' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            if i + 1 < bytes.len() && matches!(bytes[i + 1], b'<' | b'{' | b'}') {
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
         if bytes[i] != b'<' {
             i += 1;
             continue;
@@ -919,6 +980,322 @@ fn patch_ion_js_chunk(raw: &str) -> (String, usize, bool) {
     }
 }
 
+fn parse_js_quoted_string(slice: &str) -> Option<(String, usize)> {
+    let bytes = slice.as_bytes();
+    let quote = *bytes.first()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' {
+            i += 2;
+            continue;
+        }
+        if b == b'\n' || b == b'\r' {
+            return None;
+        }
+        if b == quote {
+            let raw_inner = &slice[1..i];
+            let decoded = if quote == b'"' {
+                let raw_literal = &slice[..=i];
+                serde_json::from_str::<String>(raw_literal).ok().or_else(|| {
+                    let sanitized = raw_inner.replace("\\'", "'");
+                    serde_json::from_str::<String>(&format!("\"{sanitized}\"")).ok()
+                })?
+            } else {
+                let mut json_buf = String::with_capacity(raw_inner.len() + 2);
+                json_buf.push('"');
+                let mut chars = raw_inner.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        if let Some(&next) = chars.peek() {
+                            if next == '\'' {
+                                chars.next();
+                                json_buf.push('\'');
+                            } else {
+                                json_buf.push('\\');
+                                json_buf.push(chars.next().unwrap());
+                            }
+                        } else {
+                            return None;
+                        }
+                    } else if c == '"' {
+                        json_buf.push_str("\\\"");
+                    } else {
+                        json_buf.push(c);
+                    }
+                }
+                json_buf.push('"');
+                serde_json::from_str::<String>(&json_buf).ok()?
+            };
+            return Some((decoded, i + 1));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn is_valid_format_message_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 80
+        && !id.chars().any(|c| c.is_whitespace() || matches!(c, '{' | '}' | '"' | '\''))
+}
+
+fn skip_ws(s: &str) -> &str {
+    s.trim_start_matches(|c: char| c.is_ascii_whitespace())
+}
+
+fn try_parse_named_prop<'a>(s: &'a str, prop: &str) -> Option<(String, &'a str)> {
+    let rest = skip_ws(s);
+    let after_name = rest
+        .strip_prefix(prop)
+        .or_else(|| {
+            rest.strip_prefix('"')
+                .and_then(|r| r.strip_prefix(prop))
+                .and_then(|r| r.strip_prefix('"'))
+        })
+        .or_else(|| {
+            rest.strip_prefix('\'')
+                .and_then(|r| r.strip_prefix(prop))
+                .and_then(|r| r.strip_prefix('\''))
+        })?;
+    let after_colon = skip_ws(after_name).strip_prefix(':')?;
+    let val_slice = skip_ws(after_colon);
+    let (val, consumed) = parse_js_quoted_string(val_slice)?;
+    Some((val, &val_slice[consumed..]))
+}
+
+/// Extracts React-Intl `{ id, defaultMessage }` message descriptors from bundled JS
+/// chunks so messages omitted from `i18n/en-US.json` (or living in `frame-shell`)
+/// can still be translated into `zh-Hans.json`.
+fn extract_js_format_messages(src: &str, out: &mut HashMap<String, String>) {
+    let needle = "defaultMessage";
+    let mut search_from = 0usize;
+    while let Some(rel) = src[search_from..].find(needle) {
+        let key_pos = search_from + rel;
+        search_from = key_pos + needle.len();
+
+        // Ensure `defaultMessage` is a property key (preceded by `{`, `,`, quote, or whitespace)
+        if key_pos > 0 {
+            let prev = src.as_bytes()[key_pos - 1];
+            if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'$' {
+                continue;
+            }
+        }
+
+        let after_key = &src[key_pos + needle.len()..];
+        let after_key_trim = after_key
+            .strip_prefix('"')
+            .or_else(|| after_key.strip_prefix('\''))
+            .unwrap_or(after_key);
+        let Some(after_colon) = skip_ws(after_key_trim).strip_prefix(':') else {
+            continue;
+        };
+        let dm_slice = skip_ws(after_colon);
+        let Some((dm_val, dm_len)) = parse_js_quoted_string(dm_slice) else {
+            continue;
+        };
+        let after_dm = &dm_slice[dm_len..];
+
+        // Case 1: `defaultMessage: "...", [description: "...",] id: "..."`
+        let mut found_id: Option<String> = None;
+        if let Some(after_comma) = skip_ws(after_dm).strip_prefix(',') {
+            if let Some((id_val, _)) = try_parse_named_prop(after_comma, "id") {
+                found_id = Some(id_val);
+            } else if let Some((_, after_desc)) = try_parse_named_prop(after_comma, "description") {
+                if let Some(after_desc_comma) = skip_ws(after_desc).strip_prefix(',') {
+                    if let Some((id_val, _)) = try_parse_named_prop(after_desc_comma, "id") {
+                        found_id = Some(id_val);
+                    }
+                }
+            }
+        }
+
+        // Case 2: `id: "...", [description: "...",] defaultMessage: "..."`
+        if found_id.is_none() {
+            let lookback_start = key_pos.saturating_sub(320);
+            let mut safe_start = lookback_start;
+            while safe_start < key_pos && !src.is_char_boundary(safe_start) {
+                safe_start += 1;
+            }
+            let prefix = &src[safe_start..key_pos];
+            // Trim to after the closest `{` so we stay inside the same flat descriptor object.
+            let obj_prefix = match prefix.rfind('{') {
+                Some(b) => &prefix[b + 1..],
+                None => prefix,
+            };
+            if !obj_prefix.contains('}') {
+                if let Some((id_val, rest)) = try_parse_named_prop(obj_prefix, "id") {
+                    let after_id = skip_ws(rest);
+                    if let Some(after_comma) = after_id.strip_prefix(',') {
+                        let tail = skip_ws(after_comma);
+                        if tail.is_empty() || tail == "\"" || tail == "'" {
+                            found_id = Some(id_val);
+                        } else if let Some((_, after_desc)) =
+                            try_parse_named_prop(after_comma, "description")
+                        {
+                            if let Some(after_desc_comma) = skip_ws(after_desc).strip_prefix(',') {
+                                let tail2 = skip_ws(after_desc_comma);
+                                if tail2.is_empty() || tail2 == "\"" || tail2 == "'" {
+                                    found_id = Some(id_val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(id) = found_id {
+            if is_valid_format_message_id(&id) {
+                out.entry(id).or_insert(dm_val);
+            }
+        }
+    }
+}
+
+fn patch_frame_shell_html_meta(html: &str, hash12: &str) -> (String, bool) {
+    let Some(meta_pos) = html.find("name=\"frame-shell-i18n\"") else {
+        return (html.to_string(), false);
+    };
+    let Some(tag_start) = html[..meta_pos].rfind('<') else {
+        return (html.to_string(), false);
+    };
+    let Some(tag_end_rel) = html[meta_pos..].find('>') else {
+        return (html.to_string(), false);
+    };
+    let tag_end = meta_pos + tag_end_rel + 1;
+    let orig_tag = &html[tag_start..tag_end];
+    let mut tag = orig_tag.to_string();
+
+    // 1. Ensure `zh-Hans` is listed in `data-shipped="..."`
+    if let Some(shipped_pos) = tag.find("data-shipped=\"") {
+        let val_start = shipped_pos + "data-shipped=\"".len();
+        if let Some(val_end_rel) = tag[val_start..].find('"') {
+            let val_end = val_start + val_end_rel;
+            let shipped_val = &tag[val_start..val_end];
+            if !shipped_val.split(',').any(|loc| loc == "zh-Hans") {
+                let sep = if shipped_val.is_empty() { "" } else { "," };
+                tag.insert_str(val_end, &format!("{sep}zh-Hans"));
+            }
+        }
+    }
+
+    // 2. Ensure `zh-Hans:<hash12>` is listed in `data-catalogs="..."`
+    if let Some(cat_pos) = tag.find("data-catalogs=\"") {
+        let val_start = cat_pos + "data-catalogs=\"".len();
+        if let Some(val_end_rel) = tag[val_start..].find('"') {
+            let val_end = val_start + val_end_rel;
+            let cat_val = &tag[val_start..val_end];
+            let mut entries: Vec<String> = cat_val
+                .split(',')
+                .filter(|e| !e.is_empty() && !e.starts_with("zh-Hans:"))
+                .map(str::to_string)
+                .collect();
+            entries.push(format!("zh-Hans:{hash12}"));
+            let next_cat = entries.join(",");
+            if next_cat != cat_val {
+                tag.replace_range(val_start..val_end, &next_cat);
+            }
+        }
+    }
+
+    if tag == orig_tag {
+        return (html.to_string(), false);
+    }
+
+    let mut out = String::with_capacity(html.len() + 32);
+    out.push_str(&html[..tag_start]);
+    out.push_str(&tag);
+    out.push_str(&html[tag_end..]);
+    (out, true)
+}
+
+fn patch_app_frame_shell_i18n(
+    archive: &mut AsarArchive,
+    app_en_map: &HashMap<String, String>,
+    ion_en_map: &HashMap<String, String>,
+    shell_en_to_zh: &HashMap<String, String>,
+    dict: &HashMap<String, String>,
+) -> Result<(), String> {
+    let html_path = "resources/frame/shell/frame-shell.html";
+    let Some(html_bytes) = archive.get_file(html_path) else {
+        return Ok(());
+    };
+    let Ok(html_str) = std::str::from_utf8(html_bytes).map(str::to_string) else {
+        return Ok(());
+    };
+
+    let ref_catalog_path = archive
+        .file_paths()
+        .into_iter()
+        .find(|p| {
+            p.starts_with("resources/frame/shell/i18n/frame-shell/")
+                && p.ends_with(".json")
+                && !p.ends_with("/zh-Hans.json")
+        });
+    let Some(ref_catalog_path) = ref_catalog_path else {
+        return Ok(());
+    };
+    let Some(ref_bytes) = archive.get_file(&ref_catalog_path) else {
+        return Ok(());
+    };
+    let Ok(ref_map) = serde_json::from_slice::<Map<String, Value>>(ref_bytes) else {
+        return Ok(());
+    };
+
+    let mut frame_js_msgs: HashMap<String, String> = HashMap::new();
+    let frame_js_paths: Vec<String> = archive
+        .file_paths()
+        .into_iter()
+        .filter(|p| p.starts_with("resources/frame/shell/") && p.ends_with(".js"))
+        .collect();
+    for rel in frame_js_paths {
+        if let Some(raw) = archive.get_file(&rel) {
+            if let Ok(txt) = std::str::from_utf8(raw) {
+                extract_js_format_messages(txt, &mut frame_js_msgs);
+            }
+        }
+    }
+
+    let mut zh_map = Map::with_capacity(ref_map.len());
+    for key in ref_map.keys() {
+        let en_opt = ion_en_map
+            .get(key)
+            .or_else(|| frame_js_msgs.get(key))
+            .or_else(|| app_en_map.get(key));
+        if let Some(en_str) = en_opt {
+            let zh = translate_en_to_zh(en_str, shell_en_to_zh, dict);
+            zh_map.insert(key.clone(), Value::String(zh.to_string()));
+        }
+    }
+    for (key, en_str) in &frame_js_msgs {
+        if !zh_map.contains_key(key) {
+            let zh = translate_en_to_zh(en_str, shell_en_to_zh, dict);
+            if zh != en_str.as_str() {
+                zh_map.insert(key.clone(), Value::String(zh.to_string()));
+            }
+        }
+    }
+
+    if zh_map.is_empty() {
+        return Ok(());
+    }
+
+    let zh_bytes = serde_json::to_vec(&Value::Object(zh_map))
+        .map_err(|e| format!("序列化 frame-shell zh-Hans.json 失败: {e}"))?;
+    let hash12 = &sha256_hex(&zh_bytes)[..12];
+    archive.set_file("resources/frame/shell/i18n/frame-shell/zh-Hans.json", zh_bytes)?;
+
+    let (patched_html, changed) = patch_frame_shell_html_meta(&html_str, hash12);
+    if changed {
+        archive.set_file(html_path, patched_html.into_bytes())?;
+    }
+    Ok(())
+}
+
 fn translate_en_to_zh<'a>(
     en: &'a str,
     shell_en_to_zh: &'a HashMap<String, String>,
@@ -942,11 +1319,14 @@ fn patch_app_asar_in_memory(
     orig_sha256: &str,
     app_version: Option<&str>,
     target_patch_version: &str,
+    ion_en_map: &HashMap<String, String>,
     dict: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>, String> {
     let mut shell_en_to_zh: HashMap<String, String> = HashMap::new();
+    let mut app_en_strings: HashMap<String, String> = HashMap::new();
 
-    // 1. Merge/fill resources/i18n/zh-Hans.json while preserving existing translations
+    // 1. Merge/fill resources/i18n/zh-Hans.json while preserving genuinely translated entries
+    //    and upgrading entries that upstream left untranslated (existing_zh == en_str).
     if let Some(en_bytes) = archive.get_file("resources/i18n/en-US.json") {
         let en_map: Map<String, Value> = serde_json::from_slice(en_bytes)
             .map_err(|e| format!("解析 app.asar resources/i18n/en-US.json 失败: {e}"))?;
@@ -959,11 +1339,17 @@ fn patch_app_asar_in_memory(
             let Some(en_str) = en_val.as_str() else {
                 continue;
             };
+            app_en_strings.insert(key.clone(), en_str.to_string());
             if let Some(existing_zh) = zh_map.get(key).and_then(Value::as_str) {
-                if !existing_zh.is_empty() && validate_icu_compatibility(en_str, existing_zh) {
+                let existing_is_translated = !existing_zh.is_empty() && existing_zh != en_str;
+                if existing_is_translated && validate_icu_compatibility(en_str, existing_zh) {
                     shell_en_to_zh
                         .entry(en_str.to_string())
                         .or_insert_with(|| existing_zh.to_string());
+                } else if let Some(cand) = dict.get(en_str).filter(|cand| {
+                    cand.as_str() != en_str && validate_icu_compatibility(en_str, cand)
+                }) {
+                    zh_map.insert(key.clone(), Value::String(cand.clone()));
                 }
             } else {
                 let translated = dict
@@ -979,6 +1365,10 @@ fn patch_app_asar_in_memory(
             .map_err(|e| format!("序列化 app.asar resources/i18n/zh-Hans.json 失败: {e}"))?;
         archive.set_file("resources/i18n/zh-Hans.json", zh_bytes)?;
     }
+
+    // 1b. Generate resources/frame/shell/i18n/frame-shell/zh-Hans.json and register it in
+    //     frame-shell.html so embedded Artifact / Cowork frames also render in Chinese.
+    patch_app_frame_shell_i18n(archive, &app_en_strings, ion_en_map, &shell_en_to_zh, dict)?;
 
     // 2. Patch .vite/build/*.js
     let build_js_paths: Vec<String> = archive
@@ -1032,6 +1422,37 @@ fn patch_app_asar_in_memory(
     Ok(shell_en_to_zh)
 }
 
+fn patch_ion_index_html_ui_polish(raw: &str) -> (String, bool) {
+    if raw.contains(CLAUDE_UI_POLISH_MARKER) {
+        return (raw.to_string(), false);
+    }
+    let cleaned = if let Some(start) = raw.find(&format!("<style id=\"{CLAUDE_UI_POLISH_STYLE_ID}\"")) {
+        if let Some(end_rel) = raw[start..].find("</style>") {
+            let end = start + end_rel + "</style>".len();
+            format!("{}{}", &raw[..start], &raw[end..])
+        } else {
+            raw.to_string()
+        }
+    } else {
+        raw.to_string()
+    };
+    if let Some(pos) = cleaned.rfind("</body>") {
+        let mut out = String::with_capacity(cleaned.len() + CLAUDE_UI_POLISH_STYLE_TAG.len());
+        out.push_str(&cleaned[..pos]);
+        out.push_str(CLAUDE_UI_POLISH_STYLE_TAG);
+        out.push_str(&cleaned[pos..]);
+        (out, true)
+    } else if let Some(pos) = cleaned.rfind("</head>") {
+        let mut out = String::with_capacity(cleaned.len() + CLAUDE_UI_POLISH_STYLE_TAG.len());
+        out.push_str(&cleaned[..pos]);
+        out.push_str(CLAUDE_UI_POLISH_STYLE_TAG);
+        out.push_str(&cleaned[pos..]);
+        (out, true)
+    } else {
+        (cleaned, false)
+    }
+}
+
 fn patch_ion_asar_in_memory(
     archive: &mut AsarArchive,
     orig_sha256: &str,
@@ -1041,7 +1462,8 @@ fn patch_ion_asar_in_memory(
     dict: &HashMap<String, String>,
 ) -> Result<(), String> {
 
-    // 1. Scan assets/**/*.js for 11-locale whitelist arrays & display name map
+    // 1. Scan assets/**/*.js for 11-locale whitelist arrays, display name map, and any
+    //    inline FormatJS defaultMessage descriptors missing from i18n/en-US.json.
     let js_paths: Vec<String> = archive
         .file_paths()
         .into_iter()
@@ -1049,6 +1471,7 @@ fn patch_ion_asar_in_memory(
         .collect();
 
     let mut total_whitelist_hits = 0usize;
+    let mut js_default_messages: HashMap<String, String> = HashMap::new();
     for rel in js_paths {
         let Some(raw_bytes) = archive.get_file(&rel) else {
             continue;
@@ -1056,6 +1479,7 @@ fn patch_ion_asar_in_memory(
         let Ok(raw_str) = std::str::from_utf8(raw_bytes) else {
             continue;
         };
+        extract_js_format_messages(raw_str, &mut js_default_messages);
         let (patched, hits, mutated) = patch_ion_js_chunk(raw_str);
         total_whitelist_hits += hits;
         if mutated {
@@ -1094,12 +1518,13 @@ fn patch_ion_asar_in_memory(
     archive.set_file("i18n/dynamic/zh-Hans.json", dyn_zh_bytes)?;
 
     // 3. Build & inject i18n/zh-Hans.json with 100% key parity to i18n/en-US.json
+    //    plus translations for any JS-only defaultMessage IDs omitted from en-US.json.
     let en_bytes = archive
         .get_file("i18n/en-US.json")
         .ok_or_else(|| "ion-dist.asar 缺少 i18n/en-US.json 主语言目录".to_string())?;
     let en_map: Map<String, Value> = serde_json::from_slice(en_bytes)
         .map_err(|e| format!("解析 ion-dist.asar i18n/en-US.json 失败: {e}"))?;
-    let mut zh_map = Map::with_capacity(en_map.len());
+    let mut zh_map = Map::with_capacity(en_map.len() + js_default_messages.len().min(512));
     for (k, v) in en_map {
         if let Some(en_str) = v.as_str() {
             let zh = translate_en_to_zh(en_str, shell_en_to_zh, dict);
@@ -1108,9 +1533,28 @@ fn patch_ion_asar_in_memory(
             zh_map.insert(k, v);
         }
     }
+    for (id, en_str) in js_default_messages {
+        if !zh_map.contains_key(&id) {
+            let zh = translate_en_to_zh(&en_str, shell_en_to_zh, dict);
+            if zh != en_str.as_str() {
+                zh_map.insert(id, Value::String(zh.to_string()));
+            }
+        }
+    }
     let zh_bytes = serde_json::to_vec(&Value::Object(zh_map))
         .map_err(|e| format!("序列化 i18n/zh-Hans.json 失败: {e}"))?;
     archive.set_file("i18n/zh-Hans.json", zh_bytes)?;
+
+    // 3b. Inject clean pure-CSS empty-state layout polish into index.html (scoped strictly
+    //     to `:has([data-testid="epitaxy-start-card"])` so active conversations are untouched).
+    if let Some(html_bytes) = archive.get_file("index.html") {
+        if let Ok(html_str) = std::str::from_utf8(html_bytes) {
+            let (patched_html, changed) = patch_ion_index_html_ui_polish(html_str);
+            if changed {
+                archive.set_file("index.html", patched_html.into_bytes())?;
+            }
+        }
+    }
 
     // 4. Inject patch marker
     let marker = ClaudePatchMarker {
@@ -1750,11 +2194,21 @@ pub fn patch_claude_ui_for_paths(paths: &AppPaths) -> Result<UiPatchInfo, String
 
     // Mutate BOTH archives fully in memory BEFORE writing anything to disk!
     let effective_dict = load_effective_claude_zh_dict(paths);
+    let ion_en_strings: HashMap<String, String> = base_ion_archive
+        .get_file("i18n/en-US.json")
+        .and_then(|b| serde_json::from_slice::<Map<String, Value>>(b).ok())
+        .map(|m| {
+            m.into_iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
     let shell_en_to_zh = patch_app_asar_in_memory(
         &mut base_app_archive,
         &orig_app_sha,
         app_version.as_deref(),
         &target_patch_version,
+        &ion_en_strings,
         effective_dict.as_ref(),
     )?;
     patch_ion_asar_in_memory(
@@ -2380,5 +2834,204 @@ mod tests {
         let (untouched, dq_changed) = patch_claude_code_mirror_base_url(double_quoted);
         assert!(!dq_changed);
         assert_eq!(untouched, double_quoted);
+    }
+
+    #[test]
+    fn ion_index_html_ui_polish_injects_once_and_is_idempotent() {
+        let html = "<!doctype html><html><head></head><body><div id=\"root\"></div></body></html>";
+        let (patched, changed) = patch_ion_index_html_ui_polish(html);
+        assert!(changed);
+        assert!(patched.contains(CLAUDE_UI_POLISH_STYLE_ID));
+        assert!(patched.contains(CLAUDE_UI_POLISH_MARKER));
+        assert!(patched.ends_with("</body></html>"));
+
+        let (second, changed_again) = patch_ion_index_html_ui_polish(&patched);
+        assert!(!changed_again);
+        assert_eq!(second, patched);
+    }
+
+    #[test]
+    fn icu_validator_accepts_single_quoted_literal_braces_and_cli_tags() {
+        assert!(validate_icu_compatibility(
+            "The JSON must be an object of settings — it should start with '{'.",
+            "JSON 必须是设置对象 — 应以 '{' 开头。"
+        ));
+        assert!(validate_icu_compatibility(
+            "No booted simulator found. Boot one with `xcrun simctl boot '<device>'`.",
+            "未找到已启动的模拟器。请运行 `xcrun simctl boot '<device>'` 启动一个。"
+        ));
+        // Still rejects truly unclosed ICU braces or mismatched XML tags
+        assert!(!validate_icu_compatibility(
+            "Hello {name}",
+            "你好 {name"
+        ));
+        assert!(!validate_icu_compatibility(
+            "Click <link>here</link>",
+            "点击 <link>这里"
+        ));
+    }
+
+    #[test]
+    fn js_format_message_extractor_and_frame_shell_meta_patch_work_and_are_idempotent() {
+        let js = r#"
+            const a = f({defaultMessage:"Approve with edits",id:"UJPHMm0vsr"});
+            const b = f({id:"prOcQ9FPvY",defaultMessage:"Don\u2019t enter passwords here."});
+            const c = f({defaultMessage:"Voice call",description:"btn",id:"/3Yo0ONwYu"});
+            const d = f({id:'singleId',defaultMessage:'Can\'t connect'});
+        "#;
+        let mut extracted = HashMap::new();
+        extract_js_format_messages(js, &mut extracted);
+        assert_eq!(
+            extracted.get("UJPHMm0vsr").map(String::as_str),
+            Some("Approve with edits")
+        );
+        assert_eq!(
+            extracted.get("prOcQ9FPvY").map(String::as_str),
+            Some("Don\u{2019}t enter passwords here.")
+        );
+        assert_eq!(
+            extracted.get("/3Yo0ONwYu").map(String::as_str),
+            Some("Voice call")
+        );
+        assert_eq!(
+            extracted.get("singleId").map(String::as_str),
+            Some("Can't connect")
+        );
+
+        let html = r#"<!doctype html><html><head><meta name="frame-shell-i18n" data-shipped="en-US,de-DE" data-catalogs="de-DE:7ff29108bb22"></head><body></body></html>"#;
+        let (patched, changed) = patch_frame_shell_html_meta(html, "0123456789ab");
+        assert!(changed);
+        assert!(patched.contains(r#"data-shipped="en-US,de-DE,zh-Hans""#));
+        assert!(patched.contains(r#"data-catalogs="de-DE:7ff29108bb22,zh-Hans:0123456789ab""#));
+
+        let (second, changed_again) = patch_frame_shell_html_meta(&patched, "0123456789ab");
+        assert!(!changed_again);
+        assert_eq!(second, patched);
+    }
+
+    #[test]
+    fn patch_upgrades_untranslated_app_shell_entries_and_injects_frame_shell_and_js_only_messages() {
+        let mut app_arc = AsarArchive::new_empty();
+        app_arc
+            .set_file(
+                "package.json",
+                br#"{"name":"claude","version":"7.37095.0"}"#.to_vec(),
+            )
+            .unwrap();
+        app_arc
+            .set_file(
+                ".vite/build/index.js",
+                br#"const locales={en:"en-US","ja-JP":"ja-JP","id-ID":"id-ID"};"#.to_vec(),
+            )
+            .unwrap();
+        app_arc
+            .set_file(
+                "resources/i18n/en-US.json",
+                br#"{"jewac1Lnjr":"Max","NPqkiAP6m1":"Remote Control","k1":"Settings"}"#.to_vec(),
+            )
+            .unwrap();
+        app_arc
+            .set_file(
+                "resources/i18n/zh-Hans.json",
+                r#"{"jewac1Lnjr":"Max","NPqkiAP6m1":"Remote Control","k1":"设置"}"#
+                    .as_bytes()
+                    .to_vec(),
+            )
+            .unwrap();
+        app_arc
+            .set_file(
+                "resources/frame/shell/frame-shell.html",
+                br#"<!doctype html><head><meta name="frame-shell-i18n" data-shipped="en-US,de-DE" data-catalogs="de-DE:abc123456789"></head>"#.to_vec(),
+            )
+            .unwrap();
+        app_arc
+            .set_file(
+                "resources/frame/shell/i18n/frame-shell/de-DE.json",
+                br#"{"fsOnly":"Das braucht deinen Chat.","sharedKey":"Schlaf"}"#.to_vec(),
+            )
+            .unwrap();
+        app_arc
+            .set_file(
+                "resources/frame/shell/frame-shell-chrome.js",
+                br#"const x={defaultMessage:"This needs your chat.",id:"fsOnly"};"#.to_vec(),
+            )
+            .unwrap();
+
+        let mut ion_arc = AsarArchive::new_empty();
+        ion_arc
+            .set_file(
+                "assets/main.js",
+                br#"const LOC=["en-US","de-DE","fr-FR","ko-KR","ja-JP","es-419","es-ES","it-IT","hi-IN","pt-BR","id-ID"];const msg={defaultMessage:"Approve with edits",id:"UJPHMm0vsr"};"#.to_vec(),
+            )
+            .unwrap();
+        ion_arc
+            .set_file(
+                "i18n/en-US.json",
+                br#"{"sharedKey":"Sleep","mKey":"Max"}"#.to_vec(),
+            )
+            .unwrap();
+
+        let ion_en: HashMap<String, String> = [
+            ("sharedKey".to_string(), "Sleep".to_string()),
+            ("mKey".to_string(), "Max".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let dict = claude_zh_dict();
+
+        let shell_en_to_zh = patch_app_asar_in_memory(
+            &mut app_arc,
+            "orig_app_sha",
+            Some("7.37095.0"),
+            "2.3.7",
+            &ion_en,
+            dict,
+        )
+        .unwrap();
+        // Untranslated English in orig zh-Hans must NOT shadow dict
+        assert!(!shell_en_to_zh.contains_key("Max"));
+        assert!(!shell_en_to_zh.contains_key("Remote Control"));
+        assert_eq!(shell_en_to_zh.get("Settings").map(String::as_str), Some("设置"));
+
+        let app_zh: Map<String, Value> =
+            serde_json::from_slice(app_arc.get_file("resources/i18n/zh-Hans.json").unwrap())
+                .unwrap();
+        assert_eq!(app_zh.get("NPqkiAP6m1").and_then(Value::as_str), Some("远程控制"));
+        assert_eq!(app_zh.get("jewac1Lnjr").and_then(Value::as_str), Some("极致"));
+
+        let fs_zh: Map<String, Value> = serde_json::from_slice(
+            app_arc
+                .get_file("resources/frame/shell/i18n/frame-shell/zh-Hans.json")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            fs_zh.get("fsOnly").and_then(Value::as_str),
+            Some("此操作需要打开您的对话。")
+        );
+        assert_eq!(fs_zh.get("sharedKey").and_then(Value::as_str), Some("休眠"));
+        let fs_html =
+            std::str::from_utf8(app_arc.get_file("resources/frame/shell/frame-shell.html").unwrap())
+                .unwrap();
+        assert!(fs_html.contains("data-shipped=\"en-US,de-DE,zh-Hans\""));
+        assert!(fs_html.contains(",zh-Hans:"));
+
+        patch_ion_asar_in_memory(
+            &mut ion_arc,
+            "orig_ion_sha",
+            Some("7.37095.0"),
+            "2.3.7",
+            &shell_en_to_zh,
+            dict,
+        )
+        .unwrap();
+        let ion_zh: Map<String, Value> =
+            serde_json::from_slice(ion_arc.get_file("i18n/zh-Hans.json").unwrap()).unwrap();
+        assert_eq!(ion_zh.get("sharedKey").and_then(Value::as_str), Some("休眠"));
+        assert_eq!(ion_zh.get("mKey").and_then(Value::as_str), Some("极致"));
+        assert_eq!(
+            ion_zh.get("UJPHMm0vsr").and_then(Value::as_str),
+            Some("修改后批准")
+        );
     }
 }

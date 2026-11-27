@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 #[cfg(target_os = "macos")]
 use crate::adapters::{
-    find_macos_app, is_macos_bundle_id_running, launch_macos_app, quit_macos_bundle_id,
+    find_macos_app, is_macos_bundle_id_running, quit_macos_bundle_id,
     read_macos_app_bundle_version, sync_macos_apple_languages,
 };
 
@@ -31,6 +31,12 @@ const AGY_MACOS_BUNDLE_ID: &str = "com.google.antigravity";
 const AGY_TAKO_MCP_GRANT: &str = "mcp(tako/*)";
 const AGY_EDGEONE_MCP_GRANT: &str = "mcp(tako-web-page/*)";
 const AGY_AUTO_CHECK_UPDATES_KEY: &str = "autoCheckForUpdates";
+const STALE_AGY_ENV_KEYS: &[&str] = &[
+    "AGY_LLM_GATEWAY_MODELS",
+    "AGY_LLM_GATEWAY_TIER_PRO",
+    "AGY_LLM_GATEWAY_TIER_FLASH",
+    "AGY_LLM_GATEWAY_TIER_FLASH_LITE",
+];
 
 const AGY_CHINESE_AGENTS_BODY: &str = "\
 - 默认使用简体中文回复用户，思考摘要、任务清单、实现计划与验收说明等产物默认使用简体中文（除非用户明确指定其他语言）。\n\
@@ -397,8 +403,15 @@ impl DesktopAppAdapter for AntigravityAdapter {
         let _ = paths;
         #[cfg(target_os = "macos")]
         {
+            // Clear any stale AGY_LLM_GATEWAY_MODELS / TIER_* env vars so Antigravity
+            // always discovers the filtered catalog from the local gateway rather than
+            // inheriting duplicate/legacy hardcoded model lists from a parent shell.
+            let gw_env = Self::read_gateway_env(paths);
+            if gw_env.contains_key("AGY_LLM_GATEWAY_URL") {
+                let _ = ensure_gateway_service(paths);
+            }
             let app_path = find_macos_app(paths, &["Antigravity.app"], AGY_MACOS_BUNDLE_ID);
-            launch_macos_app(app_path.as_deref(), AGY_MACOS_BUNDLE_ID)
+            launch_macos_antigravity_clean(app_path.as_deref(), &gw_env)
         }
         #[cfg(target_os = "windows")]
         {
@@ -566,8 +579,13 @@ fn xml_escape(raw: &str) -> String {
 fn render_launch_agent_plist(base_url: &str, api_key: &str) -> String {
     let sh_url = shell_single_quote(base_url);
     let sh_key = shell_single_quote(api_key);
+    let unset_stale = STALE_AGY_ENV_KEYS
+        .iter()
+        .map(|k| format!("launchctl unsetenv {k}"))
+        .collect::<Vec<_>>()
+        .join("; ");
     let cmd = format!(
-        "launchctl setenv AGY_LLM_GATEWAY_URL {sh_url} && launchctl setenv AGY_LLM_GATEWAY_API_KEY {sh_key} && launchctl setenv AGY_LLM_GATEWAY_WIRE_PROTOCOL genai && launchctl setenv AGY_CLI_DISABLE_AUTO_UPDATE 1"
+        "launchctl setenv AGY_LLM_GATEWAY_URL {sh_url} && launchctl setenv AGY_LLM_GATEWAY_API_KEY {sh_key} && launchctl setenv AGY_LLM_GATEWAY_WIRE_PROTOCOL genai && launchctl setenv AGY_CLI_DISABLE_AUTO_UPDATE 1 && ({unset_stale}; true)"
     );
     let escaped_cmd = xml_escape(&cmd);
     format!(
@@ -628,8 +646,45 @@ fn extract_launchctl_setenv(plist: &str, key: &str) -> Option<String> {
         }
         return Some(out);
     }
-    let end = rest.find([' ', '<', '\n']).unwrap_or(rest.len());
+    let end = rest.find([' ', ';', '<', '\n']).unwrap_or(rest.len());
     Some(rest[..end].trim().to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn launch_macos_antigravity_clean(
+    app_path: Option<&std::path::Path>,
+    gw_env: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("/usr/bin/open");
+    for key in [
+        "AGY_LLM_GATEWAY_URL",
+        "AGY_LLM_GATEWAY_API_KEY",
+        "AGY_LLM_GATEWAY_WIRE_PROTOCOL",
+        "AGY_CLI_DISABLE_AUTO_UPDATE",
+    ] {
+        if let Some(val) = gw_env.get(key) {
+            cmd.env(key, val);
+        } else {
+            cmd.env_remove(key);
+        }
+    }
+    for key in STALE_AGY_ENV_KEYS {
+        cmd.env_remove(key);
+    }
+    if let Some(path) = app_path {
+        cmd.arg(path);
+    } else {
+        cmd.arg("-b").arg(AGY_MACOS_BUNDLE_ID);
+    }
+    let out = cmd.output().map_err(|e| format!("拉起应用失败: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "拉起应用失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -646,6 +701,11 @@ fn apply_macos_launchctl_env(base_url: &str, api_key: &str) {
     let _ = std::process::Command::new("/bin/launchctl")
         .args(["setenv", "AGY_CLI_DISABLE_AUTO_UPDATE", "1"])
         .output();
+    for key in STALE_AGY_ENV_KEYS {
+        let _ = std::process::Command::new("/bin/launchctl")
+            .args(["unsetenv", key])
+            .output();
+    }
     // Ensure LaunchAgent is active for future logins without failing if GUI session is absent.
     if let Ok(uid_out) = std::process::Command::new("/usr/bin/id").arg("-u").output() {
         let uid = String::from_utf8_lossy(&uid_out.stdout).trim().to_string();
@@ -674,7 +734,10 @@ fn clear_macos_launchctl_env() {
         "AGY_LLM_GATEWAY_API_KEY",
         "AGY_LLM_GATEWAY_WIRE_PROTOCOL",
         "AGY_CLI_DISABLE_AUTO_UPDATE",
-    ] {
+    ]
+    .iter()
+    .chain(STALE_AGY_ENV_KEYS.iter())
+    {
         let _ = std::process::Command::new("/bin/launchctl")
             .args(["unsetenv", key])
             .output();
@@ -767,6 +830,9 @@ fn write_windows_hkcu_env(base_url: &str, api_key: &str) -> Result<(), String> {
         .map_err(|e| format!("写入 AGY_LLM_GATEWAY_WIRE_PROTOCOL 失败: {e}"))?;
     env.set_value("AGY_CLI_DISABLE_AUTO_UPDATE", &"1")
         .map_err(|e| format!("写入 AGY_CLI_DISABLE_AUTO_UPDATE 失败: {e}"))?;
+    for key in STALE_AGY_ENV_KEYS {
+        let _ = env.delete_value(key);
+    }
 
     // Broadcast WM_SETTINGCHANGE via native Win32 API (no powershell.exe spawn, immune to AV blocks)
     // so Explorer / Start Menu / desktop shortcuts inherit the updated environment immediately.
@@ -785,7 +851,10 @@ fn clear_windows_hkcu_env() -> Result<(), String> {
             "AGY_LLM_GATEWAY_API_KEY",
             "AGY_LLM_GATEWAY_WIRE_PROTOCOL",
             "AGY_CLI_DISABLE_AUTO_UPDATE",
-        ] {
+        ]
+        .iter()
+        .chain(STALE_AGY_ENV_KEYS.iter())
+        {
             let _ = env.delete_value(key);
         }
     }
@@ -863,6 +932,9 @@ fn launch_windows_antigravity(paths: &AppPaths) -> Result<(), String> {
             } else {
                 cmd.env_remove(key);
             }
+        }
+        for key in STALE_AGY_ENV_KEYS {
+            cmd.env_remove(key);
         }
         cmd.spawn()
             .map_err(|e| format!("启动 Antigravity 失败: {e}"))?;
