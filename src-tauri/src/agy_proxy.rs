@@ -3185,7 +3185,7 @@ pub fn decode_claude_wire_model_id(wire_id: &str) -> Option<String> {
     }
     let enc_bytes = encoded.as_bytes();
     let mut raw = Vec::with_capacity(enc_bytes.len() / 2);
-    for pair in enc_bytes.chunks_exact(2) {
+    for pair in enc_bytes.as_chunks::<2>().0 {
         let hi = decode_claude_wire_nibble(pair[0])?;
         let lo = decode_claude_wire_nibble(pair[1])?;
         raw.push((hi << 4) | lo);
