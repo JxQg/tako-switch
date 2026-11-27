@@ -412,16 +412,18 @@ fn probe_locations(paths: &AppPaths, platform: ExtPlatform) -> (Vec<PathBuf>, Ve
 }
 
 fn is_executable_file(path: &Path) -> bool {
-    if !path.is_file() {
+    let Ok(metadata) = fs::metadata(path) else {
         return false;
-    }
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
-    true
+    {
+        metadata.is_file()
+    }
 }
 
 fn detect_cli(

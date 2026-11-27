@@ -1609,6 +1609,34 @@ fn directory_link(source: &Path, target: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(unix)]
+fn rename_new_skill(staged: &Path, destination: &Path) -> std::io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+
+    renameat_with(CWD, staged, CWD, destination, RenameFlags::NOREPLACE).map_err(Into::into)
+}
+
+#[cfg(windows)]
+fn rename_new_skill(staged: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    debug_assert_eq!(staged.parent(), destination.parent());
+    let parent = fs::canonicalize(destination.parent().ok_or(ErrorKind::InvalidInput)?)?;
+    let encode = |path: &Path| -> std::io::Result<Vec<u16>> {
+        let name = path.file_name().ok_or(ErrorKind::InvalidInput)?;
+        Ok(parent.join(name).as_os_str().encode_wide().chain([0]).collect())
+    };
+    let staged = encode(staged)?;
+    let destination = encode(destination)?;
+    // Both paths are NUL-terminated. No flags means no replacement or cross-volume copying.
+    if unsafe { MoveFileExW(staged.as_ptr(), destination.as_ptr(), 0) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 struct DirectoryChange {
     destination: PathBuf,
     staged: Option<PathBuf>,
@@ -1621,6 +1649,7 @@ struct DirectoryTransaction<'a> {
     paths: &'a AppPaths,
     changes: Vec<DirectoryChange>,
     committed: bool,
+    allow_replace: bool,
 }
 
 impl<'a> DirectoryTransaction<'a> {
@@ -1629,7 +1658,14 @@ impl<'a> DirectoryTransaction<'a> {
             paths,
             changes: Vec::new(),
             committed: false,
+            allow_replace: true,
         }
+    }
+
+    fn for_install(paths: &'a AppPaths) -> Self {
+        let mut transaction = Self::new(paths);
+        transaction.allow_replace = false;
+        transaction
     }
 
     fn reserve(&mut self, destination: &Path, removal: bool) -> Result<Option<PathBuf>, String> {
@@ -1737,6 +1773,14 @@ impl<'a> DirectoryTransaction<'a> {
 
     fn apply(&mut self) -> Result<(), String> {
         for change in &mut self.changes {
+            if !self.allow_replace {
+                let staged = change.staged.as_deref().ok_or("缺少技能暂存路径")?;
+                rename_new_skill(staged, &change.destination).map_err(|e| {
+                    format!("无法安装技能到 {}（未覆盖目标）: {e}", change.destination.display())
+                })?;
+                change.installed = true;
+                continue;
+            }
             if path_exists(&change.destination)? {
                 fs::rename(&change.destination, &change.previous).map_err(|e| {
                     format!("暂存原技能 {} 失败: {e}", change.destination.display())
@@ -1756,7 +1800,9 @@ impl<'a> DirectoryTransaction<'a> {
     fn finish(mut self) -> Result<(), String> {
         self.committed = true;
         for change in &self.changes {
-            remove_path(&change.previous)?;
+            if change.moved_previous {
+                remove_path(&change.previous)?;
+            }
         }
         Ok(())
     }
@@ -1776,8 +1822,10 @@ impl Drop for DirectoryTransaction<'_> {
                         })?;
                     }
                 }
-                if let Some(staged) = &change.staged {
-                    remove_path(staged)?;
+                if !change.installed {
+                    if let Some(staged) = &change.staged {
+                        remove_path(staged)?;
+                    }
                 }
                 Ok(())
             };
@@ -1993,7 +2041,9 @@ fn stage_platforms(
     let master = master_skills_dir(paths).join(&skill.id);
     for &platform in ExtPlatform::all() {
         let enabled = targets.contains(&platform);
-        if !enabled && !skill.enabled_platforms.contains(&platform) {
+        if !enabled
+            && (!transaction.allow_replace || !skill.enabled_platforms.contains(&platform))
+        {
             continue;
         }
         for (index, root) in platform_skills_dirs(paths, platform).iter().enumerate() {
@@ -2002,7 +2052,9 @@ fn stage_platforms(
                 continue;
             }
             ensure_plain_ancestors(paths, root)?;
-            backup_target(paths, platform, &skill.id, &destination, index)?;
+            if transaction.allow_replace {
+                backup_target(paths, platform, &skill.id, &destination, index)?;
+            }
             if enabled {
                 transaction.stage_delivery(&master, &destination, tree, method, expected_hash)?;
             } else {
@@ -2494,7 +2546,7 @@ fn install_batch(
             }
         }
     }
-    let mut transaction = DirectoryTransaction::new(paths);
+    let mut transaction = DirectoryTransaction::for_install(paths);
     let targets = normalize_platforms(targets);
     for (mut skill, tree) in incoming {
         let expected_hash = skill.installed_hash.clone();
@@ -3363,6 +3415,31 @@ mod tests {
             fs::read_dir(destination.parent().unwrap()).unwrap().count(),
             1
         );
+    }
+
+    #[test]
+    fn new_install_keeps_occupied_targets_and_rolls_back_the_batch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_test(tmp.path());
+        let master = master_skills_dir(&paths);
+        let first = master.join("first");
+        let occupied = master.join("occupied");
+        let tree = seed_skill_dir(&paths.home.join("incoming"), b"# new skill");
+        fs::create_dir_all(&occupied).unwrap();
+        {
+            let mut transaction = DirectoryTransaction::for_install(&paths);
+            for destination in [&first, &occupied] {
+                transaction
+                    .stage_tree(destination, &tree, MAX_LOCAL_SKILL_BYTES, None)
+                    .unwrap();
+            }
+            let error = transaction.apply().unwrap_err();
+            assert!(error.contains("未覆盖目标"), "{error}");
+            assert!(first.join("SKILL.md").is_file());
+        }
+        assert!(!first.exists());
+        assert_eq!(fs::read_dir(&occupied).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&master).unwrap().count(), 1);
     }
 
     #[test]

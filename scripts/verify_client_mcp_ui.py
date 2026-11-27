@@ -172,10 +172,69 @@ FORBIDDEN_EXTERNAL_ASAR_PATTERNS = [
     (re.compile(r"\bnpx\s+asar\b", re.IGNORECASE), "npx asar CLI invocation"),
 ]
 
+APP_ASAR_REFERENCE_RE = re.compile(r"app\.asar", re.IGNORECASE)
+APP_ASAR_REFERENCE_ERROR = "unauthorized reference to third-party app.asar"
 FORBIDDEN_ASAR_PATTERNS = [
-    (re.compile(r"app\.asar", re.IGNORECASE), "unauthorized reference to third-party app.asar"),
+    (APP_ASAR_REFERENCE_RE, APP_ASAR_REFERENCE_ERROR),
     *FORBIDDEN_EXTERNAL_ASAR_PATTERNS,
 ]
+
+# Exact source excerpts for the existing read-only audit and synthetic fixtures.
+APP_ASAR_REFERENCE_EXCEPTIONS = {
+    "src-tauri/src/client_monitor.rs": (
+        '        let asar = extract_log_error_finding(\n'
+        '            "main.log",\n'
+        r'            "FATAL: ElectronAsarIntegrity mismatch for Resources/app.asar (sk-secret1234567890)\n",'
+        '\n        )\n        .unwrap();',
+    ),
+    "scripts/manage-releases.py": (
+        '                        or "(Claude Desktop RELEASES.json 未附正文日志，请重点核对内嵌 Claude Code CLI 版本与 app.asar 差分)",',
+        '                else "(updater yml 未附 releaseNotes，请通过 verify-macos 三门禁对比 app.asar 变更)",',
+        '    if app_id == "claude":\n'
+        '        app_asar_path = resources / "app.asar"',
+        '            loc_details.append("缺少 app.asar 或 ion-dist.asar")',
+        '                loc_details.append("app.asar 缺少 resources/i18n/en-US.json")',
+        '                loc_details.append(f"app.asar i18n 词条覆盖: {covered}/{total_keys} ({coverage:.1f}%)")',
+        '    elif app_id == "antigravity":\n'
+        '        app_asar_path = resources / "app.asar"',
+        '            loc_details.append("缺少 Contents/Resources/app.asar")',
+        '            loc_details.append(f"app.asar 可解析（共 {len(all_files)} 个文件 / {len(js_files)} 个 JS）")',
+        '    elif app_id == "codex":\n'
+        '        zh_lproj = resources / "zh_CN.lproj"\n'
+        '        app_asar_path = resources / "app.asar"',
+        '            inj_details.append("缺少 Contents/Resources/app.asar")',
+        '                loc_details.append("app.asar 保留 desktop.localeOverride 锚点")',
+        '                loc_details.append("app.asar 缺失 desktop.localeOverride 锚点")',
+        "                inj_details.append(f\"app.asar 缺失注入锚点: {', '.join(missing)}\")",
+        '    elif app_id == "workbuddy":\n'
+        '        loc_details.append("WorkBuddy 国内版原生简体中文")\n'
+        '        asar_path = resources / "app.asar"',
+        '                inj_details.append("app.asar 中未找到 cli/product.json，请人工核对 models.json 兼容")',
+        '            inj_details.append("Resources 下缺少 app.asar")',
+    ),
+    "scripts/test_manage_releases.py": (
+        '''            (res_dir / "app.asar").write_bytes(
+                build_minimal_asar(
+                    {
+                        "resources/i18n/en-US.json": en_i18n,
+                        ".vite/build/index.js": build_js,
+                    }
+                )
+            )''',
+    ),
+}
+
+
+def allowed_app_asar_lines(rel: Path, lines: List[str]) -> set[int]:
+    allowed: set[int] = set()
+    for excerpt in APP_ASAR_REFERENCE_EXCEPTIONS.get(rel.as_posix(), ()):
+        expected = excerpt.splitlines()
+        for start, line in enumerate(lines):
+            end = start + len(expected)
+            if line == expected[0] and lines[start:end] == expected:
+                allowed.update(range(start + 1, end + 1))
+                break  # Each exception authorizes only the first exact occurrence.
+    return allowed
 
 
 def parse_csp(csp_raw: str) -> Dict[str, List[str]]:
@@ -779,10 +838,14 @@ def run_checks(repo_root: Path) -> List[Tuple[str, bool, str]]:
                 if resolved in controlled_asar_paths
                 else FORBIDDEN_ASAR_PATTERNS
             )
-            for idx, line in enumerate(content.splitlines(), start=1):
+            rel = fpath.relative_to(repo_root)
+            lines = content.splitlines()
+            allowed = allowed_app_asar_lines(rel, lines)
+            for idx, line in enumerate(lines, start=1):
                 for pat, desc in patterns:
+                    if pat is APP_ASAR_REFERENCE_RE and idx in allowed:
+                        continue
                     if pat.search(line):
-                        rel = fpath.relative_to(repo_root)
                         asar_hits.append(f"{rel}:{idx} ({desc}): {line.strip()}")
     checks.append(
         (
@@ -983,6 +1046,8 @@ export const Leaky = () => (
         (root / "src" / "components" / "extensions").mkdir()
         (root / "src-tauri" / "src" / "adapters").mkdir(parents=True)
         (root / "scripts").mkdir(parents=True)
+        for rel, excerpts in APP_ASAR_REFERENCE_EXCEPTIONS.items():
+            (root / rel).write_text("\n\n".join(excerpts) + "\n", encoding="utf-8")
 
         (root / CONTROLLED_AGY_I18N_REL).write_text(
             """
@@ -1130,11 +1195,39 @@ export const McpInlineTheater = () => (
             json.dumps(synth_dict, ensure_ascii=False), encoding="utf-8"
         )
 
-        # Unauthorized app.asar outside antigravity_i18n.rs must fail
-        (root / "src" / "rogue.ts").write_text('const p = "Resources/app.asar";\n', encoding="utf-8")
-        rogue_res = dict((n, ok) for n, ok, _ in run_checks(root))
-        assert not rogue_res["security:no-app-asar-tampering"]
-        (root / "src" / "rogue.ts").unlink()
+        def assert_asar_rejected(rel: str, text: str, reason: str) -> None:
+            path = root / rel
+            original = path.read_text(encoding="utf-8") if path.exists() else None
+            path.write_text(text, encoding="utf-8")
+            _, ok, message = next(c for c in run_checks(root) if c[0] == "security:no-app-asar-tampering")
+            assert not ok and f"{Path(rel)}:" in message and reason in message, message
+            if original is None:
+                path.unlink()
+            else:
+                path.write_text(original, encoding="utf-8")
+
+        assert_asar_rejected("src/rogue.ts", 'const p = "Resources/app.asar";\n', APP_ASAR_REFERENCE_ERROR)
+        for rel, excerpts in APP_ASAR_REFERENCE_EXCEPTIONS.items():
+            approved = (root / rel).read_text(encoding="utf-8")
+            for extra in ('"new app.asar reference"', excerpts[0]):
+                assert_asar_rejected(rel, approved + extra + "\n", APP_ASAR_REFERENCE_ERROR)
+
+        release_rel = "scripts/manage-releases.py"
+        release_excerpt = APP_ASAR_REFERENCE_EXCEPTIONS[release_rel][0]
+        (root / "scripts/nested").mkdir()
+        assert_asar_rejected("scripts/nested/manage-releases.py", release_excerpt, APP_ASAR_REFERENCE_ERROR)
+
+        fixture_rel = "scripts/test_manage_releases.py"
+        fixture = APP_ASAR_REFERENCE_EXCEPTIONS[fixture_rel][0]
+        assert_asar_rejected(fixture_rel, fixture.replace("en_i18n,", "other_data,"), APP_ASAR_REFERENCE_ERROR)
+
+        approved_release = (root / release_rel).read_text(encoding="utf-8")
+        for marker, reason in (
+            ("@electron/asar", "electron/asar package usage"),
+            ("asar.extractAll", "asar unpack/repack call"),
+            ("npx asar", "npx asar CLI invocation"),
+        ):
+            assert_asar_rejected(release_rel, approved_release + f"# {marker}\n", reason)
 
         # npx asar inside antigravity_i18n.rs must still fail
         (root / CONTROLLED_AGY_I18N_REL).write_text('const BAD: &str = "npx asar pack";\n', encoding="utf-8")
